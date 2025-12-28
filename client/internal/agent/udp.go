@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"playit-prototype/client/internal/udpproto"
+	"hostit/client/internal/udpproto"
 )
 
 type udpSession struct {

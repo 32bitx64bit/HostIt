@@ -71,8 +71,8 @@ func writeSelfSigned(certFile, keyFile string) (fingerprintHex string, err error
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName:   "playit-prototype-tunnel",
-			Organization: []string{"playit-prototype"},
+			CommonName:   "hostit-tunnel",
+			Organization: []string{"hostit"},
 		},
 		NotBefore:             now.Add(-1 * time.Hour),
 		NotAfter:              now.Add(3650 * 24 * time.Hour),

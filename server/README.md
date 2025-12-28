@@ -1,4 +1,4 @@
-# playit-prototype (server)
+# HostIt (server)
 
 Self-hosted TCP tunnel server + web dashboard.
 

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"playit-prototype/client/internal/lineproto"
+	"hostit/client/internal/lineproto"
 )
 
 type Hooks struct {
@@ -45,7 +45,10 @@ func RunWithHooks(ctx context.Context, cfg Config, hooks *Hooks) error {
 }
 
 func debugEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("PLAYIT_DEBUG"))
+	v := strings.TrimSpace(os.Getenv("HOSTIT_DEBUG"))
+	if v == "" {
+		v = strings.TrimSpace(os.Getenv("PLAYIT_DEBUG"))
+	}
 	if v == "" || v == "0" {
 		return false
 	}
@@ -257,7 +260,6 @@ func hostFromRemoteAddr(addr net.Addr) string {
 	return strings.TrimSpace(h)
 }
 
-
 func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, error) {
 	// Keep dial/handshake bounded so a missing/blocked data listener can't stall
 	// until the server-side PairTimeout closes the public connection.
@@ -393,8 +395,8 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 	for _, cand := range cands {
 		for attempt := 0; attempt < 2; attempt++ {
 			var (
-				c   net.Conn
-				err error
+				c        net.Conn
+				err      error
 				fromPool bool
 			)
 			if attempt == 0 {

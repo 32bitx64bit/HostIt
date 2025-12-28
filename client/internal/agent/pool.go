@@ -8,10 +8,10 @@ import (
 )
 
 type dataConnPool struct {
-	addr   string
-	useTLS bool
+	addr    string
+	useTLS  bool
 	noDelay bool
-	ch     chan net.Conn
+	ch      chan net.Conn
 }
 
 func startDataPools(ctx context.Context, cfg Config, routesByName map[string]RemoteRoute, dataAddrTLS string, dataAddrInsecure string) map[string]*dataConnPool {

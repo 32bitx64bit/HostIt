@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"playit-prototype/client/internal/udpproto"
+	"hostit/client/internal/udpproto"
 )
 
 type udpSecurityState struct {

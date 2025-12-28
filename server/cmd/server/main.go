@@ -17,10 +17,10 @@ import (
 	"syscall"
 	"time"
 
-	"playit-prototype/server/internal/auth"
-	"playit-prototype/server/internal/configio"
-	"playit-prototype/server/internal/tlsutil"
-	"playit-prototype/server/internal/tunnel"
+	"hostit/server/internal/auth"
+	"hostit/server/internal/configio"
+	"hostit/server/internal/tlsutil"
+	"hostit/server/internal/tunnel"
 )
 
 func main() {
@@ -423,34 +423,34 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		csrf := ensureCSRF(w, r, cookieSecure)
 		cfg, st, err := runner.Get()
 		routes := effectiveServerRoutes(cfg)
-				type routeView struct {
-					Name       string
-					Proto      string
-					PublicAddr string
-					TCPNoDelay bool
-					TunnelTLS  bool
-					Preconnect int
-				}
+		type routeView struct {
+			Name       string
+			Proto      string
+			PublicAddr string
+			TCPNoDelay bool
+			TunnelTLS  bool
+			Preconnect int
+		}
 		routeViews := make([]routeView, 0, len(routes))
 		for _, rt := range routes {
 			noDelay := true
 			if rt.TCPNoDelay != nil {
 				noDelay = *rt.TCPNoDelay
 			}
-					tlsOn := true
-					if rt.TunnelTLS != nil {
-						tlsOn = *rt.TunnelTLS
-					}
-					pc := 0
-					if rt.Preconnect != nil {
-						pc = *rt.Preconnect
-					} else {
-						p := strings.ToLower(strings.TrimSpace(rt.Proto))
-						if p == "tcp" || p == "both" {
-							pc = 4
-						}
-					}
-					routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, TCPNoDelay: noDelay, TunnelTLS: tlsOn, Preconnect: pc})
+			tlsOn := true
+			if rt.TunnelTLS != nil {
+				tlsOn = *rt.TunnelTLS
+			}
+			pc := 0
+			if rt.Preconnect != nil {
+				pc = *rt.Preconnect
+			} else {
+				p := strings.ToLower(strings.TrimSpace(rt.Proto))
+				if p == "tcp" || p == "both" {
+					pc = 4
+				}
+			}
+			routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, TCPNoDelay: noDelay, TunnelTLS: tlsOn, Preconnect: pc})
 		}
 		data := map[string]any{
 			"Cfg":        cfg,

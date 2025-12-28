@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"playit-prototype/server/internal/lineproto"
+	"hostit/server/internal/lineproto"
 )
 
 func TestEndToEndTCP(t *testing.T) {

@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"playit-prototype/server/internal/lineproto"
-	"playit-prototype/server/internal/udpproto"
+	"hostit/server/internal/lineproto"
+	"hostit/server/internal/udpproto"
 )
 
 type ServerStatus struct {
@@ -262,7 +262,10 @@ type pendingConn struct {
 }
 
 func debugEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("PLAYIT_DEBUG"))
+	v := strings.TrimSpace(os.Getenv("HOSTIT_DEBUG"))
+	if v == "" {
+		v = strings.TrimSpace(os.Getenv("PLAYIT_DEBUG"))
+	}
 	if v == "" || v == "0" {
 		return false
 	}

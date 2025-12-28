@@ -94,7 +94,7 @@ func newAEAD(mode Mode, token string, salt []byte) (cipher.AEAD, error) {
 	if len(salt) == 0 {
 		return nil, errors.New("missing salt")
 	}
-	info := []byte("playit-prototype/udp/" + string(mode))
+	info := []byte("hostit/udp/" + string(mode))
 	rk := hkdf.New(sha256.New, []byte(token), salt, info)
 	key := make([]byte, keyLen)
 	if _, err := io.ReadFull(rk, key); err != nil {

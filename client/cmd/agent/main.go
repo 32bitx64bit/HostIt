@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"playit-prototype/client/internal/agent"
-	"playit-prototype/client/internal/configio"
+	"hostit/client/internal/agent"
+	"hostit/client/internal/configio"
 )
 
 func main() {

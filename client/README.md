@@ -1,4 +1,4 @@
-# playit-prototype (client)
+# HostIt (client)
 
 Local agent that connects to the tunnel server and forwards based on server-pushed routes.
 
