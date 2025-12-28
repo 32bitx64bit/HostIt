@@ -48,6 +48,7 @@ cd client
 
 - Agent dashboard: `http://127.0.0.1:7003`
 - The agent page has **Start / Stop / Restart** controls and live status updates.
+- You can alternatively just start the server and set the token + IP via the GUI.
 
 ### 3) Connect from the internet
 
