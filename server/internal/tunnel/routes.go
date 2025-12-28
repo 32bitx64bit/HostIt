@@ -4,10 +4,12 @@ import "strings"
 
 func normalizeRoutes(cfg *ServerConfig) {
 	if len(cfg.Routes) == 0 && strings.TrimSpace(cfg.PublicAddr) != "" {
+		b := true
 		cfg.Routes = []RouteConfig{{
 			Name:       "default",
 			Proto:      "tcp",
 			PublicAddr: cfg.PublicAddr,
+			TCPNoDelay: &b,
 		}}
 	}
 	for i := range cfg.Routes {
@@ -20,6 +22,10 @@ func normalizeRoutes(cfg *ServerConfig) {
 			cfg.Routes[i].Proto = "tcp"
 		}
 		cfg.Routes[i].PublicAddr = strings.TrimSpace(cfg.Routes[i].PublicAddr)
+		if cfg.Routes[i].TCPNoDelay == nil {
+			b := true
+			cfg.Routes[i].TCPNoDelay = &b
+		}
 	}
 }
 

@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,19 +19,15 @@ import (
 )
 
 func main() {
-	var controlAddr string
-	var dataAddr string
+	var serverHost string
 	var token string
-	var localAddr string
 	var webAddr string
 	var configPath string
 	var autostart bool
 
-	flag.StringVar(&controlAddr, "control", "127.0.0.1:7000", "server control address")
-	flag.StringVar(&dataAddr, "data", "127.0.0.1:7001", "server data address")
-	flag.StringVar(&token, "token", "", "shared token (optional)")
-	flag.StringVar(&localAddr, "local", "127.0.0.1:8080", "local target address")
-	flag.StringVar(&webAddr, "web", "127.0.0.1:7070", "agent web dashboard listen address (empty to disable)")
+	flag.StringVar(&serverHost, "server", "", "tunnel server host/IP (optionally include control port, e.g. host:7000)")
+	flag.StringVar(&token, "token", "", "shared token (required)")
+	flag.StringVar(&webAddr, "web", ":7003", "agent web dashboard listen address (empty to disable)")
 	flag.StringVar(&configPath, "config", "agent.json", "path to agent config JSON")
 	flag.BoolVar(&autostart, "autostart", true, "start agent automatically")
 	flag.Parse()
@@ -39,13 +35,33 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	cfg := agent.Config{
-		ControlAddr: controlAddr,
-		DataAddr:    dataAddr,
-		Token:       token,
-		LocalAddr:   localAddr,
+	cfg := agent.Config{}
+	loaded, _ := configio.Load(configPath, &cfg)
+	if !loaded && strings.TrimSpace(cfg.Server) == "" {
+		// First-run convenience: if no config file exists, default to localhost.
+		cfg.Server = "127.0.0.1"
 	}
-	_, _ = configio.Load(configPath, &cfg)
+	if strings.TrimSpace(token) != "" {
+		cfg.Token = token
+	}
+	if strings.TrimSpace(serverHost) != "" {
+		cfg.Server = serverHost
+	}
+
+	if strings.TrimSpace(cfg.Server) == "" {
+		if webAddr == "" {
+			log.Fatalf("agent server is required (set -server or agent.json Server)")
+		}
+		autostart = false
+		log.Printf("agent server not set; web UI is available to configure it")
+	}
+	if strings.TrimSpace(cfg.Token) == "" {
+		if webAddr == "" {
+			log.Fatalf("agent token is required (set -token or agent.json Token)")
+		}
+		autostart = false
+		log.Printf("agent token not set; web UI is available to configure it")
+	}
 
 	ctrl := newAgentController(ctx, cfg)
 	if autostart {
@@ -54,7 +70,11 @@ func main() {
 
 	if webAddr != "" {
 		go func() {
-			log.Printf("agent web: http://%s", webAddr)
+			display := webAddr
+			if strings.HasPrefix(display, ":") {
+				display = "127.0.0.1" + display
+			}
+			log.Printf("agent web: http://%s", display)
 			if err := serveAgentDashboard(ctx, webAddr, configPath, ctrl); err != nil {
 				log.Printf("agent web error: %v", err)
 			}
@@ -72,17 +92,20 @@ type agentController struct {
 	running   bool
 	connected bool
 	lastErr   string
+	routes    []agent.RemoteRoute
 	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 func newAgentController(root context.Context, cfg agent.Config) *agentController {
 	return &agentController{root: root, cfg: cfg}
 }
 
-func (a *agentController) Get() (agent.Config, bool, bool, string) {
+func (a *agentController) Get() (agent.Config, bool, bool, string, []agent.RemoteRoute) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.cfg, a.running, a.connected, a.lastErr
+	routes := append([]agent.RemoteRoute(nil), a.routes...)
+	return a.cfg, a.running, a.connected, a.lastErr, routes
 }
 
 func (a *agentController) SetConfig(cfg agent.Config) {
@@ -97,12 +120,21 @@ func (a *agentController) Start() {
 		a.mu.Unlock()
 		return
 	}
+	cfg := a.cfg
+	if strings.TrimSpace(cfg.Server) == "" || strings.TrimSpace(cfg.Token) == "" {
+		a.running = false
+		a.connected = false
+		a.lastErr = "missing server and/or token (set them on /)"
+		a.mu.Unlock()
+		return
+	}
 	ctx, cancel := context.WithCancel(a.root)
 	a.cancel = cancel
+	done := make(chan struct{})
+	a.done = done
 	a.running = true
 	a.connected = false
 	a.lastErr = ""
-	cfg := a.cfg
 	a.mu.Unlock()
 
 	hooks := &agent.Hooks{
@@ -110,6 +142,11 @@ func (a *agentController) Start() {
 			a.mu.Lock()
 			a.connected = true
 			a.lastErr = ""
+			a.mu.Unlock()
+		},
+		OnRoutes: func(routes []agent.RemoteRoute) {
+			a.mu.Lock()
+			a.routes = append([]agent.RemoteRoute(nil), routes...)
 			a.mu.Unlock()
 		},
 		OnDisconnected: func(err error) {
@@ -131,11 +168,13 @@ func (a *agentController) Start() {
 	}
 
 	go func() {
+		defer close(done)
 		err := agent.RunWithHooks(ctx, cfg, hooks)
 		a.mu.Lock()
 		a.connected = false
 		a.running = false
 		a.cancel = nil
+		a.done = nil
 		if err != nil && a.lastErr == "" {
 			a.lastErr = err.Error()
 		}
@@ -145,17 +184,45 @@ func (a *agentController) Start() {
 
 func (a *agentController) Stop() {
 	a.mu.Lock()
-	if a.cancel != nil {
-		a.cancel()
-		a.cancel = nil
-	}
+	cancel := a.cancel
+	done := a.done
+	a.cancel = nil
 	a.running = false
 	a.connected = false
 	a.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func serveAgentDashboard(ctx context.Context, addr string, configPath string, ctrl *agentController) error {
-	tpl := template.Must(template.New("agent").Parse(agentPageHTML))
+	tplHome := template.Must(template.New("home").Parse(agentHomeHTML))
+
+	type routeView struct {
+		Name        string
+		Proto       string
+		PublicAddr  string
+		LocalTarget string
+	}
+	makeRouteViews := func(routes []agent.RemoteRoute) []routeView {
+		out := make([]routeView, 0, len(routes))
+		for _, rt := range routes {
+			out = append(out, routeView{
+				Name:        rt.Name,
+				Proto:       rt.Proto,
+				PublicAddr:  rt.PublicAddr,
+				LocalTarget: localTargetFromPublicAddr(rt.PublicAddr),
+			})
+		}
+		return out
+	}
 
 	var msgMu sync.Mutex
 	var msg string
@@ -171,29 +238,37 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}
 
 	mux := http.NewServeMux()
+
+	// Single page
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		cfg, running, connected, lastErr := ctrl.Get()
-		routes := cfg.Routes
-		if len(routes) == 0 && strings.TrimSpace(cfg.LocalAddr) != "" {
-			routes = []agent.RouteConfig{{Name: "default", Proto: "tcp", LocalTCPAddr: cfg.LocalAddr}}
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
 		}
-		routesJSON := ""
-		if b, jerr := json.MarshalIndent(routes, "", "  "); jerr == nil {
-			routesJSON = string(b)
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
+		cfg, running, connected, lastErr, routes := ctrl.Get()
 		data := map[string]any{
 			"Cfg":        cfg,
 			"Running":    running,
 			"Connected":  connected,
+			"HasToken":   strings.TrimSpace(cfg.Token) != "",
 			"LastErr":    lastErr,
 			"ConfigPath": configPath,
 			"Msg":        getMsg(),
-			"RoutesJSON": routesJSON,
+			"RoutesView": makeRouteViews(routes),
 		}
-		_ = tpl.Execute(w, data)
+		_ = tplHome.Execute(w, data)
 	})
 
-	mux.HandleFunc("/save", func(w http.ResponseWriter, r *http.Request) {
+	// Back-compat: old config page
+	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	})
+
+	saveHandler := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -202,49 +277,35 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		cfg := agent.Config{
-			ControlAddr: r.Form.Get("control"),
-			DataAddr:    r.Form.Get("data"),
-			Token:       r.Form.Get("token"),
-			LocalAddr:   r.Form.Get("local"),
+		old, _, _, _, _ := ctrl.Get()
+		cfg := old
+		cfg.Server = strings.TrimSpace(r.Form.Get("server"))
+		cfg.Token = strings.TrimSpace(r.Form.Get("token"))
+		if cfg.Server == "" {
+			http.Error(w, "server is required", http.StatusBadRequest)
+			return
 		}
-		routesJSON := strings.TrimSpace(r.Form.Get("routes_json"))
-		if routesJSON != "" {
-			var routes []agent.RouteConfig
-			if err := json.Unmarshal([]byte(routesJSON), &routes); err != nil {
-				http.Error(w, "invalid routes JSON", http.StatusBadRequest)
-				return
-			}
-			cfg.Routes = routes
+		if cfg.Token == "" {
+			http.Error(w, "token is required", http.StatusBadRequest)
+			return
 		}
 		if err := configio.Save(configPath, cfg); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		ctrl.SetConfig(cfg)
-		setMsg("Saved")
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-	})
-
-	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		ctrl.Start()
-		setMsg("Starting")
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-	})
-
-	mux.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+		// Apply immediately.
 		ctrl.Stop()
-		setMsg("Stopped")
+		ctrl.SetConfig(cfg)
+		ctrl.Start()
+		setMsg("Saved + restarted")
 		http.Redirect(w, r, "/", http.StatusSeeOther)
-	})
+	}
+
+	// Save endpoint (and back-compat path)
+	mux.HandleFunc("/save", saveHandler)
+	mux.HandleFunc("/config/save", saveHandler)
+
+	// No start/stop controls: agent runs as a service.
 
 	h := &http.Server{Addr: addr, Handler: mux}
 	go func() {
@@ -261,7 +322,33 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	return err
 }
 
-const agentPageHTML = `<!doctype html>
+func localTargetFromPublicAddr(publicAddr string) string {
+	if strings.TrimSpace(publicAddr) == "" {
+		return "127.0.0.1"
+	}
+	if strings.HasPrefix(publicAddr, ":") {
+		port := strings.TrimPrefix(publicAddr, ":")
+		if port == "" {
+			return "127.0.0.1"
+		}
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+
+	_, port, err := net.SplitHostPort(publicAddr)
+	if err == nil {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+
+	if idx := strings.LastIndex(publicAddr, ":"); idx != -1 && idx+1 < len(publicAddr) {
+		port = publicAddr[idx+1:]
+		if port != "" {
+			return net.JoinHostPort("127.0.0.1", port)
+		}
+	}
+	return "127.0.0.1"
+}
+
+const agentHomeHTML = `<!doctype html>
 <html>
 <head>
 	<meta charset="utf-8" />
@@ -280,8 +367,7 @@ const agentPageHTML = `<!doctype html>
 		@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
 		label { font-weight: 600; display:block; margin: 0 0 4px; }
 		.help { font-size: 12px; margin: 0 0 8px; opacity: .85; line-height: 1.35; }
-		input, textarea { width: 100%; max-width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); }
-		textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+		input { width: 100%; max-width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); }
 		.btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
 		button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
 		button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
@@ -290,6 +376,7 @@ const agentPageHTML = `<!doctype html>
 		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
 		code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
 		.flash { margin: 10px 0 0; }
+		.row { margin-bottom: 10px; }
 	</style>
 </head>
 <body>
@@ -297,75 +384,50 @@ const agentPageHTML = `<!doctype html>
 		<div class="top">
 			<div>
 				<h1>Tunnel Agent</h1>
-				<div class="muted">Runs near your private service and connects outbound to your tunnel server.</div>
+				<div class="muted">Connects outbound to your tunnel server and forwards based on server configuration.</div>
 			</div>
 			<div class="card">
-				<div><b>Status:</b>
+				<div class="row"><b>Status:</b>
 					{{if .Running}}<span class="pill ok">Running</span>{{else}}<span class="pill bad">Stopped</span>{{end}}
 					{{if .Connected}}<span class="pill ok">Connected</span>{{else}}<span class="pill bad">Disconnected</span>{{end}}
 				</div>
-				<div style="margin-top:8px"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
-				{{if .LastErr}}<div style="margin-top:8px"><b>Last error:</b> <span class="muted">{{.LastErr}}</span></div>{{end}}
+				<div class="row"><b>Server:</b> <code>{{.Cfg.Server}}</code></div>
+				<div class="row"><b>Token:</b> {{if .HasToken}}<span class="pill ok">Set</span>{{else}}<span class="pill bad">Missing</span>{{end}}</div>
+				<div class="row"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
+				{{if .LastErr}}<div class="row"><b>Last error:</b> <span class="muted">{{.LastErr}}</span></div>{{end}}
 			</div>
 		</div>
 
 		{{if .Msg}}<div class="flash pill ok">{{.Msg}}</div>{{end}}
 
-		<h2>How this works</h2>
-		<div class="card">
-			<div class="muted">When the server gets a public connection, it tells this agent to attach. The agent then dials <b>Local target</b> and pipes bytes both ways. Start/Stop here only affects the agent connection; your local service keeps running.</div>
-		</div>
-
-		<h2>Config</h2>
 		<form method="post" action="/save" class="card">
+			<h2>Connection</h2>
 			<div class="grid">
 				<div>
-					<label>Server control</label>
-					<div class="help">Tunnel server control address (e.g. <code>your-vps:7000</code>).</div>
-					<input name="control" value="{{.Cfg.ControlAddr}}" />
+					<label>Server</label>
+					<div class="help">Tunnel server host/IP (defaults to ports 7000/7001).</div>
+					<input name="server" value="{{.Cfg.Server}}" />
 				</div>
-
 				<div>
-					<label>Server data</label>
-					<div class="help">Tunnel server data address (e.g. <code>your-vps:7001</code>).</div>
-					<input name="data" value="{{.Cfg.DataAddr}}" />
-				</div>
-
-				<div>
-					<label>Local target (legacy single TCP)</label>
-					<div class="help">Backwards-compatible: if <b>Routes</b> is empty, a single TCP route named <code>default</code> is created from this value.</div>
-					<input name="local" value="{{.Cfg.LocalAddr}}" />
-				</div>
-
-				<div>
-					<label>Token (optional)</label>
-					<div class="help">Must match the server token if set. Leave blank if the server has no token.</div>
+					<label>Token</label>
+					<div class="help">Required. Must match the server token.</div>
 					<input name="token" value="{{.Cfg.Token}}" />
 				</div>
 			</div>
-
-			<div style="margin-top: 12px">
-				<label>Routes (JSON)</label>
-				<div class="help">Define multiple internal targets. Route <code>Name</code> must match the server’s route name. Use <code>Proto</code> = <code>tcp</code>, <code>udp</code>, or <code>both</code> and set <code>LocalTCPAddr</code>/<code>LocalUDPAddr</code> accordingly.</div>
-				<textarea name="routes_json">{{.RoutesJSON}}</textarea>
-			</div>
-
+			<div style="margin-top:12px" class="muted">This agent does not configure routes. Routes come from the server, and the agent forwards to <code>127.0.0.1:&lt;publicPort&gt;</code> on this machine.</div>
 			<div class="btns">
-				<button type="submit" class="primary">Save</button>
+				<button type="submit" class="primary">Save + restart agent</button>
 			</div>
 		</form>
 
-		<h2>Control</h2>
+		<h2>Routes</h2>
 		<div class="card">
-			<div class="help">If you changed config above, click <b>Save</b> first. If the agent is running, you may need to Stop then Start to reconnect using new settings.</div>
-			<div class="btns">
-				<form method="post" action="/start" style="display:inline">
-					<button type="submit" class="primary">Start</button>
-				</form>
-				<form method="post" action="/stop" style="display:inline">
-					<button type="submit">Stop</button>
-				</form>
-			</div>
+			{{if not .Connected}}
+				<div class="muted">Routes appear after the agent connects to the server.</div>
+			{{end}}
+			{{range .RoutesView}}
+				<div class="row"><b>{{.Name}}</b> <span class="muted">({{.Proto}})</span> public: <code>{{.PublicAddr}}</code> local: <code>{{.LocalTarget}}</code></div>
+			{{end}}
 		</div>
 	</div>
 </body>

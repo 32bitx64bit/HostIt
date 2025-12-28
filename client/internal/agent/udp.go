@@ -16,7 +16,7 @@ type udpSession struct {
 	close  sync.Once
 }
 
-func runUDP(ctx context.Context, cfg Config, routesByName map[string]RouteConfig) {
+func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurityState, routesByName map[string]RemoteRoute) {
 	const idle = 2 * time.Minute
 
 	for {
@@ -24,7 +24,7 @@ func runUDP(ctx context.Context, cfg Config, routesByName map[string]RouteConfig
 			return
 		}
 
-		c, err := net.Dial("udp", cfg.DataAddr)
+		c, err := net.Dial("udp", dataAddr)
 		if err != nil {
 			t := time.NewTimer(1 * time.Second)
 			select {
@@ -43,7 +43,12 @@ func runUDP(ctx context.Context, cfg Config, routesByName map[string]RouteConfig
 		}
 
 		// Register so the server learns our UDP address.
-		_, _ = uc.Write(udpproto.EncodeReg(cfg.Token))
+		ks := sec.Get()
+		if ks.Enabled() {
+			_, _ = uc.Write(udpproto.EncodeRegEnc2(ks, token))
+		} else {
+			_, _ = uc.Write(udpproto.EncodeReg(token))
+		}
 
 		sessionsMu := sync.Mutex{}
 		sessions := map[string]map[string]*udpSession{} // route -> client -> session
@@ -80,7 +85,12 @@ func runUDP(ctx context.Context, cfg Config, routesByName map[string]RouteConfig
 					if err != nil {
 						break
 					}
-					_, _ = uc.Write(udpproto.EncodeData(routeName, clientAddr, buf[:n]))
+					ks := sec.Get()
+					if ks.Enabled() {
+						_, _ = uc.Write(udpproto.EncodeDataEnc2ForKeyID(ks, ks.CurID, routeName, clientAddr, buf[:n]))
+					} else {
+						_, _ = uc.Write(udpproto.EncodeData(routeName, clientAddr, buf[:n]))
+					}
 				}
 
 				s.close.Do(func() {
@@ -106,20 +116,33 @@ func runUDP(ctx context.Context, cfg Config, routesByName map[string]RouteConfig
 				n, err := uc.Read(buf)
 				if err != nil {
 					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						_, _ = uc.Write(udpproto.EncodeReg(cfg.Token))
+						ks := sec.Get()
+						if ks.Enabled() {
+							_, _ = uc.Write(udpproto.EncodeRegEnc2(ks, token))
+						} else {
+							_, _ = uc.Write(udpproto.EncodeReg(token))
+						}
 						continue
 					}
 					return err
 				}
-				routeName, clientAddr, payload, ok := udpproto.DecodeData(buf[:n])
+				ks := sec.Get()
+				routeName, clientAddr, payload, _, ok := udpproto.DecodeDataEnc2(ks, buf[:n])
+				if !ok {
+					routeName, clientAddr, payload, ok = udpproto.DecodeData(buf[:n])
+					if !ok {
+						continue
+					}
+				}
+				rt, ok := routesByName[routeName]
+				if !ok || !routeHasUDP(rt.Proto) {
+					continue
+				}
+				localTarget, ok := localTargetFromPublicAddr(rt.PublicAddr)
 				if !ok {
 					continue
 				}
-				rt, ok := routesByName[routeName]
-				if !ok || !routeHasUDP(rt.Proto) || rt.LocalUDPAddr == "" {
-					continue
-				}
-				s, ok := getOrCreate(routeName, clientAddr, rt.LocalUDPAddr)
+				s, ok := getOrCreate(routeName, clientAddr, localTarget)
 				if !ok || s == nil {
 					continue
 				}

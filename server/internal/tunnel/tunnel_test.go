@@ -55,11 +55,11 @@ func TestEndToEndTCP(t *testing.T) {
 	publicAddr := publicLn.Addr().String()
 	_ = publicLn.Close()
 
-	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, PublicAddr: publicAddr, PairTimeout: 2 * time.Second})
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, PublicAddr: publicAddr, Token: "testtoken", PairTimeout: 2 * time.Second, DisableTLS: true})
 	go func() { _ = srv.Run(ctx) }()
 
 	// Fake agent: connect to control; for each NEW id, connect to data and then to local echo.
-	go fakeAgent(ctx, controlAddr, dataAddr, echoLn.Addr().String())
+	go fakeAgent(ctx, controlAddr, dataAddr, echoLn.Addr().String(), "testtoken")
 
 	msg := []byte("hello\n")
 	deadline := time.Now().Add(2 * time.Second)
@@ -94,7 +94,7 @@ func TestEndToEndTCP(t *testing.T) {
 	}
 }
 
-func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string) {
+func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, token string) {
 	var controlConn net.Conn
 	for {
 		select {
@@ -113,7 +113,7 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string) {
 	defer controlConn.Close()
 
 	rw := lineproto.New(controlConn, controlConn)
-	_ = rw.WriteLinef("HELLO ")
+	_ = rw.WriteLinef("HELLO %s", token)
 	_, err := rw.ReadLine() // OK ...
 	if err != nil {
 		return

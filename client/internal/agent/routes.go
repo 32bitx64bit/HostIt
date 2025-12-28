@@ -1,28 +1,9 @@
 package agent
 
-import "strings"
-
-func normalizeRoutes(cfg *Config) {
-	if len(cfg.Routes) == 0 && strings.TrimSpace(cfg.LocalAddr) != "" {
-		cfg.Routes = []RouteConfig{{
-			Name:         "default",
-			Proto:        "tcp",
-			LocalTCPAddr: cfg.LocalAddr,
-		}}
-	}
-	for i := range cfg.Routes {
-		cfg.Routes[i].Name = strings.TrimSpace(cfg.Routes[i].Name)
-		if cfg.Routes[i].Name == "" {
-			cfg.Routes[i].Name = "default"
-		}
-		cfg.Routes[i].Proto = strings.ToLower(strings.TrimSpace(cfg.Routes[i].Proto))
-		if cfg.Routes[i].Proto == "" {
-			cfg.Routes[i].Proto = "tcp"
-		}
-		cfg.Routes[i].LocalTCPAddr = strings.TrimSpace(cfg.Routes[i].LocalTCPAddr)
-		cfg.Routes[i].LocalUDPAddr = strings.TrimSpace(cfg.Routes[i].LocalUDPAddr)
-	}
-}
+import (
+	"net"
+	"strings"
+)
 
 func routeHasTCP(proto string) bool {
 	switch strings.ToLower(strings.TrimSpace(proto)) {
@@ -40,4 +21,22 @@ func routeHasUDP(proto string) bool {
 	default:
 		return false
 	}
+}
+
+func localTargetFromPublicAddr(publicAddr string) (string, bool) {
+	pa := strings.TrimSpace(publicAddr)
+	if pa == "" {
+		return "", false
+	}
+	_, port, err := net.SplitHostPort(pa)
+	if err != nil {
+		// Handle ":1234" variants robustly.
+		if strings.HasPrefix(pa, ":") {
+			_, port, err = net.SplitHostPort("0.0.0.0" + pa)
+		}
+	}
+	if err != nil || strings.TrimSpace(port) == "" {
+		return "", false
+	}
+	return net.JoinHostPort("127.0.0.1", port), true
 }

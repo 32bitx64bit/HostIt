@@ -12,8 +12,8 @@ import (
 var ErrClosed = errors.New("connection closed")
 
 type RW struct {
-	r *bufio.Reader
-	w *bufio.Writer
+	r  *bufio.Reader
+	w  *bufio.Writer
 	mu sync.Mutex
 }
 

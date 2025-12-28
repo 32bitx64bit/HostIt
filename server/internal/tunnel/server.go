@@ -3,10 +3,13 @@ package tunnel
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,10 +30,37 @@ type Server struct {
 
 func NewServer(cfg ServerConfig) *Server {
 	normalizeRoutes(&cfg)
+	_ = EnsureUDPKeys(&cfg, time.Now())
 	if cfg.PairTimeout == 0 {
 		cfg.PairTimeout = 10 * time.Second
 	}
-	return &Server{cfg: cfg, st: &serverState{cfg: cfg, pending: map[string]chan net.Conn{}, publicUDP: map[string]net.PacketConn{}}}
+	st := &serverState{cfg: cfg, pending: map[string]pendingConn{}, publicUDP: map[string]net.PacketConn{}}
+	st.udpKeys = buildUDPKeySet(cfg)
+	return &Server{cfg: cfg, st: st}
+}
+
+func buildUDPKeySet(cfg ServerConfig) udpproto.KeySet {
+	mode := udpproto.NormalizeMode(cfg.UDPEncryptionMode)
+	if cfg.DisableUDPEncryption {
+		mode = udpproto.ModeNone
+	}
+	if mode == udpproto.ModeNone {
+		ks, _ := udpproto.NewKeySet(mode, "", 0, nil, 0, nil)
+		return ks
+	}
+	curSalt, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(cfg.UDPKeySaltB64))
+	if err != nil {
+		curSalt = nil
+	}
+	prevSalt, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(cfg.UDPPrevKeySaltB64))
+	if err != nil {
+		prevSalt = nil
+	}
+	ks, err := udpproto.NewKeySet(mode, strings.TrimSpace(cfg.Token), cfg.UDPKeyID, curSalt, cfg.UDPPrevKeyID, prevSalt)
+	if err != nil {
+		ks, _ = udpproto.NewKeySet(udpproto.ModeNone, "", 0, nil, 0, nil)
+	}
+	return ks
 }
 
 func (s *Server) Status() ServerStatus {
@@ -44,13 +74,13 @@ func Serve(ctx context.Context, cfg ServerConfig) error {
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	controlLn, err := net.Listen("tcp", s.cfg.ControlAddr)
+	controlLn, err := listenControl(s.cfg)
 	if err != nil {
 		return fmt.Errorf("listen control: %w", err)
 	}
 	defer controlLn.Close()
 
-	dataLn, err := net.Listen("tcp", s.cfg.DataAddr)
+	dataLn, err := listenDataTCP(s.cfg)
 	if err != nil {
 		return fmt.Errorf("listen data: %w", err)
 	}
@@ -157,18 +187,72 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-type serverState struct {
-	cfg ServerConfig
+func listenControl(cfg ServerConfig) (net.Listener, error) {
+	return listenMaybeTLS(cfg, cfg.ControlAddr)
+}
 
-	mu         sync.Mutex
-	agentConn  net.Conn
-	agentProto *lineproto.RW
-	agentUDPAddr net.Addr
-	udpData net.PacketConn
-	publicUDP map[string]net.PacketConn
+func listenDataTCP(cfg ServerConfig) (net.Listener, error) {
+	return listenMaybeTLS(cfg, cfg.DataAddr)
+}
+
+func listenMaybeTLS(cfg ServerConfig, addr string) (net.Listener, error) {
+	if cfg.DisableTLS {
+		return net.Listen("tcp", addr)
+	}
+	certFile := strings.TrimSpace(cfg.TLSCertFile)
+	keyFile := strings.TrimSpace(cfg.TLSKeyFile)
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("tls enabled but TLSCertFile/TLSKeyFile not set")
+	}
+	if _, err := os.Stat(certFile); err != nil {
+		return nil, fmt.Errorf("tls cert file: %w", err)
+	}
+	if _, err := os.Stat(keyFile); err != nil {
+		return nil, fmt.Errorf("tls key file: %w", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load tls keypair: %w", err)
+	}
+	tlsCfg := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}
+	return tls.Listen("tcp", addr, tlsCfg)
+}
+
+type serverState struct {
+	cfg     ServerConfig
+	udpKeys udpproto.KeySet
+
+	mu            sync.Mutex
+	agentConn     net.Conn
+	agentProto    *lineproto.RW
+	agentUDPAddr  net.Addr
+	agentUDPKeyID uint32
+	udpData       net.PacketConn
+	publicUDP     map[string]net.PacketConn
 
 	pendingMu sync.Mutex
-	pending   map[string]chan net.Conn
+	pending   map[string]pendingConn
+}
+
+type pendingConn struct {
+	ch        chan net.Conn
+	routeName string
+}
+
+func (st *serverState) routeTCPNoDelay(routeName string) bool {
+	for _, rt := range st.cfg.Routes {
+		if rt.Name != routeName {
+			continue
+		}
+		if rt.TCPNoDelay == nil {
+			return true
+		}
+		return *rt.TCPNoDelay
+	}
+	return true
 }
 
 func (st *serverState) acceptControl(ctx context.Context, ln net.Listener) error {
@@ -198,7 +282,13 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	expected := strings.TrimSpace(st.cfg.Token)
-	if expected != "" && rest != expected {
+	if expected == "" {
+		_ = rw.WriteLinef("ERR %s", "server token not set")
+		_ = conn.Close()
+		return
+	}
+	provided := strings.TrimSpace(rest)
+	if provided != expected {
 		_ = rw.WriteLinef("ERR %s", "bad token (agent token must match server token)")
 		_ = conn.Close()
 		return
@@ -216,6 +306,31 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	st.mu.Unlock()
 
 	_ = rw.WriteLinef("OK %s", st.cfg.DataAddr)
+	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
+	if st.cfg.DisableUDPEncryption {
+		mode = "none"
+	}
+	curSalt := strings.TrimSpace(st.cfg.UDPKeySaltB64)
+	prevSalt := strings.TrimSpace(st.cfg.UDPPrevKeySaltB64)
+	if curSalt == "" {
+		curSalt = "-"
+	}
+	if prevSalt == "" {
+		prevSalt = "-"
+	}
+	_ = rw.WriteLinef("UDPSEC %s %d %s %d %s", mode, st.cfg.UDPKeyID, curSalt, st.cfg.UDPPrevKeyID, prevSalt)
+	for _, rt := range st.cfg.Routes {
+		noDelay := true
+		if rt.TCPNoDelay != nil {
+			noDelay = *rt.TCPNoDelay
+		}
+		nd := 0
+		if noDelay {
+			nd = 1
+		}
+		_ = rw.WriteLinef("ROUTE %s %s %s nodelay=%d", rt.Name, rt.Proto, rt.PublicAddr, nd)
+	}
+	_ = rw.WriteLinef("READY")
 
 	// Heartbeat: server pings agent periodically; agent replies with PONG.
 	const pingEvery = 15 * time.Second
@@ -318,7 +433,7 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 	id := rest
 
 	st.pendingMu.Lock()
-	ch, ok := st.pending[id]
+	pend, ok := st.pending[id]
 	if ok {
 		delete(st.pending, id)
 	}
@@ -327,9 +442,12 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	if st.routeTCPNoDelay(pend.routeName) {
+		setTCPNoDelay(conn, true)
+	}
 
 	select {
-	case ch <- conn:
+	case pend.ch <- conn:
 		return
 	default:
 		_ = conn.Close()
@@ -344,6 +462,9 @@ func (st *serverState) acceptPublicTCP(ctx context.Context, ln net.Listener, rou
 			return err
 		}
 		setTCPKeepAlive(clientConn, 30*time.Second)
+		if st.routeTCPNoDelay(routeName) {
+			setTCPNoDelay(clientConn, true)
+		}
 		go st.handlePublicConn(ctx, clientConn, routeName)
 	}
 }
@@ -359,7 +480,7 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 	id := newID()
 	ch := make(chan net.Conn, 1)
 	st.pendingMu.Lock()
-	st.pending[id] = ch
+	st.pending[id] = pendingConn{ch: ch, routeName: routeName}
 	st.pendingMu.Unlock()
 
 	err := proto.WriteLinef("NEW %s %s", id, routeName)
@@ -398,9 +519,21 @@ func (st *serverState) getAgentUDPAddr() net.Addr {
 	return st.agentUDPAddr
 }
 
+func (st *serverState) getAgentUDPKeyID() uint32 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.agentUDPKeyID
+}
+
 func (st *serverState) setAgentUDPAddr(addr net.Addr) {
 	st.mu.Lock()
 	st.agentUDPAddr = addr
+	st.mu.Unlock()
+}
+
+func (st *serverState) setAgentUDPKeyID(id uint32) {
+	st.mu.Lock()
+	st.agentUDPKeyID = id
 	st.mu.Unlock()
 }
 
@@ -438,8 +571,41 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 				continue
 			}
 			st.setAgentUDPAddr(addr)
+			st.setAgentUDPKeyID(0)
+		case udpproto.MsgRegEnc2:
+			expected := strings.TrimSpace(st.cfg.Token)
+			if expected == "" {
+				continue
+			}
+			kid, ok := udpproto.DecodeRegEnc2(st.udpKeys, expected, pkt)
+			if !ok {
+				continue
+			}
+			if st.getAgentProto() == nil {
+				continue
+			}
+			st.setAgentUDPAddr(addr)
+			st.setAgentUDPKeyID(kid)
 		case udpproto.MsgData:
 			route, client, payload, ok := udpproto.DecodeData(pkt)
+			if !ok {
+				continue
+			}
+			agent := st.getAgentUDPAddr()
+			if agent == nil || agent.String() != addr.String() {
+				continue
+			}
+			pc2 := st.publicUDP[route]
+			if pc2 == nil {
+				continue
+			}
+			ua, err := net.ResolveUDPAddr("udp", client)
+			if err != nil {
+				continue
+			}
+			_, _ = pc2.WriteTo(payload, ua)
+		case udpproto.MsgDataEnc2:
+			route, client, payload, _, ok := udpproto.DecodeDataEnc2(st.udpKeys, pkt)
 			if !ok {
 				continue
 			}
@@ -478,7 +644,20 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 		if agent == nil {
 			continue
 		}
-		msg := udpproto.EncodeData(routeName, clientAddr.String(), buf[:n])
+		var msg []byte
+		mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
+		if st.cfg.DisableUDPEncryption {
+			mode = "none"
+		}
+		if strings.EqualFold(mode, "none") || !st.udpKeys.Enabled() {
+			msg = udpproto.EncodeData(routeName, clientAddr.String(), buf[:n])
+		} else {
+			kid := st.getAgentUDPKeyID()
+			if kid == 0 {
+				kid = st.cfg.UDPKeyID
+			}
+			msg = udpproto.EncodeDataEnc2ForKeyID(st.udpKeys, kid, routeName, clientAddr.String(), buf[:n])
+		}
 		_, _ = st.udpData.WriteTo(msg, agent)
 	}
 }
@@ -496,4 +675,12 @@ func setTCPKeepAlive(conn net.Conn, period time.Duration) {
 	}
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(period)
+}
+
+func setTCPNoDelay(conn net.Conn, on bool) {
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tc.SetNoDelay(on)
 }
