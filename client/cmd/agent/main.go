@@ -95,6 +95,7 @@ type agentController struct {
 	routes    []agent.RemoteRoute
 	cancel    context.CancelFunc
 	done      chan struct{}
+	runID     uint64
 }
 
 func newAgentController(root context.Context, cfg agent.Config) *agentController {
@@ -120,6 +121,8 @@ func (a *agentController) Start() {
 		a.mu.Unlock()
 		return
 	}
+	a.runID++
+	rid := a.runID
 	cfg := a.cfg
 	if strings.TrimSpace(cfg.Server) == "" || strings.TrimSpace(cfg.Token) == "" {
 		a.running = false
@@ -140,17 +143,29 @@ func (a *agentController) Start() {
 	hooks := &agent.Hooks{
 		OnConnected: func() {
 			a.mu.Lock()
+			if a.runID != rid {
+				a.mu.Unlock()
+				return
+			}
 			a.connected = true
 			a.lastErr = ""
 			a.mu.Unlock()
 		},
 		OnRoutes: func(routes []agent.RemoteRoute) {
 			a.mu.Lock()
+			if a.runID != rid {
+				a.mu.Unlock()
+				return
+			}
 			a.routes = append([]agent.RemoteRoute(nil), routes...)
 			a.mu.Unlock()
 		},
 		OnDisconnected: func(err error) {
 			a.mu.Lock()
+			if a.runID != rid {
+				a.mu.Unlock()
+				return
+			}
 			a.connected = false
 			if err != nil {
 				a.lastErr = err.Error()
@@ -159,6 +174,10 @@ func (a *agentController) Start() {
 		},
 		OnError: func(err error) {
 			a.mu.Lock()
+			if a.runID != rid {
+				a.mu.Unlock()
+				return
+			}
 			a.connected = false
 			if err != nil {
 				a.lastErr = err.Error()
@@ -171,12 +190,14 @@ func (a *agentController) Start() {
 		defer close(done)
 		err := agent.RunWithHooks(ctx, cfg, hooks)
 		a.mu.Lock()
-		a.connected = false
-		a.running = false
-		a.cancel = nil
-		a.done = nil
-		if err != nil && a.lastErr == "" {
-			a.lastErr = err.Error()
+		if a.runID == rid {
+			a.connected = false
+			a.running = false
+			a.cancel = nil
+			a.done = nil
+			if err != nil && a.lastErr == "" {
+				a.lastErr = err.Error()
+			}
 		}
 		a.mu.Unlock()
 	}()
@@ -184,6 +205,7 @@ func (a *agentController) Start() {
 
 func (a *agentController) Stop() {
 	a.mu.Lock()
+	a.runID++
 	cancel := a.cancel
 	done := a.done
 	a.cancel = nil

@@ -423,19 +423,34 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		csrf := ensureCSRF(w, r, cookieSecure)
 		cfg, st, err := runner.Get()
 		routes := effectiveServerRoutes(cfg)
-		type routeView struct {
-			Name       string
-			Proto      string
-			PublicAddr string
-			TCPNoDelay bool
-		}
+				type routeView struct {
+					Name       string
+					Proto      string
+					PublicAddr string
+					TCPNoDelay bool
+					TunnelTLS  bool
+					Preconnect int
+				}
 		routeViews := make([]routeView, 0, len(routes))
 		for _, rt := range routes {
 			noDelay := true
 			if rt.TCPNoDelay != nil {
 				noDelay = *rt.TCPNoDelay
 			}
-			routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, TCPNoDelay: noDelay})
+					tlsOn := true
+					if rt.TunnelTLS != nil {
+						tlsOn = *rt.TunnelTLS
+					}
+					pc := 0
+					if rt.Preconnect != nil {
+						pc = *rt.Preconnect
+					} else {
+						p := strings.ToLower(strings.TrimSpace(rt.Proto))
+						if p == "tcp" || p == "both" {
+							pc = 4
+						}
+					}
+					routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, TCPNoDelay: noDelay, TunnelTLS: tlsOn, Preconnect: pc})
 		}
 		data := map[string]any{
 			"Cfg":        cfg,
@@ -490,6 +505,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		oldEnc := strings.TrimSpace(cfg.UDPEncryptionMode)
 		cfg.ControlAddr = r.Form.Get("control")
 		cfg.DataAddr = r.Form.Get("data")
+		cfg.DataAddrInsecure = r.Form.Get("data_insecure")
 		cfg.PublicAddr = r.Form.Get("public")
 		cfg.Token = strings.TrimSpace(r.Form.Get("token"))
 		cfg.PairTimeout = pt
@@ -638,6 +654,21 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		pub := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_public"))
 		nodelayRaw := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_nodelay"))
 		nodelay := nodelayRaw != "" && nodelayRaw != "0" && !strings.EqualFold(nodelayRaw, "false")
+		tlsRaw := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_tls"))
+		tlsOn := tlsRaw != "" && tlsRaw != "0" && !strings.EqualFold(tlsRaw, "false")
+		pcRaw := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_preconnect"))
+		pc := 0
+		if pcRaw != "" {
+			if n, err := strconv.Atoi(pcRaw); err == nil {
+				if n < 0 {
+					n = 0
+				}
+				if n > 64 {
+					n = 64
+				}
+				pc = n
+			}
+		}
 		if name == "" && proto == "" && pub == "" {
 			continue
 		}
@@ -647,7 +678,7 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		if proto == "" {
 			proto = "tcp"
 		}
-		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, TCPNoDelay: &nodelay})
+		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, TCPNoDelay: &nodelay, TunnelTLS: &tlsOn, Preconnect: &pc})
 	}
 	return routes
 }
@@ -816,6 +847,12 @@ const serverConfigHTML = `<!doctype html>
 				</div>
 
 				<div>
+					<label>Insecure data listen (optional)</label>
+					<div class="help">Optional plaintext TCP data listener for routes that disable tunnel TLS. Leave empty to disable (recommended).</div>
+					<input name="data_insecure" value="{{.Cfg.DataAddrInsecure}}" />
+				</div>
+
+				<div>
 					<label>Public listen (legacy single TCP)</label>
 					<div class="help">If Routes are empty, a single TCP route named <code>default</code> is created from this value.</div>
 					<input name="public" value="{{.Cfg.PublicAddr}}" />
@@ -917,6 +954,19 @@ const serverConfigHTML = `<!doctype html>
 									<span>Enable TCP_NODELAY</span>
 								</label>
 							</div>
+							<div>
+								<label>Data channel TLS</label>
+								<div class="help">Encrypts the agent↔server TCP data channel for this route. Disabling reduces overhead but exposes traffic/token to the network.</div>
+								<label style="font-weight: 400; display:flex; gap:8px; align-items:center">
+									<input type="checkbox" name="route_{{$i}}_tls" value="1" style="width:auto" {{if $r.TunnelTLS}}checked{{end}} />
+									<span>Enable TLS</span>
+								</label>
+							</div>
+							<div>
+								<label>Preconnect</label>
+								<div class="help">Number of ready data connections to keep warm for this route. <code>0</code> = on-demand.</div>
+								<input type="number" min="0" max="64" name="route_{{$i}}_preconnect" value="{{$r.Preconnect}}" />
+							</div>
 						</div>
 					</div>
 				{{end}}
@@ -964,6 +1014,19 @@ const serverConfigHTML = `<!doctype html>
 						<input type="checkbox" name="route_IDX_nodelay" value="1" style="width:auto" checked />
 						<span>Enable TCP_NODELAY</span>
 					</label>
+				</div>
+				<div>
+					<label>Data channel TLS</label>
+					<div class="help">Encrypts the agent↔server TCP data channel for this route.</div>
+					<label style="font-weight: 400; display:flex; gap:8px; align-items:center">
+						<input type="checkbox" name="route_IDX_tls" value="1" style="width:auto" checked />
+						<span>Enable TLS</span>
+					</label>
+				</div>
+				<div>
+					<label>Preconnect</label>
+					<div class="help">Number of ready data connections to keep warm for this route. <code>0</code> = on-demand.</div>
+					<input type="number" min="0" max="64" name="route_IDX_preconnect" value="4" />
 				</div>
 			</div>
 		</div>

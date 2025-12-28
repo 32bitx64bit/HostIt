@@ -5,11 +5,14 @@ import "strings"
 func normalizeRoutes(cfg *ServerConfig) {
 	if len(cfg.Routes) == 0 && strings.TrimSpace(cfg.PublicAddr) != "" {
 		b := true
+		p := 4
 		cfg.Routes = []RouteConfig{{
 			Name:       "default",
 			Proto:      "tcp",
 			PublicAddr: cfg.PublicAddr,
 			TCPNoDelay: &b,
+			TunnelTLS:  &b,
+			Preconnect: &p,
 		}}
 	}
 	for i := range cfg.Routes {
@@ -25,6 +28,29 @@ func normalizeRoutes(cfg *ServerConfig) {
 		if cfg.Routes[i].TCPNoDelay == nil {
 			b := true
 			cfg.Routes[i].TCPNoDelay = &b
+		}
+		if cfg.Routes[i].TunnelTLS == nil {
+			b := true
+			cfg.Routes[i].TunnelTLS = &b
+		}
+		if cfg.Routes[i].Preconnect == nil {
+			if routeHasTCP(cfg.Routes[i].Proto) {
+				p := 4
+				cfg.Routes[i].Preconnect = &p
+			} else {
+				p := 0
+				cfg.Routes[i].Preconnect = &p
+			}
+		}
+		if cfg.Routes[i].Preconnect != nil {
+			p := *cfg.Routes[i].Preconnect
+			if p < 0 {
+				p = 0
+			}
+			if p > 64 {
+				p = 64
+			}
+			*cfg.Routes[i].Preconnect = p
 		}
 	}
 }

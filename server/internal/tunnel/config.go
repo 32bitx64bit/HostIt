@@ -9,11 +9,26 @@ type RouteConfig struct {
 	// TCPNoDelay controls TCP_NODELAY for this route's TCP connections.
 	// If nil, the default is enabled (true).
 	TCPNoDelay *bool
+	// TunnelTLS controls whether the agent<->server data channel should be TLS-encrypted
+	// for this route.
+	//
+	// Note: this is only applicable if the server is configured with an insecure data
+	// listener as well (DataAddrInsecure). If nil, the default is enabled (true).
+	TunnelTLS *bool
+	// Preconnect controls how many pre-handshaked data TCP connections the agent should
+	// keep ready to reduce per-connection pairing latency.
+	// If nil, the default is 4 for TCP-capable routes.
+	// If 0, the agent dials on-demand.
+	Preconnect *int
 }
 
 type ServerConfig struct {
 	ControlAddr string
 	DataAddr    string
+	// DataAddrInsecure optionally enables a second (non-TLS) TCP listener for the agent
+	// data channel. This is only used when TLS is enabled globally and some routes have
+	// TunnelTLS=false.
+	DataAddrInsecure string
 	// PublicAddr is kept for backwards compatibility. If Routes is empty, a default
 	// TCP route named "default" is created from PublicAddr.
 	PublicAddr string

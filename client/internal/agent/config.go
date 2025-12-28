@@ -15,6 +15,12 @@ type RemoteRoute struct {
 	// TCPNoDelay enables TCP_NODELAY (low latency) for this route.
 	// If true, the agent will disable Nagle on the data TCP connection and the local backend TCP connection.
 	TCPNoDelay bool
+	// TunnelTLS controls whether the agent should use the TLS-encrypted data channel for this route.
+	// Default is true.
+	TunnelTLS bool
+	// Preconnect controls how many ready data connections the agent maintains for this route.
+	// Default is 0 unless the server provides a value.
+	Preconnect int
 }
 
 type Config struct {

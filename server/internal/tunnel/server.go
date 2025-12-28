@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strings"
@@ -86,6 +87,18 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	defer dataLn.Close()
 
+	var dataLnInsecure net.Listener
+	if !s.cfg.DisableTLS {
+		if addr := strings.TrimSpace(s.cfg.DataAddrInsecure); addr != "" {
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return fmt.Errorf("listen data insecure: %w", err)
+			}
+			dataLnInsecure = ln
+			defer dataLnInsecure.Close()
+		}
+	}
+
 	udpDataConn, err := net.ListenPacket("udp", s.cfg.DataAddr)
 	if err != nil {
 		return fmt.Errorf("listen data udp: %w", err)
@@ -150,6 +163,9 @@ func (s *Server) Run(ctx context.Context) error {
 		<-ctx.Done()
 		_ = controlLn.Close()
 		_ = dataLn.Close()
+		if dataLnInsecure != nil {
+			_ = dataLnInsecure.Close()
+		}
 		_ = udpDataConn.Close()
 		for _, x := range publicTCP {
 			_ = x.ln.Close()
@@ -160,9 +176,12 @@ func (s *Server) Run(ctx context.Context) error {
 		st.clearAgent(nil)
 	}()
 
-	errCh := make(chan error, 3+len(publicTCP)+len(publicUDP))
+	errCh := make(chan error, 4+len(publicTCP)+len(publicUDP))
 	go func() { errCh <- st.acceptControl(ctx, controlLn) }()
 	go func() { errCh <- st.acceptData(ctx, dataLn) }()
+	if dataLnInsecure != nil {
+		go func() { errCh <- st.acceptData(ctx, dataLnInsecure) }()
+	}
 	go func() { errCh <- st.acceptAgentUDP(ctx) }()
 	for _, x := range publicTCP {
 		go func(name string, l net.Listener) { errCh <- st.acceptPublicTCP(ctx, l, name) }(x.name, x.ln)
@@ -242,6 +261,21 @@ type pendingConn struct {
 	routeName string
 }
 
+func debugEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("PLAYIT_DEBUG"))
+	if v == "" || v == "0" {
+		return false
+	}
+	return true
+}
+
+func debugf(format string, args ...any) {
+	if !debugEnabled() {
+		return
+	}
+	log.Printf(format, args...)
+}
+
 func (st *serverState) routeTCPNoDelay(routeName string) bool {
 	for _, rt := range st.cfg.Routes {
 		if rt.Name != routeName {
@@ -296,16 +330,22 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 
 	st.mu.Lock()
 	if st.agentConn != nil {
-		_ = rw.WriteLinef("ERR %s", "agent already connected")
-		st.mu.Unlock()
-		_ = conn.Close()
-		return
+		// Takeover: close the previous agent and accept the new one.
+		_ = st.agentConn.Close()
+		st.agentConn = nil
+		st.agentProto = nil
+		st.agentUDPAddr = nil
+		st.agentUDPKeyID = 0
 	}
 	st.agentConn = conn
 	st.agentProto = rw
 	st.mu.Unlock()
 
-	_ = rw.WriteLinef("OK %s", st.cfg.DataAddr)
+	insec := strings.TrimSpace(st.cfg.DataAddrInsecure)
+	if insec == "" {
+		insec = "-"
+	}
+	_ = rw.WriteLinef("OK %s %s", st.cfg.DataAddr, insec)
 	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
 	if st.cfg.DisableUDPEncryption {
 		mode = "none"
@@ -328,7 +368,19 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 		if noDelay {
 			nd = 1
 		}
-		_ = rw.WriteLinef("ROUTE %s %s %s nodelay=%d", rt.Name, rt.Proto, rt.PublicAddr, nd)
+		useTLS := true
+		if rt.TunnelTLS != nil {
+			useTLS = *rt.TunnelTLS
+		}
+		tlsFlag := 0
+		if useTLS {
+			tlsFlag = 1
+		}
+		pc := 0
+		if rt.Preconnect != nil {
+			pc = *rt.Preconnect
+		}
+		_ = rw.WriteLinef("ROUTE %s %s %s nodelay=%d tls=%d preconnect=%d", rt.Name, rt.Proto, rt.PublicAddr, nd, tlsFlag, pc)
 	}
 	_ = rw.WriteLinef("READY")
 
@@ -404,6 +456,7 @@ func (st *serverState) clearAgent(conn net.Conn) {
 		st.agentConn = nil
 		st.agentProto = nil
 		st.agentUDPAddr = nil
+		st.agentUDPKeyID = 0
 	}
 }
 
@@ -439,11 +492,14 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 	}
 	st.pendingMu.Unlock()
 	if !ok {
+		debugf("tunnel: CONN id=%s -> no pending match (closing)", id)
 		_ = conn.Close()
 		return
 	}
+	debugf("tunnel: CONN id=%s -> matched route=%s", id, pend.routeName)
 	if st.routeTCPNoDelay(pend.routeName) {
 		setTCPNoDelay(conn, true)
+		setTCPQuickACK(conn, true)
 	}
 
 	select {
@@ -464,6 +520,7 @@ func (st *serverState) acceptPublicTCP(ctx context.Context, ln net.Listener, rou
 		setTCPKeepAlive(clientConn, 30*time.Second)
 		if st.routeTCPNoDelay(routeName) {
 			setTCPNoDelay(clientConn, true)
+			setTCPQuickACK(clientConn, true)
 		}
 		go st.handlePublicConn(ctx, clientConn, routeName)
 	}
@@ -482,6 +539,7 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 	st.pendingMu.Lock()
 	st.pending[id] = pendingConn{ch: ch, routeName: routeName}
 	st.pendingMu.Unlock()
+	debugf("tunnel: NEW id=%s route=%s", id, routeName)
 
 	err := proto.WriteLinef("NEW %s %s", id, routeName)
 	if err != nil {
@@ -500,6 +558,7 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		}
 		bidirPipe(clientConn, agentConn)
 	case <-time.After(st.cfg.PairTimeout):
+		debugf("tunnel: pair timeout id=%s route=%s after=%s", id, routeName, st.cfg.PairTimeout)
 		st.pendingMu.Lock()
 		delete(st.pending, id)
 		st.pendingMu.Unlock()
@@ -669,17 +728,30 @@ func newID() string {
 }
 
 func setTCPKeepAlive(conn net.Conn, period time.Duration) {
-	tc, ok := conn.(*net.TCPConn)
-	if !ok {
+	tc := unwrapTCPConn(conn)
+	if tc == nil {
 		return
 	}
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(period)
 }
 
+func unwrapTCPConn(conn net.Conn) *net.TCPConn {
+	if conn == nil {
+		return nil
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		return tc
+	}
+	if nc, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		return unwrapTCPConn(nc.NetConn())
+	}
+	return nil
+}
+
 func setTCPNoDelay(conn net.Conn, on bool) {
-	tc, ok := conn.(*net.TCPConn)
-	if !ok {
+	tc := unwrapTCPConn(conn)
+	if tc == nil {
 		return
 	}
 	_ = tc.SetNoDelay(on)
