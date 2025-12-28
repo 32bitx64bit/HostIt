@@ -1,0 +1,23 @@
+# Go build outputs
+**/bin/
+**/*.exe
+**/*.dll
+**/*.so
+**/*.dylib
+
+# Runtime configs / local state
+**/*.json
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# Temp files
+**/*.tmp
+**/*.log
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

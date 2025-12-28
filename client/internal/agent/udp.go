@@ -1,0 +1,141 @@
+package agent
+
+import (
+	"context"
+	"net"
+	"sync"
+	"time"
+
+	"playit-prototype/client/internal/udpproto"
+)
+
+type udpSession struct {
+	conn   *net.UDPConn
+	route  string
+	client string
+	close  sync.Once
+}
+
+func runUDP(ctx context.Context, cfg Config, routesByName map[string]RouteConfig) {
+	const idle = 2 * time.Minute
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		c, err := net.Dial("udp", cfg.DataAddr)
+		if err != nil {
+			t := time.NewTimer(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+			continue
+		}
+
+		uc, ok := c.(*net.UDPConn)
+		if !ok {
+			_ = c.Close()
+			return
+		}
+
+		// Register so the server learns our UDP address.
+		_, _ = uc.Write(udpproto.EncodeReg(cfg.Token))
+
+		sessionsMu := sync.Mutex{}
+		sessions := map[string]map[string]*udpSession{} // route -> client -> session
+
+		getOrCreate := func(routeName, clientAddr, localTarget string) (*udpSession, bool) {
+			sessionsMu.Lock()
+			defer sessionsMu.Unlock()
+			m := sessions[routeName]
+			if m == nil {
+				m = map[string]*udpSession{}
+				sessions[routeName] = m
+			}
+			if s := m[clientAddr]; s != nil {
+				return s, true
+			}
+
+			raddr, err := net.ResolveUDPAddr("udp", localTarget)
+			if err != nil {
+				return nil, false
+			}
+			lc := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+			lconn, err := net.DialUDP("udp", lc, raddr)
+			if err != nil {
+				return nil, false
+			}
+			s := &udpSession{conn: lconn, route: routeName, client: clientAddr}
+			m[clientAddr] = s
+
+			go func() {
+				buf := make([]byte, 64*1024)
+				for {
+					_ = lconn.SetReadDeadline(time.Now().Add(idle))
+					n, err := lconn.Read(buf)
+					if err != nil {
+						break
+					}
+					_, _ = uc.Write(udpproto.EncodeData(routeName, clientAddr, buf[:n]))
+				}
+
+				s.close.Do(func() {
+					_ = lconn.Close()
+				})
+				sessionsMu.Lock()
+				if mm := sessions[routeName]; mm != nil {
+					delete(mm, clientAddr)
+					if len(mm) == 0 {
+						delete(sessions, routeName)
+					}
+				}
+				sessionsMu.Unlock()
+			}()
+
+			return s, true
+		}
+
+		buf := make([]byte, 64*1024)
+		readErr := func() error {
+			for {
+				_ = uc.SetReadDeadline(time.Now().Add(30 * time.Second))
+				n, err := uc.Read(buf)
+				if err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						_, _ = uc.Write(udpproto.EncodeReg(cfg.Token))
+						continue
+					}
+					return err
+				}
+				routeName, clientAddr, payload, ok := udpproto.DecodeData(buf[:n])
+				if !ok {
+					continue
+				}
+				rt, ok := routesByName[routeName]
+				if !ok || !routeHasUDP(rt.Proto) || rt.LocalUDPAddr == "" {
+					continue
+				}
+				s, ok := getOrCreate(routeName, clientAddr, rt.LocalUDPAddr)
+				if !ok || s == nil {
+					continue
+				}
+				_, _ = s.conn.Write(payload)
+			}
+		}()
+
+		_ = uc.Close()
+		_ = readErr
+		// Backoff and retry.
+		t := time.NewTimer(1 * time.Second)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+	}
+}
