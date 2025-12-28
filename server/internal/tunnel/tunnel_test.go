@@ -55,7 +55,7 @@ func TestEndToEndTCP(t *testing.T) {
 	publicAddr := publicLn.Addr().String()
 	_ = publicLn.Close()
 
-	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, PublicAddr: publicAddr, Token: "testtoken", PairTimeout: 2 * time.Second, DisableTLS: true})
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 2 * time.Second, DisableTLS: true})
 	go func() { _ = srv.Run(ctx) }()
 
 	// Fake agent: connect to control; for each NEW id, connect to data and then to local echo.

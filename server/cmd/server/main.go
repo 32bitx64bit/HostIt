@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"encoding/hex"
 	"flag"
 	"html/template"
@@ -26,7 +27,6 @@ import (
 func main() {
 	var controlAddr string
 	var dataAddr string
-	var publicAddr string
 	var token string
 	var pairTimeout time.Duration
 	var webAddr string
@@ -41,7 +41,6 @@ func main() {
 
 	flag.StringVar(&controlAddr, "control", ":7000", "control listen address")
 	flag.StringVar(&dataAddr, "data", ":7001", "data listen address")
-	flag.StringVar(&publicAddr, "public", ":7777", "public listen address")
 	flag.StringVar(&token, "token", "", "shared token (optional)")
 	flag.BoolVar(&disableTLS, "disable-tls", false, "disable TLS for agent<->server control/data TCP")
 	flag.StringVar(&tlsCert, "tls-cert", "", "TLS certificate PEM path (default: alongside config)")
@@ -61,7 +60,6 @@ func main() {
 	cfg := tunnel.ServerConfig{
 		ControlAddr:          controlAddr,
 		DataAddr:             dataAddr,
-		PublicAddr:           publicAddr,
 		Token:                token,
 		DisableTLS:           disableTLS,
 		TLSCertFile:          tlsCert,
@@ -234,6 +232,18 @@ func (r *serverRunner) Get() (tunnel.ServerConfig, tunnel.ServerStatus, error) {
 	return r.cfg, st, r.err
 }
 
+func (r *serverRunner) Dashboard(now time.Time) (tunnel.ServerConfig, tunnel.ServerStatus, tunnel.DashboardSnapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var st tunnel.ServerStatus
+	var snap tunnel.DashboardSnapshot
+	if r.srv != nil {
+		st = r.srv.Status()
+		snap = r.srv.Dashboard(now)
+	}
+	return r.cfg, st, snap, r.err
+}
+
 type ctxKey int
 
 const (
@@ -400,7 +410,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		}
 		csrf := ensureCSRF(w, r, cookieSecure)
 		cfg, st, err := runner.Get()
-		routes := effectiveServerRoutes(cfg)
+		routes := cfg.Routes
 		data := map[string]any{
 			"Cfg":        cfg,
 			"Status":     st,
@@ -414,6 +424,43 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		_ = tplStats.Execute(w, data)
 	})))
 
+	// Live stats API (protected)
+	mux.HandleFunc("/api/stats", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		cfg, _, snap, err := runner.Dashboard(time.Now())
+		type routeOut struct {
+			Name       string               `json:"name"`
+			Proto      string               `json:"proto"`
+			PublicAddr string               `json:"publicAddr"`
+			Active     int64                `json:"active"`
+			Events     []tunnel.DashboardEvent `json:"events"`
+		}
+		outRoutes := make([]routeOut, 0, len(cfg.Routes))
+		for _, rt := range cfg.Routes {
+			rs := snap.Routes[rt.Name]
+			outRoutes = append(outRoutes, routeOut{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, Active: rs.ActiveClients, Events: rs.Events})
+		}
+		resp := map[string]any{
+			"nowUnix":        snap.NowUnix,
+			"agentConnected": snap.AgentConnected,
+			"activeClients":  snap.ActiveClients,
+			"bytesTotal":     snap.BytesTotal,
+			"series":         snap.Series,
+			"routes":         outRoutes,
+			"err": func() string {
+				if err == nil {
+					return ""
+				}
+				return err.Error()
+			}(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})))
+
 	// Config (protected)
 	mux.HandleFunc("/config", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -422,7 +469,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		}
 		csrf := ensureCSRF(w, r, cookieSecure)
 		cfg, st, err := runner.Get()
-		routes := effectiveServerRoutes(cfg)
+		routes := cfg.Routes
 		type routeView struct {
 			Name       string
 			Proto      string
@@ -506,7 +553,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		cfg.ControlAddr = r.Form.Get("control")
 		cfg.DataAddr = r.Form.Get("data")
 		cfg.DataAddrInsecure = r.Form.Get("data_insecure")
-		cfg.PublicAddr = r.Form.Get("public")
 		cfg.Token = strings.TrimSpace(r.Form.Get("token"))
 		cfg.PairTimeout = pt
 		if cfg.Token == "" {
@@ -626,12 +672,6 @@ func genToken() string {
 }
 
 func effectiveServerRoutes(cfg tunnel.ServerConfig) []tunnel.RouteConfig {
-	if len(cfg.Routes) == 0 {
-		if strings.TrimSpace(cfg.PublicAddr) != "" {
-			return []tunnel.RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: cfg.PublicAddr}}
-		}
-		return []tunnel.RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: ":7777"}}
-	}
 	return cfg.Routes
 }
 
@@ -748,22 +788,159 @@ const serverStatsHTML = `<!doctype html>
 		<h2>Statistics</h2>
 		<div class="grid">
 			<div class="card">
+				<div class="row"><b>Agent:</b>
+					<span id="agentPill" class="pill {{if .Status.AgentConnected}}ok{{else}}bad{{end}}">{{if .Status.AgentConnected}}Connected{{else}}Disconnected{{end}}</span>
+				</div>
+				<div class="row"><b>Public clients:</b> <span id="activeClientsVal">—</span></div>
+				<div class="row"><b>Bandwidth (last 5m):</b> <span id="bw5mVal">—</span></div>
+				<div class="row"><b>Total transferred:</b> <span id="bytesTotalVal">—</span></div>
 				<div class="row"><b>Routes:</b> {{.RouteCount}}</div>
 				<div class="row"><b>Control:</b> <code>{{.Cfg.ControlAddr}}</code></div>
 				<div class="row"><b>Data:</b> <code>{{.Cfg.DataAddr}}</code></div>
+				<div class="row" id="errRow" style="display:none"><b>Last server error:</b> <span class="muted" id="errText"></span></div>
+				<div class="row"><span class="muted" id="liveText">Updating…</span></div>
 			</div>
 			<div class="card">
 				<div class="muted">Edit server settings on the <a href="/config">Config</a> page.</div>
 			</div>
 		</div>
 
-		<h2>Routes</h2>
+		<h2>Bandwidth (7 days, 5-minute buckets)</h2>
 		<div class="card">
-			{{range .Routes}}
-				<div class="row"><b>{{.Name}}</b> <span class="muted">({{.Proto}})</span> — <code>{{.PublicAddr}}</code></div>
-			{{end}}
+			<canvas id="bwChart" width="880" height="160" style="width:100%; max-width:100%;"></canvas>
+			<div class="muted" style="margin-top:8px">Shows bytes transferred per 5-minute interval.</div>
 		</div>
+
+		<h2>Routes</h2>
+		{{if eq .RouteCount 0}}
+			<div class="card">
+				<div class="muted">No routes are configured. Add routes in <a href="/config">Config</a> to start accepting public connections.</div>
+			</div>
+		{{end}}
+		{{range .Routes}}
+			<details class="card" style="margin-top:12px" data-route="{{.Name}}">
+				<summary style="cursor:pointer">
+					<b>{{.Name}}</b> <span class="muted">({{.Proto}})</span> — <code>{{.PublicAddr}}</code>
+				</summary>
+				<div style="margin-top:10px">
+					<div class="row"><b>Active clients:</b> <span data-route-active>—</span></div>
+					<div class="row"><b>Recent events</b> <span class="muted">(newest first)</span></div>
+					<pre data-route-console style="white-space:pre-wrap; margin:0; padding:10px; border-radius:10px; border:1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 260px; overflow:auto;"></pre>
+				</div>
+			</details>
+		{{end}}
   </div>
+	<script>
+		(function(){
+			function fmtBytes(n){
+				n = Number(n||0);
+				if (!isFinite(n) || n < 0) n = 0;
+				var units = ['B','KiB','MiB','GiB','TiB'];
+				var u = 0;
+				while (n >= 1024 && u < units.length-1){ n /= 1024; u++; }
+				return (u === 0 ? String(Math.round(n)) : n.toFixed(2)) + ' ' + units[u];
+			}
+			function setPill(el, ok, text){
+				if(!el) return;
+				el.classList.remove('ok');
+				el.classList.remove('bad');
+				el.classList.add(ok ? 'ok' : 'bad');
+				el.textContent = text;
+			}
+			function drawChart(series){
+				var c = document.getElementById('bwChart');
+				if(!c || !c.getContext) return;
+				var ctx = c.getContext('2d');
+				var w = c.width, h = c.height;
+				ctx.clearRect(0,0,w,h);
+				if(!series || !series.length) return;
+				var max = 0;
+				for (var i=0;i<series.length;i++) max = Math.max(max, Number(series[i].bytes||0));
+				if (max <= 0) max = 1;
+				ctx.strokeStyle = 'rgba(46, 125, 255, .85)';
+				ctx.lineWidth = 2;
+				ctx.beginPath();
+				for (var i2=0;i2<series.length;i2++){
+					var x = (i2/(series.length-1)) * (w-2) + 1;
+					var y = h - ((Number(series[i2].bytes||0)/max) * (h-10)) - 5;
+					if(i2===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+				}
+				ctx.stroke();
+				ctx.strokeStyle = 'rgba(127,127,127,.35)';
+				ctx.lineWidth = 1;
+				ctx.strokeRect(0.5,0.5,w-1,h-1);
+			}
+			function renderRouteConsole(el, route){
+				if(!el) return;
+				var lines = [];
+				var ev = (route && route.events) ? route.events : [];
+				for (var i=ev.length-1;i>=0;i--){
+					var e = ev[i] || {};
+					var ts = e.t ? new Date(e.t*1000).toLocaleString() : '';
+					var s = ts + '  ' + (e.kind||'')
+						+ (e.ip ? ('  ip=' + e.ip) : '')
+						+ (e.id ? ('  id=' + e.id) : '')
+						+ (e.bytes ? ('  bytes=' + fmtBytes(e.bytes)) : '')
+						+ (e.durMs ? ('  dur=' + e.durMs + 'ms') : '')
+						+ (e.detail ? ('  ' + e.detail) : '');
+					lines.push(s);
+					if (lines.length >= 20) break;
+				}
+				el.textContent = lines.length ? lines.join('\n') : 'No events yet.';
+			}
+
+			var agentPill = document.getElementById('agentPill');
+			var activeClientsVal = document.getElementById('activeClientsVal');
+			var bw5mVal = document.getElementById('bw5mVal');
+			var bytesTotalVal = document.getElementById('bytesTotalVal');
+			var liveText = document.getElementById('liveText');
+			var errRow = document.getElementById('errRow');
+			var errText = document.getElementById('errText');
+			var lastSeries = null;
+
+			function computeLast5m(series){
+				if(!series || !series.length) return 0;
+				var p = series[series.length-1];
+				return Number(p && p.bytes ? p.bytes : 0);
+			}
+
+			async function poll(){
+				try {
+					var res = await fetch('/api/stats', {cache:'no-store'});
+					if(!res.ok) throw new Error('http ' + res.status);
+					var j = await res.json();
+					setPill(agentPill, !!j.agentConnected, j.agentConnected ? 'Connected' : 'Disconnected');
+					if(activeClientsVal) activeClientsVal.textContent = String(j.activeClients == null ? '—' : j.activeClients);
+					if(bw5mVal) bw5mVal.textContent = fmtBytes(computeLast5m(j.series));
+					if(bytesTotalVal) bytesTotalVal.textContent = fmtBytes(j.bytesTotal || 0);
+					if(errRow && errText){
+						if(j.err){ errRow.style.display = ''; errText.textContent = j.err; }
+						else { errRow.style.display = 'none'; errText.textContent = ''; }
+					}
+					if(liveText) liveText.textContent = 'Last update: ' + new Date().toLocaleTimeString();
+					if(j.series && j.series !== lastSeries){
+						lastSeries = j.series;
+						drawChart(j.series);
+					}
+					var routes = j.routes || [];
+					for (var i=0;i<routes.length;i++){
+						var rt = routes[i] || {};
+						var det = document.querySelector('details[data-route="' + (rt.name||'') + '"]');
+						if(!det) continue;
+						var a = det.querySelector('[data-route-active]');
+						if(a) a.textContent = String(rt.active == null ? '—' : rt.active);
+						var c = det.querySelector('[data-route-console]');
+						renderRouteConsole(c, rt);
+					}
+				} catch (e) {
+					if(liveText) liveText.textContent = 'Offline (' + (e && e.message ? e.message : 'error') + ')';
+				}
+			}
+
+			poll();
+			setInterval(poll, 2000);
+		})();
+	</script>
 </body>
 </html>`
 
@@ -850,12 +1027,6 @@ const serverConfigHTML = `<!doctype html>
 					<label>Insecure data listen (optional)</label>
 					<div class="help">Optional plaintext TCP data listener for routes that disable tunnel TLS. Leave empty to disable (recommended).</div>
 					<input name="data_insecure" value="{{.Cfg.DataAddrInsecure}}" />
-				</div>
-
-				<div>
-					<label>Public listen (legacy single TCP)</label>
-					<div class="help">If Routes are empty, a single TCP route named <code>default</code> is created from this value.</div>
-					<input name="public" value="{{.Cfg.PublicAddr}}" />
 				</div>
 
 				<div>

@@ -3,18 +3,6 @@ package tunnel
 import "strings"
 
 func normalizeRoutes(cfg *ServerConfig) {
-	if len(cfg.Routes) == 0 && strings.TrimSpace(cfg.PublicAddr) != "" {
-		b := true
-		p := 4
-		cfg.Routes = []RouteConfig{{
-			Name:       "default",
-			Proto:      "tcp",
-			PublicAddr: cfg.PublicAddr,
-			TCPNoDelay: &b,
-			TunnelTLS:  &b,
-			Preconnect: &p,
-		}}
-	}
 	for i := range cfg.Routes {
 		cfg.Routes[i].Name = strings.TrimSpace(cfg.Routes[i].Name)
 		if cfg.Routes[i].Name == "" {

@@ -35,7 +35,7 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.PairTimeout == 0 {
 		cfg.PairTimeout = 10 * time.Second
 	}
-	st := &serverState{cfg: cfg, pending: map[string]pendingConn{}, publicUDP: map[string]net.PacketConn{}}
+	st := &serverState{cfg: cfg, pending: map[string]pendingConn{}, publicUDP: map[string]net.PacketConn{}, dash: newDashState()}
 	st.udpKeys = buildUDPKeySet(cfg)
 	return &Server{cfg: cfg, st: st}
 }
@@ -68,6 +68,16 @@ func (s *Server) Status() ServerStatus {
 	s.st.mu.Lock()
 	defer s.st.mu.Unlock()
 	return ServerStatus{AgentConnected: s.st.agentConn != nil}
+}
+
+func (s *Server) Dashboard(now time.Time) DashboardSnapshot {
+	s.st.mu.Lock()
+	agentConnected := s.st.agentConn != nil
+	s.st.mu.Unlock()
+	if s.st.dash == nil {
+		return DashboardSnapshot{NowUnix: now.Unix(), AgentConnected: agentConnected}
+	}
+	return s.st.dash.snapshot(now, agentConnected)
 }
 
 func Serve(ctx context.Context, cfg ServerConfig) error {
@@ -243,6 +253,7 @@ func listenMaybeTLS(cfg ServerConfig, addr string) (net.Listener, error) {
 type serverState struct {
 	cfg     ServerConfig
 	udpKeys udpproto.KeySet
+	dash    *dashState
 
 	mu            sync.Mutex
 	agentConn     net.Conn
@@ -532,12 +543,30 @@ func (st *serverState) acceptPublicTCP(ctx context.Context, ln net.Listener, rou
 func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn, routeName string) {
 	defer clientConn.Close()
 
+	var remoteIP string
+	if ra := clientConn.RemoteAddr(); ra != nil {
+		remoteIP = ra.String()
+		if h, _, err := net.SplitHostPort(remoteIP); err == nil {
+			remoteIP = h
+		}
+	}
+
+	start := time.Now()
+	id := newID()
+	if st.dash != nil {
+		st.dash.incActive(routeName)
+		st.dash.addEvent(routeName, DashboardEvent{TimeUnix: start.Unix(), Kind: "connect", RemoteIP: remoteIP, ConnID: id})
+		defer st.dash.decActive(routeName)
+	}
+
 	proto := st.getAgentProto()
 	if proto == nil {
+		if st.dash != nil {
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "reject_no_agent", RemoteIP: remoteIP, ConnID: id})
+		}
 		return
 	}
 
-	id := newID()
 	ch := make(chan net.Conn, 1)
 	st.pendingMu.Lock()
 	st.pending[id] = pendingConn{ch: ch, routeName: routeName}
@@ -549,6 +578,9 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		st.pendingMu.Lock()
 		delete(st.pending, id)
 		st.pendingMu.Unlock()
+		if st.dash != nil {
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "control_write_failed", RemoteIP: remoteIP, ConnID: id, Detail: err.Error()})
+		}
 		return
 	}
 
@@ -559,12 +591,23 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		if agentConn == nil {
 			return
 		}
-		bidirPipe(clientConn, agentConn)
+		if st.dash != nil {
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "paired", RemoteIP: remoteIP, ConnID: id})
+		}
+		a2b, b2a := bidirPipeCount(clientConn, agentConn)
+		if st.dash != nil {
+			bytes := a2b + b2a
+			st.dash.addBytes(time.Now(), bytes)
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "disconnect", RemoteIP: remoteIP, ConnID: id, Bytes: bytes, DurationMS: time.Since(start).Milliseconds()})
+		}
 	case <-time.After(st.cfg.PairTimeout):
 		debugf("tunnel: pair timeout id=%s route=%s after=%s", id, routeName, st.cfg.PairTimeout)
 		st.pendingMu.Lock()
 		delete(st.pending, id)
 		st.pendingMu.Unlock()
+		if st.dash != nil {
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "pair_timeout", RemoteIP: remoteIP, ConnID: id, Detail: st.cfg.PairTimeout.String()})
+		}
 		return
 	}
 }

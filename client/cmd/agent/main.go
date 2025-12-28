@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"html/template"
 	"log"
@@ -261,6 +262,65 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux := http.NewServeMux()
 
+	// Live status API
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		cfg, running, connected, lastErr, routes := ctrl.Get()
+		type routeView struct {
+			Name        string `json:"name"`
+			Proto       string `json:"proto"`
+			PublicAddr  string `json:"publicAddr"`
+			LocalTarget string `json:"localTarget"`
+		}
+		outRoutes := make([]routeView, 0, len(routes))
+		for _, rt := range routes {
+			outRoutes = append(outRoutes, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, LocalTarget: localTargetFromPublicAddr(rt.PublicAddr)})
+		}
+		resp := map[string]any{
+			"running":     running,
+			"connected":   connected,
+			"lastErr":     lastErr,
+			"server":      cfg.Server,
+			"tokenSet":    strings.TrimSpace(cfg.Token) != "",
+			"configPath":  configPath,
+			"nowUnix":     time.Now().Unix(),
+			"routes":      outRoutes,
+			"routeCount":  len(outRoutes),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	// Service controls
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctrl.Start()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctrl.Stop()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/restart", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctrl.Stop()
+		ctrl.Start()
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	// Single page
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -327,7 +387,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	mux.HandleFunc("/save", saveHandler)
 	mux.HandleFunc("/config/save", saveHandler)
 
-	// No start/stop controls: agent runs as a service.
+	// Agent also supports explicit start/stop/restart via /start,/stop,/restart.
 
 	h := &http.Server{Addr: addr, Handler: mux}
 	go func() {
@@ -393,12 +453,14 @@ const agentHomeHTML = `<!doctype html>
 		.btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
 		button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
 		button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
+		button.warn { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .10); }
 		.pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
 		.ok { border-color: rgba(46, 160, 67, .55); background: rgba(46, 160, 67, .18); }
 		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
 		code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
 		.flash { margin: 10px 0 0; }
 		.row { margin-bottom: 10px; }
+		.small { font-size: 12px; opacity: .85; }
 	</style>
 </head>
 <body>
@@ -409,14 +471,22 @@ const agentHomeHTML = `<!doctype html>
 				<div class="muted">Connects outbound to your tunnel server and forwards based on server configuration.</div>
 			</div>
 			<div class="card">
-				<div class="row"><b>Status:</b>
-					{{if .Running}}<span class="pill ok">Running</span>{{else}}<span class="pill bad">Stopped</span>{{end}}
-					{{if .Connected}}<span class="pill ok">Connected</span>{{else}}<span class="pill bad">Disconnected</span>{{end}}
+				<div class="row"><b>Service:</b>
+					<span id="svcPill" class="pill {{if .Running}}ok{{else}}bad{{end}}">{{if .Running}}Running{{else}}Stopped{{end}}</span>
 				</div>
-				<div class="row"><b>Server:</b> <code>{{.Cfg.Server}}</code></div>
-				<div class="row"><b>Token:</b> {{if .HasToken}}<span class="pill ok">Set</span>{{else}}<span class="pill bad">Missing</span>{{end}}</div>
+				<div class="row"><b>Control:</b>
+					<span id="ctlPill" class="pill {{if .Connected}}ok{{else}}bad{{end}}">{{if .Connected}}Connected{{else}}Disconnected{{end}}</span>
+				</div>
+				<div class="row"><b>Server:</b> <code id="serverVal">{{.Cfg.Server}}</code></div>
+				<div class="row"><b>Token:</b> <span id="tokenPill" class="pill {{if .HasToken}}ok{{else}}bad{{end}}">{{if .HasToken}}Set{{else}}Missing{{end}}</span></div>
 				<div class="row"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
-				{{if .LastErr}}<div class="row"><b>Last error:</b> <span class="muted">{{.LastErr}}</span></div>{{end}}
+				<div class="btns">
+					<button id="btnStart" type="button" class="primary">Start</button>
+					<button id="btnStop" type="button" class="warn">Stop</button>
+					<button id="btnRestart" type="button">Restart</button>
+				</div>
+				<div class="row small"><b>Live:</b> <span id="liveText">Updating…</span></div>
+				<div class="row" id="errRow" style="display:none"><b>Last error:</b> <span class="muted" id="errText"></span></div>
 			</div>
 		</div>
 
@@ -444,13 +514,110 @@ const agentHomeHTML = `<!doctype html>
 
 		<h2>Routes</h2>
 		<div class="card">
-			{{if not .Connected}}
-				<div class="muted">Routes appear after the agent connects to the server.</div>
-			{{end}}
-			{{range .RoutesView}}
-				<div class="row"><b>{{.Name}}</b> <span class="muted">({{.Proto}})</span> public: <code>{{.PublicAddr}}</code> local: <code>{{.LocalTarget}}</code></div>
-			{{end}}
+			<div id="routesEmpty" class="muted" {{if .Connected}}style="display:none"{{end}}>Routes appear after the agent connects to the server.</div>
+			<div id="routesList">
+				{{range .RoutesView}}
+					<div class="row"><b>{{.Name}}</b> <span class="muted">({{.Proto}})</span> public: <code>{{.PublicAddr}}</code> local: <code>{{.LocalTarget}}</code></div>
+				{{end}}
+			</div>
 		</div>
 	</div>
+	<script>
+		(function(){
+			function setPill(el, ok, text){
+				if(!el) return;
+				el.classList.remove('ok');
+				el.classList.remove('bad');
+				el.classList.add(ok ? 'ok' : 'bad');
+				el.textContent = text;
+			}
+			function escapeText(s){
+				return (s == null) ? '' : String(s);
+			}
+			var svcPill = document.getElementById('svcPill');
+			var ctlPill = document.getElementById('ctlPill');
+			var tokenPill = document.getElementById('tokenPill');
+			var serverVal = document.getElementById('serverVal');
+			var liveText = document.getElementById('liveText');
+			var errRow = document.getElementById('errRow');
+			var errText = document.getElementById('errText');
+			var routesEmpty = document.getElementById('routesEmpty');
+			var routesList = document.getElementById('routesList');
+			var btnStart = document.getElementById('btnStart');
+			var btnStop = document.getElementById('btnStop');
+			var btnRestart = document.getElementById('btnRestart');
+
+			async function post(path){
+				try {
+					await fetch(path, {method:'POST'});
+				} catch (_) {}
+				await pollOnce();
+			}
+
+			if (btnStart) btnStart.addEventListener('click', function(){ post('/start'); });
+			if (btnStop) btnStop.addEventListener('click', function(){ post('/stop'); });
+			if (btnRestart) btnRestart.addEventListener('click', function(){ post('/restart'); });
+
+			function renderRoutes(routes){
+				if(!routesList) return;
+				routesList.innerHTML = '';
+				if(!routes || !routes.length){
+					if (routesEmpty) routesEmpty.style.display = '';
+					return;
+				}
+				if (routesEmpty) routesEmpty.style.display = 'none';
+				for (var i=0;i<routes.length;i++){
+					var rt = routes[i] || {};
+					var row = document.createElement('div');
+					row.className = 'row';
+					var b = document.createElement('b');
+					b.textContent = escapeText(rt.name);
+					row.appendChild(b);
+					var sp = document.createElement('span');
+					sp.className = 'muted';
+					sp.textContent = ' (' + escapeText(rt.proto) + ') ';
+					row.appendChild(document.createTextNode(' '));
+					row.appendChild(sp);
+					row.appendChild(document.createTextNode(' public: '));
+					var c1 = document.createElement('code');
+					c1.textContent = escapeText(rt.publicAddr);
+					row.appendChild(c1);
+					row.appendChild(document.createTextNode(' local: '));
+					var c2 = document.createElement('code');
+					c2.textContent = escapeText(rt.localTarget);
+					row.appendChild(c2);
+					routesList.appendChild(row);
+				}
+			}
+
+			async function pollOnce(){
+				try {
+					var res = await fetch('/api/status', {cache:'no-store'});
+					if(!res.ok) throw new Error('http ' + res.status);
+					var j = await res.json();
+					setPill(svcPill, !!j.running, j.running ? 'Running' : 'Stopped');
+					setPill(ctlPill, !!j.connected, j.connected ? 'Connected' : 'Disconnected');
+					setPill(tokenPill, !!j.tokenSet, j.tokenSet ? 'Set' : 'Missing');
+					if(serverVal) serverVal.textContent = escapeText(j.server);
+					if(errRow && errText){
+						if(j.lastErr){
+							errRow.style.display = '';
+							errText.textContent = escapeText(j.lastErr);
+						} else {
+							errRow.style.display = 'none';
+							errText.textContent = '';
+						}
+					}
+					renderRoutes(j.routes);
+					if(liveText) liveText.textContent = 'Last update: ' + new Date().toLocaleTimeString();
+				} catch (e) {
+					if(liveText) liveText.textContent = 'Offline (' + (e && e.message ? e.message : 'error') + ')';
+				}
+			}
+
+			pollOnce();
+			setInterval(pollOnce, 2000);
+		})();
+	</script>
 </body>
 </html>`

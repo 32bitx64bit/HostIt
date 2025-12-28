@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
 var copyBufPool = sync.Pool{New: func() any {
@@ -32,22 +33,33 @@ func closeWrite(c net.Conn) {
 	_ = c.Close()
 }
 
-func bidirPipe(a net.Conn, b net.Conn) {
+func bidirPipeCount(a net.Conn, b net.Conn) (aToB int64, bToA int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	var n1 atomic.Int64
+	var n2 atomic.Int64
+
 	go func() {
 		defer wg.Done()
-		_, _ = copyOptimized(a, b)
+		n, _ := copyOptimized(a, b)
+		n1.Store(n)
 		closeWrite(a)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = copyOptimized(b, a)
+		n, _ := copyOptimized(b, a)
+		n2.Store(n)
 		closeWrite(b)
 	}()
 
 	wg.Wait()
 	_ = a.Close()
 	_ = b.Close()
+
+	return n1.Load(), n2.Load()
+}
+
+func bidirPipe(a net.Conn, b net.Conn) {
+	_, _ = bidirPipeCount(a, b)
 }
