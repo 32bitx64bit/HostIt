@@ -1,60 +1,53 @@
-# HostIt (Playit.gg-style self-hosted tunnel)
-
+# HostIt
 HostIt is a self-hosted alternative to playit.gg.
-## Quick start
 
-### 1) Start the server (on your VPS)
+## Quick Start
 
-```fish
-./server.sh
-```
+### Prerequisites
+- Go 1.24 installed.
+- VPS for a Linux server. 
+- Ports 7000/7001 (agent control and data listeners), 7002 (dashboard). So ensure these ports are opened and not blocked.
 
-- Open the dashboard: `http://<vps-ip>:7002/setup` (only available until you create the first user).
-- After setup/login, go to **Config** and add at least one **Route**.
+### Server (Linux only)
+1. cd into the server directory
+Then run
+   ```sh
+   ./build.sh
+   ```
+2. Start the server. 
+   ```sh
+   ./server.sh
+   ```
+3. Open the dashboard (`http://<server-host>:7002`) to finish setup. First start shows the setup wizard, once finished the server has been setup.
 
-Example Minecraft route:
-- Name: `minecraft`
-- Protocol: `both`
-- Public address: `:25565`
+### Client
 
-If your VPS requires you to open up specific ports, make sure todo so. Importantly 7000, 7001, and 7002.
+#### Linux client
+1. cd into the client dictory and run
+   ```sh
+   ./build.sh
+   ```
+2. Start the agent launcher script (the dashboard runs on `127.0.0.1:7003` by default):
+   ```sh
+   ./client.sh
+   ```
+3. Setup the client with the correct token and server IP.
 
-### 2) Start the agent (on the machine running the service)
+4. Click "Save + restart agent", it should connect successfully to the server, unless something is misconfigured.
 
-```fish
-set -x SERVER "<vps-ip>"      # or "<vps-ip>:7000"
-set -x TOKEN  "<server-token>"
-./client.sh
-```
+#### Windows client
+1. cd into the client dictory and run 
+   ```powershell
+   .\build.ps1
+   ```
+2. Run the launcher:
+   ```powershell
+   .\client.ps1
+   ```
+3. Setup the client with the correct token and server IP.
 
-Windows (PowerShell):
+4. Click "Save + restart agent", it should connect successfully to the server, unless something is misconfigured.
 
-```powershell
-cd client
-$env:SERVER = "<vps-ip>"      # or "<vps-ip>:7000"
-$env:TOKEN  = "<server-token>"
-\client.ps1
-```
-
-If you want a standalone executable on Windows:
-
-```powershell
-\build.ps1
-\bin\tunnel-agent.exe -web 127.0.0.1:7003 -server "<vps-ip>" -token "<server-token>"
-```
-
-- Agent dashboard: `http://127.0.0.1:7003`
-- The agent page has **Start / Stop / Restart** controls and live status updates.
-- You can alternatively just start the server and set the token + IP via the GUI.
-
-### 3) Connect from the internet
-
-Congrats, if you can connect from your VPS IP, then you've successfully setup the project.
+5. Additional note, windows is considered experimental, and untested. Expect bugs!
 
 
-Additional notes : 
-Windows support is considered experimental, and untested. As I don't use Windows. So use at your own risk.
-
-You also need a VPS that runs Linux, so you are required to have some Linux knowledge, and know how to setup a Linux VPS. Lookup tutorials on how todo so. 
-
-Make sure the terminal is correctly pointed to the directory. I.e for example : cd /home/ubuntu/server/ / /home/ubuntu/client/
