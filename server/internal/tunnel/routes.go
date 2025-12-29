@@ -1,13 +1,45 @@
 package tunnel
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 func normalizeRoutes(cfg *ServerConfig) {
+	// Route names must be unique. The agent keys routes by name, and duplicate names
+	// will cause one route to overwrite another (breaking multi-port forwarding).
+	//
+	// Additionally, when deduping we avoid generating a name that collides with any
+	// explicitly configured name elsewhere in cfg.Routes (e.g. don't auto-generate
+	// "app-2" if there is an actual "app-2" route).
+	reserved := map[string]int{}
 	for i := range cfg.Routes {
-		cfg.Routes[i].Name = strings.TrimSpace(cfg.Routes[i].Name)
-		if cfg.Routes[i].Name == "" {
-			cfg.Routes[i].Name = "default"
+		name := strings.TrimSpace(cfg.Routes[i].Name)
+		if name == "" {
+			name = "default"
 		}
+		cfg.Routes[i].Name = name
+		reserved[name]++
+	}
+
+	used := map[string]bool{}
+	for i := range cfg.Routes {
+		base := cfg.Routes[i].Name
+		name := base
+		if used[name] {
+			n := 2
+			for {
+				cand := fmt.Sprintf("%s-%d", base, n)
+				if !used[cand] && reserved[cand] == 0 {
+					name = cand
+					break
+				}
+				n++
+			}
+		}
+		cfg.Routes[i].Name = name
+		used[name] = true
+
 		cfg.Routes[i].Proto = strings.ToLower(strings.TrimSpace(cfg.Routes[i].Proto))
 		if cfg.Routes[i].Proto == "" {
 			cfg.Routes[i].Proto = "tcp"

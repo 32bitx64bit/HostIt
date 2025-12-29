@@ -41,6 +41,9 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			_ = c.Close()
 			return
 		}
+		// Larger UDP buffers reduce drops/jitter for high-bitrate UDP workloads.
+		_ = uc.SetReadBuffer(4 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
 
 		// Register so the server learns our UDP address.
 		ks := sec.Get()
@@ -74,6 +77,8 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			if err != nil {
 				return nil, false
 			}
+			_ = lconn.SetReadBuffer(4 * 1024 * 1024)
+			_ = lconn.SetWriteBuffer(4 * 1024 * 1024)
 			s := &udpSession{conn: lconn, route: routeName, client: clientAddr}
 			m[clientAddr] = s
 

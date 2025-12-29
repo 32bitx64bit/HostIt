@@ -113,6 +113,11 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen data udp: %w", err)
 	}
+	if uc, ok := udpDataConn.(*net.UDPConn); ok {
+		// Larger UDP buffers reduce drops/jitter for high-bitrate UDP workloads.
+		_ = uc.SetReadBuffer(4 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+	}
 	defer udpDataConn.Close()
 
 	type publicTCPListener struct {
@@ -154,6 +159,10 @@ func (s *Server) Run(ctx context.Context) error {
 				_ = x.pc.Close()
 			}
 			return fmt.Errorf("listen public udp (%s=%s): %w", rt.Name, rt.PublicAddr, err)
+		}
+		if uc, ok := pc.(*net.UDPConn); ok {
+			_ = uc.SetReadBuffer(4 * 1024 * 1024)
+			_ = uc.SetWriteBuffer(4 * 1024 * 1024)
 		}
 		publicUDP = append(publicUDP, publicUDPListener{name: rt.Name, pc: pc})
 	}
@@ -315,6 +324,9 @@ func (st *serverState) acceptControl(ctx context.Context, ln net.Listener) error
 
 func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	setTCPKeepAlive(conn, 30*time.Second)
+	// Control channel is latency-sensitive (NEW/CONN pairing, ROUTE updates).
+	setTCPNoDelay(conn, true)
+	setTCPQuickACK(conn, true)
 
 	rw := lineproto.New(conn, conn)
 	line, err := rw.ReadLine()
