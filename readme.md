@@ -1,5 +1,6 @@
 # HostIt
-HostIt is a self-hosted alternative to playit.gg.
+HostIt is a high performance self hosted version of similar services such as Playit.gg or Ngrok used to create a tunnel to forward your local projects to the wider web.
+Very useful especially in cases where your ISP or router can't do port forwarding, and also provides better security than port forwarding. 
 
 ## Quick Start
 
