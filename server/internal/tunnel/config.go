@@ -39,6 +39,13 @@ type ServerConfig struct {
 	// TLSCertFile and TLSKeyFile are PEM files used when TLS is enabled.
 	TLSCertFile string
 	TLSKeyFile  string
+	// WebHTTPS enables HTTPS for the server dashboard listener (the -web address).
+	// When enabled, the dashboard serves via TLS using WebTLSCertFile/WebTLSKeyFile.
+	WebHTTPS bool
+	// WebTLSCertFile and WebTLSKeyFile are PEM files used for dashboard HTTPS.
+	// If empty, defaults are used alongside the main config file.
+	WebTLSCertFile string
+	WebTLSKeyFile  string
 	// DisableUDPEncryption disables application-layer encryption for the agent<->server
 	// UDP data channel (used for UDP forwarding). By default it is enabled.
 	//

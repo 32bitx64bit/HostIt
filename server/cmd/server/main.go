@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"encoding/hex"
+	"fmt"
 	"flag"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -152,7 +154,11 @@ func main() {
 			}
 			defer store.Close()
 
-			log.Printf("server web: http://%s", webAddr)
+			scheme := "http"
+			if cfg.WebHTTPS {
+				scheme = "https"
+			}
+			log.Printf("server web: %s://%s", scheme, webAddr)
 			if err := serveServerDashboard(ctx, webAddr, configPath, runner, store, cookieSecure, sessionTTL); err != nil {
 				log.Printf("server web error: %v", err)
 			}
@@ -269,10 +275,20 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		return msg
 	}
 
-	mux := http.NewServeMux()
+	restartCh := make(chan struct{}, 1)
+	requestRestart := func() {
+		select {
+		case restartCh <- struct{}{}:
+		default:
+		}
+	}
 
-	// Setup: only available if no users exist.
-	mux.HandleFunc("/setup", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+	buildMux := func(cookieSecure bool, webHTTPS bool, webCertFile string, webKeyFile string, webFingerprint string) *http.ServeMux {
+		mux := http.NewServeMux()
+		lim := newIPRateLimiter(10, 30*time.Second) // 10 attempts per 30s per IP
+
+		// Setup: only available if no users exist.
+		mux.HandleFunc("/setup", securityHeaders(cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		hasUsers, err := store.HasAnyUsers(r.Context())
 		if err != nil {
 			http.Error(w, "auth db error", http.StatusInternalServerError)
@@ -289,6 +305,11 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			_ = tplSetup.Execute(w, map[string]any{"CSRF": csrf, "Msg": getMsg()})
 			return
 		case http.MethodPost:
+			if !lim.Allow(clientIP(r)) {
+				http.Error(w, "too many attempts", http.StatusTooManyRequests)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			if err := r.ParseForm(); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -326,10 +347,10 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-	}))
+		}))
 
-	// Login.
-	mux.HandleFunc("/login", securityHeaders(func(w http.ResponseWriter, r *http.Request) {
+		// Login.
+		mux.HandleFunc("/login", securityHeaders(cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		hasUsers, err := store.HasAnyUsers(r.Context())
 		if err != nil {
 			http.Error(w, "auth db error", http.StatusInternalServerError)
@@ -346,6 +367,11 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			_ = tplLogin.Execute(w, map[string]any{"CSRF": csrf, "Msg": getMsg()})
 			return
 		case http.MethodPost:
+			if !lim.Allow(clientIP(r)) {
+				http.Error(w, "too many attempts", http.StatusTooManyRequests)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			if err := r.ParseForm(); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -379,14 +405,15 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-	}))
+		}))
 
-	// Logout.
-	mux.HandleFunc("/logout", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		// Logout.
+		mux.HandleFunc("/logout", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -400,10 +427,10 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		}
 		clearSessionCookie(w, cookieSecure)
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
-	})))
+		})))
 
-	// Stats (protected)
-	mux.HandleFunc("/", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		// Stats (protected)
+		mux.HandleFunc("/", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -420,12 +447,13 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			"CSRF":       csrf,
 			"Routes":     routes,
 			"RouteCount": len(routes),
+			"WebHTTPS":   webHTTPS,
 		}
 		_ = tplStats.Execute(w, data)
-	})))
+		})))
 
-	// Live stats API (protected)
-	mux.HandleFunc("/api/stats", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		// Live stats API (protected)
+		mux.HandleFunc("/api/stats", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -459,10 +487,10 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
-	})))
+		})))
 
-	// Config (protected)
-	mux.HandleFunc("/config", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		// Config (protected)
+		mux.HandleFunc("/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -508,6 +536,10 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			"CSRF":       csrf,
 			"Routes":     routeViews,
 			"RouteCount": len(routeViews),
+			"WebHTTPS":   webHTTPS,
+			"WebTLSCert": webCertFile,
+			"WebTLSKey":  webKeyFile,
+			"WebTLSFP":   webFingerprint,
 			"UDPKeyCreated": func() string {
 				if cfg.UDPKeyCreatedUnix == 0 {
 					return ""
@@ -516,13 +548,14 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			}(),
 		}
 		_ = tplConfig.Execute(w, data)
-	})))
+		})))
 
-	mux.HandleFunc("/config/save", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/config/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -544,17 +577,16 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			}
 			msgs = append(msgs, s)
 		}
-		cfg := tunnel.ServerConfig{
-			// Preserve non-UI fields by starting from current config.
-		}
 		old, _, _ := runner.Get()
-		cfg = old
+		cfg := old
 		oldEnc := strings.TrimSpace(cfg.UDPEncryptionMode)
+		webWas := cfg.WebHTTPS
 		cfg.ControlAddr = r.Form.Get("control")
 		cfg.DataAddr = r.Form.Get("data")
 		cfg.DataAddrInsecure = r.Form.Get("data_insecure")
 		cfg.Token = strings.TrimSpace(r.Form.Get("token"))
 		cfg.PairTimeout = pt
+		cfg.WebHTTPS = strings.TrimSpace(r.Form.Get("web_https")) != ""
 		if cfg.Token == "" {
 			cfg.Token = genToken()
 			addMsg("Token was empty; generated a new token")
@@ -611,6 +643,32 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			}
 			log.Printf("tunnel tls enabled; cert sha256=%s", fp)
 		}
+
+		// Dashboard HTTPS (self-signed)
+		cfgDir := filepath.Dir(configPath)
+		if strings.TrimSpace(cfg.WebTLSCertFile) == "" {
+			cfg.WebTLSCertFile = filepath.Join(cfgDir, "web.crt")
+		}
+		if strings.TrimSpace(cfg.WebTLSKeyFile) == "" {
+			cfg.WebTLSKeyFile = filepath.Join(cfgDir, "web.key")
+		}
+		if strings.TrimSpace(r.Form.Get("web_tls_regen")) != "" {
+			fp, err := tlsutil.RegenerateSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			addMsg("Regenerated dashboard HTTPS cert/key; cert sha256=" + fp)
+		}
+		if cfg.WebHTTPS {
+			fp, err := tlsutil.EnsureSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			addMsg("Dashboard HTTPS enabled (self-signed); cert sha256=" + fp)
+		}
+
 		if err := configio.Save(configPath, cfg); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -618,19 +676,36 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		runner.Restart(cfg)
 		addMsg("Saved + restarted")
 		setMsg(strings.Join(msgs, " · "))
+
+		webNow := cfg.WebHTTPS
+		needsWebRestart := webWas != webNow || strings.TrimSpace(r.Form.Get("web_tls_regen")) != ""
+		if needsWebRestart {
+			requestRestart()
+		}
+		if webWas != webNow {
+			scheme := "http"
+			if webNow {
+				scheme = "https"
+			}
+			target := scheme + "://" + r.Host + "/config"
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprintf(w, "<!doctype html><html><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>Redirect</title></head><body style=\"font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px\"><h2>Dashboard HTTPS updated</h2><p>Open: <a href=\"%s\">%s</a></p><p style=\"opacity:.8\">Self-signed certs will show a browser warning; that's expected.</p></body></html>", target, target)
+			return
+		}
 		http.Redirect(w, r, "/config", http.StatusSeeOther)
 	})))
 
-	// Back-compat: old save endpoint
-	mux.HandleFunc("/save", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		// Back-compat: old save endpoint
+		mux.HandleFunc("/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/config", http.StatusSeeOther)
-	})))
+		})))
 
-	mux.HandleFunc("/gen-token", securityHeaders(requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/gen-token", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -648,21 +723,88 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		runner.Restart(cfg)
 		setMsg("Generated token + restarted")
 		http.Redirect(w, r, "/config", http.StatusSeeOther)
-	})))
+		})))
 
-	h := &http.Server{Addr: addr, Handler: mux}
-	go func() {
-		<-ctx.Done()
-		ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = h.Shutdown(ctx2)
-	}()
-
-	err := h.ListenAndServe()
-	if err == http.ErrServerClosed {
-		return nil
+		return mux
 	}
-	return err
+
+	for {
+		cfg, _, _ := runner.Get()
+		useTLS := cfg.WebHTTPS
+		cookieSecureEff := cookieSecure || useTLS
+
+		cfgDir := filepath.Dir(configPath)
+		webCert := strings.TrimSpace(cfg.WebTLSCertFile)
+		webKey := strings.TrimSpace(cfg.WebTLSKeyFile)
+		if webCert == "" {
+			webCert = filepath.Join(cfgDir, "web.crt")
+		}
+		if webKey == "" {
+			webKey = filepath.Join(cfgDir, "web.key")
+		}
+		webFP := ""
+		if useTLS {
+			fp, err := tlsutil.EnsureSelfSignedDashboard(webCert, webKey)
+			if err != nil {
+				return err
+			}
+			webFP = fp
+		}
+
+		h := &http.Server{
+			Addr:              addr,
+			Handler:           buildMux(cookieSecureEff, useTLS, webCert, webKey, webFP),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+
+		errCh := make(chan error, 1)
+		go func() {
+			if useTLS {
+				errCh <- h.ListenAndServeTLS(webCert, webKey)
+				return
+			}
+			errCh <- h.ListenAndServe()
+		}()
+
+		select {
+		case <-ctx.Done():
+			ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = h.Shutdown(ctx2)
+			cancel()
+			err := <-errCh
+			if err == http.ErrServerClosed {
+				return nil
+			}
+			return err
+		case <-restartCh:
+			ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = h.Shutdown(ctx2)
+			cancel()
+			err := <-errCh
+			if err != nil && err != http.ErrServerClosed {
+				return err
+			}
+			// Drain any queued restarts.
+			for {
+				select {
+				case <-restartCh:
+				default:
+					goto next
+				}
+			}
+		case err := <-errCh:
+			if err == http.ErrServerClosed {
+				return nil
+			}
+			return err
+		}
+		
+	next:
+		continue
+	}
 }
 
 func genToken() string {
@@ -1063,6 +1205,18 @@ const serverConfigHTML = `<!doctype html>
 					{{end}}
 				</div>
 				<div>
+					<label>Dashboard HTTPS (self-signed)</label>
+					<div class="help">Serves this dashboard over HTTPS on the <code>-web</code> address. Browsers will show a warning for self-signed certs; that's expected.</div>
+					<label style="font-weight: 400; display:flex; gap:8px; align-items:center">
+						<input type="checkbox" name="web_https" value="1" style="width:auto" {{if .Cfg.WebHTTPS}}checked{{end}} />
+						<span>Enable HTTPS for dashboard</span>
+					</label>
+					<div class="help" style="margin-top:8px">Cert: <code>{{.WebTLSCert}}</code><br/>Key: <code>{{.WebTLSKey}}</code>{{if .WebTLSFP}}<br/>Cert sha256: <code>{{.WebTLSFP}}</code>{{end}}</div>
+					<div class="btns">
+						<button type="submit" name="web_tls_regen" value="1">Regenerate dashboard cert/key</button>
+					</div>
+				</div>
+				<div>
 					<label>UDP Encryption</label>
 					<div class="help">Message-layer encryption for agent↔server UDP relay.</div>
 					<select name="udp_enc">
@@ -1334,14 +1488,83 @@ const setupPageHTML = `<!doctype html>
 </body>
 </html>`
 
-func securityHeaders(next http.HandlerFunc) http.HandlerFunc {
+func securityHeaders(secureCookies bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+		// Only emit HSTS when cookies are marked Secure (should only be enabled behind HTTPS).
+		if secureCookies {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 		next(w, r)
 	}
+}
+
+type ipRateLimiter struct {
+	mu     sync.Mutex
+	limit  int
+	window time.Duration
+	byIP   map[string][]time.Time
+}
+
+func newIPRateLimiter(limit int, window time.Duration) *ipRateLimiter {
+	if limit <= 0 {
+		limit = 10
+	}
+	if window <= 0 {
+		window = 30 * time.Second
+	}
+	return &ipRateLimiter{limit: limit, window: window, byIP: map[string][]time.Time{}}
+}
+
+func (l *ipRateLimiter) Allow(ip string) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		ip = "unknown"
+	}
+	now := time.Now()
+	cut := now.Add(-l.window)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	arr := l.byIP[ip]
+	// prune
+	j := 0
+	for ; j < len(arr); j++ {
+		if arr[j].After(cut) {
+			break
+		}
+	}
+	if j > 0 {
+		arr = append([]time.Time(nil), arr[j:]...)
+	}
+	if len(arr) >= l.limit {
+		l.byIP[ip] = arr
+		return false
+	}
+	arr = append(arr, now)
+	l.byIP[ip] = arr
+	return true
+}
+
+func clientIP(r *http.Request) string {
+	// Note: we deliberately do NOT trust X-Forwarded-For here.
+	// If you run behind a reverse proxy, enforce auth/rate-limit there too.
+	if r == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
 }
 
 func requireAuth(store *auth.Store, cookieSecure bool, next http.HandlerFunc) http.HandlerFunc {
@@ -1384,7 +1607,7 @@ func ensureCSRF(w http.ResponseWriter, r *http.Request, secure bool) string {
 		Value:    tok,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		Secure:   secure,
 		MaxAge:   60 * 60 * 24 * 7,
 	})
@@ -1417,7 +1640,7 @@ func setSessionCookie(w http.ResponseWriter, sid string, secure bool) {
 		Value:    sid,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		Secure:   secure,
 		MaxAge:   60 * 60 * 24 * 7,
 	})
@@ -1429,7 +1652,7 @@ func clearSessionCookie(w http.ResponseWriter, secure bool) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		Secure:   secure,
 		MaxAge:   -1,
 	})

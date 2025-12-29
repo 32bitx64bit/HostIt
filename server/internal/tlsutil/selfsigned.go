@@ -36,7 +36,7 @@ func EnsureSelfSigned(certFile, keyFile string) (fingerprintHex string, err erro
 		return hex.EncodeToString(sum[:]), nil
 	}
 
-	return writeSelfSigned(certFile, keyFile)
+	return writeSelfSigned(certFile, keyFile, "hostit-tunnel")
 }
 
 // RegenerateSelfSigned always overwrites the certificate/key with a new self-signed
@@ -45,10 +45,41 @@ func RegenerateSelfSigned(certFile, keyFile string) (fingerprintHex string, err 
 	if certFile == "" || keyFile == "" {
 		return "", fmt.Errorf("certFile/keyFile required")
 	}
-	return writeSelfSigned(certFile, keyFile)
+	return writeSelfSigned(certFile, keyFile, "hostit-tunnel")
 }
 
-func writeSelfSigned(certFile, keyFile string) (fingerprintHex string, err error) {
+// EnsureSelfSignedDashboard writes a self-signed ECDSA certificate/key pair if the files
+// do not already exist, using a dashboard-specific certificate identity.
+func EnsureSelfSignedDashboard(certFile, keyFile string) (fingerprintHex string, err error) {
+	if certFile == "" || keyFile == "" {
+		return "", fmt.Errorf("certFile/keyFile required")
+	}
+
+	certExists := fileExists(certFile)
+	keyExists := fileExists(keyFile)
+
+	if certExists && keyExists {
+		der, err := readFirstCertDER(certFile)
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256(der)
+		return hex.EncodeToString(sum[:]), nil
+	}
+
+	return writeSelfSigned(certFile, keyFile, "hostit-dashboard")
+}
+
+// RegenerateSelfSignedDashboard always overwrites the certificate/key with a new self-signed
+// ECDSA pair and returns the SHA256 fingerprint of the cert DER.
+func RegenerateSelfSignedDashboard(certFile, keyFile string) (fingerprintHex string, err error) {
+	if certFile == "" || keyFile == "" {
+		return "", fmt.Errorf("certFile/keyFile required")
+	}
+	return writeSelfSigned(certFile, keyFile, "hostit-dashboard")
+}
+
+func writeSelfSigned(certFile, keyFile string, commonName string) (fingerprintHex string, err error) {
 	if err := os.MkdirAll(filepath.Dir(certFile), 0o755); err != nil && filepath.Dir(certFile) != "." {
 		return "", err
 	}
@@ -71,7 +102,7 @@ func writeSelfSigned(certFile, keyFile string) (fingerprintHex string, err error
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName:   "hostit-tunnel",
+			CommonName:   commonName,
 			Organization: []string{"hostit"},
 		},
 		NotBefore:             now.Add(-1 * time.Hour),

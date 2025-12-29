@@ -6,7 +6,6 @@ HostIt is a self-hosted alternative to playit.gg.
 ### 1) Start the server (on your VPS)
 
 ```fish
-cd /home/gavin/Desktop/Playit-prototype/server
 ./server.sh
 ```
 
@@ -23,7 +22,6 @@ If your VPS requires you to open up specific ports, make sure todo so. Important
 ### 2) Start the agent (on the machine running the service)
 
 ```fish
-cd /home/gavin/Desktop/Playit-prototype/client
 set -x SERVER "<vps-ip>"      # or "<vps-ip>:7000"
 set -x TOKEN  "<server-token>"
 ./client.sh
@@ -41,7 +39,6 @@ $env:TOKEN  = "<server-token>"
 If you want a standalone executable on Windows:
 
 ```powershell
-cd client
 \build.ps1
 \bin\tunnel-agent.exe -web 127.0.0.1:7003 -server "<vps-ip>" -token "<server-token>"
 ```
@@ -59,3 +56,5 @@ Additional notes :
 Windows support is considered experimental, and untested. As I don't use Windows. So use at your own risk.
 
 You also need a VPS that runs Linux, so you are required to have some Linux knowledge, and know how to setup a Linux VPS. Lookup tutorials on how todo so. 
+
+Make sure the terminal is correctly pointed to the directory. I.e for example : cd /home/ubuntu/server/ / /home/ubuntu/client/
