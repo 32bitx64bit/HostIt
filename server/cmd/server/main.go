@@ -295,6 +295,18 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			return
 		}
 		csrf := ensureCSRF(w, r, cookieSecure)
+		render := func(errMsg string, username string, errUser bool, errPass bool, errConfirm bool) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_ = tplSetup.Execute(w, map[string]any{
+				"CSRF":       csrf,
+				"Msg":        getMsg(),
+				"Err":        errMsg,
+				"Username":   username,
+				"ErrUsername": errUser,
+				"ErrPassword": errPass,
+				"ErrConfirm":  errConfirm,
+			})
+		}
 		if hasUsers {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
@@ -302,36 +314,47 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 
 		switch r.Method {
 		case http.MethodGet:
-			_ = tplSetup.Execute(w, map[string]any{"CSRF": csrf, "Msg": getMsg()})
+			render("", "", false, false, false)
 			return
 		case http.MethodPost:
 			if !lim.Allow(clientIP(r)) {
-				http.Error(w, "too many attempts", http.StatusTooManyRequests)
+				render("Too many attempts. Please wait a moment and try again.", "", false, false, false)
 				return
 			}
 			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			if err := r.ParseForm(); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				render("Invalid form input.", "", false, false, false)
 				return
 			}
 			if !checkCSRF(r) {
-				http.Error(w, "csrf", http.StatusBadRequest)
+				render("Session expired. Please refresh and try again.", "", false, false, false)
 				return
 			}
 			username := strings.TrimSpace(r.Form.Get("username"))
 			password := r.Form.Get("password")
 			confirm := r.Form.Get("confirm")
-			if username == "" || len(password) < 10 || password != confirm {
-				http.Error(w, "invalid input (password must be >= 10 chars and match)", http.StatusBadRequest)
+			errUser := username == ""
+			errPass := len(password) < 10
+			errConfirm := password != confirm
+			if errUser || errPass || errConfirm {
+				errMsg := "Please fix the highlighted fields."
+				if errPass {
+					errMsg = "Password must be at least 10 characters."
+				}
+				if errConfirm {
+					// If both are true, this message is more actionable.
+					errMsg = "Passwords must match."
+				}
+				render(errMsg, username, errUser, errPass, errConfirm)
 				return
 			}
 			if err := store.CreateUser(r.Context(), username, password); err != nil {
-				http.Error(w, "create user failed", http.StatusBadRequest)
+				render("Create account failed. Please try a different username.", username, true, false, false)
 				return
 			}
 			userID, ok, err := store.Authenticate(r.Context(), username, password)
 			if err != nil || !ok {
-				http.Error(w, "login failed", http.StatusInternalServerError)
+				render("Account was created, but login failed. Please try logging in.", username, false, false, false)
 				return
 			}
 			sid, err := store.CreateSession(r.Context(), userID, sessionTTL)
@@ -1518,39 +1541,53 @@ const setupPageHTML = `<!doctype html>
     label { font-weight: 600; display:block; margin: 0 0 4px; }
     .help { font-size: 12px; margin: 0 0 8px; opacity: .85; line-height: 1.35; }
     input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); }
+		.inputErr { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .10); }
     .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
     button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
     button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
+		.pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
+		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>First-time Setup</h1>
     <div class="muted">Create the initial admin account for this server.</div>
+		{{if .Err}}<div class="pill bad" style="margin-top: 12px">{{.Err}}</div>{{end}}
 
     <form method="post" action="/setup" class="card">
       <input type="hidden" name="csrf" value="{{.CSRF}}" />
 
       <label>Username</label>
       <div class="help">Pick a unique username. This will be your admin login.</div>
-      <input name="username" autocomplete="username" />
+	<input name="username" autocomplete="username" value="{{.Username}}" class="{{if .ErrUsername}}inputErr{{end}}" />
 
       <div style="height: 10px"></div>
 
       <label>Password</label>
       <div class="help">Use a long password (minimum 10 characters). Use a password manager.</div>
-      <input name="password" type="password" autocomplete="new-password" />
+	<input name="password" type="password" autocomplete="new-password" class="{{if .ErrPassword}}inputErr{{end}}" />
 
       <div style="height: 10px"></div>
 
       <label>Confirm password</label>
-      <input name="confirm" type="password" autocomplete="new-password" />
+	<input name="confirm" type="password" autocomplete="new-password" class="{{if .ErrConfirm}}inputErr{{end}}" />
 
       <div class="btns">
         <button type="submit" class="primary">Create account</button>
       </div>
     </form>
   </div>
+	{{if .Err}}
+	<script>
+		(function(){
+			var p = document.querySelector('input[name="password"]');
+			var c = document.querySelector('input[name="confirm"]');
+			if (p) p.value = '';
+			if (c) c.value = '';
+		})();
+	</script>
+	{{end}}
 </body>
 </html>`
 
