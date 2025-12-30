@@ -157,8 +157,18 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 					return err
 				}
 				ks := sec.Get()
-				routeName, clientAddr, payload, _, ok := udpproto.DecodeDataEnc2(ks, buf[:n])
-				if !ok {
+				var (
+					routeName  string
+					clientAddr string
+					payload    []byte
+					ok         bool
+				)
+				if ks.Enabled() {
+					routeName, clientAddr, payload, _, ok = udpproto.DecodeDataEnc2(ks, buf[:n])
+					if !ok {
+						continue
+					}
+				} else {
 					routeName, clientAddr, payload, ok = udpproto.DecodeData(buf[:n])
 					if !ok {
 						continue

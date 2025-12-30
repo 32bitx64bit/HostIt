@@ -28,7 +28,7 @@ func main() {
 
 	flag.StringVar(&serverHost, "server", "", "tunnel server host/IP (optionally include control port, e.g. host:7000)")
 	flag.StringVar(&token, "token", "", "shared token (required)")
-	flag.StringVar(&webAddr, "web", ":7003", "agent web dashboard listen address (empty to disable)")
+	flag.StringVar(&webAddr, "web", "127.0.0.1:7003", "agent web dashboard listen address (empty to disable)")
 	flag.StringVar(&configPath, "config", "agent.json", "path to agent config JSON")
 	flag.BoolVar(&autostart, "autostart", true, "start agent automatically")
 	flag.Parse()
@@ -73,7 +73,13 @@ func main() {
 		go func() {
 			display := webAddr
 			if strings.HasPrefix(display, ":") {
-				display = "127.0.0.1" + display
+				display = "0.0.0.0" + display
+				log.Printf("WARNING: agent web UI is unauthenticated; binding to all interfaces")
+			} else if h, _, err := net.SplitHostPort(display); err == nil {
+				h = strings.TrimSpace(h)
+				if h == "" || h == "0.0.0.0" || h == "::" {
+					log.Printf("WARNING: agent web UI is unauthenticated; binding to all interfaces")
+				}
 			}
 			log.Printf("agent web: http://%s", display)
 			if err := serveAgentDashboard(ctx, webAddr, configPath, ctrl); err != nil {

@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -19,6 +20,18 @@ import (
 	"hostit/server/internal/lineproto"
 	"hostit/server/internal/udpproto"
 )
+
+func tokensEqualCT(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
 
 type ServerStatus struct {
 	AgentConnected bool
@@ -313,11 +326,37 @@ func (st *serverState) routeTCPNoDelay(routeName string) bool {
 }
 
 func (st *serverState) acceptControl(ctx context.Context, ln net.Listener) error {
+	backoff := 50 * time.Millisecond
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		conn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
+				t := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return nil
+				case <-t.C:
+				}
+				if backoff < 1*time.Second {
+					backoff *= 2
+					if backoff > 1*time.Second {
+						backoff = 1 * time.Second
+					}
+				}
+				continue
+			}
 			return err
 		}
+		backoff = 50 * time.Millisecond
 		go st.handleControlConn(ctx, conn)
 	}
 }
@@ -329,7 +368,9 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	setTCPQuickACK(conn, true)
 
 	rw := lineproto.New(conn, conn)
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	line, err := rw.ReadLine()
+	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		_ = rw.WriteLinef("ERR %s", "no hello")
 		_ = conn.Close()
@@ -347,8 +388,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	provided := strings.TrimSpace(rest)
-	if provided != expected {
+	if !tokensEqualCT(expected, rest) {
 		_ = rw.WriteLinef("ERR %s", "bad token (agent token must match server token)")
 		_ = conn.Close()
 		return
@@ -487,11 +527,37 @@ func (st *serverState) clearAgent(conn net.Conn) {
 }
 
 func (st *serverState) acceptData(ctx context.Context, ln net.Listener) error {
+	backoff := 50 * time.Millisecond
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		conn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
+				t := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return nil
+				case <-t.C:
+				}
+				if backoff < 1*time.Second {
+					backoff *= 2
+					if backoff > 1*time.Second {
+						backoff = 1 * time.Second
+					}
+				}
+				continue
+			}
 			return err
 		}
+		backoff = 50 * time.Millisecond
 		setTCPKeepAlive(conn, 30*time.Second)
 		go st.handleDataConn(conn)
 	}
@@ -499,7 +565,9 @@ func (st *serverState) acceptData(ctx context.Context, ln net.Listener) error {
 
 func (st *serverState) handleDataConn(conn net.Conn) {
 	rw := lineproto.New(conn, conn)
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	line, err := rw.ReadLine()
+	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		_ = conn.Close()
 		return
@@ -538,11 +606,37 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 }
 
 func (st *serverState) acceptPublicTCP(ctx context.Context, ln net.Listener, routeName string) error {
+	backoff := 50 * time.Millisecond
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		clientConn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
+				t := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return nil
+				case <-t.C:
+				}
+				if backoff < 1*time.Second {
+					backoff *= 2
+					if backoff > 1*time.Second {
+						backoff = 1 * time.Second
+					}
+				}
+				continue
+			}
 			return err
 		}
+		backoff = 50 * time.Millisecond
 		setTCPKeepAlive(clientConn, 30*time.Second)
 		if st.routeTCPNoDelay(routeName) {
 			setTCPNoDelay(clientConn, true)
@@ -660,6 +754,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		return nil
 	}
 	buf := make([]byte, 64*1024)
+	backoff := 50 * time.Millisecond
 	for {
 		select {
 		case <-ctx.Done():
@@ -668,20 +763,47 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		}
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
+				t := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return nil
+				case <-t.C:
+				}
+				if backoff < 1*time.Second {
+					backoff *= 2
+					if backoff > 1*time.Second {
+						backoff = 1 * time.Second
+					}
+				}
+				continue
+			}
 			return err
 		}
+		backoff = 50 * time.Millisecond
 		pkt := buf[:n]
 		if len(pkt) == 0 {
 			continue
 		}
+		mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
+		if st.cfg.DisableUDPEncryption {
+			mode = "none"
+		}
 		switch pkt[0] {
 		case udpproto.MsgReg:
+			if !strings.EqualFold(mode, "none") {
+				continue
+			}
 			tok, ok := udpproto.DecodeReg(pkt)
 			if !ok {
 				continue
 			}
 			expected := strings.TrimSpace(st.cfg.Token)
-			if expected != "" && tok != expected {
+			if expected != "" && !tokensEqualCT(expected, tok) {
 				continue
 			}
 			if st.getAgentProto() == nil {
@@ -690,6 +812,9 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 			st.setAgentUDPAddr(addr)
 			st.setAgentUDPKeyID(0)
 		case udpproto.MsgRegEnc2:
+			if strings.EqualFold(mode, "none") {
+				continue
+			}
 			expected := strings.TrimSpace(st.cfg.Token)
 			if expected == "" {
 				continue
@@ -704,6 +829,9 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 			st.setAgentUDPAddr(addr)
 			st.setAgentUDPKeyID(kid)
 		case udpproto.MsgData:
+			if !strings.EqualFold(mode, "none") {
+				continue
+			}
 			route, client, payload, ok := udpproto.DecodeData(pkt)
 			if !ok {
 				continue
@@ -722,6 +850,9 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 			}
 			_, _ = pc2.WriteTo(payload, ua)
 		case udpproto.MsgDataEnc2:
+			if strings.EqualFold(mode, "none") {
+				continue
+			}
 			route, client, payload, _, ok := udpproto.DecodeDataEnc2(st.udpKeys, pkt)
 			if !ok {
 				continue
@@ -747,6 +878,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 
 func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, routeName string) error {
 	buf := make([]byte, 64*1024)
+	backoff := 50 * time.Millisecond
 	for {
 		select {
 		case <-ctx.Done():
@@ -755,8 +887,28 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 		}
 		n, clientAddr, err := pc.ReadFrom(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
+				t := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return nil
+				case <-t.C:
+				}
+				if backoff < 1*time.Second {
+					backoff *= 2
+					if backoff > 1*time.Second {
+						backoff = 1 * time.Second
+					}
+				}
+				continue
+			}
 			return err
 		}
+		backoff = 50 * time.Millisecond
 		agent := st.getAgentUDPAddr()
 		if agent == nil {
 			continue

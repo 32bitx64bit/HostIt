@@ -11,10 +11,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"hostit/client/internal/lineproto"
 )
+
+var warnTLSPinOnce sync.Once
 
 type Hooks struct {
 	OnConnected    func()
@@ -90,7 +93,9 @@ func runOnce(ctx context.Context, cfg Config, hooks *Hooks) error {
 		}
 		return fmt.Errorf("hello: %w", err)
 	}
+	_ = controlConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	line, err := rw.ReadLine()
+	_ = controlConn.SetReadDeadline(time.Time{})
 	if err != nil {
 		if hooks != nil && hooks.OnError != nil {
 			hooks.OnError(err)
@@ -278,6 +283,12 @@ func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, erro
 			setTCPQuickACK(c, true)
 		}
 		return c, nil
+	}
+
+	if strings.TrimSpace(cfg.TLSPinSHA256) == "" {
+		warnTLSPinOnce.Do(func() {
+			log.Printf("WARNING: agent TLS is not verifying the server certificate (MITM risk). Set TLSPinSHA256 to pin the server cert fingerprint.")
+		})
 	}
 	host, _ := splitHostPortOrDefault(addr, "")
 	tlsCfg := &tls.Config{

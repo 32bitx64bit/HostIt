@@ -49,7 +49,7 @@ func main() {
 	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key PEM path (default: alongside config)")
 	flag.BoolVar(&disableUDPEnc, "disable-udp-encryption", false, "disable application-layer encryption for agent<->server UDP data (deprecated; use server config: UDP Encryption = none)")
 	flag.DurationVar(&pairTimeout, "pair-timeout", 10*time.Second, "max wait for agent to attach")
-	flag.StringVar(&webAddr, "web", ":7002", "web dashboard listen address (empty to disable)")
+	flag.StringVar(&webAddr, "web", "127.0.0.1:7002", "web dashboard listen address (empty to disable)")
 	flag.StringVar(&configPath, "config", "server.json", "path to server config JSON")
 	flag.StringVar(&authDBPath, "auth-db", "auth.db", "sqlite auth db path")
 	flag.BoolVar(&cookieSecure, "cookie-secure", false, "set Secure on cookies (recommended behind HTTPS)")
