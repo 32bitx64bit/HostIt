@@ -947,8 +947,16 @@ const serverStatsHTML = `<!doctype html>
 			</div>
 		</div>
 
-		<h2>Bandwidth (7 days, 5-minute buckets)</h2>
+
+		<h2>Bandwidth</h2>
 		<div class="card">
+			<div class="btns" style="margin-top:0">
+				<button type="button" id="bwScale1h">1 hour</button>
+				<button type="button" id="bwScale6h">6 hours</button>
+				<button type="button" id="bwScale12h">12 hours</button>
+				<button type="button" id="bwScale24h">1 day</button>
+				<span class="muted" id="bwScaleLabel" style="align-self:center">—</span>
+			</div>
 			<canvas id="bwChart" width="880" height="160" style="width:100%; max-width:100%;"></canvas>
 			<div class="muted" style="margin-top:8px">Shows bytes transferred per 5-minute interval.</div>
 		</div>
@@ -1012,6 +1020,26 @@ const serverStatsHTML = `<!doctype html>
 				ctx.lineWidth = 1;
 				ctx.strokeRect(0.5,0.5,w-1,h-1);
 			}
+			function bucketSeconds(series){
+				if(!series || series.length < 2) return 300;
+				var a = Number(series[0].t||0);
+				var b = Number(series[1].t||0);
+				var dt = b - a;
+				if(!isFinite(dt) || dt <= 0) return 300;
+				// clamp to something sane
+				if(dt > 3600) return 3600;
+				return dt;
+			}
+			function sliceWindow(series, windowSec){
+				if(!series || !series.length) return series;
+				windowSec = Number(windowSec||0);
+				if(!isFinite(windowSec) || windowSec <= 0) return series;
+				var dt = bucketSeconds(series);
+				var n = Math.floor(windowSec / dt);
+				if(n < 1) n = 1;
+				if(n > series.length) n = series.length;
+				return series.slice(series.length - n);
+			}
 			function renderRouteConsole(el, route){
 				if(!el) return;
 				var lines = [];
@@ -1039,6 +1067,39 @@ const serverStatsHTML = `<!doctype html>
 			var errRow = document.getElementById('errRow');
 			var errText = document.getElementById('errText');
 			var lastSeries = null;
+			var bwScaleSec = 24 * 3600;
+			var bwScaleLabel = document.getElementById('bwScaleLabel');
+			var bwBtn1h = document.getElementById('bwScale1h');
+			var bwBtn6h = document.getElementById('bwScale6h');
+			var bwBtn12h = document.getElementById('bwScale12h');
+			var bwBtn24h = document.getElementById('bwScale24h');
+
+			function setScale(sec){
+				bwScaleSec = Number(sec||0);
+				if(!isFinite(bwScaleSec) || bwScaleSec <= 0) bwScaleSec = 24*3600;
+				var btns = [bwBtn1h,bwBtn6h,bwBtn12h,bwBtn24h];
+				for(var i=0;i<btns.length;i++){
+					var b = btns[i];
+					if(!b) continue;
+					b.classList.remove('primary');
+				}
+				if(bwScaleSec === 3600 && bwBtn1h) bwBtn1h.classList.add('primary');
+				else if(bwScaleSec === 6*3600 && bwBtn6h) bwBtn6h.classList.add('primary');
+				else if(bwScaleSec === 12*3600 && bwBtn12h) bwBtn12h.classList.add('primary');
+				else if(bwScaleSec === 24*3600 && bwBtn24h) bwBtn24h.classList.add('primary');
+				if(bwScaleLabel){
+					var txt = 'Range: ';
+					if(bwScaleSec === 3600) txt += '1 hour';
+					else if(bwScaleSec === 6*3600) txt += '6 hours';
+					else if(bwScaleSec === 12*3600) txt += '12 hours';
+					else if(bwScaleSec === 24*3600) txt += '1 day';
+					else txt += Math.round(bwScaleSec/3600) + 'h';
+					bwScaleLabel.textContent = txt;
+				}
+				if(lastSeries){
+					drawChart(sliceWindow(lastSeries, bwScaleSec));
+				}
+			}
 
 			function computeLast5m(series){
 				if(!series || !series.length) return 0;
@@ -1062,7 +1123,7 @@ const serverStatsHTML = `<!doctype html>
 					if(liveText) liveText.textContent = 'Last update: ' + new Date().toLocaleTimeString();
 					if(j.series && j.series !== lastSeries){
 						lastSeries = j.series;
-						drawChart(j.series);
+						drawChart(sliceWindow(j.series, bwScaleSec));
 					}
 					var routes = j.routes || [];
 					for (var i=0;i<routes.length;i++){
@@ -1079,6 +1140,11 @@ const serverStatsHTML = `<!doctype html>
 				}
 			}
 
+			if(bwBtn1h) bwBtn1h.addEventListener('click', function(){ setScale(3600); });
+			if(bwBtn6h) bwBtn6h.addEventListener('click', function(){ setScale(6*3600); });
+			if(bwBtn12h) bwBtn12h.addEventListener('click', function(){ setScale(12*3600); });
+			if(bwBtn24h) bwBtn24h.addEventListener('click', function(){ setScale(24*3600); });
+			setScale(24*3600);
 			poll();
 			setInterval(poll, 2000);
 		})();

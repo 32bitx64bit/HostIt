@@ -5,8 +5,8 @@ Very useful especially in cases where your ISP or router can't do port forwardin
 ## Quick Start
 
 ### Prerequisites
-- Go 1.24 installed.
-- VPS for a Linux server. 
+- GO version 1.24.0 (Or greater) needs to be installed.
+- VPS for a Linux server (With go installed as well)
 - Ports 7000/7001 (agent control and data listeners), 7002 (dashboard). So ensure these ports are opened and not blocked.
 
 ### Server (Linux only)
