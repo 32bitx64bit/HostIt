@@ -18,6 +18,7 @@ type udpSession struct {
 
 func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurityState, routesByName map[string]RemoteRoute) {
 	const idle = 2 * time.Minute
+	const keepaliveEvery = 5 * time.Second
 
 	for {
 		if ctx.Err() != nil {
@@ -52,6 +53,30 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		} else {
 			_, _ = uc.Write(udpproto.EncodeReg(token))
 		}
+
+		// Keepalive: some NATs expire UDP mappings quickly (often ~10-30s) when idle
+		// or when traffic is primarily one-way. Periodically re-register to keep the
+		// mapping alive and refresh the server-side observed agent UDP address.
+		kaDone := make(chan struct{})
+		go func() {
+			t := time.NewTicker(keepaliveEvery)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-kaDone:
+					return
+				case <-t.C:
+					ks := sec.Get()
+					if ks.Enabled() {
+						_, _ = uc.Write(udpproto.EncodeRegEnc2(ks, token))
+					} else {
+						_, _ = uc.Write(udpproto.EncodeReg(token))
+					}
+				}
+			}
+		}()
 
 		sessionsMu := sync.Mutex{}
 		sessions := map[string]map[string]*udpSession{} // route -> client -> session
@@ -155,6 +180,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			}
 		}()
 
+		close(kaDone)
 		_ = uc.Close()
 		_ = readErr
 		// Backoff and retry.
