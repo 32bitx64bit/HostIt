@@ -2,8 +2,10 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +93,113 @@ func TestEndToEndTCP(t *testing.T) {
 			t.Fatalf("expected %q got %q", string(msg), string(buf))
 		}
 		break
+	}
+}
+
+func TestEndToEndTCPConcurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// local echo server
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	controlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlAddr := controlLn.Addr().String()
+	_ = controlLn.Close()
+
+	dataLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataAddr := dataLn.Addr().String()
+	_ = dataLn.Close()
+
+	publicLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicAddr := publicLn.Addr().String()
+	_ = publicLn.Close()
+
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 2 * time.Second, DisableTLS: true})
+	go func() { _ = srv.Run(ctx) }()
+
+	go fakeAgent(ctx, controlAddr, dataAddr, echoLn.Addr().String(), "testtoken")
+
+	// Wait for the public listener to become reachable.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("tunnel never became ready")
+		}
+		c, err := net.Dial("tcp", publicAddr)
+		if err != nil {
+			time.Sleep(25 * time.Millisecond)
+			continue
+		}
+		_ = c.Close()
+		break
+	}
+
+	const clients = 10
+	const rounds = 10
+
+	for r := 0; r < rounds; r++ {
+		errCh := make(chan error, clients)
+		start := make(chan struct{})
+		for i := 0; i < clients; i++ {
+			i := i
+			go func() {
+				<-start
+				client, err := net.Dial("tcp", publicAddr)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer client.Close()
+				_ = client.SetDeadline(time.Now().Add(750 * time.Millisecond))
+				msg := []byte("hello-" + strconv.Itoa(r) + "-" + strconv.Itoa(i) + "\n")
+				if _, err := client.Write(msg); err != nil {
+					errCh <- err
+					return
+				}
+				buf := make([]byte, len(msg))
+				if _, err := io.ReadFull(client, buf); err != nil {
+					errCh <- err
+					return
+				}
+				if string(buf) != string(msg) {
+					errCh <- fmt.Errorf("expected %q got %q", string(msg), string(buf))
+					return
+				}
+				errCh <- nil
+			}()
+		}
+		close(start)
+		for i := 0; i < clients; i++ {
+			if err := <-errCh; err != nil {
+				t.Fatalf("round %d: %v", r, err)
+			}
+		}
 	}
 }
 

@@ -280,6 +280,7 @@ type serverState struct {
 	mu            sync.Mutex
 	agentConn     net.Conn
 	agentProto    *lineproto.RW
+	agentWriteMu  sync.Mutex
 	agentUDPAddr  net.Addr
 	agentUDPKeyID uint32
 	udpData       net.PacketConn
@@ -292,6 +293,30 @@ type serverState struct {
 type pendingConn struct {
 	ch        chan net.Conn
 	routeName string
+}
+
+func (st *serverState) hasAgent() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.agentConn != nil && st.agentProto != nil
+}
+
+func (st *serverState) agentWriteLinef(expectedConn net.Conn, format string, args ...any) error {
+	st.agentWriteMu.Lock()
+	defer st.agentWriteMu.Unlock()
+
+	st.mu.Lock()
+	conn := st.agentConn
+	proto := st.agentProto
+	st.mu.Unlock()
+
+	if conn == nil || proto == nil {
+		return errors.New("no agent connected")
+	}
+	if expectedConn != nil && conn != expectedConn {
+		return errors.New("agent changed")
+	}
+	return proto.WriteLinef(format, args...)
 }
 
 func debugEnabled() bool {
@@ -411,7 +436,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	if insec == "" {
 		insec = "-"
 	}
-	_ = rw.WriteLinef("OK %s %s", st.cfg.DataAddr, insec)
+	_ = st.agentWriteLinef(conn, "OK %s %s", st.cfg.DataAddr, insec)
 	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
 	if st.cfg.DisableUDPEncryption {
 		mode = "none"
@@ -424,7 +449,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	if prevSalt == "" {
 		prevSalt = "-"
 	}
-	_ = rw.WriteLinef("UDPSEC %s %d %s %d %s", mode, st.cfg.UDPKeyID, curSalt, st.cfg.UDPPrevKeyID, prevSalt)
+	_ = st.agentWriteLinef(conn, "UDPSEC %s %d %s %d %s", mode, st.cfg.UDPKeyID, curSalt, st.cfg.UDPPrevKeyID, prevSalt)
 	for _, rt := range st.cfg.Routes {
 		noDelay := true
 		if rt.TCPNoDelay != nil {
@@ -446,9 +471,9 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 		if rt.Preconnect != nil {
 			pc = *rt.Preconnect
 		}
-		_ = rw.WriteLinef("ROUTE %s %s %s nodelay=%d tls=%d preconnect=%d", rt.Name, rt.Proto, rt.PublicAddr, nd, tlsFlag, pc)
+		_ = st.agentWriteLinef(conn, "ROUTE %s %s %s nodelay=%d tls=%d preconnect=%d", rt.Name, rt.Proto, rt.PublicAddr, nd, tlsFlag, pc)
 	}
-	_ = rw.WriteLinef("READY")
+	_ = st.agentWriteLinef(conn, "READY")
 
 	// Heartbeat: server pings agent periodically; agent replies with PONG.
 	const pingEvery = 15 * time.Second
@@ -471,7 +496,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 			case "PONG":
 				// ok
 			case "PING":
-				_ = rw.WriteLinef("PONG %s", rest)
+				_ = st.agentWriteLinef(conn, "PONG %s", rest)
 			default:
 				// ignore
 			}
@@ -494,7 +519,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 					_ = conn.Close()
 					return
 				}
-				if err := rw.WriteLinef("PING %s", newID()); err != nil {
+				if err := st.agentWriteLinef(conn, "PING %s", newID()); err != nil {
 					st.clearAgent(conn)
 					_ = conn.Close()
 					return
@@ -665,8 +690,7 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		defer st.dash.decActive(routeName)
 	}
 
-	proto := st.getAgentProto()
-	if proto == nil {
+	if !st.hasAgent() {
 		if st.dash != nil {
 			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "reject_no_agent", RemoteIP: remoteIP, ConnID: id})
 		}
@@ -679,7 +703,7 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 	st.pendingMu.Unlock()
 	debugf("tunnel: NEW id=%s route=%s", id, routeName)
 
-	err := proto.WriteLinef("NEW %s %s", id, routeName)
+	err := st.agentWriteLinef(nil, "NEW %s %s", id, routeName)
 	if err != nil {
 		st.pendingMu.Lock()
 		delete(st.pending, id)
