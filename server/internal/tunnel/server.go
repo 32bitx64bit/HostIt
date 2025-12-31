@@ -358,6 +358,60 @@ type pendingConn struct {
 	createdAt time.Time
 }
 
+func (b *newCommandBatcher) start(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-b.flush:
+				b.flushPending()
+			}
+		}
+	}()
+}
+
+func (b *newCommandBatcher) add(id, route string) {
+	b.mu.Lock()
+	b.pending = append(b.pending, newCommand{id: id, route: route})
+	needsTimer := len(b.pending) == 1
+	full := len(b.pending) >= 10
+	b.mu.Unlock()
+
+	if full {
+		// Flush immediately if batch is full
+		select {
+		case b.flush <- struct{}{}:
+		default:
+		}
+	} else if needsTimer {
+		// Start timer for first command in batch
+		b.timer.Reset(1 * time.Millisecond)
+		go func() {
+			<-b.timer.C
+			select {
+			case b.flush <- struct{}{}:
+			default:
+			}
+		}()
+	}
+}
+
+func (b *newCommandBatcher) flushPending() {
+	b.mu.Lock()
+	if len(b.pending) == 0 {
+		b.mu.Unlock()
+		return
+	}
+	batch := b.pending
+	b.pending = nil
+	b.mu.Unlock()
+
+	for _, cmd := range batch {
+		_ = b.st.agentWriteLinef(nil, "NEW %s %s", cmd.id, cmd.route)
+	}
+}
+
 func (st *serverState) hasAgent() bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
