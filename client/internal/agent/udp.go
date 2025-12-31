@@ -146,11 +146,13 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			return s, true
 		}
 
-		buf := make([]byte, 64*1024)
+		readBufPtr := udpBufPool.Get().(*[]byte)
+		readBuf := *readBufPtr
 		readErr := func() error {
+			defer udpBufPool.Put(readBufPtr)
 			for {
 				_ = uc.SetReadDeadline(time.Now().Add(30 * time.Second))
-				n, err := uc.Read(buf)
+				n, err := uc.Read(readBuf)
 				if err != nil {
 					if ne, ok := err.(net.Error); ok && ne.Timeout() {
 						ks := sec.Get()
@@ -171,12 +173,12 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 					ok         bool
 				)
 				if ks.Enabled() {
-					routeName, clientAddr, payload, _, ok = udpproto.DecodeDataEnc2(ks, buf[:n])
+					routeName, clientAddr, payload, _, ok = udpproto.DecodeDataEnc2(ks, readBuf[:n])
 					if !ok {
 						continue
 					}
 				} else {
-					routeName, clientAddr, payload, ok = udpproto.DecodeData(buf[:n])
+					routeName, clientAddr, payload, ok = udpproto.DecodeData(readBuf[:n])
 					if !ok {
 						continue
 					}

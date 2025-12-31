@@ -5,14 +5,17 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type dataConnPool struct {
-	addr    string
-	useTLS  bool
-	noDelay bool
-	ch      chan net.Conn
+	addr     string
+	useTLS   bool
+	noDelay  bool
+	ch       chan net.Conn
+	capacity int32
+	size     atomic.Int32 // Track current pool size for smarter refill
 }
 
 func startDataPools(ctx context.Context, cfg Config, routesByName map[string]RemoteRoute, dataAddrTLS string, dataAddrInsecure string) map[string]*dataConnPool {
@@ -33,7 +36,7 @@ func startDataPools(ctx context.Context, cfg Config, routesByName map[string]Rem
 		if !useTLS {
 			addr = dataAddrInsecure
 		}
-		p := &dataConnPool{addr: addr, useTLS: useTLS, noDelay: rt.TCPNoDelay, ch: make(chan net.Conn, pc)}
+		p := &dataConnPool{addr: addr, useTLS: useTLS, noDelay: rt.TCPNoDelay, ch: make(chan net.Conn, pc), capacity: int32(pc)}
 		pools[name] = p
 		// Warmup pool in parallel for faster startup
 		go p.warmup(ctx, cfg, pc)
@@ -61,6 +64,7 @@ func (p *dataConnPool) warmup(ctx context.Context, cfg Config, count int) {
 			if err == nil {
 				select {
 				case p.ch <- c:
+					p.size.Add(1)
 				case <-ctx.Done():
 					_ = c.Close()
 				default:
@@ -75,6 +79,7 @@ func (p *dataConnPool) warmup(ctx context.Context, cfg Config, count int) {
 func (p *dataConnPool) tryGet() net.Conn {
 	select {
 	case c := <-p.ch:
+		p.size.Add(-1)
 		return c
 	default:
 		return nil
@@ -101,31 +106,56 @@ func (p *dataConnPool) fillLoop(ctx context.Context, cfg Config) {
 		}
 	}()
 
-	backoff := 50 * time.Millisecond
+	backoff := 25 * time.Millisecond // Start with lower backoff for faster refill
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		// If the pool is full, use adaptive backoff.
-		if len(p.ch) >= cap(p.ch) {
-			wait := 150 * time.Millisecond
-			for len(p.ch) >= cap(p.ch) && ctx.Err() == nil {
-				t := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					t.Stop()
-					return
-				case <-t.C:
-				}
-				if wait < 2*time.Second {
-					wait = wait * 2
-				}
+
+		// Only fill if pool is below half capacity for more aggressive refill
+		currentSize := p.size.Load()
+		if currentSize >= p.capacity {
+			// Pool is full, wait a bit before checking again
+			t := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
 			}
 			continue
 		}
 
-		c, err := dialTCPData(ctx, cfg, p.addr, p.noDelay, p.useTLS)
-		if err != nil {
+		// Determine how many connections to create in parallel
+		missing := int(p.capacity - currentSize)
+		if missing > 4 {
+			missing = 4 // Limit parallel dials
+		}
+		
+		var wg sync.WaitGroup
+		for i := 0; i < missing; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c, err := dialTCPData(ctx, cfg, p.addr, p.noDelay, p.useTLS)
+				if err != nil {
+					return
+				}
+				select {
+				case p.ch <- c:
+					p.size.Add(1)
+				case <-ctx.Done():
+					_ = c.Close()
+				default:
+					_ = c.Close()
+				}
+			}()
+		}
+		wg.Wait()
+		
+		// Check if we successfully added any connections
+		if p.size.Load() < p.capacity {
+			// Still not full, backoff
 			t := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():
@@ -133,22 +163,14 @@ func (p *dataConnPool) fillLoop(ctx context.Context, cfg Config) {
 				return
 			case <-t.C:
 			}
-			if backoff < 1*time.Second {
+			if backoff < 500*time.Millisecond {
 				backoff *= 2
-				if backoff > 1*time.Second {
-					backoff = 1 * time.Second
+				if backoff > 500*time.Millisecond {
+					backoff = 500 * time.Millisecond
 				}
 			}
-			continue
-		}
-		backoff = 50 * time.Millisecond
-
-		select {
-		case p.ch <- c:
-			continue
-		case <-ctx.Done():
-			_ = c.Close()
-			return
+		} else {
+			backoff = 25 * time.Millisecond // Reset backoff on success
 		}
 	}
 }

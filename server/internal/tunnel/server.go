@@ -338,8 +338,10 @@ type serverState struct {
 const dashSystemRoute = "_system"
 
 type udpJob struct {
-	data []byte
-	addr net.Addr
+	data   []byte
+	len    int      // Actual data length (data may be from pool with larger capacity)
+	addr   net.Addr
+	bufPtr *[]byte  // Pool buffer to return after processing (nil if data was copied)
 }
 
 type newCommandBatcher struct {
@@ -363,38 +365,14 @@ type pendingConn struct {
 
 func (b *newCommandBatcher) start(ctx context.Context) {
 	go func() {
-		timer := time.NewTimer(time.Hour)
-		timer.Stop()
-		scheduled := false
-		defer timer.Stop()
-
-		stopAndDrain := func() {
-			if !scheduled {
-				return
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			scheduled = false
-		}
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-b.flush:
-				stopAndDrain()
 				b.flushPending()
 			case <-b.notify:
-				if !scheduled {
-					scheduled = true
-					timer.Reset(1 * time.Millisecond)
-				}
-			case <-timer.C:
-				scheduled = false
+				// Flush immediately on first command - no artificial delay
 				b.flushPending()
 			}
 		}
@@ -1089,15 +1067,12 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		}
 		backoff = 50 * time.Millisecond
 
-		// Copy packet data since buf is reused
-		pktData := make([]byte, n)
-		copy(pktData, buf[:n])
-		udpBufPool.Put(bufPtr)
-
+		// Pass pool buffer directly to worker - worker returns it after processing
 		select {
-		case jobs <- udpJob{data: pktData, addr: addr}:
+		case jobs <- udpJob{data: buf, len: n, addr: addr, bufPtr: bufPtr}:
 		default:
-			// Drop packet if workers overwhelmed
+			// Drop packet if workers overwhelmed, return buffer to pool
+			udpBufPool.Put(bufPtr)
 		}
 	}
 }
@@ -1111,7 +1086,15 @@ func (st *serverState) udpAgentWorker(ctx context.Context, jobs <-chan udpJob) {
 			if !ok {
 				return
 			}
-			st.processAgentUDPPacket(job.data, job.addr)
+			pkt := job.data
+			if job.len > 0 && job.len < len(pkt) {
+				pkt = pkt[:job.len]
+			}
+			st.processAgentUDPPacket(pkt, job.addr)
+			// Return buffer to pool after processing
+			if job.bufPtr != nil {
+				udpBufPool.Put(job.bufPtr)
+			}
 		}
 	}
 }
@@ -1291,15 +1274,12 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 		}
 		backoff = 50 * time.Millisecond
 
-		// Copy packet data
-		pktData := make([]byte, n)
-		copy(pktData, buf[:n])
-		udpBufPool.Put(bufPtr)
-
+		// Pass pool buffer directly to worker - worker returns it after processing
 		select {
-		case jobs <- udpJob{data: pktData, addr: clientAddr}:
+		case jobs <- udpJob{data: buf, len: n, addr: clientAddr, bufPtr: bufPtr}:
 		default:
-			// Drop if workers overwhelmed
+			// Drop if workers overwhelmed, return buffer to pool
+			udpBufPool.Put(bufPtr)
 		}
 	}
 }
@@ -1313,7 +1293,15 @@ func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, 
 			if !ok {
 				return
 			}
-			st.processPublicUDPPacket(job.data, job.addr, routeName)
+			pkt := job.data
+			if job.len > 0 && job.len < len(pkt) {
+				pkt = pkt[:job.len]
+			}
+			st.processPublicUDPPacket(pkt, job.addr, routeName)
+			// Return buffer to pool after processing
+			if job.bufPtr != nil {
+				udpBufPool.Put(job.bufPtr)
+			}
 		}
 	}
 }

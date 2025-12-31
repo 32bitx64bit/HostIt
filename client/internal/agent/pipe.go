@@ -8,10 +8,14 @@ import (
 
 var copyBufPool = sync.Pool{New: func() any {
 	// Larger buffer reduces syscall overhead on bulk transfers.
-	return make([]byte, 256*1024)
+	// 512KB provides a good balance for high-throughput scenarios.
+	return make([]byte, 512*1024)
 }}
 
 func copyOptimized(dst io.Writer, src io.Reader) (int64, error) {
+	// Note: WriterTo/ReaderFrom checks are kept for raw TCP connections
+	// but TLS connections don't implement these interfaces, so they'll
+	// use the buffer path. The larger buffer size compensates.
 	if wt, ok := src.(io.WriterTo); ok {
 		return wt.WriteTo(dst)
 	}
@@ -32,22 +36,30 @@ func closeWrite(c net.Conn) {
 	_ = c.Close()
 }
 
-func bidirPipe(a net.Conn, b net.Conn) {
+func bidirPipeCount(a net.Conn, b net.Conn) (aToB int64, bToA int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	var n1, n2 int64
+
 	go func() {
 		defer wg.Done()
-		_, _ = copyOptimized(a, b)
+		n1, _ = copyOptimized(a, b)
 		closeWrite(a)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = copyOptimized(b, a)
+		n2, _ = copyOptimized(b, a)
 		closeWrite(b)
 	}()
 
 	wg.Wait()
 	_ = a.Close()
 	_ = b.Close()
+
+	return n1, n2
+}
+
+func bidirPipe(a net.Conn, b net.Conn) {
+	_, _ = bidirPipeCount(a, b)
 }

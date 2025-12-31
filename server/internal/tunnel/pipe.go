@@ -9,10 +9,14 @@ import (
 
 var copyBufPool = sync.Pool{New: func() any {
 	// Larger buffer reduces syscall overhead on bulk transfers.
-	return make([]byte, 256*1024)
+	// 512KB provides a good balance for high-throughput scenarios.
+	return make([]byte, 512*1024)
 }}
 
 func copyOptimized(dst io.Writer, src io.Reader) (int64, error) {
+	// Note: WriterTo/ReaderFrom checks are kept for raw TCP connections
+	// but TLS connections don't implement these interfaces, so they'll
+	// use the buffer path. The larger buffer size compensates.
 	if wt, ok := src.(io.WriterTo); ok {
 		return wt.WriteTo(dst)
 	}

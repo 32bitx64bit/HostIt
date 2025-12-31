@@ -55,7 +55,7 @@ func normalizeRoutes(cfg *ServerConfig) {
 		}
 		if cfg.Routes[i].Preconnect == nil {
 			if routeHasTCP(cfg.Routes[i].Proto) {
-				p := 2
+				p := 4 // Increased from 2 for better high-throughput handling
 				cfg.Routes[i].Preconnect = &p
 			} else {
 				p := 0

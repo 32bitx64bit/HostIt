@@ -19,6 +19,10 @@ import (
 
 var warnTLSPinOnce sync.Once
 
+// Shared TLS session cache for connection reuse across all data connections.
+// This dramatically reduces handshake latency for subsequent connections.
+var globalTLSSessionCache = tls.NewLRUClientSessionCache(128)
+
 type Hooks struct {
 	OnConnected    func()
 	OnRoutes       func(routes []RemoteRoute)
@@ -296,6 +300,11 @@ func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, erro
 		if err != nil {
 			return nil, err
 		}
+		// Set socket buffers early for better throughput
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetReadBuffer(256 * 1024)
+			_ = tc.SetWriteBuffer(256 * 1024)
+		}
 		setTCPKeepAlive(c, 30*time.Second)
 		if noDelay {
 			setTCPNoDelay(c, true)
@@ -314,7 +323,7 @@ func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, erro
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true,
 		ServerName:         host,
-		ClientSessionCache: tls.NewLRUClientSessionCache(32),
+		ClientSessionCache: globalTLSSessionCache,
 	}
 	d := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
 	raw, err := d.Dial("tcp", addr)
@@ -322,6 +331,11 @@ func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, erro
 		return nil, err
 	}
 	setTCPKeepAlive(raw, 30*time.Second)
+	// Set socket buffers early (before TLS handshake) for better throughput
+	if tc, ok := raw.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(256 * 1024)
+		_ = tc.SetWriteBuffer(256 * 1024)
+	}
 	if noDelay {
 		setTCPNoDelay(raw, true)
 		setTCPQuickACK(raw, true)
@@ -453,9 +467,10 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 					continue
 				}
 
-				rw := lineproto.New(c, c)
+				// Write CONN directly without buffering overhead
+				connMsg := []byte("CONN " + id + "\n")
 				_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-				err = rw.WriteLinef("CONN %s", id)
+				_, err = c.Write(connMsg)
 				_ = c.SetWriteDeadline(time.Time{})
 				if err != nil {
 					lastErr = err
@@ -502,19 +517,25 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 	if !ok {
 		return
 	}
-	localConn, err := net.Dial("tcp", localAddr)
+	// Use a dialer with configured socket options for better performance
+	localDialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	localConn, err := localDialer.Dial("tcp", localAddr)
 	if err != nil {
 		debugf("agent: local dial failed id=%s route=%s addr=%s err=%v", id, routeName, localAddr, err)
 		return
+	}
+	// Set socket buffers immediately after connection
+	if tc := unwrapTCPConn(localConn); tc != nil {
+		_ = tc.SetReadBuffer(256 * 1024)
+		_ = tc.SetWriteBuffer(256 * 1024)
 	}
 	setTCPKeepAlive(localConn, 30*time.Second)
 	if rt.TCPNoDelay {
 		setTCPNoDelay(localConn, true)
 		setTCPQuickACK(localConn, true)
-	}
-	if tc := unwrapTCPConn(localConn); tc != nil {
-		_ = tc.SetReadBuffer(256 * 1024)
-		_ = tc.SetWriteBuffer(256 * 1024)
 	}
 	defer localConn.Close()
 
