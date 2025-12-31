@@ -2,11 +2,9 @@ package tunnel
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
