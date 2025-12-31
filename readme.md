@@ -52,3 +52,5 @@ Then run
 5. Additional note, windows is considered experimental, and untested. Expect bugs!
 
 
+# Additional note 
+You CAN NOT connect via the server with your VPS IP if you're on the same NAT network, especially in games. Weird networking crap. Just connect locally.
