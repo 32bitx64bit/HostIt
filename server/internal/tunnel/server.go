@@ -62,6 +62,7 @@ func NewServer(cfg ServerConfig) *Server {
 		publicUDP:     map[string]net.PacketConn{},
 		dash:          newDashState(),
 		udpPublicJobs: make(map[string]chan udpJob),
+		errLast:       make(map[string]time.Time),
 	}
 	st.udpKeys = buildUDPKeySet(cfg)
 	st.newBatcher = &newCommandBatcher{
@@ -313,6 +314,9 @@ type serverState struct {
 	udpKeys udpproto.KeySet
 	dash    *dashState
 
+	errMu   sync.Mutex
+	errLast map[string]time.Time
+
 	mu            sync.Mutex
 	agentConn     net.Conn
 	agentProto    *lineproto.RW
@@ -330,6 +334,8 @@ type serverState struct {
 	udpAgentJobs  chan udpJob
 	udpPublicJobs map[string]chan udpJob
 }
+
+const dashSystemRoute = "_system"
 
 type udpJob struct {
 	data []byte
@@ -432,6 +438,7 @@ func (b *newCommandBatcher) flushPending() {
 		if err := b.st.agentWriteLinef(nil, "NEW %s %s", cmd.id, cmd.route); err != nil {
 			// This is high-signal: if NEW can't be delivered, pairing will always time out.
 			log.Printf("pair: NEW write failed id=%s route=%s err=%v", cmd.id, cmd.route, err)
+			b.st.dashError(cmd.route, "error_new_send", "", cmd.id, err.Error())
 		}
 	}
 }
@@ -514,6 +521,65 @@ func traceUDPf(format string, args ...any) {
 	log.Printf(format, args...)
 }
 
+func hostFromAddr(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	if ta, ok := addr.(*net.TCPAddr); ok {
+		if ta.IP != nil {
+			return ta.IP.String()
+		}
+		return ""
+	}
+	if ua, ok := addr.(*net.UDPAddr); ok {
+		if ua.IP != nil {
+			return ua.IP.String()
+		}
+		return ""
+	}
+	h, _, err := net.SplitHostPort(addr.String())
+	if err == nil {
+		return strings.TrimSpace(h)
+	}
+	return strings.TrimSpace(addr.String())
+}
+
+func (st *serverState) dashError(routeName, kind, remoteIP, connID, detail string) {
+	if st == nil || st.dash == nil {
+		return
+	}
+	r := strings.TrimSpace(routeName)
+	if r == "" {
+		r = dashSystemRoute
+	}
+	st.dash.addEvent(r, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: kind, RemoteIP: remoteIP, ConnID: connID, Detail: detail})
+}
+
+func (st *serverState) dashErrorRateLimited(routeName, kind, remoteIP, connID, detail string, minInterval time.Duration) {
+	if st == nil {
+		return
+	}
+	if minInterval <= 0 {
+		st.dashError(routeName, kind, remoteIP, connID, detail)
+		return
+	}
+	r := strings.TrimSpace(routeName)
+	if r == "" {
+		r = dashSystemRoute
+	}
+	key := r + "|" + strings.TrimSpace(kind)
+	now := time.Now()
+	st.errMu.Lock()
+	last := st.errLast[key]
+	if !last.IsZero() && now.Sub(last) < minInterval {
+		st.errMu.Unlock()
+		return
+	}
+	st.errLast[key] = now
+	st.errMu.Unlock()
+	st.dashError(r, kind, remoteIP, connID, detail)
+}
+
 func (st *serverState) routeTCPNoDelay(routeName string) bool {
 	for _, rt := range st.cfg.Routes {
 		if rt.Name != routeName {
@@ -556,6 +622,7 @@ func (st *serverState) acceptControl(ctx context.Context, ln net.Listener) error
 				}
 				continue
 			}
+			st.dashError(dashSystemRoute, "error_accept_control", "", "", err.Error())
 			return err
 		}
 		backoff = 50 * time.Millisecond
@@ -757,6 +824,7 @@ func (st *serverState) acceptData(ctx context.Context, ln net.Listener) error {
 				}
 				continue
 			}
+			st.dashError(dashSystemRoute, "error_accept_data", "", "", err.Error())
 			return err
 		}
 		backoff = 50 * time.Millisecond
@@ -771,11 +839,15 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 	line, err := rw.ReadLine()
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
+		tracePairf("pair: data conn read failed from=%v err=%v", conn.RemoteAddr(), err)
+		st.dashError(dashSystemRoute, "error_data_read", hostFromAddr(conn.RemoteAddr()), "", err.Error())
 		_ = conn.Close()
 		return
 	}
 	cmd, rest := lineproto.Split2(line)
 	if cmd != "CONN" || rest == "" {
+		tracePairf("pair: data conn invalid first line from=%v line=%q", conn.RemoteAddr(), line)
+		st.dashError(dashSystemRoute, "error_data_invalid", hostFromAddr(conn.RemoteAddr()), "", line)
 		_ = conn.Close()
 		return
 	}
@@ -788,11 +860,12 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 	}
 	st.pendingMu.Unlock()
 	if !ok {
-		debugf("tunnel: CONN id=%s -> no pending match (closing)", id)
+		tracePairf("pair: CONN id=%s -> no pending match from=%v (closing)", id, conn.RemoteAddr())
+		st.dashError(dashSystemRoute, "error_conn_no_pending", hostFromAddr(conn.RemoteAddr()), id, "")
 		_ = conn.Close()
 		return
 	}
-	debugf("tunnel: CONN id=%s -> matched route=%s", id, pend.routeName)
+	tracePairf("pair: CONN id=%s -> matched route=%s from=%v", id, pend.routeName, conn.RemoteAddr())
 	if tc := unwrapTCPConn(conn); tc != nil {
 		_ = tc.SetReadBuffer(256 * 1024)
 		_ = tc.SetWriteBuffer(256 * 1024)
@@ -840,6 +913,7 @@ func (st *serverState) acceptPublicTCP(ctx context.Context, ln net.Listener, rou
 				}
 				continue
 			}
+			st.dashError(routeName, "error_accept_public_tcp", "", "", err.Error())
 			return err
 		}
 		backoff = 50 * time.Millisecond
@@ -1009,6 +1083,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 				}
 				continue
 			}
+			st.dashError(dashSystemRoute, "error_accept_agent_udp", hostFromAddr(addr), "", err.Error())
 			close(jobs)
 			return err
 		}
@@ -1057,11 +1132,13 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		tok, ok := udpproto.DecodeReg(pkt)
 		if !ok {
 			traceUDPf("udp: REG decode failed from=%v", addr)
+			st.dashErrorRateLimited(dashSystemRoute, "error_udp_reg_decode", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
 		expected := strings.TrimSpace(st.cfg.Token)
 		if expected != "" && !tokensEqualCT(expected, tok) {
 			traceUDPf("udp: REG token mismatch from=%v", addr)
+			st.dashErrorRateLimited(dashSystemRoute, "error_udp_reg_token", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
 		if st.getAgentProto() == nil {
@@ -1080,6 +1157,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		kid, ok := udpproto.DecodeRegEnc2(st.udpKeys, expected, pkt)
 		if !ok {
 			traceUDPf("udp: REGEnc2 decode failed from=%v", addr)
+			st.dashErrorRateLimited(dashSystemRoute, "error_udp_regenc2_decode", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
 		if st.getAgentProto() == nil {
@@ -1094,6 +1172,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		route, client, payload, ok := udpproto.DecodeData(pkt)
 		if !ok {
 			traceUDPf("udp: DATA decode failed from=%v", addr)
+			st.dashErrorRateLimited(dashSystemRoute, "error_udp_data_decode", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
 		agent := st.getAgentUDPAddr()
@@ -1103,15 +1182,18 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		pc2 := st.publicUDP[route]
 		if pc2 == nil {
 			traceUDPf("udp: DATA unknown route=%s from=%v", route, addr)
+			st.dashErrorRateLimited(route, "error_udp_unknown_route", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
 		ua, err := net.ResolveUDPAddr("udp", client)
 		if err != nil {
 			traceUDPf("udp: DATA bad client addr=%q route=%s err=%v", client, route, err)
+			st.dashErrorRateLimited(route, "error_udp_bad_client", hostFromAddr(addr), client, err.Error(), 1*time.Second)
 			return
 		}
 		if _, err := pc2.WriteTo(payload, ua); err != nil {
 			traceUDPf("udp: DATA writeTo failed route=%s to=%v err=%v", route, ua, err)
+			st.dashErrorRateLimited(route, "error_udp_write_public", hostFromAddr(ua), client, err.Error(), 1*time.Second)
 		}
 	case udpproto.MsgDataEnc2:
 		if strings.EqualFold(mode, "none") {
@@ -1120,6 +1202,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		route, client, payload, _, ok := udpproto.DecodeDataEnc2(st.udpKeys, pkt)
 		if !ok {
 			traceUDPf("udp: DATAEnc2 decode failed from=%v", addr)
+			st.dashErrorRateLimited(dashSystemRoute, "error_udp_dataenc2_decode", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
 		agent := st.getAgentUDPAddr()
@@ -1129,15 +1212,18 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		pc2 := st.publicUDP[route]
 		if pc2 == nil {
 			traceUDPf("udp: DATAEnc2 unknown route=%s from=%v", route, addr)
+			st.dashErrorRateLimited(route, "error_udp_unknown_route", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
 		ua, err := net.ResolveUDPAddr("udp", client)
 		if err != nil {
 			traceUDPf("udp: DATAEnc2 bad client addr=%q route=%s err=%v", client, route, err)
+			st.dashErrorRateLimited(route, "error_udp_bad_client", hostFromAddr(addr), client, err.Error(), 1*time.Second)
 			return
 		}
 		if _, err := pc2.WriteTo(payload, ua); err != nil {
 			traceUDPf("udp: DATAEnc2 writeTo failed route=%s to=%v err=%v", route, ua, err)
+			st.dashErrorRateLimited(route, "error_udp_write_public", hostFromAddr(ua), client, err.Error(), 1*time.Second)
 		}
 	}
 }
@@ -1199,6 +1285,7 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 				}
 				continue
 			}
+			st.dashError(routeName, "error_accept_public_udp", "", "", err.Error())
 			close(jobs)
 			return err
 		}
@@ -1234,6 +1321,7 @@ func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, 
 func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, routeName string) {
 	agent := st.getAgentUDPAddr()
 	if agent == nil {
+		st.dashErrorRateLimited(routeName, "error_udp_no_agent", "", "", "", 1*time.Second)
 		return
 	}
 	var msg []byte
@@ -1250,7 +1338,9 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 		}
 		msg = udpproto.EncodeDataEnc2ForKeyID(st.udpKeys, kid, routeName, clientAddr.String(), pkt)
 	}
-	_, _ = st.udpData.WriteTo(msg, agent)
+	if _, err := st.udpData.WriteTo(msg, agent); err != nil {
+		st.dashErrorRateLimited(routeName, "error_udp_write_agent", hostFromAddr(agent), "", err.Error(), 1*time.Second)
+	}
 }
 
 func newID() string {
