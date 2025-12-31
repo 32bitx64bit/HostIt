@@ -65,11 +65,10 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	st.udpKeys = buildUDPKeySet(cfg)
 	st.newBatcher = &newCommandBatcher{
-		flush: make(chan struct{}, 1),
-		timer: time.NewTimer(time.Hour),
-		st:    st,
+		notify: make(chan struct{}, 1),
+		flush:  make(chan struct{}, 1),
+		st:     st,
 	}
-	st.newBatcher.timer.Stop()
 	return &Server{cfg: cfg, st: st}
 }
 
@@ -340,7 +339,7 @@ type udpJob struct {
 type newCommandBatcher struct {
 	mu      sync.Mutex
 	pending []newCommand
-	timer   *time.Timer
+	notify  chan struct{}
 	flush   chan struct{}
 	st      *serverState
 }
@@ -358,11 +357,38 @@ type pendingConn struct {
 
 func (b *newCommandBatcher) start(ctx context.Context) {
 	go func() {
+		timer := time.NewTimer(time.Hour)
+		timer.Stop()
+		scheduled := false
+		defer timer.Stop()
+
+		stopAndDrain := func() {
+			if !scheduled {
+				return
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			scheduled = false
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-b.flush:
+				stopAndDrain()
+				b.flushPending()
+			case <-b.notify:
+				if !scheduled {
+					scheduled = true
+					timer.Reset(1 * time.Millisecond)
+				}
+			case <-timer.C:
+				scheduled = false
 				b.flushPending()
 			}
 		}
@@ -372,26 +398,21 @@ func (b *newCommandBatcher) start(ctx context.Context) {
 func (b *newCommandBatcher) add(id, route string) {
 	b.mu.Lock()
 	b.pending = append(b.pending, newCommand{id: id, route: route})
-	needsTimer := len(b.pending) == 1
-	full := len(b.pending) >= 10
+	n := len(b.pending)
 	b.mu.Unlock()
 
-	if full {
-		// Flush immediately if batch is full
+	if n >= 10 {
 		select {
 		case b.flush <- struct{}{}:
 		default:
 		}
-	} else if needsTimer {
-		// Start timer for first command in batch
-		b.timer.Reset(1 * time.Millisecond)
-		go func() {
-			<-b.timer.C
-			select {
-			case b.flush <- struct{}{}:
-			default:
-			}
-		}()
+		return
+	}
+	if n == 1 {
+		select {
+		case b.notify <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -406,7 +427,9 @@ func (b *newCommandBatcher) flushPending() {
 	b.mu.Unlock()
 
 	for _, cmd := range batch {
-		_ = b.st.agentWriteLinef(nil, "NEW %s %s", cmd.id, cmd.route)
+		if err := b.st.agentWriteLinef(nil, "NEW %s %s", cmd.id, cmd.route); err != nil {
+			debugf("tunnel: NEW write failed id=%s route=%s err=%v", cmd.id, cmd.route, err)
+		}
 	}
 }
 
