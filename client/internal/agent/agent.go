@@ -422,10 +422,10 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 						fromPool = true
 						c, err = p.getOrDial(ctx, cfg)
 					} else {
-						c, err = dialTCP(cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
+						c, err = dialTCPData(ctx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
 					}
 				} else {
-					c, err = dialTCP(cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
+					c, err = dialTCPData(ctx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
 				}
 				if err != nil {
 					lastErr = err

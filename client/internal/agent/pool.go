@@ -52,7 +52,7 @@ func (p *dataConnPool) getOrDial(ctx context.Context, cfg Config) (net.Conn, err
 	if c := p.tryGet(); c != nil {
 		return c, nil
 	}
-	return dialTCP(cfg, p.addr, p.noDelay, p.useTLS)
+	return dialTCPData(ctx, cfg, p.addr, p.noDelay, p.useTLS)
 }
 
 func (p *dataConnPool) fillLoop(ctx context.Context, cfg Config) {
@@ -85,7 +85,7 @@ func (p *dataConnPool) fillLoop(ctx context.Context, cfg Config) {
 			continue
 		}
 
-		c, err := dialTCP(cfg, p.addr, p.noDelay, p.useTLS)
+		c, err := dialTCPData(ctx, cfg, p.addr, p.noDelay, p.useTLS)
 		if err != nil {
 			t := time.NewTimer(backoff)
 			select {

@@ -714,6 +714,9 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		return
 	}
 
+	timeout := time.NewTimer(st.cfg.PairTimeout)
+	defer timeout.Stop()
+
 	select {
 	case <-ctx.Done():
 		return
@@ -721,6 +724,8 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		if agentConn == nil {
 			return
 		}
+		// Stop the timeout promptly so it doesn't fire during a long-lived pipe.
+		timeout.Stop()
 		if st.dash != nil {
 			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "paired", RemoteIP: remoteIP, ConnID: id})
 		}
@@ -730,7 +735,7 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 			st.dash.addBytes(time.Now(), bytes)
 			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "disconnect", RemoteIP: remoteIP, ConnID: id, Bytes: bytes, DurationMS: time.Since(start).Milliseconds()})
 		}
-	case <-time.After(st.cfg.PairTimeout):
+	case <-timeout.C:
 		debugf("tunnel: pair timeout id=%s route=%s after=%s", id, routeName, st.cfg.PairTimeout)
 		st.pendingMu.Lock()
 		delete(st.pending, id)
