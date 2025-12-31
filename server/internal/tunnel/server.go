@@ -426,9 +426,12 @@ func (b *newCommandBatcher) flushPending() {
 	b.pending = nil
 	b.mu.Unlock()
 
+	tracePairf("pair: flushing NEW batch size=%d", len(batch))
+
 	for _, cmd := range batch {
 		if err := b.st.agentWriteLinef(nil, "NEW %s %s", cmd.id, cmd.route); err != nil {
-			debugf("tunnel: NEW write failed id=%s route=%s err=%v", cmd.id, cmd.route, err)
+			// This is high-signal: if NEW can't be delivered, pairing will always time out.
+			log.Printf("pair: NEW write failed id=%s route=%s err=%v", cmd.id, cmd.route, err)
 		}
 	}
 }
@@ -468,8 +471,44 @@ func debugEnabled() bool {
 	return true
 }
 
+func tracePairEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("HOSTIT_TRACE_PAIR"))
+	if v == "" {
+		v = strings.TrimSpace(os.Getenv("PLAYIT_TRACE_PAIR"))
+	}
+	if v == "" || v == "0" {
+		return false
+	}
+	return true
+}
+
+func traceUDPEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("HOSTIT_TRACE_UDP"))
+	if v == "" {
+		v = strings.TrimSpace(os.Getenv("PLAYIT_TRACE_UDP"))
+	}
+	if v == "" || v == "0" {
+		return false
+	}
+	return true
+}
+
 func debugf(format string, args ...any) {
 	if !debugEnabled() {
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func tracePairf(format string, args ...any) {
+	if !tracePairEnabled() {
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func traceUDPf(format string, args ...any) {
+	if !traceUDPEnabled() {
 		return
 	}
 	log.Printf(format, args...)
@@ -1017,10 +1056,12 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		}
 		tok, ok := udpproto.DecodeReg(pkt)
 		if !ok {
+			traceUDPf("udp: REG decode failed from=%v", addr)
 			return
 		}
 		expected := strings.TrimSpace(st.cfg.Token)
 		if expected != "" && !tokensEqualCT(expected, tok) {
+			traceUDPf("udp: REG token mismatch from=%v", addr)
 			return
 		}
 		if st.getAgentProto() == nil {
@@ -1038,6 +1079,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		}
 		kid, ok := udpproto.DecodeRegEnc2(st.udpKeys, expected, pkt)
 		if !ok {
+			traceUDPf("udp: REGEnc2 decode failed from=%v", addr)
 			return
 		}
 		if st.getAgentProto() == nil {
@@ -1051,6 +1093,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		}
 		route, client, payload, ok := udpproto.DecodeData(pkt)
 		if !ok {
+			traceUDPf("udp: DATA decode failed from=%v", addr)
 			return
 		}
 		agent := st.getAgentUDPAddr()
@@ -1059,19 +1102,24 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		}
 		pc2 := st.publicUDP[route]
 		if pc2 == nil {
+			traceUDPf("udp: DATA unknown route=%s from=%v", route, addr)
 			return
 		}
 		ua, err := net.ResolveUDPAddr("udp", client)
 		if err != nil {
+			traceUDPf("udp: DATA bad client addr=%q route=%s err=%v", client, route, err)
 			return
 		}
-		_, _ = pc2.WriteTo(payload, ua)
+		if _, err := pc2.WriteTo(payload, ua); err != nil {
+			traceUDPf("udp: DATA writeTo failed route=%s to=%v err=%v", route, ua, err)
+		}
 	case udpproto.MsgDataEnc2:
 		if strings.EqualFold(mode, "none") {
 			return
 		}
 		route, client, payload, _, ok := udpproto.DecodeDataEnc2(st.udpKeys, pkt)
 		if !ok {
+			traceUDPf("udp: DATAEnc2 decode failed from=%v", addr)
 			return
 		}
 		agent := st.getAgentUDPAddr()
@@ -1080,13 +1128,17 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		}
 		pc2 := st.publicUDP[route]
 		if pc2 == nil {
+			traceUDPf("udp: DATAEnc2 unknown route=%s from=%v", route, addr)
 			return
 		}
 		ua, err := net.ResolveUDPAddr("udp", client)
 		if err != nil {
+			traceUDPf("udp: DATAEnc2 bad client addr=%q route=%s err=%v", client, route, err)
 			return
 		}
-		_, _ = pc2.WriteTo(payload, ua)
+		if _, err := pc2.WriteTo(payload, ua); err != nil {
+			traceUDPf("udp: DATAEnc2 writeTo failed route=%s to=%v err=%v", route, ua, err)
+		}
 	}
 }
 

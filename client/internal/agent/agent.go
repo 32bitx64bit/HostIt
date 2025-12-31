@@ -58,8 +58,26 @@ func debugEnabled() bool {
 	return true
 }
 
+func tracePairEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("HOSTIT_TRACE_PAIR"))
+	if v == "" {
+		v = strings.TrimSpace(os.Getenv("PLAYIT_TRACE_PAIR"))
+	}
+	if v == "" || v == "0" {
+		return false
+	}
+	return true
+}
+
 func debugf(format string, args ...any) {
 	if !debugEnabled() {
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func tracePairf(format string, args ...any) {
+	if !tracePairEnabled() {
 		return
 	}
 	log.Printf(format, args...)
@@ -235,6 +253,7 @@ ready:
 			if len(fields) >= 2 {
 				routeName = fields[1]
 			}
+			tracePairf("pair: got NEW id=%s route=%s", id, routeName)
 			go handleOne(ctx, cfg, dataAddrTLS, dataAddrInsecure, pools, routesByName, id, routeName)
 		case "PING":
 			_ = rw.WriteLinef("PONG %s", rest)
@@ -470,7 +489,10 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 	}
 	if dataConn == nil {
 		if lastErr != nil {
+			tracePairf("pair: attach failed id=%s route=%s err=%v", id, routeName, lastErr)
 			debugf("agent: attach failed id=%s route=%s err=%v", id, routeName, lastErr)
+		} else {
+			tracePairf("pair: attach failed id=%s route=%s err=<nil>", id, routeName)
 		}
 		return
 	}
