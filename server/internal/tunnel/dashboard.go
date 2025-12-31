@@ -62,13 +62,77 @@ type dashState struct {
 	mu      sync.Mutex
 	buckets []bucket
 	routes  map[string]*routeDash
+
+	eventBatcher *dashEventBatcher
+}
+
+type dashEventBatcher struct {
+	mu     sync.Mutex
+	events map[string][]DashboardEvent
+	ticker *time.Ticker
+	done   chan struct{}
+	dash   *dashState
 }
 
 func newDashState() *dashState {
-	return &dashState{
+	d := &dashState{
 		buckets: make([]bucket, dashboardBucketCount),
 		routes:  map[string]*routeDash{},
 	}
+	d.eventBatcher = &dashEventBatcher{
+		events: make(map[string][]DashboardEvent),
+		ticker: time.NewTicker(50 * time.Millisecond),
+		done:   make(chan struct{}),
+		dash:   d,
+	}
+	go d.eventBatcher.start()
+	return d
+}
+
+func (b *dashEventBatcher) start() {
+	for {
+		select {
+		case <-b.done:
+			b.ticker.Stop()
+			return
+		case <-b.ticker.C:
+			b.flush()
+		}
+	}
+}
+
+func (b *dashEventBatcher) add(route string, ev DashboardEvent) {
+	b.mu.Lock()
+	b.events[route] = append(b.events[route], ev)
+	b.mu.Unlock()
+}
+
+func (b *dashEventBatcher) flush() {
+	b.mu.Lock()
+	if len(b.events) == 0 {
+		b.mu.Unlock()
+		return
+	}
+	snapshot := b.events
+	b.events = make(map[string][]DashboardEvent)
+	b.mu.Unlock()
+
+	// Process batches in parallel per route
+	var wg sync.WaitGroup
+	for route, events := range snapshot {
+		wg.Add(1)
+		go func(r string, evs []DashboardEvent) {
+			defer wg.Done()
+			rd := b.dash.route(r)
+			rd.mu.Lock()
+			rd.events = append(rd.events, evs...)
+			if len(rd.events) > maxRouteEvents {
+				rd.events = rd.events[len(rd.events)-maxRouteEvents:]
+			}
+			rd.mu.Unlock()
+		}(route, events)
+	}
+	wg.Wait()
 }
 
 func (d *dashState) route(name string) *routeDash {
@@ -107,15 +171,19 @@ func (d *dashState) addBytes(at time.Time, n int64) {
 }
 
 func (d *dashState) addEvent(routeName string, ev DashboardEvent) {
-	rd := d.route(routeName)
 	ev.Route = strings.TrimSpace(routeName)
-
-	rd.mu.Lock()
-	rd.events = append(rd.events, ev)
-	if len(rd.events) > maxRouteEvents {
-		rd.events = append([]DashboardEvent(nil), rd.events[len(rd.events)-maxRouteEvents:]...)
+	if d.eventBatcher != nil {
+		d.eventBatcher.add(routeName, ev)
+	} else {
+		// Fallback if batcher not initialized
+		rd := d.route(routeName)
+		rd.mu.Lock()
+		rd.events = append(rd.events, ev)
+		if len(rd.events) > maxRouteEvents {
+			rd.events = append([]DashboardEvent(nil), rd.events[len(rd.events)-maxRouteEvents:]...)
+		}
+		rd.mu.Unlock()
 	}
-	rd.mu.Unlock()
 }
 
 func (d *dashState) incActive(routeName string) {

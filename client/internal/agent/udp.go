@@ -9,6 +9,11 @@ import (
 	"hostit/client/internal/udpproto"
 )
 
+var udpBufPool = sync.Pool{New: func() any {
+	b := make([]byte, 64*1024)
+	return &b
+}}
+
 type udpSession struct {
 	conn   *net.UDPConn
 	route  string
@@ -108,18 +113,20 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			m[clientAddr] = s
 
 			go func() {
-				buf := make([]byte, 64*1024)
+				localBufPtr := udpBufPool.Get().(*[]byte)
+				localBuf := *localBufPtr
+				defer udpBufPool.Put(localBufPtr)
 				for {
 					_ = lconn.SetReadDeadline(time.Now().Add(idle))
-					n, err := lconn.Read(buf)
+					n, err := lconn.Read(localBuf)
 					if err != nil {
 						break
 					}
 					ks := sec.Get()
 					if ks.Enabled() {
-						_, _ = uc.Write(udpproto.EncodeDataEnc2ForKeyID(ks, ks.CurID, routeName, clientAddr, buf[:n]))
+						_, _ = uc.Write(udpproto.EncodeDataEnc2ForKeyID(ks, ks.CurID, routeName, clientAddr, localBuf[:n]))
 					} else {
-						_, _ = uc.Write(udpproto.EncodeData(routeName, clientAddr, buf[:n]))
+						_, _ = uc.Write(udpproto.EncodeData(routeName, clientAddr, localBuf[:n]))
 					}
 				}
 

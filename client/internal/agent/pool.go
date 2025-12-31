@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,9 +35,41 @@ func startDataPools(ctx context.Context, cfg Config, routesByName map[string]Rem
 		}
 		p := &dataConnPool{addr: addr, useTLS: useTLS, noDelay: rt.TCPNoDelay, ch: make(chan net.Conn, pc)}
 		pools[name] = p
+		// Warmup pool in parallel for faster startup
+		go p.warmup(ctx, cfg, pc)
 		go p.fillLoop(ctx, cfg)
 	}
 	return pools
+}
+
+func (p *dataConnPool) warmup(ctx context.Context, cfg Config, count int) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16) // Allow 16 concurrent handshakes
+	
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+			
+			c, err := dialTCPData(ctx, cfg, p.addr, p.noDelay, p.useTLS)
+			if err == nil {
+				select {
+				case p.ch <- c:
+				case <-ctx.Done():
+					_ = c.Close()
+				default:
+					_ = c.Close()
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func (p *dataConnPool) tryGet() net.Conn {
@@ -73,14 +106,20 @@ func (p *dataConnPool) fillLoop(ctx context.Context, cfg Config) {
 		if ctx.Err() != nil {
 			return
 		}
-		// If the pool is full, wait a bit.
+		// If the pool is full, use adaptive backoff.
 		if len(p.ch) >= cap(p.ch) {
-			t := time.NewTimer(150 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return
-			case <-t.C:
+			wait := 150 * time.Millisecond
+			for len(p.ch) >= cap(p.ch) && ctx.Err() == nil {
+				t := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return
+				case <-t.C:
+				}
+				if wait < 2*time.Second {
+					wait = wait * 2
+				}
 			}
 			continue
 		}

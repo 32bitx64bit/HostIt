@@ -18,7 +18,10 @@ type RW struct {
 }
 
 func New(r io.Reader, w io.Writer) *RW {
-	return &RW{r: bufio.NewReader(r), w: bufio.NewWriter(w)}
+	return &RW{
+		r: bufio.NewReaderSize(r, 16*1024),
+		w: bufio.NewWriterSize(w, 16*1024),
+	}
 }
 
 func (rw *RW) ReadLine() (string, error) {

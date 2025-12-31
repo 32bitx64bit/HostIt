@@ -295,6 +295,7 @@ func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, erro
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true,
 		ServerName:         host,
+		ClientSessionCache: tls.NewLRUClientSessionCache(32),
 	}
 	d := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
 	raw, err := d.Dial("tcp", addr)
@@ -488,6 +489,10 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 	if rt.TCPNoDelay {
 		setTCPNoDelay(localConn, true)
 		setTCPQuickACK(localConn, true)
+	}
+	if tc := unwrapTCPConn(localConn); tc != nil {
+		_ = tc.SetReadBuffer(256 * 1024)
+		_ = tc.SetWriteBuffer(256 * 1024)
 	}
 	defer localConn.Close()
 

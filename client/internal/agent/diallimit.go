@@ -18,7 +18,7 @@ func initDataDialLimiter() {
 		// agent feel slow/laggy. Limit concurrent data dials to keep connect smooth.
 		//
 		// Tuning: set HOSTIT_DATA_DIAL_CONCURRENCY (or PLAYIT_DATA_DIAL_CONCURRENCY).
-		n := 4
+		n := 8
 		// Precedence: PLAYIT_ overrides HOSTIT_.
 		v := strings.TrimSpace(os.Getenv("HOSTIT_DATA_DIAL_CONCURRENCY"))
 		if vp := strings.TrimSpace(os.Getenv("PLAYIT_DATA_DIAL_CONCURRENCY")); vp != "" {

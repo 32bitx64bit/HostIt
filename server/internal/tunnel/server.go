@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mathrand "math/rand"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,14 @@ import (
 	"hostit/server/internal/lineproto"
 	"hostit/server/internal/udpproto"
 )
+
+var udpBufPool = sync.Pool{New: func() any {
+	b := make([]byte, 64*1024)
+	return &b
+}}
+
+var idSource = mathrand.NewSource(time.Now().UnixNano())
+var idMu sync.Mutex
 
 func tokensEqualCT(a, b string) bool {
 	a = strings.TrimSpace(a)
@@ -48,8 +58,20 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.PairTimeout == 0 {
 		cfg.PairTimeout = 10 * time.Second
 	}
-	st := &serverState{cfg: cfg, pending: map[string]pendingConn{}, publicUDP: map[string]net.PacketConn{}, dash: newDashState()}
+	st := &serverState{
+		cfg:           cfg,
+		pending:       map[string]pendingConn{},
+		publicUDP:     map[string]net.PacketConn{},
+		dash:          newDashState(),
+		udpPublicJobs: make(map[string]chan udpJob),
+	}
 	st.udpKeys = buildUDPKeySet(cfg)
+	st.newBatcher = &newCommandBatcher{
+		flush: make(chan struct{}, 1),
+		timer: time.NewTimer(time.Hour),
+		st:    st,
+	}
+	st.newBatcher.timer.Stop()
 	return &Server{cfg: cfg, st: st}
 }
 
@@ -191,6 +213,12 @@ func (s *Server) Run(ctx context.Context) error {
 		st.publicUDP[x.name] = x.pc
 	}
 
+	// Start NEW command batcher
+	st.newBatcher.start(ctx)
+
+	// Start pending connection cleaner
+	go st.startPendingCleaner(ctx)
+
 	go func() {
 		<-ctx.Done()
 		_ = controlLn.Close()
@@ -215,8 +243,19 @@ func (s *Server) Run(ctx context.Context) error {
 		go func() { errCh <- st.acceptData(ctx, dataLnInsecure) }()
 	}
 	go func() { errCh <- st.acceptAgentUDP(ctx) }()
+	// Use parallel accept for high-core systems
+	acceptWorkers := 1
+	if numCPU := os.Getenv("HOSTIT_ACCEPT_WORKERS"); numCPU != "" {
+		if n, err := strconv.Atoi(numCPU); err == nil && n > 1 && n <= 32 {
+			acceptWorkers = n
+		}
+	}
 	for _, x := range publicTCP {
-		go func(name string, l net.Listener) { errCh <- st.acceptPublicTCP(ctx, l, name) }(x.name, x.ln)
+		if acceptWorkers > 1 {
+			go func(name string, l net.Listener) { errCh <- st.acceptPublicTCPParallel(ctx, l, name, acceptWorkers) }(x.name, x.ln)
+		} else {
+			go func(name string, l net.Listener) { errCh <- st.acceptPublicTCP(ctx, l, name) }(x.name, x.ln)
+		}
 	}
 	for _, x := range publicUDP {
 		go func(name string, pc net.PacketConn) { errCh <- st.acceptPublicUDP(ctx, pc, name) }(x.name, x.pc)
@@ -288,11 +327,35 @@ type serverState struct {
 
 	pendingMu sync.Mutex
 	pending   map[string]pendingConn
+
+	// Parallelization structures
+	newBatcher    *newCommandBatcher
+	udpAgentJobs  chan udpJob
+	udpPublicJobs map[string]chan udpJob
+}
+
+type udpJob struct {
+	data []byte
+	addr net.Addr
+}
+
+type newCommandBatcher struct {
+	mu      sync.Mutex
+	pending []newCommand
+	timer   *time.Timer
+	flush   chan struct{}
+	st      *serverState
+}
+
+type newCommand struct {
+	id    string
+	route string
 }
 
 type pendingConn struct {
 	ch        chan net.Conn
 	routeName string
+	createdAt time.Time
 }
 
 func (st *serverState) hasAgent() bool {
@@ -616,6 +679,10 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 		return
 	}
 	debugf("tunnel: CONN id=%s -> matched route=%s", id, pend.routeName)
+	if tc := unwrapTCPConn(conn); tc != nil {
+		_ = tc.SetReadBuffer(256 * 1024)
+		_ = tc.SetWriteBuffer(256 * 1024)
+	}
 	if st.routeTCPNoDelay(pend.routeName) {
 		setTCPNoDelay(conn, true)
 		setTCPQuickACK(conn, true)
@@ -663,6 +730,10 @@ func (st *serverState) acceptPublicTCP(ctx context.Context, ln net.Listener, rou
 		}
 		backoff = 50 * time.Millisecond
 		setTCPKeepAlive(clientConn, 30*time.Second)
+		if tc := unwrapTCPConn(clientConn); tc != nil {
+			_ = tc.SetReadBuffer(256 * 1024)
+			_ = tc.SetWriteBuffer(256 * 1024)
+		}
 		if st.routeTCPNoDelay(routeName) {
 			setTCPNoDelay(clientConn, true)
 			setTCPQuickACK(clientConn, true)
@@ -699,21 +770,11 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 
 	ch := make(chan net.Conn, 1)
 	st.pendingMu.Lock()
-	st.pending[id] = pendingConn{ch: ch, routeName: routeName}
+	st.pending[id] = pendingConn{ch: ch, routeName: routeName, createdAt: start}
 	st.pendingMu.Unlock()
 	debugf("tunnel: NEW id=%s route=%s", id, routeName)
 
-	err := st.agentWriteLinef(nil, "NEW %s %s", id, routeName)
-	if err != nil {
-		st.pendingMu.Lock()
-		delete(st.pending, id)
-		st.pendingMu.Unlock()
-		if st.dash != nil {
-			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "control_write_failed", RemoteIP: remoteIP, ConnID: id, Detail: err.Error()})
-		}
-		return
-	}
-
+	st.newBatcher.add(id, routeName)
 	timeout := time.NewTimer(st.cfg.PairTimeout)
 	defer timeout.Stop()
 
@@ -782,17 +843,39 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 	if pc == nil {
 		return nil
 	}
-	buf := make([]byte, 64*1024)
+
+	// Determine worker count from environment or default to CPU count
+	workers := 4
+	if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
+		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 64 {
+			workers = n
+		}
+	}
+
+	jobs := make(chan udpJob, workers*10)
+	st.udpAgentJobs = jobs
+
+	// Start worker pool
+	for i := 0; i < workers; i++ {
+		go st.udpAgentWorker(ctx, jobs)
+	}
+
+	// Single reader distributes packets to workers
 	backoff := 50 * time.Millisecond
 	for {
 		select {
 		case <-ctx.Done():
+			close(jobs)
 			return nil
 		default:
 		}
+		bufPtr := udpBufPool.Get().(*[]byte)
+		buf := *bufPtr
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
+			udpBufPool.Put(bufPtr)
 			if errors.Is(err, net.ErrClosed) {
+				close(jobs)
 				return nil
 			}
 			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
@@ -800,6 +883,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
 					t.Stop()
+					close(jobs)
 					return nil
 				case <-t.C:
 				}
@@ -811,112 +895,164 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 				}
 				continue
 			}
+			close(jobs)
 			return err
 		}
 		backoff = 50 * time.Millisecond
-		pkt := buf[:n]
-		if len(pkt) == 0 {
-			continue
-		}
-		mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
-		if st.cfg.DisableUDPEncryption {
-			mode = "none"
-		}
-		switch pkt[0] {
-		case udpproto.MsgReg:
-			if !strings.EqualFold(mode, "none") {
-				continue
-			}
-			tok, ok := udpproto.DecodeReg(pkt)
-			if !ok {
-				continue
-			}
-			expected := strings.TrimSpace(st.cfg.Token)
-			if expected != "" && !tokensEqualCT(expected, tok) {
-				continue
-			}
-			if st.getAgentProto() == nil {
-				continue
-			}
-			st.setAgentUDPAddr(addr)
-			st.setAgentUDPKeyID(0)
-		case udpproto.MsgRegEnc2:
-			if strings.EqualFold(mode, "none") {
-				continue
-			}
-			expected := strings.TrimSpace(st.cfg.Token)
-			if expected == "" {
-				continue
-			}
-			kid, ok := udpproto.DecodeRegEnc2(st.udpKeys, expected, pkt)
-			if !ok {
-				continue
-			}
-			if st.getAgentProto() == nil {
-				continue
-			}
-			st.setAgentUDPAddr(addr)
-			st.setAgentUDPKeyID(kid)
-		case udpproto.MsgData:
-			if !strings.EqualFold(mode, "none") {
-				continue
-			}
-			route, client, payload, ok := udpproto.DecodeData(pkt)
-			if !ok {
-				continue
-			}
-			agent := st.getAgentUDPAddr()
-			if agent == nil || agent.String() != addr.String() {
-				continue
-			}
-			pc2 := st.publicUDP[route]
-			if pc2 == nil {
-				continue
-			}
-			ua, err := net.ResolveUDPAddr("udp", client)
-			if err != nil {
-				continue
-			}
-			_, _ = pc2.WriteTo(payload, ua)
-		case udpproto.MsgDataEnc2:
-			if strings.EqualFold(mode, "none") {
-				continue
-			}
-			route, client, payload, _, ok := udpproto.DecodeDataEnc2(st.udpKeys, pkt)
-			if !ok {
-				continue
-			}
-			agent := st.getAgentUDPAddr()
-			if agent == nil || agent.String() != addr.String() {
-				continue
-			}
-			pc2 := st.publicUDP[route]
-			if pc2 == nil {
-				continue
-			}
-			ua, err := net.ResolveUDPAddr("udp", client)
-			if err != nil {
-				continue
-			}
-			_, _ = pc2.WriteTo(payload, ua)
+
+		// Copy packet data since buf is reused
+		pktData := make([]byte, n)
+		copy(pktData, buf[:n])
+		udpBufPool.Put(bufPtr)
+
+		select {
+		case jobs <- udpJob{data: pktData, addr: addr}:
 		default:
-			continue
+			// Drop packet if workers overwhelmed
 		}
+	}
+}
+
+func (st *serverState) udpAgentWorker(ctx context.Context, jobs <-chan udpJob) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			st.processAgentUDPPacket(job.data, job.addr)
+		}
+	}
+}
+
+func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
+	if len(pkt) == 0 {
+		return
+	}
+	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
+	if st.cfg.DisableUDPEncryption {
+		mode = "none"
+	}
+	switch pkt[0] {
+	case udpproto.MsgReg:
+		if !strings.EqualFold(mode, "none") {
+			return
+		}
+		tok, ok := udpproto.DecodeReg(pkt)
+		if !ok {
+			return
+		}
+		expected := strings.TrimSpace(st.cfg.Token)
+		if expected != "" && !tokensEqualCT(expected, tok) {
+			return
+		}
+		if st.getAgentProto() == nil {
+			return
+		}
+		st.setAgentUDPAddr(addr)
+		st.setAgentUDPKeyID(0)
+	case udpproto.MsgRegEnc2:
+		if strings.EqualFold(mode, "none") {
+			return
+		}
+		expected := strings.TrimSpace(st.cfg.Token)
+		if expected == "" {
+			return
+		}
+		kid, ok := udpproto.DecodeRegEnc2(st.udpKeys, expected, pkt)
+		if !ok {
+			return
+		}
+		if st.getAgentProto() == nil {
+			return
+		}
+		st.setAgentUDPAddr(addr)
+		st.setAgentUDPKeyID(kid)
+	case udpproto.MsgData:
+		if !strings.EqualFold(mode, "none") {
+			return
+		}
+		route, client, payload, ok := udpproto.DecodeData(pkt)
+		if !ok {
+			return
+		}
+		agent := st.getAgentUDPAddr()
+		if agent == nil || agent.String() != addr.String() {
+			return
+		}
+		pc2 := st.publicUDP[route]
+		if pc2 == nil {
+			return
+		}
+		ua, err := net.ResolveUDPAddr("udp", client)
+		if err != nil {
+			return
+		}
+		_, _ = pc2.WriteTo(payload, ua)
+	case udpproto.MsgDataEnc2:
+		if strings.EqualFold(mode, "none") {
+			return
+		}
+		route, client, payload, _, ok := udpproto.DecodeDataEnc2(st.udpKeys, pkt)
+		if !ok {
+			return
+		}
+		agent := st.getAgentUDPAddr()
+		if agent == nil || agent.String() != addr.String() {
+			return
+		}
+		pc2 := st.publicUDP[route]
+		if pc2 == nil {
+			return
+		}
+		ua, err := net.ResolveUDPAddr("udp", client)
+		if err != nil {
+			return
+		}
+		_, _ = pc2.WriteTo(payload, ua)
 	}
 }
 
 func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, routeName string) error {
-	buf := make([]byte, 64*1024)
+	// Determine worker count
+	workers := 4
+	if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
+		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 64 {
+			workers = n
+		}
+	}
+
+	jobs := make(chan udpJob, workers*10)
+	st.mu.Lock()
+	if st.udpPublicJobs == nil {
+		st.udpPublicJobs = make(map[string]chan udpJob)
+	}
+	st.udpPublicJobs[routeName] = jobs
+	st.mu.Unlock()
+
+	// Start worker pool
+	for i := 0; i < workers; i++ {
+		go st.udpPublicWorker(ctx, jobs, routeName)
+	}
+
+	// Single reader distributes packets to workers
 	backoff := 50 * time.Millisecond
 	for {
 		select {
 		case <-ctx.Done():
+			close(jobs)
 			return nil
 		default:
 		}
+		bufPtr := udpBufPool.Get().(*[]byte)
+		buf := *bufPtr
 		n, clientAddr, err := pc.ReadFrom(buf)
 		if err != nil {
+			udpBufPool.Put(bufPtr)
 			if errors.Is(err, net.ErrClosed) {
+				close(jobs)
 				return nil
 			}
 			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
@@ -924,6 +1060,7 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 				select {
 				case <-ctx.Done():
 					t.Stop()
+					close(jobs)
 					return nil
 				case <-t.C:
 				}
@@ -935,35 +1072,65 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 				}
 				continue
 			}
+			close(jobs)
 			return err
 		}
 		backoff = 50 * time.Millisecond
-		agent := st.getAgentUDPAddr()
-		if agent == nil {
-			continue
+
+		// Copy packet data
+		pktData := make([]byte, n)
+		copy(pktData, buf[:n])
+		udpBufPool.Put(bufPtr)
+
+		select {
+		case jobs <- udpJob{data: pktData, addr: clientAddr}:
+		default:
+			// Drop if workers overwhelmed
 		}
-		var msg []byte
-		mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
-		if st.cfg.DisableUDPEncryption {
-			mode = "none"
-		}
-		if strings.EqualFold(mode, "none") || !st.udpKeys.Enabled() {
-			msg = udpproto.EncodeData(routeName, clientAddr.String(), buf[:n])
-		} else {
-			kid := st.getAgentUDPKeyID()
-			if kid == 0 {
-				kid = st.cfg.UDPKeyID
-			}
-			msg = udpproto.EncodeDataEnc2ForKeyID(st.udpKeys, kid, routeName, clientAddr.String(), buf[:n])
-		}
-		_, _ = st.udpData.WriteTo(msg, agent)
 	}
 }
 
+func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, routeName string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			st.processPublicUDPPacket(job.data, job.addr, routeName)
+		}
+	}
+}
+
+func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, routeName string) {
+	agent := st.getAgentUDPAddr()
+	if agent == nil {
+		return
+	}
+	var msg []byte
+	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
+	if st.cfg.DisableUDPEncryption {
+		mode = "none"
+	}
+	if strings.EqualFold(mode, "none") || !st.udpKeys.Enabled() {
+		msg = udpproto.EncodeData(routeName, clientAddr.String(), pkt)
+	} else {
+		kid := st.getAgentUDPKeyID()
+		if kid == 0 {
+			kid = st.cfg.UDPKeyID
+		}
+		msg = udpproto.EncodeDataEnc2ForKeyID(st.udpKeys, kid, routeName, clientAddr.String(), pkt)
+	}
+	_, _ = st.udpData.WriteTo(msg, agent)
+}
+
 func newID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+	idMu.Lock()
+	v := idSource.Int63()
+	idMu.Unlock()
+	return fmt.Sprintf("%016x", v)
 }
 
 func setTCPKeepAlive(conn net.Conn, period time.Duration) {
@@ -994,4 +1161,47 @@ func setTCPNoDelay(conn net.Conn, on bool) {
 		return
 	}
 	_ = tc.SetNoDelay(on)
+}
+
+func (st *serverState) startPendingCleaner(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			st.cleanupOldPending(time.Now().Add(-30 * time.Second))
+		}
+	}
+}
+
+func (st *serverState) cleanupOldPending(cutoff time.Time) {
+	st.pendingMu.Lock()
+	var toDelete []string
+	for id, pend := range st.pending {
+		if pend.createdAt.Before(cutoff) {
+			toDelete = append(toDelete, id)
+			close(pend.ch)
+		}
+	}
+	for _, id := range toDelete {
+		delete(st.pending, id)
+	}
+	st.pendingMu.Unlock()
+}
+
+func (st *serverState) acceptPublicTCPParallel(ctx context.Context, ln net.Listener, routeName string, workers int) error {
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			errCh <- st.acceptPublicTCP(ctx, ln, routeName)
+		}()
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		return err
+	}
 }
