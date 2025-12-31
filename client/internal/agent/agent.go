@@ -403,45 +403,74 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 		cands = append(cands, candidate{addr: dataAddrTLS, useTLS: true})
 	}
 	var dataConn net.Conn
-	for _, cand := range cands {
-		for attempt := 0; attempt < 2; attempt++ {
-			var (
-				c        net.Conn
-				err      error
-				fromPool bool
-			)
-			if attempt == 0 {
-				if p := pools[routeName]; p != nil && p.addr == cand.addr && p.useTLS == cand.useTLS {
-					fromPool = true
-					c, err = p.getOrDial(ctx, cfg)
+	// Server-side PairTimeout defaults to 10s. If we give up too quickly on transient
+	// dial/handshake failures, the server will log pair_timeout even though a retry
+	// would have succeeded.
+	attachDeadline := time.Now().Add(9 * time.Second)
+	backoff := 50 * time.Millisecond
+	var lastErr error
+	for dataConn == nil && ctx.Err() == nil && time.Now().Before(attachDeadline) {
+		for _, cand := range cands {
+			for attempt := 0; attempt < 2; attempt++ {
+				var (
+					c        net.Conn
+					err      error
+					fromPool bool
+				)
+				if attempt == 0 {
+					if p := pools[routeName]; p != nil && p.addr == cand.addr && p.useTLS == cand.useTLS {
+						fromPool = true
+						c, err = p.getOrDial(ctx, cfg)
+					} else {
+						c, err = dialTCP(cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
+					}
 				} else {
 					c, err = dialTCP(cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
 				}
-			} else {
-				c, err = dialTCP(cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
-			}
-			if err != nil {
-				debugf("agent: attach dial failed id=%s route=%s addr=%s tls=%v pool=%v err=%v", id, routeName, cand.addr, cand.useTLS, fromPool, err)
-				continue
-			}
+				if err != nil {
+					lastErr = err
+					debugf("agent: attach dial failed id=%s route=%s addr=%s tls=%v pool=%v err=%v", id, routeName, cand.addr, cand.useTLS, fromPool, err)
+					continue
+				}
 
-			rw := lineproto.New(c, c)
-			_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			err = rw.WriteLinef("CONN %s", id)
-			_ = c.SetWriteDeadline(time.Time{})
-			if err != nil {
-				debugf("agent: attach CONN write failed id=%s route=%s addr=%s tls=%v pool=%v err=%v", id, routeName, cand.addr, cand.useTLS, fromPool, err)
-				_ = c.Close()
-				continue
+				rw := lineproto.New(c, c)
+				_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				err = rw.WriteLinef("CONN %s", id)
+				_ = c.SetWriteDeadline(time.Time{})
+				if err != nil {
+					lastErr = err
+					debugf("agent: attach CONN write failed id=%s route=%s addr=%s tls=%v pool=%v err=%v", id, routeName, cand.addr, cand.useTLS, fromPool, err)
+					_ = c.Close()
+					continue
+				}
+				dataConn = c
+				break
 			}
-			dataConn = c
-			break
+			if dataConn != nil {
+				break
+			}
 		}
 		if dataConn != nil {
 			break
 		}
+		t := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			break
+		case <-t.C:
+		}
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+			if backoff > 500*time.Millisecond {
+				backoff = 500 * time.Millisecond
+			}
+		}
 	}
 	if dataConn == nil {
+		if lastErr != nil {
+			debugf("agent: attach failed id=%s route=%s err=%v", id, routeName, lastErr)
+		}
 		return
 	}
 	defer dataConn.Close()
@@ -452,6 +481,7 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 	}
 	localConn, err := net.Dial("tcp", localAddr)
 	if err != nil {
+		debugf("agent: local dial failed id=%s route=%s addr=%s err=%v", id, routeName, localAddr, err)
 		return
 	}
 	setTCPKeepAlive(localConn, 30*time.Second)
