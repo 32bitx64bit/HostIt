@@ -10,13 +10,16 @@ import (
 )
 
 type dataConnPool struct {
-	addr     string
-	useTLS   bool
-	noDelay  bool
-	ch       chan net.Conn
-	capacity int32
-	size     atomic.Int32 // Track current pool size for smarter refill
+	addr      string
+	useTLS    bool
+	noDelay   bool
+	ch        chan net.Conn
+	capacity  int32
+	size      atomic.Int32 // Track current pool size for smarter refill
+	createdAt sync.Map     // Track when each connection was created
 }
+
+const poolConnMaxAge = 30 * time.Second // Connections older than this are considered stale
 
 func startDataPools(ctx context.Context, cfg Config, routesByName map[string]RemoteRoute, dataAddrTLS string, dataAddrInsecure string) map[string]*dataConnPool {
 	pools := map[string]*dataConnPool{}
@@ -64,6 +67,7 @@ func (p *dataConnPool) warmup(ctx context.Context, cfg Config, count int) {
 			if err == nil {
 				select {
 				case p.ch <- c:
+					p.createdAt.Store(c, time.Now())
 					p.size.Add(1)
 				case <-ctx.Done():
 					_ = c.Close()
@@ -76,13 +80,30 @@ func (p *dataConnPool) warmup(ctx context.Context, cfg Config, count int) {
 	wg.Wait()
 }
 
+func (p *dataConnPool) isStale(c net.Conn) bool {
+	if created, ok := p.createdAt.Load(c); ok {
+		if time.Since(created.(time.Time)) > poolConnMaxAge {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *dataConnPool) tryGet() net.Conn {
-	select {
-	case c := <-p.ch:
-		p.size.Add(-1)
-		return c
-	default:
-		return nil
+	for {
+		select {
+		case c := <-p.ch:
+			p.size.Add(-1)
+			p.createdAt.Delete(c)
+			// Check if connection is stale
+			if p.isStale(c) {
+				_ = c.Close()
+				continue // Try to get another
+			}
+			return c
+		default:
+			return nil
+		}
 	}
 }
 
@@ -143,6 +164,7 @@ func (p *dataConnPool) fillLoop(ctx context.Context, cfg Config) {
 				}
 				select {
 				case p.ch <- c:
+					p.createdAt.Store(c, time.Now())
 					p.size.Add(1)
 				case <-ctx.Done():
 					_ = c.Close()

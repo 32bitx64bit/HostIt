@@ -441,29 +441,35 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 	// dial/handshake failures, the server will log pair_timeout even though a retry
 	// would have succeeded.
 	attachDeadline := time.Now().Add(9 * time.Second)
+	attachStart := time.Now()
 	backoff := 50 * time.Millisecond
 	var lastErr error
+	dialAttempts := 0
 	for dataConn == nil && ctx.Err() == nil && time.Now().Before(attachDeadline) {
 		for _, cand := range cands {
 			for attempt := 0; attempt < 2; attempt++ {
+				dialAttempts++
 				var (
 					c        net.Conn
 					err      error
 					fromPool bool
 				)
+				// Per-dial timeout to avoid blocking too long on dial limiter
+				dialCtx, dialCancel := context.WithTimeout(ctx, 3*time.Second)
 				if attempt == 0 {
 					if p := pools[routeName]; p != nil && p.addr == cand.addr && p.useTLS == cand.useTLS {
 						fromPool = true
-						c, err = p.getOrDial(ctx, cfg)
+						c, err = p.getOrDial(dialCtx, cfg)
 					} else {
-						c, err = dialTCPData(ctx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
+						c, err = dialTCPData(dialCtx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
 					}
 				} else {
-					c, err = dialTCPData(ctx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
+					c, err = dialTCPData(dialCtx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
 				}
+				dialCancel()
 				if err != nil {
 					lastErr = err
-					debugf("agent: attach dial failed id=%s route=%s addr=%s tls=%v pool=%v err=%v", id, routeName, cand.addr, cand.useTLS, fromPool, err)
+					debugf("agent: attach dial failed id=%s route=%s addr=%s tls=%v pool=%v attempt=%d err=%v", id, routeName, cand.addr, cand.useTLS, fromPool, dialAttempts, err)
 					continue
 				}
 
@@ -504,13 +510,14 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 	}
 	if dataConn == nil {
 		if lastErr != nil {
-			tracePairf("pair: attach failed id=%s route=%s err=%v", id, routeName, lastErr)
-			debugf("agent: attach failed id=%s route=%s err=%v", id, routeName, lastErr)
+			tracePairf("pair: attach failed id=%s route=%s attempts=%d elapsed=%v err=%v", id, routeName, dialAttempts, time.Since(attachStart), lastErr)
+			debugf("agent: attach failed id=%s route=%s attempts=%d elapsed=%v err=%v", id, routeName, dialAttempts, time.Since(attachStart), lastErr)
 		} else {
-			tracePairf("pair: attach failed id=%s route=%s err=<nil>", id, routeName)
+			tracePairf("pair: attach failed id=%s route=%s attempts=%d elapsed=%v err=<nil>", id, routeName, dialAttempts, time.Since(attachStart))
 		}
 		return
 	}
+	tracePairf("pair: attach success id=%s route=%s attempts=%d elapsed=%v", id, routeName, dialAttempts, time.Since(attachStart))
 	defer dataConn.Close()
 
 	localAddr, ok := localTargetFromPublicAddr(rt.PublicAddr)
