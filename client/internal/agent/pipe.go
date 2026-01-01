@@ -36,26 +36,42 @@ func closeWrite(c net.Conn) {
 	_ = c.Close()
 }
 
+func closeRead(c net.Conn) {
+	if cr, ok := c.(interface{ CloseRead() error }); ok {
+		_ = cr.CloseRead()
+		return
+	}
+}
+
 func bidirPipeCount(a net.Conn, b net.Conn) (aToB int64, bToA int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
+
+	var once sync.Once
+	closeBoth := func() {
+		_ = a.Close()
+		_ = b.Close()
+	}
 
 	var n1, n2 int64
 
 	go func() {
 		defer wg.Done()
 		n1, _ = copyOptimized(a, b)
+		closeRead(b)
 		closeWrite(a)
+		once.Do(closeBoth)
 	}()
 	go func() {
 		defer wg.Done()
 		n2, _ = copyOptimized(b, a)
+		closeRead(a)
 		closeWrite(b)
+		once.Do(closeBoth)
 	}()
 
 	wg.Wait()
-	_ = a.Close()
-	_ = b.Close()
+	once.Do(closeBoth)
 
 	return n1, n2
 }
