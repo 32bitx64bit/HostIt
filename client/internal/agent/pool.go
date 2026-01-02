@@ -94,9 +94,10 @@ func (p *dataConnPool) tryGet() net.Conn {
 		select {
 		case c := <-p.ch:
 			p.size.Add(-1)
+			// Check staleness before deleting tracking metadata.
+			stale := p.isStale(c)
 			p.createdAt.Delete(c)
-			// Check if connection is stale
-			if p.isStale(c) {
+			if stale {
 				_ = c.Close()
 				continue // Try to get another
 			}
