@@ -22,8 +22,10 @@ import (
 
 	"hostit/server/internal/auth"
 	"hostit/server/internal/configio"
+	"hostit/server/internal/serverlog"
 	"hostit/server/internal/tlsutil"
 	"hostit/server/internal/tunnel"
+	"hostit/shared/logging"
 )
 
 func main() {
@@ -56,6 +58,10 @@ func main() {
 	flag.DurationVar(&sessionTTL, "session-ttl", 7*24*time.Hour, "session lifetime")
 	flag.Parse()
 
+	// Initialize centralized logging
+	serverlog.Init()
+	slog := serverlog.Log
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -70,6 +76,7 @@ func main() {
 		PairTimeout:          pairTimeout,
 	}
 	_, _ = configio.Load(configPath, &cfg)
+
 	// Apply flag overrides after loading.
 	if disableTLS {
 		cfg.DisableTLS = true
@@ -88,12 +95,13 @@ func main() {
 	if strings.TrimSpace(cfg.Token) == "" {
 		cfg.Token = genToken()
 		_ = configio.Save(configPath, cfg)
-		log.Printf("server token was empty; generated a new one")
+		slog.Info(logging.CatSystem, "generated new server token (was empty)")
 	}
 
 	// Normalize/ensure UDP encryption settings + key material.
 	if changed := tunnel.EnsureUDPKeys(&cfg, time.Now()); changed {
 		_ = configio.Save(configPath, cfg)
+		slog.Info(logging.CatEncryption, "UDP encryption keys updated", serverlog.F("key_id", cfg.UDPKeyID))
 	}
 	if !cfg.DisableTLS {
 		cfgDir := filepath.Dir(configPath)
@@ -105,14 +113,19 @@ func main() {
 		}
 		fp, err := tlsutil.EnsureSelfSigned(cfg.TLSCertFile, cfg.TLSKeyFile)
 		if err != nil {
-			log.Fatalf("tls setup: %v", err)
+			slog.Fatal(logging.CatSystem, "TLS setup failed", serverlog.F("error", err))
 		}
 		_ = configio.Save(configPath, cfg)
-		log.Printf("tunnel tls enabled; cert sha256=%s", fp)
+		slog.Info(logging.CatEncryption, "tunnel TLS enabled", serverlog.F("cert_sha256", fp))
 	}
 
 	runner := newServerRunner(ctx, cfg)
 	runner.Start()
+	slog.Info(logging.CatSystem, "server started", serverlog.F(
+		"control_addr", cfg.ControlAddr,
+		"data_addr", cfg.DataAddr,
+		"tls_enabled", !cfg.DisableTLS,
+	))
 
 	// Auto-rotate UDP keys every 60 days (checked periodically).
 	go func() {
@@ -137,11 +150,11 @@ func main() {
 				continue
 			}
 			if err := configio.Save(configPath, cfg); err != nil {
-				log.Printf("udp key rotation save error: %v", err)
+				slog.Error(logging.CatEncryption, "UDP key rotation save failed", serverlog.F("error", err))
 				continue
 			}
 			runner.Restart(cfg)
-			log.Printf("udp keys rotated; new key id=%d", cfg.UDPKeyID)
+			slog.Info(logging.CatEncryption, "UDP keys rotated", serverlog.F("new_key_id", cfg.UDPKeyID))
 		}
 	}()
 
@@ -149,7 +162,7 @@ func main() {
 		go func() {
 			store, err := auth.Open(authDBPath)
 			if err != nil {
-				log.Printf("auth db open error: %v", err)
+				slog.Error(logging.CatAuth, "auth database open failed", serverlog.F("error", err, "path", authDBPath))
 				return
 			}
 			defer store.Close()
@@ -158,9 +171,9 @@ func main() {
 			if cfg.WebHTTPS {
 				scheme = "https"
 			}
-			log.Printf("server web: %s://%s", scheme, webAddr)
+			slog.Info(logging.CatDashboard, "web dashboard starting", serverlog.F("url", scheme+"://"+webAddr))
 			if err := serveServerDashboard(ctx, webAddr, configPath, runner, store, cookieSecure, sessionTTL); err != nil {
-				log.Printf("server web error: %v", err)
+				slog.Error(logging.CatDashboard, "web dashboard error", serverlog.F("error", err))
 			}
 		}()
 	}

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"hostit/client/internal/udpproto"
+	"hostit/shared/logging"
+	"hostit/shared/udputil"
 )
 
 var udpBufPool = sync.Pool{New: func() any {
@@ -25,13 +27,37 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 	const idle = 2 * time.Minute
 	const keepaliveEvery = 5 * time.Second
 
+	// UDP stats for monitoring
+	stats := udputil.NewStats()
+	
+	// Log stats periodically
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s := stats.Snapshot()
+				if s.PacketsReceived > 0 || s.PacketsSent > 0 {
+					log.Infof(logging.CatUDP, "UDP stats: sent=%d recv=%d lost=%d loss=%.2f%%", 
+						s.PacketsSent, s.PacketsReceived, s.PacketsLost, s.LossRate*100)
+				}
+			}
+		}
+	}()
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
+		log.Debugf(logging.CatUDP, "dialing UDP server %s", dataAddr)
 		c, err := net.Dial("udp", dataAddr)
 		if err != nil {
+			log.Warnf(logging.CatUDP, "UDP dial failed: %v", err)
+			stats.RecordLoss(1)
 			t := time.NewTimer(1 * time.Second)
 			select {
 			case <-ctx.Done():
@@ -41,6 +67,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			}
 			continue
 		}
+		log.Infof(logging.CatUDP, "UDP connection established to %s", dataAddr)
 
 		uc, ok := c.(*net.UDPConn)
 		if !ok {
@@ -100,17 +127,22 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 
 			raddr, err := net.ResolveUDPAddr("udp", localTarget)
 			if err != nil {
+				log.Warnf(logging.CatUDP, "UDP resolve failed route=%s client=%s target=%s: %v", routeName, clientAddr, localTarget, err)
+				stats.RecordLoss(1)
 				return nil, false
 			}
 			lc := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 			lconn, err := net.DialUDP("udp", lc, raddr)
 			if err != nil {
+				log.Warnf(logging.CatUDP, "UDP local dial failed route=%s target=%s: %v", routeName, localTarget, err)
+				stats.RecordLoss(1)
 				return nil, false
 			}
 			_ = lconn.SetReadBuffer(4 * 1024 * 1024)
 			_ = lconn.SetWriteBuffer(4 * 1024 * 1024)
 			s := &udpSession{conn: lconn, route: routeName, client: clientAddr}
 			m[clientAddr] = s
+			log.Debugf(logging.CatUDP, "new UDP session route=%s client=%s target=%s", routeName, clientAddr, localTarget)
 
 			go func() {
 				localBufPtr := udpBufPool.Get().(*[]byte)
@@ -122,6 +154,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 					if err != nil {
 						break
 					}
+					stats.RecordSend(n)
 					ks := sec.Get()
 					if ks.Enabled() {
 						_, _ = uc.Write(udpproto.EncodeDataEnc2ForKeyID(ks, ks.CurID, routeName, clientAddr, localBuf[:n]))
@@ -133,6 +166,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				s.close.Do(func() {
 					_ = lconn.Close()
 				})
+				log.Debugf(logging.CatUDP, "UDP session closed route=%s client=%s", routeName, clientAddr)
 				sessionsMu.Lock()
 				if mm := sessions[routeName]; mm != nil {
 					delete(mm, clientAddr)
@@ -165,6 +199,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 					}
 					return err
 				}
+				stats.RecordReceive(n)
 				ks := sec.Get()
 				var (
 					routeName  string
@@ -175,24 +210,30 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				if ks.Enabled() {
 					routeName, clientAddr, payload, _, ok = udpproto.DecodeDataEnc2(ks, readBuf[:n])
 					if !ok {
+						stats.RecordLoss(1)
 						continue
 					}
 				} else {
 					routeName, clientAddr, payload, ok = udpproto.DecodeData(readBuf[:n])
 					if !ok {
+						stats.RecordLoss(1)
 						continue
 					}
 				}
 				rt, ok := routesByName[routeName]
 				if !ok || !routeHasUDP(rt.Proto) {
+					stats.RecordLoss(1)
+					log.Debugf(logging.CatUDP, "UDP packet dropped: unknown route=%s", routeName)
 					continue
 				}
 				localTarget, ok := localTargetFromPublicAddr(rt.PublicAddr)
 				if !ok {
+					stats.RecordLoss(1)
 					continue
 				}
 				s, ok := getOrCreate(routeName, clientAddr, localTarget)
 				if !ok || s == nil {
+					stats.RecordLoss(1)
 					continue
 				}
 				_, _ = s.conn.Write(payload)
@@ -201,6 +242,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 
 		close(kaDone)
 		_ = uc.Close()
+		log.Info(logging.CatUDP, "UDP connection closed, reconnecting...")
 		_ = readErr
 		// Backoff and retry.
 		t := time.NewTimer(1 * time.Second)

@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"log"
 	mathrand "math/rand"
 	"net"
 	"os"
@@ -19,7 +18,17 @@ import (
 
 	"hostit/server/internal/lineproto"
 	"hostit/server/internal/udpproto"
+	"hostit/shared/logging"
+	"hostit/shared/udputil"
 )
+
+// Logger for tunnel operations - can be set externally
+var log = logging.Global()
+
+// SetLogger sets the logger for the tunnel package.
+func SetLogger(l *logging.Logger) {
+	log = l
+}
 
 var udpBufPool = sync.Pool{New: func() any {
 	b := make([]byte, 64*1024)
@@ -63,6 +72,7 @@ func NewServer(cfg ServerConfig) *Server {
 		dash:          newDashState(),
 		udpPublicJobs: make(map[string]chan udpJob),
 		errLast:       make(map[string]time.Time),
+		udpStats:      udputil.NewSessionStats(1000, 5*time.Minute),
 	}
 	st.udpKeys = buildUDPKeySet(cfg)
 	st.newBatcher = &newCommandBatcher{
@@ -110,7 +120,21 @@ func (s *Server) Dashboard(now time.Time) DashboardSnapshot {
 	if s.st.dash == nil {
 		return DashboardSnapshot{NowUnix: now.Unix(), AgentConnected: agentConnected}
 	}
-	return s.st.dash.snapshot(now, agentConnected)
+	snap := s.st.dash.snapshot(now, agentConnected)
+	
+	// Add UDP stats if available
+	if s.st.udpStats != nil {
+		summary := s.st.udpStats.Summary()
+		snap.UDP = &UDPStats{
+			PacketsIn:    int64(summary.GlobalStats.PacketsReceived),
+			PacketsOut:   int64(summary.GlobalStats.PacketsSent),
+			BytesIn:      int64(summary.GlobalStats.BytesReceived),
+			BytesOut:     int64(summary.GlobalStats.BytesSent),
+			ActiveRoutes: len(summary.ByRoute),
+		}
+	}
+	
+	return snap
 }
 
 func Serve(ctx context.Context, cfg ServerConfig) error {
@@ -333,6 +357,9 @@ type serverState struct {
 	newBatcher    *newCommandBatcher
 	udpAgentJobs  chan udpJob
 	udpPublicJobs map[string]chan udpJob
+
+	// UDP statistics
+	udpStats *udputil.SessionStats
 }
 
 const dashSystemRoute = "_system"
@@ -415,7 +442,11 @@ func (b *newCommandBatcher) flushPending() {
 	for _, cmd := range batch {
 		if err := b.st.agentWriteLinef(nil, "NEW %s %s", cmd.id, cmd.route); err != nil {
 			// This is high-signal: if NEW can't be delivered, pairing will always time out.
-			log.Printf("pair: NEW write failed id=%s route=%s err=%v", cmd.id, cmd.route, err)
+			log.Error(logging.CatPairing, "NEW command write failed", logging.F(
+				"conn_id", cmd.id,
+				"route", cmd.route,
+				"error", err,
+			))
 			b.st.dashError(cmd.route, "error_new_send", "", cmd.id, err.Error())
 		}
 	}
@@ -482,21 +513,21 @@ func debugf(format string, args ...any) {
 	if !debugEnabled() {
 		return
 	}
-	log.Printf(format, args...)
+	log.Debugf(logging.CatSystem, format, args...)
 }
 
 func tracePairf(format string, args ...any) {
 	if !tracePairEnabled() {
 		return
 	}
-	log.Printf(format, args...)
+	log.Tracef(logging.CatPairing, format, args...)
 }
 
 func traceUDPf(format string, args ...any) {
 	if !traceUDPEnabled() {
 		return
 	}
-	log.Printf(format, args...)
+	log.Tracef(logging.CatUDP, format, args...)
 }
 
 func hostFromAddr(addr net.Addr) string {
@@ -609,6 +640,7 @@ func (st *serverState) acceptControl(ctx context.Context, ln net.Listener) error
 }
 
 func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
+	remoteIP := hostFromAddr(conn.RemoteAddr())
 	setTCPKeepAlive(conn, 30*time.Second)
 	// Control channel is latency-sensitive (NEW/CONN pairing, ROUTE updates).
 	setTCPNoDelay(conn, true)
@@ -619,23 +651,36 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	line, err := rw.ReadLine()
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
+		log.Debug(logging.CatControl, "control connection failed to read HELLO", logging.F(
+			"remote_ip", remoteIP,
+			"error", err,
+		))
 		_ = rw.WriteLinef("ERR %s", "no hello")
 		_ = conn.Close()
 		return
 	}
 	cmd, rest := lineproto.Split2(line)
 	if cmd != "HELLO" {
+		log.Warn(logging.CatControl, "control connection sent invalid command", logging.F(
+			"remote_ip", remoteIP,
+			"expected", "HELLO",
+			"got", cmd,
+		))
 		_ = rw.WriteLinef("ERR %s", "expected HELLO")
 		_ = conn.Close()
 		return
 	}
 	expected := strings.TrimSpace(st.cfg.Token)
 	if expected == "" {
+		log.Error(logging.CatControl, "server token not configured")
 		_ = rw.WriteLinef("ERR %s", "server token not set")
 		_ = conn.Close()
 		return
 	}
 	if !tokensEqualCT(expected, rest) {
+		log.Warn(logging.CatAuth, "agent authentication failed - bad token", logging.F(
+			"remote_ip", remoteIP,
+		))
 		_ = rw.WriteLinef("ERR %s", "bad token (agent token must match server token)")
 		_ = conn.Close()
 		return
@@ -644,6 +689,9 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	st.mu.Lock()
 	if st.agentConn != nil {
 		// Takeover: close the previous agent and accept the new one.
+		log.Info(logging.CatControl, "agent reconnected, closing previous connection", logging.F(
+			"remote_ip", remoteIP,
+		))
 		_ = st.agentConn.Close()
 		st.agentConn = nil
 		st.agentProto = nil
@@ -653,6 +701,11 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	st.agentConn = conn
 	st.agentProto = rw
 	st.mu.Unlock()
+
+	log.Info(logging.CatControl, "agent connected", logging.F(
+		"remote_ip", remoteIP,
+		"routes", len(st.cfg.Routes),
+	))
 
 	insec := strings.TrimSpace(st.cfg.DataAddrInsecure)
 	if insec == "" {
@@ -694,6 +747,11 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 			pc = *rt.Preconnect
 		}
 		_ = st.agentWriteLinef(conn, "ROUTE %s %s %s nodelay=%d tls=%d preconnect=%d", rt.Name, rt.Proto, rt.PublicAddr, nd, tlsFlag, pc)
+		log.Debug(logging.CatControl, "sent route to agent", logging.F(
+			"route", rt.Name,
+			"proto", rt.Proto,
+			"public_addr", rt.PublicAddr,
+		))
 	}
 	_ = st.agentWriteLinef(conn, "READY")
 
@@ -1127,8 +1185,12 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if st.getAgentProto() == nil {
 			return
 		}
+		oldAddr := st.getAgentUDPAddr()
 		st.setAgentUDPAddr(addr)
 		st.setAgentUDPKeyID(0)
+		if oldAddr == nil || oldAddr.String() != addr.String() {
+			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=plaintext", addr)
+		}
 	case udpproto.MsgRegEnc2:
 		if strings.EqualFold(mode, "none") {
 			return
@@ -1146,8 +1208,12 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if st.getAgentProto() == nil {
 			return
 		}
+		oldAddr := st.getAgentUDPAddr()
 		st.setAgentUDPAddr(addr)
 		st.setAgentUDPKeyID(kid)
+		if oldAddr == nil || oldAddr.String() != addr.String() {
+			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=encrypted keyID=%d", addr, kid)
+		}
 	case udpproto.MsgData:
 		if !strings.EqualFold(mode, "none") {
 			return
@@ -1312,6 +1378,15 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 		st.dashErrorRateLimited(routeName, "error_udp_no_agent", "", "", "", 1*time.Second)
 		return
 	}
+	
+	// Track UDP session stats
+	if st.udpStats != nil {
+		clientIP := hostFromAddr(clientAddr)
+		sessionID := routeName + ":" + clientIP
+		st.udpStats.GetOrCreate(sessionID, routeName, clientIP, "")
+		st.udpStats.RecordReceive(sessionID, len(pkt))
+	}
+	
 	var msg []byte
 	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
 	if st.cfg.DisableUDPEncryption {
@@ -1328,6 +1403,7 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 	}
 	if _, err := st.udpData.WriteTo(msg, agent); err != nil {
 		st.dashErrorRateLimited(routeName, "error_udp_write_agent", hostFromAddr(agent), "", err.Error(), 1*time.Second)
+		log.Warnf(logging.CatUDP, "UDP write to agent failed route=%s: %v", routeName, err)
 	}
 }
 

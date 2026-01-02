@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"strconv"
@@ -15,7 +14,17 @@ import (
 	"time"
 
 	"hostit/client/internal/lineproto"
+	"hostit/shared/logging"
+	"hostit/shared/retry"
 )
+
+// Logger for agent operations - can be set externally
+var log = logging.Global()
+
+// SetLogger sets the logger for the agent package.
+func SetLogger(l *logging.Logger) {
+	log = l
+}
 
 var warnTLSPinOnce sync.Once
 
@@ -35,19 +44,30 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 func RunWithHooks(ctx context.Context, cfg Config, hooks *Hooks) error {
+	backoff := retry.NewBackoff(retry.Config{
+		MaxRetries:   0, // Infinite retries
+		InitialDelay: 1 * time.Second,
+		MaxDelay:     30 * time.Second,
+		Multiplier:   2.0,
+		JitterFactor: 0.25, // 25% jitter
+	})
 	for {
+		attempt := backoff.Attempt() + 1
+		log.Infof(logging.CatControl, "connecting to server (attempt %d)", attempt)
 		err := runOnce(ctx, cfg, hooks)
 		if ctx.Err() != nil {
+			log.Info(logging.CatControl, "agent shutdown requested")
 			return nil
 		}
-		t := time.NewTimer(1 * time.Second)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return nil
-		case <-t.C:
+		if err != nil {
+			log.Warnf(logging.CatControl, "connection failed: %v", err)
 		}
-		_ = err
+		if waitErr := backoff.NextWithContext(ctx); waitErr != nil {
+			if waitErr == context.Canceled || waitErr == context.DeadlineExceeded {
+				log.Info(logging.CatControl, "agent shutdown requested")
+				return nil
+			}
+		}
 	}
 }
 
@@ -77,14 +97,14 @@ func debugf(format string, args ...any) {
 	if !debugEnabled() {
 		return
 	}
-	log.Printf(format, args...)
+	log.Debugf(logging.CatSystem, format, args...)
 }
 
 func tracePairf(format string, args ...any) {
 	if !tracePairEnabled() {
 		return
 	}
-	log.Printf(format, args...)
+	log.Debugf(logging.CatPairing, format, args...)
 }
 
 func runOnce(ctx context.Context, cfg Config, hooks *Hooks) error {
@@ -214,6 +234,7 @@ func runOnce(ctx context.Context, cfg Config, hooks *Hooks) error {
 	}
 
 ready:
+	log.Infof(logging.CatControl, "connected to server, received %d routes", len(routesList))
 	if hooks != nil && hooks.OnRoutes != nil {
 		hooks.OnRoutes(routesList)
 	}
@@ -225,6 +246,7 @@ ready:
 	if cfg.DisableUDPEncryption {
 		udpSec.ForceNone()
 	}
+	log.Debugf(logging.CatUDP, "starting UDP handler (encryption=%v)", !cfg.DisableUDPEncryption)
 	go runUDP(udpCtx, dataAddrTLS, cfg.Token, udpSec, routesByName)
 	pools := startDataPools(onceCtx, cfg, routesByName, dataAddrTLS, dataAddrInsecure)
 
@@ -237,6 +259,7 @@ ready:
 		_ = controlConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		line, err := rw.ReadLine()
 		if err != nil {
+			log.Warnf(logging.CatControl, "control connection lost: %v", err)
 			if hooks != nil && hooks.OnDisconnected != nil {
 				hooks.OnDisconnected(err)
 			}
@@ -257,11 +280,13 @@ ready:
 			if len(fields) >= 2 {
 				routeName = fields[1]
 			}
+			log.Debugf(logging.CatData, "new connection request id=%s route=%s", id, routeName)
 			tracePairf("pair: got NEW id=%s route=%s", id, routeName)
 			go handleOne(ctx, cfg, dataAddrTLS, dataAddrInsecure, pools, routesByName, id, routeName)
 		case "PING":
 			_ = rw.WriteLinef("PONG %s", rest)
 		case "UDPSEC":
+			log.Debug(logging.CatUDP, "received UDPSEC update")
 			if !cfg.DisableUDPEncryption {
 				udpSec.UpdateFromLine(cfg.Token, rest)
 			}
@@ -315,7 +340,7 @@ func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, erro
 
 	if strings.TrimSpace(cfg.TLSPinSHA256) == "" {
 		warnTLSPinOnce.Do(func() {
-			log.Printf("WARNING: agent TLS is not verifying the server certificate (MITM risk). Set TLSPinSHA256 to pin the server cert fingerprint.")
+			log.Warn(logging.CatSystem, "agent TLS is not verifying the server certificate (MITM risk). Set TLSPinSHA256 to pin the server cert fingerprint.")
 		})
 	}
 	host, _ := splitHostPortOrDefault(addr, "")
