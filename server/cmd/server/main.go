@@ -26,6 +26,8 @@ import (
 	"hostit/server/internal/tlsutil"
 	"hostit/server/internal/tunnel"
 	"hostit/shared/logging"
+	"hostit/shared/updater"
+	"hostit/shared/version"
 )
 
 func main() {
@@ -274,6 +276,24 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 	tplConfig := template.Must(template.New("config").Parse(serverConfigHTML))
 	tplLogin := template.Must(template.New("login").Parse(loginPageHTML))
 	tplSetup := template.Must(template.New("setup").Parse(setupPageHTML))
+
+	absCfg := configPath
+	if p, err := filepath.Abs(configPath); err == nil {
+		absCfg = p
+	}
+	updStatePath := filepath.Join(filepath.Dir(absCfg), "update_state_server.json")
+	moduleDir := detectModuleDir(absCfg)
+	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentServer, "server.zip", moduleDir, updStatePath)
+	upd.Preserve = absCfg
+	upd.Restart = func() error {
+		bin := upd.BuiltBinaryPath()
+		if _, err := os.Stat(bin); err != nil {
+			return err
+		}
+		// Replace the current process so the restart is immediate.
+		return updater.ExecReplace(bin, os.Args[1:])
+	}
+	upd.Start(ctx)
 
 	var msgMu sync.Mutex
 	var msg string
@@ -525,6 +545,77 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		_ = json.NewEncoder(w).Encode(resp)
 		})))
 
+		// Update APIs (protected)
+		mux.HandleFunc("/api/update/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			upd.CheckIfDue(r.Context())
+			st := upd.Status()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(st)
+		})))
+		mux.HandleFunc("/api/update/remind", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			_ = upd.RemindLater(24 * time.Hour)
+			w.WriteHeader(http.StatusNoContent)
+		})))
+		mux.HandleFunc("/api/update/skip", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			_ = upd.SkipAvailableVersion()
+			w.WriteHeader(http.StatusNoContent)
+		})))
+		mux.HandleFunc("/api/update/apply", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			started, err := upd.Apply(r.Context())
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !started {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+		})))
+
 		// Config (protected)
 		mux.HandleFunc("/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -570,6 +661,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			"Msg":        getMsg(),
 			"Err":        err,
 			"CSRF":       csrf,
+			"Version":    version.Current,
 			"Routes":     routeViews,
 			"RouteCount": len(routeViews),
 			"WebHTTPS":   webHTTPS,
@@ -849,6 +941,35 @@ func genToken() string {
 	return hex.EncodeToString(b[:])
 }
 
+func detectModuleDir(configPath string) string {
+	// Prefer current working directory if build.sh is present.
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		if fileExists(filepath.Join(wd, "build.sh")) {
+			return wd
+		}
+	}
+	// If we're running from ./bin/<binary>, prefer the parent dir.
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		exeDir := filepath.Dir(exe)
+		if filepath.Base(exeDir) == "bin" {
+			parent := filepath.Dir(exeDir)
+			if fileExists(filepath.Join(parent, "build.sh")) {
+				return parent
+			}
+		}
+	}
+	// Fallback: alongside config.
+	if strings.TrimSpace(configPath) != "" {
+		return filepath.Dir(configPath)
+	}
+	return "."
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
 func effectiveServerRoutes(cfg tunnel.ServerConfig) []tunnel.RouteConfig {
 	return cfg.Routes
 }
@@ -930,6 +1051,8 @@ const serverStatsHTML = `<!doctype html>
 		.nav { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 		.nav a { text-decoration:none; padding: 6px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); }
 		.nav a.active { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
+		.updatePopup { position: fixed; right: 16px; bottom: 16px; max-width: 520px; width: calc(100% - 32px); z-index: 1000; display:none; }
+		.updatePopup pre { white-space: pre-wrap; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 220px; overflow:auto; }
   </style>
 </head>
 <body>
@@ -1016,8 +1139,126 @@ const serverStatsHTML = `<!doctype html>
 			</details>
 		{{end}}
   </div>
+	<div id="updatePopup" class="card updatePopup">
+		<div class="row"><b>Update available</b> <span class="muted" id="updVer">—</span></div>
+		<div class="row muted" id="updInfo">Current: <code>{{.Version}}</code></div>
+		<div class="btns" style="margin-top:0">
+			<button type="button" id="updRemind">Remind later</button>
+			<button type="button" id="updSkip">Skip version</button>
+			<button type="button" class="primary" id="updApply">Update</button>
+		</div>
+		<pre id="updLog" style="display:none"></pre>
+	</div>
 	<script>
 		(function(){
+			var csrf = "{{.CSRF}}";
+			var updPopup = document.getElementById('updatePopup');
+			var updVer = document.getElementById('updVer');
+			var updInfo = document.getElementById('updInfo');
+			var updLog = document.getElementById('updLog');
+			var updRemind = document.getElementById('updRemind');
+			var updSkip = document.getElementById('updSkip');
+			var updApply = document.getElementById('updApply');
+
+			function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+			async function postForm(path){
+				try {
+					return await fetch(path, {
+						method: 'POST',
+						headers: {'Content-Type':'application/x-www-form-urlencoded'},
+						body: 'csrf=' + encodeURIComponent(csrf)
+					});
+				} catch (e) {
+					return null;
+				}
+			}
+			async function fetchUpdateStatus(){
+				try {
+					var res = await fetch('/api/update/status', {cache:'no-store'});
+					if(!res.ok) return null;
+					return await res.json();
+				} catch (e) {
+					return null;
+				}
+			}
+			function setPopupVisible(v){
+				if(!updPopup) return;
+				updPopup.style.display = v ? '' : 'none';
+			}
+			function renderUpdate(st){
+				if(!st){
+					return;
+				}
+				var show = !!st.showPopup || (st.job && st.job.state && st.job.state !== 'idle');
+				setPopupVisible(show);
+				if(!show) return;
+				if(updVer) updVer.textContent = st.availableVersion ? ('→ ' + st.availableVersion) : '';
+				if(updInfo){
+					var s = 'Current: {{.Version}}';
+					if(st.availableURL){ s += ' · ' + st.availableURL; }
+					if(st.job && st.job.state === 'running') s = 'Updating… please wait.';
+					if(st.job && st.job.state === 'success') s = 'Update complete. Restarting…';
+					if(st.job && st.job.state === 'failed') s = 'Update failed.';
+					updInfo.textContent = s;
+				}
+				if(updLog){
+					var log = (st.job && st.job.log) ? String(st.job.log) : '';
+					if(st.job && (st.job.state === 'failed' || st.job.state === 'success')){
+						updLog.style.display = '';
+						updLog.textContent = log || '(no log)';
+					} else {
+						updLog.style.display = 'none';
+						updLog.textContent = '';
+					}
+				}
+				var busy = st.job && st.job.state === 'running';
+				if(updApply) updApply.disabled = busy;
+				if(updRemind) updRemind.disabled = busy;
+				if(updSkip) updSkip.disabled = busy;
+			}
+			async function pollUpdateUntilDone(){
+				for(;;){
+					var st = await fetchUpdateStatus();
+					if(st){
+						renderUpdate(st);
+						if(st.job && st.job.state && st.job.state !== 'running'){
+							break;
+						}
+					}
+					await sleep(1500);
+				}
+				// If we successfully updated, the process may restart; wait until it comes back then reload.
+				for (var i=0;i<90;i++){
+					var st2 = await fetchUpdateStatus();
+					if(st2){
+						location.reload();
+						return;
+					}
+					await sleep(1000);
+				}
+			}
+
+			if (updRemind) updRemind.addEventListener('click', async function(){
+				await postForm('/api/update/remind');
+				setPopupVisible(false);
+			});
+			if (updSkip) updSkip.addEventListener('click', async function(){
+				await postForm('/api/update/skip');
+				setPopupVisible(false);
+			});
+			if (updApply) updApply.addEventListener('click', async function(){
+				var res = await postForm('/api/update/apply');
+				if(res && (res.status === 202 || res.status === 409 || res.status === 204)){
+					pollUpdateUntilDone();
+					return;
+				}
+				await pollUpdateUntilDone();
+			});
+
+			// initial load
+			fetchUpdateStatus().then(renderUpdate);
+			setInterval(function(){ fetchUpdateStatus().then(renderUpdate); }, 30000);
+
 			function fmtBytes(n){
 				n = Number(n||0);
 				if (!isFinite(n) || n < 0) n = 0;

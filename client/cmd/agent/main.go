@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,6 +18,8 @@ import (
 
 	"hostit/client/internal/agent"
 	"hostit/client/internal/configio"
+	"hostit/shared/updater"
+	"hostit/shared/version"
 )
 
 func main() {
@@ -234,6 +237,24 @@ func (a *agentController) Stop() {
 func serveAgentDashboard(ctx context.Context, addr string, configPath string, ctrl *agentController) error {
 	tplHome := template.Must(template.New("home").Parse(agentHomeHTML))
 
+	absCfg := configPath
+	if p, err := filepath.Abs(configPath); err == nil {
+		absCfg = p
+	}
+	updStatePath := filepath.Join(filepath.Dir(absCfg), "update_state_client.json")
+	moduleDir := detectModuleDir(absCfg)
+	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentClient, "client.zip", moduleDir, updStatePath)
+	upd.Preserve = absCfg
+	upd.Restart = func() error {
+		ctrl.Stop()
+		bin := upd.BuiltBinaryPath()
+		if _, err := os.Stat(bin); err != nil {
+			return err
+		}
+		return updater.ExecReplace(bin, os.Args[1:])
+	}
+	upd.Start(ctx)
+
 	type routeView struct {
 		Name        string
 		Proto       string
@@ -300,6 +321,49 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
+	// Update APIs
+	mux.HandleFunc("/api/update/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		upd.CheckIfDue(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(upd.Status())
+	})
+	mux.HandleFunc("/api/update/remind", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = upd.RemindLater(24 * time.Hour)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/api/update/skip", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = upd.SkipAvailableVersion()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/api/update/apply", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		started, err := upd.Apply(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !started {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+
 	// Service controls
 	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -345,6 +409,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"HasToken":   strings.TrimSpace(cfg.Token) != "",
 			"LastErr":    lastErr,
 			"ConfigPath": configPath,
+			"Version":    version.Current,
 			"Msg":        getMsg(),
 			"RoutesView": makeRouteViews(routes),
 		}
@@ -436,6 +501,32 @@ func localTargetFromPublicAddr(publicAddr string) string {
 	return "127.0.0.1"
 }
 
+func detectModuleDir(configPath string) string {
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		if fileExists(filepath.Join(wd, "build.sh")) {
+			return wd
+		}
+	}
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		exeDir := filepath.Dir(exe)
+		if filepath.Base(exeDir) == "bin" {
+			parent := filepath.Dir(exeDir)
+			if fileExists(filepath.Join(parent, "build.sh")) {
+				return parent
+			}
+		}
+	}
+	if strings.TrimSpace(configPath) != "" {
+		return filepath.Dir(configPath)
+	}
+	return "."
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
 const agentHomeHTML = `<!doctype html>
 <html>
 <head>
@@ -467,6 +558,8 @@ const agentHomeHTML = `<!doctype html>
 		.flash { margin: 10px 0 0; }
 		.row { margin-bottom: 10px; }
 		.small { font-size: 12px; opacity: .85; }
+		.updatePopup { position: fixed; right: 16px; bottom: 16px; max-width: 520px; width: calc(100% - 32px); z-index: 1000; display:none; }
+		.updatePopup pre { white-space: pre-wrap; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 220px; overflow:auto; }
 	</style>
 </head>
 <body>
@@ -528,8 +621,104 @@ const agentHomeHTML = `<!doctype html>
 			</div>
 		</div>
 	</div>
+	<div id="updatePopup" class="card updatePopup">
+		<div class="row"><b>Update available</b> <span class="muted" id="updVer">—</span></div>
+		<div class="row muted" id="updInfo">Current: <code>{{.Version}}</code></div>
+		<div class="btns" style="margin-top:0">
+			<button type="button" id="updRemind">Remind later</button>
+			<button type="button" id="updSkip">Skip version</button>
+			<button type="button" class="primary" id="updApply">Update</button>
+		</div>
+		<pre id="updLog" style="display:none"></pre>
+	</div>
 	<script>
 		(function(){
+			var updPopup = document.getElementById('updatePopup');
+			var updVer = document.getElementById('updVer');
+			var updInfo = document.getElementById('updInfo');
+			var updLog = document.getElementById('updLog');
+			var updRemind = document.getElementById('updRemind');
+			var updSkip = document.getElementById('updSkip');
+			var updApply = document.getElementById('updApply');
+
+			function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+			async function postUpdate(path){
+				try { await fetch(path, {method:'POST'}); } catch (_) {}
+			}
+			async function fetchUpdateStatus(){
+				try {
+					var res = await fetch('/api/update/status', {cache:'no-store'});
+					if(!res.ok) return null;
+					return await res.json();
+				} catch (e) {
+					return null;
+				}
+			}
+			function setPopupVisible(v){
+				if(!updPopup) return;
+				updPopup.style.display = v ? '' : 'none';
+			}
+			function renderUpdate(st){
+				if(!st) return;
+				var show = !!st.showPopup || (st.job && st.job.state && st.job.state !== 'idle');
+				setPopupVisible(show);
+				if(!show) return;
+				if(updVer) updVer.textContent = st.availableVersion ? ('→ ' + st.availableVersion) : '';
+				if(updInfo){
+					var s = 'Current: {{.Version}}';
+					if(st.availableURL){ s += ' · ' + st.availableURL; }
+					if(st.job && st.job.state === 'running') s = 'Updating… please wait.';
+					if(st.job && st.job.state === 'success') s = 'Update complete. Restarting…';
+					if(st.job && st.job.state === 'failed') s = 'Update failed.';
+					updInfo.textContent = s;
+				}
+				if(updLog){
+					var log = (st.job && st.job.log) ? String(st.job.log) : '';
+					if(st.job && (st.job.state === 'failed' || st.job.state === 'success')){
+						updLog.style.display = '';
+						updLog.textContent = log || '(no log)';
+					} else {
+						updLog.style.display = 'none';
+						updLog.textContent = '';
+					}
+				}
+				var busy = st.job && st.job.state === 'running';
+				if(updApply) updApply.disabled = busy;
+				if(updRemind) updRemind.disabled = busy;
+				if(updSkip) updSkip.disabled = busy;
+			}
+			async function pollUpdateUntilDone(){
+				for(;;){
+					var st = await fetchUpdateStatus();
+					if(st){
+						renderUpdate(st);
+						if(st.job && st.job.state && st.job.state !== 'running') break;
+					}
+					await sleep(1500);
+				}
+				for (var i=0;i<90;i++){
+					var st2 = await fetchUpdateStatus();
+					if(st2){ location.reload(); return; }
+					await sleep(1000);
+				}
+			}
+
+			if (updRemind) updRemind.addEventListener('click', async function(){
+				await postUpdate('/api/update/remind');
+				setPopupVisible(false);
+			});
+			if (updSkip) updSkip.addEventListener('click', async function(){
+				await postUpdate('/api/update/skip');
+				setPopupVisible(false);
+			});
+			if (updApply) updApply.addEventListener('click', async function(){
+				await postUpdate('/api/update/apply');
+				pollUpdateUntilDone();
+			});
+
+			fetchUpdateStatus().then(renderUpdate);
+			setInterval(function(){ fetchUpdateStatus().then(renderUpdate); }, 30000);
+
 			function setPill(el, ok, text){
 				if(!el) return;
 				el.classList.remove('ok');
