@@ -331,6 +331,30 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(upd.Status())
 	})
+
+	// Process control: exits the whole agent process.
+	mux.HandleFunc("/api/process/restart", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}()
+	})
+	mux.HandleFunc("/api/process/exit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}()
+	})
 	mux.HandleFunc("/api/update/remind", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -560,6 +584,7 @@ const agentHomeHTML = `<!doctype html>
 		.small { font-size: 12px; opacity: .85; }
 		.updatePopup { position: fixed; right: 16px; bottom: 16px; max-width: 520px; width: calc(100% - 32px); z-index: 1000; display:none; }
 		.updatePopup pre { white-space: pre-wrap; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 220px; overflow:auto; }
+		.procPopup { position: fixed; right: 16px; bottom: 162px; max-width: 360px; width: calc(100% - 32px); z-index: 1000; }
 	</style>
 </head>
 <body>
@@ -631,8 +656,18 @@ const agentHomeHTML = `<!doctype html>
 		</div>
 		<pre id="updLog" style="display:none"></pre>
 	</div>
+	<div id="procPopup" class="card procPopup">
+		<div class="row"><b>Process</b> <span class="muted">(agent)</span></div>
+		<div class="btns" style="margin-top:0">
+			<button type="button" id="procRestart">Restart</button>
+			<button type="button" id="procExit">Exit</button>
+		</div>
+		<div class="muted" style="margin-top:8px">If running under systemd, it will restart automatically.</div>
+	</div>
 	<script>
 		(function(){
+			var procRestart = document.getElementById('procRestart');
+			var procExit = document.getElementById('procExit');
 			var updPopup = document.getElementById('updatePopup');
 			var updVer = document.getElementById('updVer');
 			var updInfo = document.getElementById('updInfo');
@@ -748,6 +783,14 @@ const agentHomeHTML = `<!doctype html>
 				} catch (_) {}
 				await pollOnce();
 			}
+			if (procRestart) procRestart.addEventListener('click', async function(){
+				await post('/api/process/restart');
+				setTimeout(function(){ location.reload(); }, 1000);
+			});
+			if (procExit) procExit.addEventListener('click', async function(){
+				await post('/api/process/exit');
+				setTimeout(function(){ location.reload(); }, 1000);
+			});
 
 			if (btnStart) btnStart.addEventListener('click', function(){ post('/start'); });
 			if (btnStop) btnStop.addEventListener('click', function(){ post('/stop'); });

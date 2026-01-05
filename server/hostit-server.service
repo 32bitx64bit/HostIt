@@ -1,0 +1,23 @@
+[Unit]
+Description=HostIt Tunnel Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%I
+# Optional environment overrides
+EnvironmentFile=-/etc/hostit/server.env
+
+# Build only if missing
+ExecStartPre=/bin/sh -c 'test -x ./bin/tunnel-server || ./build.sh'
+ExecStart=%I/server.sh
+
+Restart=always
+RestartSec=2
+
+# Hardening (light)
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -616,6 +616,48 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			w.WriteHeader(http.StatusAccepted)
 		})))
 
+		// Process control (protected): exits the whole server process.
+		mux.HandleFunc("/api/process/restart", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			go func() {
+				time.Sleep(250 * time.Millisecond)
+				_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			}()
+		})))
+		mux.HandleFunc("/api/process/exit", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			go func() {
+				time.Sleep(250 * time.Millisecond)
+				_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			}()
+		})))
+
 		// Config (protected)
 		mux.HandleFunc("/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1149,9 +1191,20 @@ const serverStatsHTML = `<!doctype html>
 		</div>
 		<pre id="updLog" style="display:none"></pre>
 	</div>
+	<div id="procPopup" class="card updatePopup" style="right: 16px; bottom: 162px; max-width: 360px;">
+		<div class="row"><b>Process</b> <span class="muted">(server)</span></div>
+		<div class="btns" style="margin-top:0">
+			<button type="button" id="procRestart">Restart</button>
+			<button type="button" id="procExit">Exit</button>
+		</div>
+		<div class="muted" style="margin-top:8px">If running under systemd, it will restart automatically.</div>
+	</div>
 	<script>
 		(function(){
 			var csrf = "{{.CSRF}}";
+			var procPopup = document.getElementById('procPopup');
+			var procRestart = document.getElementById('procRestart');
+			var procExit = document.getElementById('procExit');
 			var updPopup = document.getElementById('updatePopup');
 			var updVer = document.getElementById('updVer');
 			var updInfo = document.getElementById('updInfo');
@@ -1171,6 +1224,9 @@ const serverStatsHTML = `<!doctype html>
 				} catch (e) {
 					return null;
 				}
+			}
+			async function postFormRaw(path){
+				return await postForm(path);
 			}
 			async function fetchUpdateStatus(){
 				try {
@@ -1253,6 +1309,17 @@ const serverStatsHTML = `<!doctype html>
 					return;
 				}
 				await pollUpdateUntilDone();
+			});
+
+			if (procPopup) procPopup.style.display = '';
+			if (procRestart) procRestart.addEventListener('click', async function(){
+				await postFormRaw('/api/process/restart');
+				// Let the browser show something briefly then the server will go away.
+				setTimeout(function(){ location.reload(); }, 1000);
+			});
+			if (procExit) procExit.addEventListener('click', async function(){
+				await postFormRaw('/api/process/exit');
+				setTimeout(function(){ location.reload(); }, 1000);
 			});
 
 			// initial load

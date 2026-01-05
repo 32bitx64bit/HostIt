@@ -51,6 +51,31 @@ Then run
 
 5. Additional note, windows is considered experimental, and untested. Expect bugs!
 
+## Run in the background (daemon) on Linux
+
+If you launch the server/agent from an SSH session in the foreground, it will exit when the SSH session closes.
+Use systemd so it keeps running in the background and can auto-restart.
+
+### Server systemd service
+
+- Build once: `cd server && ./build.sh`
+- Install + start (requires sudo): `sudo sh ./server/install-service.sh`
+- Logs: `journalctl -u hostit-server@$(systemd-escape -p "$(pwd)/server").service -f`
+- Stop completely: `sudo systemctl stop hostit-server@$(systemd-escape -p "$(pwd)/server").service`
+
+### Agent systemd service
+
+- Build once: `cd client && ./build.sh`
+- Install + start (requires sudo): `sudo sh ./client/install-service.sh`
+- Logs: `journalctl -u hostit-agent@$(systemd-escape -p "$(pwd)/client").service -f`
+- Stop completely: `sudo systemctl stop hostit-agent@$(systemd-escape -p "$(pwd)/client").service`
+
+### Restart/exit from inside the app
+
+Both dashboards now include **Process → Restart / Exit**.
+- When running under systemd, clicking these will terminate the process and systemd will bring it back.
+- If not running under systemd, it will just exit.
+
 
 # Additional note 
 You CAN NOT connect via the server with your VPS IP if you're on the same NAT network, especially in games. Weird networking crap. Just connect locally.
