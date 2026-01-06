@@ -246,7 +246,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	updStatePath := filepath.Join(filepath.Dir(absCfg), "update_state_client.json")
 	moduleDir := detectModuleDir(absCfg)
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentClient, "client.zip", moduleDir, updStatePath)
-	upd.Preserve = absCfg
+	upd.PreservePaths = []string{absCfg}
 	upd.Restart = func() error {
 		ctrl.Stop()
 		bin := upd.BuiltBinaryPath()
@@ -741,6 +741,7 @@ const agentHomeHTML = `<!doctype html>
 			<button type="button" id="updSkip">Skip version</button>
 			<button type="button" class="primary" id="updApply">Update</button>
 		</div>
+		<pre id="updSteps" class="muted" style="display:none; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06);"></pre>
 		<pre id="updLog" style="display:none"></pre>
 	</div>
 	<div id="procPopup" class="card procPopup">
@@ -758,6 +759,7 @@ const agentHomeHTML = `<!doctype html>
 			var updPopup = document.getElementById('updatePopup');
 			var updVer = document.getElementById('updVer');
 			var updInfo = document.getElementById('updInfo');
+			var updSteps = document.getElementById('updSteps');
 			var updLog = document.getElementById('updLog');
 			var updRemind = document.getElementById('updRemind');
 			var updSkip = document.getElementById('updSkip');
@@ -780,6 +782,31 @@ const agentHomeHTML = `<!doctype html>
 				if(!updPopup) return;
 				updPopup.style.display = v ? '' : 'none';
 			}
+			function renderUpdateSteps(st){
+				if(!updSteps) return;
+				var running = !!(st && st.job && st.job.state === 'running');
+				var log = (st && st.job && st.job.log) ? String(st.job.log) : '';
+				if(!running){
+					updSteps.style.display = 'none';
+					updSteps.textContent = '';
+					return;
+				}
+				var has = function(re){ try { return re.test(log); } catch(e){ return false; } };
+				var s1 = has(/Downloading:/) && has(/Downloaded\s+\d+\s+bytes/);
+				var s2 = has(/Extracted source:/) && has(/Applying into:/);
+				var s3 = has(/Running build\.sh/);
+				var s4 = has(/Build succeeded/) || has(/Build failed/);
+				var s5 = !!(st && st.job && st.job.restarting);
+				var fmt = function(done, label){ return (done ? '[x] ' : '[ ] ') + label; };
+				updSteps.textContent = [
+					fmt(s1, 'Download release assets'),
+					fmt(s2, 'Apply files'),
+					fmt(s3, 'Build'),
+					fmt(s4, 'Build finished'),
+					fmt(s5, 'Restarting'),
+				].join('\n');
+				updSteps.style.display = '';
+			}
 			function renderUpdate(st){
 				if(!st) return;
 				var show = !!st.showPopup || (st.job && st.job.state && st.job.state !== 'idle');
@@ -789,14 +816,15 @@ const agentHomeHTML = `<!doctype html>
 				if(updInfo){
 					var s = 'Current: {{.Version}}';
 					if(st.availableURL){ s += ' · ' + st.availableURL; }
-					if(st.job && st.job.state === 'running') s = 'Updating… please wait.';
+					if(st.job && st.job.state === 'running') s = 'Updating…';
 					if(st.job && st.job.state === 'success') s = 'Update complete. Restarting…';
 					if(st.job && st.job.state === 'failed') s = 'Update failed.';
 					updInfo.textContent = s;
 				}
+				renderUpdateSteps(st);
 				if(updLog){
 					var log = (st.job && st.job.log) ? String(st.job.log) : '';
-					if(st.job && (st.job.state === 'failed' || st.job.state === 'success')){
+					if(st.job && (st.job.state === 'failed' || st.job.state === 'success' || st.job.state === 'running')){
 						updLog.style.display = '';
 						updLog.textContent = log || '(no log)';
 					} else {
@@ -816,11 +844,11 @@ const agentHomeHTML = `<!doctype html>
 						renderUpdate(st);
 						if(st.job && st.job.state && st.job.state !== 'running') break;
 					}
-					await sleep(1500);
+					await sleep(500);
 				}
 				for (var i=0;i<90;i++){
 					var st2 = await fetchUpdateStatus();
-					if(st2){ location.reload(); return; }
+					if(st2){ location.replace(location.pathname + '?r=' + Date.now()); return; }
 					await sleep(1000);
 				}
 			}
@@ -872,11 +900,11 @@ const agentHomeHTML = `<!doctype html>
 			}
 			if (procRestart) procRestart.addEventListener('click', async function(){
 				await post('/api/process/restart');
-				setTimeout(function(){ location.reload(); }, 1000);
+				setTimeout(function(){ location.replace(location.pathname + '?r=' + Date.now()); }, 1000);
 			});
 			if (procExit) procExit.addEventListener('click', async function(){
 				await post('/api/process/exit');
-				setTimeout(function(){ location.reload(); }, 1000);
+				setTimeout(function(){ location.replace(location.pathname + '?r=' + Date.now()); }, 1000);
 			});
 
 			if (btnStart) btnStart.addEventListener('click', function(){ post('/start'); });

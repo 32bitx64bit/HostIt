@@ -17,7 +17,8 @@ type ApplyOptions struct {
 	AssetURL       string
 	ModuleDir      string
 	ExpectedFolder string // "server" or "client"; empty means module root
-	PreservePath   string // absolute path to preserve (e.g. config file)
+	PreservePath   string   // legacy single absolute path to preserve (e.g. config file)
+	PreservePaths  []string // additional absolute paths to preserve (files or directories)
 	SharedDestDir  string // optional absolute path to shared module destination
 }
 
@@ -64,7 +65,7 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 			_, _ = fmt.Fprintf(logw, "Shared source not found in zip (continuing): %v\n", err)
 		} else {
 			_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDest)
-			if err := syncDir(sharedSrc, sharedDest, "", logw); err != nil {
+				if err := syncDir(sharedSrc, sharedDest, nil, logw); err != nil {
 				return err
 			}
 		}
@@ -73,7 +74,17 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 	_, _ = fmt.Fprintf(logw, "Extracted source: %s\n", srcRoot)
 	_, _ = fmt.Fprintf(logw, "Applying into: %s\n", moduleDir)
 
-	if err := syncDir(srcRoot, moduleDir, opts.PreservePath, logw); err != nil {
+	preserve := make([]string, 0, 1+len(opts.PreservePaths))
+	if strings.TrimSpace(opts.PreservePath) != "" {
+		preserve = append(preserve, opts.PreservePath)
+	}
+	for _, p := range opts.PreservePaths {
+		if strings.TrimSpace(p) != "" {
+			preserve = append(preserve, p)
+		}
+	}
+
+	if err := syncDir(srcRoot, moduleDir, preserve, logw); err != nil {
 		return err
 	}
 
@@ -124,7 +135,7 @@ func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir st
 
 	_, _ = fmt.Fprintf(logw, "Extracted shared: %s\n", sharedSrc)
 	_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDestDir)
-	return syncDir(sharedSrc, sharedDestDir, "", logw)
+	return syncDir(sharedSrc, sharedDestDir, nil, logw)
 }
 
 func pickSharedRoot(extractDir string) (string, error) {
@@ -280,13 +291,23 @@ func pickSourceRoot(extractDir string, expectedFolder string) (string, error) {
 	return "", errors.New("could not locate build.sh in extracted zip")
 }
 
-func syncDir(srcRoot string, dstRoot string, preserveAbs string, logw io.Writer) error {
-	preserveAbs = strings.TrimSpace(preserveAbs)
-	if preserveAbs != "" {
-		p, err := filepath.Abs(preserveAbs)
-		if err == nil {
-			preserveAbs = p
+func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.Writer) error {
+	preserveFiles := make(map[string]struct{})
+	preserveDirs := make([]string, 0)
+	for _, p := range preserveAbsList {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
 		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		if st, err := os.Stat(abs); err == nil && st.IsDir() {
+			preserveDirs = append(preserveDirs, filepath.Clean(abs)+string(os.PathSeparator))
+			continue
+		}
+		preserveFiles[filepath.Clean(abs)] = struct{}{}
 	}
 
 	skipPrefixes := []string{".git", "bin"}
@@ -316,9 +337,15 @@ func syncDir(srcRoot string, dstRoot string, preserveAbs string, logw io.Writer)
 		}
 
 		dstPath := filepath.Join(dstRoot, rel)
-		if preserveAbs != "" {
-			if abs, err := filepath.Abs(dstPath); err == nil && abs == preserveAbs {
+		if abs, err := filepath.Abs(dstPath); err == nil {
+			abs = filepath.Clean(abs)
+			if _, ok := preserveFiles[abs]; ok {
 				return nil
+			}
+			for _, dirPrefix := range preserveDirs {
+				if strings.HasPrefix(abs+string(os.PathSeparator), dirPrefix) {
+					return nil
+				}
 			}
 		}
 

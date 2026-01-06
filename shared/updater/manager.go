@@ -21,7 +21,9 @@ type Manager struct {
 	AssetName  string
 	ModuleDir  string
 	Store      *Store
-	Preserve   string
+	// Preserve is kept for backwards compatibility; prefer PreservePaths.
+	Preserve      string
+	PreservePaths []string
 	Now        func() time.Time
 	Restart    func() error
 	CheckEvery time.Duration
@@ -186,8 +188,7 @@ func (m *Manager) Apply(ctx context.Context) (bool, error) {
 }
 
 func (m *Manager) runApply(targetVersion string, assetURL string) {
-	var buf bytes.Buffer
-	logw := &limitedWriter{W: &buf, N: 1 << 20}
+	logw := newJobLogWriter(m, 1<<20, 500*time.Millisecond)
 
 	ctx := context.Background()
 	if err := m.CheckNow(ctx); err != nil {
@@ -225,11 +226,22 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 		expectedFolder = "client"
 	}
 
+	preserve := make([]string, 0, 1+len(m.PreservePaths))
+	if strings.TrimSpace(m.Preserve) != "" {
+		preserve = append(preserve, m.Preserve)
+	}
+	for _, p := range m.PreservePaths {
+		if strings.TrimSpace(p) != "" {
+			preserve = append(preserve, p)
+		}
+	}
+
 	err := ApplyZipUpdate(ctx, ApplyOptions{
 		AssetURL:       assetURL,
 		ModuleDir:      m.ModuleDir,
 		ExpectedFolder: expectedFolder,
 		PreservePath:   m.Preserve,
+		PreservePaths:  preserve,
 		SharedDestDir:  siblingSharedDir(m.ModuleDir),
 	}, logw)
 
@@ -239,14 +251,14 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 		m.st.Job.State = JobFailed
 		m.st.Job.EndedAtUnix = now
 		m.st.Job.LastError = err.Error()
-		m.st.Job.Log = buf.String()
+		m.st.Job.Log = logw.String()
 		_ = m.Store.Save(m.st)
 		m.mu.Unlock()
 		return
 	}
 	m.st.Job.State = JobSuccess
 	m.st.Job.EndedAtUnix = now
-	m.st.Job.Log = buf.String()
+	m.st.Job.Log = logw.String()
 	m.st.Job.LastError = ""
 	m.st.RemindUntilUnix = 0
 	m.st.SkipVersion = ""
@@ -269,6 +281,62 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 			m.mu.Unlock()
 		}
 	}
+}
+
+type jobLogWriter struct {
+	m *Manager
+
+	mu          sync.Mutex
+	buf         bytes.Buffer
+	remaining   int
+	minPersist  time.Duration
+	lastPersist time.Time
+}
+
+func newJobLogWriter(m *Manager, limitBytes int, minPersist time.Duration) *jobLogWriter {
+	if minPersist <= 0 {
+		minPersist = 500 * time.Millisecond
+	}
+	return &jobLogWriter{m: m, remaining: limitBytes, minPersist: minPersist}
+}
+
+func (w *jobLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Enforce an upper bound on log size while still returning len(p)
+	// so callers don't treat this as a write failure.
+	if w.remaining > 0 {
+		toWrite := p
+		if len(toWrite) > w.remaining {
+			toWrite = toWrite[:w.remaining]
+		}
+		_, _ = w.buf.Write(toWrite)
+		w.remaining -= len(toWrite)
+	}
+
+	now := time.Now()
+	if w.lastPersist.IsZero() || now.Sub(w.lastPersist) >= w.minPersist {
+		w.persistLocked(now)
+	}
+	return len(p), nil
+}
+
+func (w *jobLogWriter) persistLocked(now time.Time) {
+	// Avoid hammering disk; only persist while the job is running.
+	w.m.mu.Lock()
+	if w.m.st.Job.State == JobRunning {
+		w.m.st.Job.Log = w.buf.String()
+		_ = w.m.Store.Save(w.m.st)
+	}
+	w.m.mu.Unlock()
+	w.lastPersist = now
+}
+
+func (w *jobLogWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 func siblingSharedDir(moduleDir string) string {

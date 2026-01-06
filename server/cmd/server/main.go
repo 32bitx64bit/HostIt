@@ -175,7 +175,7 @@ func main() {
 				scheme = "https"
 			}
 			slog.Info(logging.CatDashboard, "web dashboard starting", serverlog.F("url", scheme+"://"+webAddr))
-			if err := serveServerDashboard(ctx, webAddr, configPath, runner, store, cookieSecure, sessionTTL); err != nil {
+			if err := serveServerDashboard(ctx, webAddr, configPath, authDBPath, runner, store, cookieSecure, sessionTTL); err != nil {
 				slog.Error(logging.CatDashboard, "web dashboard error", serverlog.F("error", err))
 			}
 		}()
@@ -272,7 +272,7 @@ const (
 	ctxUserID ctxKey = iota
 )
 
-func serveServerDashboard(ctx context.Context, addr string, configPath string, runner *serverRunner, store *auth.Store, cookieSecure bool, sessionTTL time.Duration) error {
+func serveServerDashboard(ctx context.Context, addr string, configPath string, authDBPath string, runner *serverRunner, store *auth.Store, cookieSecure bool, sessionTTL time.Duration) error {
 	tplStats := template.Must(template.New("stats").Parse(serverStatsHTML))
 	tplConfig := template.Must(template.New("config").Parse(serverConfigHTML))
 	tplControls := template.Must(template.New("controls").Parse(serverControlsHTML))
@@ -283,10 +283,14 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 	if p, err := filepath.Abs(configPath); err == nil {
 		absCfg = p
 	}
+	absAuthDB := authDBPath
+	if p, err := filepath.Abs(authDBPath); err == nil {
+		absAuthDB = p
+	}
 	updStatePath := filepath.Join(filepath.Dir(absCfg), "update_state_server.json")
 	moduleDir := detectModuleDir(absCfg)
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentServer, "server.zip", moduleDir, updStatePath)
-	upd.Preserve = absCfg
+	upd.PreservePaths = []string{absCfg, absAuthDB}
 	upd.Restart = func() error {
 		bin := upd.BuiltBinaryPath()
 		if _, err := os.Stat(bin); err != nil {
@@ -1299,6 +1303,7 @@ const serverStatsHTML = `<!doctype html>
 			<button type="button" id="updSkip">Skip version</button>
 			<button type="button" class="primary" id="updApply">Update</button>
 		</div>
+		<pre id="updSteps" class="muted" style="display:none; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06);"></pre>
 		<pre id="updLog" style="display:none"></pre>
 	</div>
 	<div id="procPopup" class="card updatePopup" style="right: 16px; bottom: 162px; max-width: 360px;">
@@ -1318,6 +1323,7 @@ const serverStatsHTML = `<!doctype html>
 			var updPopup = document.getElementById('updatePopup');
 			var updVer = document.getElementById('updVer');
 			var updInfo = document.getElementById('updInfo');
+			var updSteps = document.getElementById('updSteps');
 			var updLog = document.getElementById('updLog');
 			var updRemind = document.getElementById('updRemind');
 			var updSkip = document.getElementById('updSkip');
@@ -1351,6 +1357,31 @@ const serverStatsHTML = `<!doctype html>
 				if(!updPopup) return;
 				updPopup.style.display = v ? '' : 'none';
 			}
+			function renderUpdateSteps(st){
+				if(!updSteps) return;
+				var running = !!(st && st.job && st.job.state === 'running');
+				var log = (st && st.job && st.job.log) ? String(st.job.log) : '';
+				if(!running){
+					updSteps.style.display = 'none';
+					updSteps.textContent = '';
+					return;
+				}
+				var has = function(re){ try { return re.test(log); } catch(e){ return false; } };
+				var s1 = has(/Downloading:/) && has(/Downloaded\s+\d+\s+bytes/);
+				var s2 = has(/Extracted source:/) && has(/Applying into:/);
+				var s3 = has(/Running build\.sh/);
+				var s4 = has(/Build succeeded/) || has(/Build failed/);
+				var s5 = !!(st && st.job && st.job.restarting);
+				var fmt = function(done, label){ return (done ? '[x] ' : '[ ] ') + label; };
+				updSteps.textContent = [
+					fmt(s1, 'Download release assets'),
+					fmt(s2, 'Apply files'),
+					fmt(s3, 'Build'),
+					fmt(s4, 'Build finished'),
+					fmt(s5, 'Restarting'),
+				].join('\n');
+				updSteps.style.display = '';
+			}
 			function renderUpdate(st){
 				if(!st){
 					return;
@@ -1362,14 +1393,15 @@ const serverStatsHTML = `<!doctype html>
 				if(updInfo){
 					var s = 'Current: {{.Version}}';
 					if(st.availableURL){ s += ' · ' + st.availableURL; }
-					if(st.job && st.job.state === 'running') s = 'Updating… please wait.';
+					if(st.job && st.job.state === 'running') s = 'Updating…';
 					if(st.job && st.job.state === 'success') s = 'Update complete. Restarting…';
 					if(st.job && st.job.state === 'failed') s = 'Update failed.';
 					updInfo.textContent = s;
 				}
+				renderUpdateSteps(st);
 				if(updLog){
 					var log = (st.job && st.job.log) ? String(st.job.log) : '';
-					if(st.job && (st.job.state === 'failed' || st.job.state === 'success')){
+					if(st.job && (st.job.state === 'failed' || st.job.state === 'success' || st.job.state === 'running')){
 						updLog.style.display = '';
 						updLog.textContent = log || '(no log)';
 					} else {
@@ -1391,13 +1423,13 @@ const serverStatsHTML = `<!doctype html>
 							break;
 						}
 					}
-					await sleep(1500);
+					await sleep(500);
 				}
 				// If we successfully updated, the process may restart; wait until it comes back then reload.
 				for (var i=0;i<90;i++){
 					var st2 = await fetchUpdateStatus();
 					if(st2){
-						location.reload();
+						location.replace(location.pathname + '?r=' + Date.now());
 						return;
 					}
 					await sleep(1000);
@@ -1425,11 +1457,11 @@ const serverStatsHTML = `<!doctype html>
 			if (procRestart) procRestart.addEventListener('click', async function(){
 				await postFormRaw('/api/process/restart');
 				// Let the browser show something briefly then the server will go away.
-				setTimeout(function(){ location.reload(); }, 1000);
+				setTimeout(function(){ location.replace(location.pathname + '?r=' + Date.now()); }, 1000);
 			});
 			if (procExit) procExit.addEventListener('click', async function(){
 				await postFormRaw('/api/process/exit');
-				setTimeout(function(){ location.reload(); }, 1000);
+				setTimeout(function(){ location.replace(location.pathname + '?r=' + Date.now()); }, 1000);
 			});
 
 			// initial load
