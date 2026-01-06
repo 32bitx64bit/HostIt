@@ -62,5 +62,5 @@ func dialTCPData(ctx context.Context, cfg Config, addr string, noDelay bool, use
 		return nil, context.Canceled
 	}
 	defer releaseDataDialSlot()
-	return dialTCP(cfg, addr, noDelay, useTLS)
+	return dialTCP(ctx, cfg, addr, noDelay, useTLS)
 }

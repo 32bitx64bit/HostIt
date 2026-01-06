@@ -986,6 +986,11 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 	}
 
 	if !st.hasAgent() {
+		log.Warn(logging.CatPairing, "public connection rejected: no agent connected", logging.F(
+			"route", routeName,
+			"remote_ip", remoteIP,
+			"conn_id", id,
+		))
 		if st.dash != nil {
 			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "reject_no_agent", RemoteIP: remoteIP, ConnID: id})
 		}
@@ -1022,6 +1027,12 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		}
 	case <-timeout.C:
 		debugf("tunnel: pair timeout id=%s route=%s after=%s", id, routeName, st.cfg.PairTimeout)
+		log.Warn(logging.CatPairing, "pair timeout waiting for agent data connection", logging.F(
+			"route", routeName,
+			"remote_ip", remoteIP,
+			"conn_id", id,
+			"timeout", st.cfg.PairTimeout.String(),
+		))
 		st.pendingMu.Lock()
 		delete(st.pending, id)
 		st.pendingMu.Unlock()

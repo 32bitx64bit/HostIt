@@ -159,11 +159,26 @@ func TestServerMultiConn_PendingCleanupAndAgentRestart(t *testing.T) {
 
 	// Stop agent and start a fresh one to simulate agent restart.
 	agentCancel()
-	time.Sleep(150 * time.Millisecond)
+	// Wait for the server to observe the disconnect.
+	deadDisc := time.Now().Add(2 * time.Second)
+	for srv.Status().AgentConnected {
+		if time.Now().After(deadDisc) {
+			t.Fatalf("server did not observe agent disconnect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	agentCtx2, agentCancel2 := context.WithCancel(ctx)
 	defer agentCancel2()
 	go fakeAgent(agentCtx2, controlAddr, dataAddr, echoLn.Addr().String(), "testtoken")
+	// Wait for the server to observe the reconnect before starting the burst.
+	deadConn := time.Now().Add(2 * time.Second)
+	for !srv.Status().AgentConnected {
+		if time.Now().After(deadConn) {
+			t.Fatalf("server did not observe agent reconnect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	burst("b", 50)
 

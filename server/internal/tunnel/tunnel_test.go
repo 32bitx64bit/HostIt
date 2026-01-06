@@ -219,6 +219,11 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, tok
 		controlConn = c
 		break
 	}
+	// Ensure cancellation interrupts any blocking reads.
+	go func() {
+		<-ctx.Done()
+		_ = controlConn.Close()
+	}()
 	defer controlConn.Close()
 
 	rw := lineproto.New(controlConn, controlConn)

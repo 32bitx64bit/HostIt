@@ -117,7 +117,11 @@ func runOnce(ctx context.Context, cfg Config, hooks *Hooks) error {
 	dataAddrTLS := cfg.DataAddr()
 	var dataAddrInsecure string
 
-	controlConn, err := dialTCP(cfg, controlAddr, true, !cfg.DisableTLS)
+	// Bound the initial control connection dial so startup doesn't hang forever,
+	// but allow more time than the old fixed 2s to handle real-world latency.
+	controlDialCtx, controlDialCancel := context.WithTimeout(ctx, 8*time.Second)
+	defer controlDialCancel()
+	controlConn, err := dialTCP(controlDialCtx, cfg, controlAddr, true, !cfg.DisableTLS)
 	if err != nil {
 		if hooks != nil && hooks.OnError != nil {
 			hooks.OnError(err)
@@ -246,8 +250,19 @@ ready:
 	if cfg.DisableUDPEncryption {
 		udpSec.ForceNone()
 	}
-	log.Debugf(logging.CatUDP, "starting UDP handler (encryption=%v)", !cfg.DisableUDPEncryption)
-	go runUDP(udpCtx, dataAddrTLS, cfg.Token, udpSec, routesByName)
+	hasUDP := false
+	for _, rt := range routesByName {
+		if routeHasUDP(rt.Proto) {
+			hasUDP = true
+			break
+		}
+	}
+	if hasUDP {
+		log.Debugf(logging.CatUDP, "starting UDP handler (encryption=%v)", !cfg.DisableUDPEncryption)
+		go runUDP(udpCtx, dataAddrTLS, cfg.Token, udpSec, routesByName)
+	} else {
+		log.Debug(logging.CatUDP, "skipping UDP handler (no UDP routes)")
+	}
 	pools := startDataPools(onceCtx, cfg, routesByName, dataAddrTLS, dataAddrInsecure)
 
 	for {
@@ -313,15 +328,39 @@ func hostFromRemoteAddr(addr net.Addr) string {
 	return strings.TrimSpace(h)
 }
 
-func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, error) {
+func dialTCP(ctx context.Context, cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, error) {
 	// Keep dial/handshake bounded so a missing/blocked data listener can't stall
 	// until the server-side PairTimeout closes the public connection.
-	const dialTimeout = 2 * time.Second
-	const tlsHandshakeTimeout = 2 * time.Second
+	//
+	// Historically this used a fixed 2s timeout which is too aggressive on
+	// real-world networks (cold TLS handshakes + jitter). We instead honor the
+	// caller's context deadline, with conservative caps.
+	const defaultDialTimeout = 4 * time.Second
+	const defaultTLSHandshakeTimeout = 4 * time.Second
+
+	dialTimeout := defaultDialTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem > 0 && rem < dialTimeout {
+			dialTimeout = rem
+		}
+	}
+	if dialTimeout <= 0 {
+		return nil, context.DeadlineExceeded
+	}
+
+	tlsHandshakeTimeout := defaultTLSHandshakeTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem > 0 && rem < tlsHandshakeTimeout {
+			tlsHandshakeTimeout = rem
+		}
+	}
+	if tlsHandshakeTimeout <= 0 {
+		return nil, context.DeadlineExceeded
+	}
 
 	if !useTLS {
 		d := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
-		c, err := d.Dial("tcp", addr)
+		c, err := d.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}
@@ -351,7 +390,7 @@ func dialTCP(cfg Config, addr string, noDelay bool, useTLS bool) (net.Conn, erro
 		ClientSessionCache: globalTLSSessionCache,
 	}
 	d := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
-	raw, err := d.Dial("tcp", addr)
+	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -479,8 +518,16 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 					err      error
 					fromPool bool
 				)
-				// Per-dial timeout to avoid blocking too long on dial limiter
-				dialCtx, dialCancel := context.WithTimeout(ctx, 3*time.Second)
+				// Per-dial timeout: honor the remaining attach window so we don't
+				// burn the entire PairTimeout on one slow dial.
+				perDial := 4 * time.Second
+				if rem := time.Until(attachDeadline); rem > 0 && rem < perDial {
+					perDial = rem
+				}
+				if perDial < 500*time.Millisecond {
+					perDial = 500 * time.Millisecond
+				}
+				dialCtx, dialCancel := context.WithTimeout(ctx, perDial)
 				if attempt == 0 {
 					if p := pools[routeName]; p != nil && p.addr == cand.addr && p.useTLS == cand.useTLS {
 						fromPool = true
@@ -537,8 +584,32 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 		if lastErr != nil {
 			tracePairf("pair: attach failed id=%s route=%s attempts=%d elapsed=%v err=%v", id, routeName, dialAttempts, time.Since(attachStart), lastErr)
 			debugf("agent: attach failed id=%s route=%s attempts=%d elapsed=%v err=%v", id, routeName, dialAttempts, time.Since(attachStart), lastErr)
+
+			log.RateLimitedWarn(logging.CatPairing, "attach_failed:"+routeName,
+				"pairing attach failed (agent could not reach server data port)",
+				logging.F(
+					"id", id,
+					"route", routeName,
+					"attempts", dialAttempts,
+					"elapsed", time.Since(attachStart).String(),
+					"data_addr_tls", dataAddrTLS,
+					"data_addr_insecure", dataAddrInsecure,
+					"last_error", lastErr,
+				),
+			)
 		} else {
 			tracePairf("pair: attach failed id=%s route=%s attempts=%d elapsed=%v err=<nil>", id, routeName, dialAttempts, time.Since(attachStart))
+			log.RateLimitedWarn(logging.CatPairing, "attach_failed:"+routeName,
+				"pairing attach failed (agent could not reach server data port)",
+				logging.F(
+					"id", id,
+					"route", routeName,
+					"attempts", dialAttempts,
+					"elapsed", time.Since(attachStart).String(),
+					"data_addr_tls", dataAddrTLS,
+					"data_addr_insecure", dataAddrInsecure,
+				),
+			)
 		}
 		return
 	}
