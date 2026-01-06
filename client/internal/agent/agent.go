@@ -501,83 +501,73 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 		cands = append(cands, candidate{addr: dataAddrTLS, useTLS: true})
 	}
 	var dataConn net.Conn
-	// Server-side PairTimeout defaults to 10s. If we give up too quickly on transient
-	// dial/handshake failures, the server will log pair_timeout even though a retry
-	// would have succeeded.
-	attachDeadline := time.Now().Add(9 * time.Second)
+	// Server-side PairTimeout defaults to 15s. We need to connect back quickly.
+	// Use aggressive timeouts to maximize retry opportunities.
+	attachDeadline := time.Now().Add(14 * time.Second)
 	attachStart := time.Now()
-	backoff := 50 * time.Millisecond
 	var lastErr error
 	dialAttempts := 0
+
+	// First, try to get a pre-established connection from the pool (instant)
+	if p := pools[routeName]; p != nil && p.addr == cands[0].addr && p.useTLS == cands[0].useTLS {
+		if c := p.tryGet(); c != nil {
+			dialAttempts++
+			connMsg := []byte("CONN " + id + "\n")
+			_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err := c.Write(connMsg)
+			_ = c.SetWriteDeadline(time.Time{})
+			if err == nil {
+				tracePairf("pair: attach success (pool) id=%s route=%s elapsed=%v", id, routeName, time.Since(attachStart))
+				dataConn = c
+			} else {
+				lastErr = err
+				debugf("agent: pool CONN write failed id=%s route=%s err=%v", id, routeName, err)
+				_ = c.Close()
+			}
+		}
+	}
+
+	// If pool didn't work, dial fresh connections with shorter timeouts
 	for dataConn == nil && ctx.Err() == nil && time.Now().Before(attachDeadline) {
 		for _, cand := range cands {
-			for attempt := 0; attempt < 2; attempt++ {
-				dialAttempts++
-				var (
-					c        net.Conn
-					err      error
-					fromPool bool
-				)
-				// Per-dial timeout: honor the remaining attach window so we don't
-				// burn the entire PairTimeout on one slow dial.
-				perDial := 4 * time.Second
-				if rem := time.Until(attachDeadline); rem > 0 && rem < perDial {
-					perDial = rem
-				}
-				if perDial < 500*time.Millisecond {
-					perDial = 500 * time.Millisecond
-				}
-				dialCtx, dialCancel := context.WithTimeout(ctx, perDial)
-				if attempt == 0 {
-					if p := pools[routeName]; p != nil && p.addr == cand.addr && p.useTLS == cand.useTLS {
-						fromPool = true
-						c, err = p.getOrDial(dialCtx, cfg)
-					} else {
-						c, err = dialTCPData(dialCtx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
-					}
-				} else {
-					c, err = dialTCPData(dialCtx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
-				}
-				dialCancel()
-				if err != nil {
-					lastErr = err
-					debugf("agent: attach dial failed id=%s route=%s addr=%s tls=%v pool=%v attempt=%d err=%v", id, routeName, cand.addr, cand.useTLS, fromPool, dialAttempts, err)
-					continue
-				}
+			dialAttempts++
+			// Use shorter per-dial timeout (2s) to allow more retries within the window
+			perDial := 2 * time.Second
+			if rem := time.Until(attachDeadline); rem > 0 && rem < perDial {
+				perDial = rem
+			}
+			if perDial < 250*time.Millisecond {
+				break // Not enough time for a meaningful dial attempt
+			}
+			dialCtx, dialCancel := context.WithTimeout(ctx, perDial)
+			c, err := dialTCPData(dialCtx, cfg, cand.addr, rt.TCPNoDelay, cand.useTLS)
+			dialCancel()
+			if err != nil {
+				lastErr = err
+				debugf("agent: attach dial failed id=%s route=%s addr=%s tls=%v attempt=%d err=%v", id, routeName, cand.addr, cand.useTLS, dialAttempts, err)
+				continue
+			}
 
-				// Write CONN directly without buffering overhead
-				connMsg := []byte("CONN " + id + "\n")
-				_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-				_, err = c.Write(connMsg)
-				_ = c.SetWriteDeadline(time.Time{})
-				if err != nil {
-					lastErr = err
-					debugf("agent: attach CONN write failed id=%s route=%s addr=%s tls=%v pool=%v err=%v", id, routeName, cand.addr, cand.useTLS, fromPool, err)
-					_ = c.Close()
-					continue
-				}
-				dataConn = c
-				break
+			// Write CONN directly without buffering overhead
+			connMsg := []byte("CONN " + id + "\n")
+			_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err = c.Write(connMsg)
+			_ = c.SetWriteDeadline(time.Time{})
+			if err != nil {
+				lastErr = err
+				debugf("agent: attach CONN write failed id=%s route=%s addr=%s tls=%v err=%v", id, routeName, cand.addr, cand.useTLS, err)
+				_ = c.Close()
+				continue
 			}
-			if dataConn != nil {
-				break
-			}
+			dataConn = c
+			break
 		}
 		if dataConn != nil {
 			break
 		}
-		t := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			break
-		case <-t.C:
-		}
-		if backoff < 500*time.Millisecond {
-			backoff *= 2
-			if backoff > 500*time.Millisecond {
-				backoff = 500 * time.Millisecond
-			}
+		// Small delay between retry rounds to avoid hammering a temporarily unavailable server
+		if time.Until(attachDeadline) > 100*time.Millisecond {
+			time.Sleep(25 * time.Millisecond)
 		}
 	}
 	if dataConn == nil {

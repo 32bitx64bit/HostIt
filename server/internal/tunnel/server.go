@@ -63,7 +63,7 @@ func NewServer(cfg ServerConfig) *Server {
 	normalizeRoutes(&cfg)
 	_ = EnsureUDPKeys(&cfg, time.Now())
 	if cfg.PairTimeout == 0 {
-		cfg.PairTimeout = 10 * time.Second
+		cfg.PairTimeout = 15 * time.Second
 	}
 	st := &serverState{
 		cfg:           cfg,
@@ -389,7 +389,12 @@ func (st *serverState) agentWriteLinef(expectedConn net.Conn, format string, arg
 	if expectedConn != nil && conn != expectedConn {
 		return errors.New("agent changed")
 	}
-	return proto.WriteLinef(format, args...)
+	// Set a write deadline to prevent blocking indefinitely on slow/stalled connections.
+	// This ensures NEW commands don't pile up waiting behind a stuck write.
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err := proto.WriteLinef(format, args...)
+	_ = conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func debugEnabled() bool {
