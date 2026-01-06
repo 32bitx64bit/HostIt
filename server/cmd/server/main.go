@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -274,6 +275,7 @@ const (
 func serveServerDashboard(ctx context.Context, addr string, configPath string, runner *serverRunner, store *auth.Store, cookieSecure bool, sessionTTL time.Duration) error {
 	tplStats := template.Must(template.New("stats").Parse(serverStatsHTML))
 	tplConfig := template.Must(template.New("config").Parse(serverConfigHTML))
+	tplControls := template.Must(template.New("controls").Parse(serverControlsHTML))
 	tplLogin := template.Must(template.New("login").Parse(loginPageHTML))
 	tplSetup := template.Must(template.New("setup").Parse(setupPageHTML))
 
@@ -290,7 +292,23 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		if _, err := os.Stat(bin); err != nil {
 			return err
 		}
-		// Replace the current process so the restart is immediate.
+		// If we're running under systemd, restart the service (or exit and let systemd restart).
+		if runningUnderSystemd() {
+			if systemctlAvailable() {
+				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx2, "systemctl", "restart", "--no-block", "hostit-server.service")
+				out, err := cmd.CombinedOutput()
+				if err == nil {
+					return nil
+				}
+				// Fall back to SIGTERM; unit has Restart=always.
+				_ = out
+			}
+			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			return nil
+		}
+		// Non-systemd run: replace the current process so the restart is immediate.
 		return updater.ExecReplace(bin, os.Args[1:])
 	}
 	upd.Start(ctx)
@@ -545,6 +563,77 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 		_ = json.NewEncoder(w).Encode(resp)
 		})))
 
+		// Manual update check (protected)
+		mux.HandleFunc("/api/update/check-now", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			_ = upd.CheckNow(r.Context())
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(upd.Status())
+		})))
+
+		// systemd status + control (protected)
+		mux.HandleFunc("/api/systemd/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			st := systemdStatus(r.Context(), "hostit-server.service")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(st)
+		})))
+		mux.HandleFunc("/api/systemd/restart", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			if err := systemdAction(r.Context(), "restart", "hostit-server.service"); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})))
+		mux.HandleFunc("/api/systemd/stop", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			if err := systemdAction(r.Context(), "stop", "hostit-server.service"); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})))
+
 		// Update APIs (protected)
 		mux.HandleFunc("/api/update/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
@@ -718,6 +807,26 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, r
 			}(),
 		}
 		_ = tplConfig.Execute(w, data)
+		})))
+
+		// Controls (protected)
+		mux.HandleFunc("/controls", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			csrf := ensureCSRF(w, r, cookieSecure)
+			cfg, st, err := runner.Get()
+			data := map[string]any{
+				"Cfg":        cfg,
+				"Status":     st,
+				"ConfigPath": configPath,
+				"Msg":        getMsg(),
+				"Err":        err,
+				"CSRF":       csrf,
+				"Version":    version.Current,
+			}
+			_ = tplControls.Execute(w, data)
 		})))
 
 		mux.HandleFunc("/config/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1108,6 +1217,7 @@ const serverStatsHTML = `<!doctype html>
 				<div class="nav">
 					<a class="active" href="/">Stats</a>
 					<a href="/config">Config</a>
+					<a href="/controls">Controls</a>
 					<form method="post" action="/logout" style="display:inline; margin: 0">
 						<input type="hidden" name="csrf" value="{{.CSRF}}" />
 						<button type="submit">Logout</button>
@@ -1543,6 +1653,7 @@ const serverConfigHTML = `<!doctype html>
 				<div class="nav">
 					<a href="/">Stats</a>
 					<a class="active" href="/config">Config</a>
+					<a href="/controls">Controls</a>
 					<form method="post" action="/logout" style="display:inline; margin: 0">
 						<input type="hidden" name="csrf" value="{{.CSRF}}" />
 						<button type="submit">Logout</button>
@@ -1797,6 +1908,189 @@ const serverConfigHTML = `<!doctype html>
 </body>
 </html>`
 
+const serverControlsHTML = `<!doctype html>
+<html>
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Tunnel Server - Controls</title>
+	<style>
+		:root { color-scheme: light dark; }
+		body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; }
+		.wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 56px; }
+		.top { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+		h1 { margin: 0 0 8px; font-size: 22px; }
+		h2 { margin: 22px 0 10px; font-size: 16px; }
+		.muted { opacity: .8; }
+		.card { border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 14px; background: rgba(127,127,127,.06); }
+		.grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+		@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+		.row { margin-bottom: 10px; }
+		.btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
+		button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
+		button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
+		button[disabled] { opacity: .55; cursor: not-allowed; }
+		.pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
+		.ok { border-color: rgba(46, 160, 67, .55); background: rgba(46, 160, 67, .18); }
+		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
+		code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+		.flash { margin: 10px 0 0; }
+		.nav { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+		.nav a { text-decoration:none; padding: 6px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); }
+		.nav a.active { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
+		pre { white-space: pre-wrap; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 220px; overflow:auto; }
+	</style>
+</head>
+<body>
+	<div class="wrap">
+		<div class="top">
+			<div>
+				<h1>Tunnel Server</h1>
+				<div class="muted">Server Controls</div>
+			</div>
+			<div class="card">
+				<div class="nav">
+					<a href="/">Stats</a>
+					<a href="/config">Config</a>
+					<a class="active" href="/controls">Controls</a>
+					<form method="post" action="/logout" style="display:inline; margin: 0">
+						<input type="hidden" name="csrf" value="{{.CSRF}}" />
+						<button type="submit">Logout</button>
+					</form>
+				</div>
+				<div class="row"><b>Status:</b>
+					{{if .Status.AgentConnected}}<span class="pill ok">Agent connected</span>{{else}}<span class="pill bad">No agent</span>{{end}}
+				</div>
+				<div class="row"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
+				{{if .Err}}<div class="row"><b>Last server error:</b> <span class="muted">{{.Err}}</span></div>{{end}}
+			</div>
+		</div>
+
+		{{if .Msg}}<div class="flash pill ok">{{.Msg}}</div>{{end}}
+
+		<h2>Updates</h2>
+		<div class="card">
+			<div class="grid">
+				<div>
+					<div class="row"><b>Current version:</b> <code>{{.Version}}</code></div>
+					<div class="row"><b>Available version:</b> <code id="availableVersion">—</code></div>
+					<div class="btns">
+						<button id="checkNowBtn" type="button">Check for updates</button>
+						<button id="applyBtn" type="button" class="primary" disabled>Update</button>
+					</div>
+					<div class="row"><span class="muted" id="updateState">—</span></div>
+				</div>
+				<div>
+					<pre id="updateLog" style="display:none"></pre>
+				</div>
+			</div>
+		</div>
+
+		<h2>systemd</h2>
+		<div class="card">
+			<div class="row"><b>Service:</b> <code>hostit-server.service</code></div>
+			<div class="row"><b>State:</b> <code id="systemdState">—</code></div>
+			<div class="btns">
+				<button id="svcRestartBtn" type="button">Restart service</button>
+				<button id="svcStopBtn" type="button">Stop service</button>
+			</div>
+			<div class="row"><span class="muted" id="systemdMsg">—</span></div>
+		</div>
+	</div>
+
+	<script>
+		var csrf = {{printf "%q" .CSRF}};
+
+		function setUpdateStatus(st) {
+			if (!st) return;
+			var avail = document.getElementById('availableVersion');
+			var btn = document.getElementById('applyBtn');
+			var state = document.getElementById('updateState');
+			var log = document.getElementById('updateLog');
+			avail.textContent = st.latestVersion || '—';
+			btn.disabled = !st.updateAvailable;
+			state.textContent = st.updateAvailable ? 'Update available' : 'Up to date';
+			if (st.job && st.job.log) {
+				log.style.display = 'block';
+				log.textContent = st.job.log;
+			} else {
+				log.style.display = 'none';
+				log.textContent = '';
+			}
+		}
+
+		async function refreshUpdateStatus() {
+			var r = await fetch('/api/update/status', { method: 'GET', credentials: 'include' });
+			setUpdateStatus(await r.json());
+		}
+
+		async function checkNow() {
+			document.getElementById('updateState').textContent = 'Checking…';
+			var body = new URLSearchParams();
+			body.set('csrf', csrf);
+			var r = await fetch('/api/update/check-now', { method: 'POST', body: body, credentials: 'include', headers: { 'X-CSRF-Token': csrf } });
+			if (!r.ok) {
+				var t = '';
+				try { t = await r.text(); } catch (e) {}
+				document.getElementById('updateState').textContent = t ? ('Check failed: ' + t) : 'Check failed';
+				return;
+			}
+			setUpdateStatus(await r.json());
+		}
+
+		async function applyUpdate() {
+			document.getElementById('updateState').textContent = 'Starting update…';
+			var body = new URLSearchParams();
+			body.set('csrf', csrf);
+			var r = await fetch('/api/update/apply', { method: 'POST', body: body, credentials: 'include', headers: { 'X-CSRF-Token': csrf } });
+			if (!r.ok) {
+				var t = '';
+				try { t = await r.text(); } catch (e) {}
+				document.getElementById('updateState').textContent = t ? ('Update failed: ' + t) : 'Update failed to start';
+				return;
+			}
+			document.getElementById('updateState').textContent = 'Updating…';
+			await refreshUpdateStatus();
+		}
+
+		function setSystemdStatus(st) {
+			if (!st) return;
+			var msg = st.error ? st.error : '';
+			document.getElementById('systemdState').textContent = st.available ? (st.active || 'unknown') : 'unavailable';
+			document.getElementById('systemdMsg').textContent = msg || '—';
+		}
+
+		async function refreshSystemdStatus() {
+			var r = await fetch('/api/systemd/status', { method: 'GET', credentials: 'include' });
+			setSystemdStatus(await r.json());
+		}
+
+		async function systemdAction(path, progressText) {
+			document.getElementById('systemdMsg').textContent = progressText;
+			var body = new URLSearchParams();
+			body.set('csrf', csrf);
+			var r = await fetch(path, { method: 'POST', body: body, credentials: 'include', headers: { 'X-CSRF-Token': csrf } });
+			if (!r.ok) {
+				var t = '';
+				try { t = await r.text(); } catch (e) {}
+				document.getElementById('systemdMsg').textContent = t ? t : 'Action failed';
+				return;
+			}
+			document.getElementById('systemdMsg').textContent = 'OK';
+			await refreshSystemdStatus();
+		}
+
+		document.getElementById('checkNowBtn').addEventListener('click', function(){ checkNow(); });
+		document.getElementById('applyBtn').addEventListener('click', function(){ applyUpdate(); });
+		document.getElementById('svcRestartBtn').addEventListener('click', function(){ systemdAction('/api/systemd/restart', 'Restarting…'); });
+		document.getElementById('svcStopBtn').addEventListener('click', function(){ systemdAction('/api/systemd/stop', 'Stopping…'); });
+
+		refreshUpdateStatus();
+		refreshSystemdStatus();
+	</script>
+</body>
+</html>`
+
 const loginPageHTML = `<!doctype html>
 <html>
 <head>
@@ -2040,6 +2334,17 @@ func ensureCSRF(w http.ResponseWriter, r *http.Request, secure bool) string {
 
 func checkCSRF(r *http.Request) bool {
 	formTok := r.Form.Get("csrf")
+	if formTok == "" {
+		formTok = r.Header.Get("X-CSRF-Token")
+	}
+	formTok = strings.TrimSpace(formTok)
+	if len(formTok) >= 2 && formTok[0] == '"' && formTok[len(formTok)-1] == '"' {
+		if unq, err := strconv.Unquote(formTok); err == nil {
+			formTok = unq
+		} else {
+			formTok = strings.Trim(formTok, "\"")
+		}
+	}
 	c, err := r.Cookie("csrf")
 	if err != nil {
 		return false
@@ -2056,6 +2361,59 @@ func subtleEq(a, b string) bool {
 		v |= a[i] ^ b[i]
 	}
 	return v == 0
+}
+
+type systemdStatusResponse struct {
+	Available bool   `json:"available"`
+	Service   string `json:"service"`
+	Active    string `json:"active"`
+	Error     string `json:"error,omitempty"`
+}
+
+func systemctlAvailable() bool {
+	_, err := exec.LookPath("systemctl")
+	return err == nil
+}
+
+func systemdAction(ctx context.Context, action string, service string) error {
+	if !systemctlAvailable() {
+		return fmt.Errorf("systemctl not found")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", action, service)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("systemctl %s %s: %s", action, service, msg)
+	}
+	return nil
+}
+
+func systemdStatus(ctx context.Context, service string) systemdStatusResponse {
+	resp := systemdStatusResponse{Available: systemctlAvailable(), Service: service}
+	if !resp.Available {
+		resp.Active = "unknown"
+		return resp
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "is-active", service)
+	out, err := cmd.CombinedOutput()
+	resp.Active = strings.TrimSpace(string(out))
+	if resp.Active == "" {
+		resp.Active = "unknown"
+	}
+	if err != nil {
+		resp.Error = strings.TrimSpace(string(out))
+		if resp.Error == "" {
+			resp.Error = err.Error()
+		}
+	}
+	return resp
 }
 
 func setSessionCookie(w http.ResponseWriter, sid string, secure bool) {

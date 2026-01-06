@@ -9,7 +9,7 @@ WorkingDirectory=%I
 EnvironmentFile=-/etc/hostit/agent.env
 
 # Build only if missing
-ExecStartPre=/bin/sh -c 'test -x ./bin/tunnel-agent || ./build.sh'
+ExecStartPre=/bin/sh -c "test -x ./bin/tunnel-agent || (echo Missing ./bin/tunnel-agent. Run ./build.sh once as your user. >&2; exit 1)"
 ExecStart=%I/client.sh
 
 Restart=always

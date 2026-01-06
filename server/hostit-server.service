@@ -10,8 +10,9 @@ WorkingDirectory=%I
 EnvironmentFile=-/etc/hostit/server.env
 
 # Build only if missing
-ExecStartPre=/bin/sh -c 'test -x ./bin/tunnel-server || ./build.sh'
+ExecStartPre=/bin/sh -c "test -x ./bin/tunnel-server || (echo Missing ./bin/tunnel-server. Run ./build.sh once as your user. >&2; exit 1)"
 ExecStart=%I/server.sh
+
 
 Restart=always
 RestartSec=2

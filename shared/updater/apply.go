@@ -18,6 +18,7 @@ type ApplyOptions struct {
 	ModuleDir      string
 	ExpectedFolder string // "server" or "client"; empty means module root
 	PreservePath   string // absolute path to preserve (e.g. config file)
+	SharedDestDir  string // optional absolute path to shared module destination
 }
 
 func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) error {
@@ -53,6 +54,22 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 		return err
 	}
 
+	sharedDest := strings.TrimSpace(opts.SharedDestDir)
+	if sharedDest != "" {
+		if p, err := filepath.Abs(sharedDest); err == nil {
+			sharedDest = p
+		}
+		sharedSrc, err := pickSharedRoot(extractDir)
+		if err != nil {
+			_, _ = fmt.Fprintf(logw, "Shared source not found in zip (continuing): %v\n", err)
+		} else {
+			_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDest)
+			if err := syncDir(sharedSrc, sharedDest, "", logw); err != nil {
+				return err
+			}
+		}
+	}
+
 	_, _ = fmt.Fprintf(logw, "Extracted source: %s\n", srcRoot)
 	_, _ = fmt.Fprintf(logw, "Applying into: %s\n", moduleDir)
 
@@ -65,6 +82,94 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 	}
 
 	return nil
+}
+
+// ApplySharedZipUpdate downloads a zip asset that contains the shared module (shared/go.mod)
+// and syncs it into sharedDestDir. It does not run build scripts.
+func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir string, logw io.Writer) error {
+	if strings.TrimSpace(assetURL) == "" {
+		return errors.New("missing asset URL")
+	}
+	if strings.TrimSpace(sharedDestDir) == "" {
+		return errors.New("missing shared dest dir")
+	}
+	sharedDestDir, err := filepath.Abs(sharedDestDir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(sharedDestDir, 0o755); err != nil {
+		return err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "hostit-update-shared-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	zipPath := filepath.Join(tmpDir, "shared.zip")
+	if err := downloadToFile(ctx, assetURL, zipPath, logw); err != nil {
+		return err
+	}
+
+	extractDir := filepath.Join(tmpDir, "unzipped")
+	if err := unzip(zipPath, extractDir); err != nil {
+		return err
+	}
+
+	sharedSrc, err := pickSharedRoot(extractDir)
+	if err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(logw, "Extracted shared: %s\n", sharedSrc)
+	_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDestDir)
+	return syncDir(sharedSrc, sharedDestDir, "", logw)
+}
+
+func pickSharedRoot(extractDir string) (string, error) {
+	// Common case: zip includes top-level shared/go.mod.
+	cand := filepath.Join(extractDir, "shared")
+	if fi, err := os.Stat(cand); err == nil && fi.IsDir() {
+		if _, err := os.Stat(filepath.Join(cand, "go.mod")); err == nil {
+			return cand, nil
+		}
+	}
+
+	// Fallback: search a few levels deep for a directory named 'shared' containing go.mod.
+	// (Release zips sometimes wrap content in an extra top folder.)
+	best := ""
+	_ = filepath.WalkDir(extractDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(extractDir, path)
+		if err != nil {
+			return nil
+		}
+		depth := 0
+		if rel != "." {
+			depth = len(strings.Split(rel, string(os.PathSeparator)))
+		}
+		if depth > 4 {
+			return filepath.SkipDir
+		}
+		if filepath.Base(path) != "shared" {
+			return nil
+		}
+		if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+			best = path
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if best != "" {
+		return best, nil
+	}
+	return "", errors.New("could not locate shared/go.mod in extracted zip")
 }
 
 func downloadToFile(ctx context.Context, url string, dst string, logw io.Writer) error {

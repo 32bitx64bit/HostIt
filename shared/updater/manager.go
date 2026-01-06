@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -193,6 +194,29 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 		_, _ = fmt.Fprintf(logw, "Check error (continuing): %v\n", err)
 	}
 
+	// If the release includes a shared.zip asset, apply it into the sibling shared module
+	// before building the component.
+	sharedDest := siblingSharedDir(m.ModuleDir)
+	if strings.TrimSpace(sharedDest) != "" {
+		ctxShared, cancel := context.WithTimeout(ctx, 12*time.Second)
+		rel, err := fetchLatestStableRelease(ctxShared, m.Repo)
+		cancel()
+		if err != nil {
+			_, _ = fmt.Fprintf(logw, "Fetch release for shared.zip failed (continuing): %v\n", err)
+		} else {
+			sharedURL := findAssetURL(rel, "shared.zip")
+			if strings.TrimSpace(sharedURL) != "" {
+				_, _ = fmt.Fprintf(logw, "Applying shared.zip update...\n")
+				if err := ApplySharedZipUpdate(ctx, sharedURL, sharedDest, logw); err != nil {
+					_, _ = fmt.Fprintf(logw, "Shared update failed: %v\n", err)
+					// Don't hard-fail: allow component update to proceed; build may still succeed.
+				}
+			} else {
+				_, _ = fmt.Fprintf(logw, "No shared.zip asset found on release (continuing).\n")
+			}
+		}
+	}
+
 	expectedFolder := ""
 	switch m.Component {
 	case ComponentServer:
@@ -206,6 +230,7 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 		ModuleDir:      m.ModuleDir,
 		ExpectedFolder: expectedFolder,
 		PreservePath:   m.Preserve,
+		SharedDestDir:  siblingSharedDir(m.ModuleDir),
 	}, logw)
 
 	now := m.Now().Unix()
@@ -230,6 +255,10 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 	m.mu.Unlock()
 
 	if restart != nil {
+		m.mu.Lock()
+		m.st.Job.Restarting = true
+		_ = m.Store.Save(m.st)
+		m.mu.Unlock()
 		if err := restart(); err != nil {
 			m.mu.Lock()
 			m.st.Job.State = JobFailed
@@ -240,6 +269,24 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 			m.mu.Unlock()
 		}
 	}
+}
+
+func siblingSharedDir(moduleDir string) string {
+	moduleDir = strings.TrimSpace(moduleDir)
+	if moduleDir == "" {
+		return ""
+	}
+	parent := filepath.Dir(moduleDir)
+	if strings.TrimSpace(parent) == "" {
+		return ""
+	}
+	shared := filepath.Join(parent, "shared")
+	if fi, err := os.Stat(shared); err == nil && fi.IsDir() {
+		return shared
+	}
+	// If it doesn't exist yet, still return the intended path so the updater
+	// can create it when the release zip includes shared/.
+	return shared
 }
 
 type limitedWriter struct {
