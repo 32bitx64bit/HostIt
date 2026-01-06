@@ -74,12 +74,7 @@ func NewServer(cfg ServerConfig) *Server {
 		errLast:       make(map[string]time.Time),
 		udpStats:      udputil.NewSessionStats(1000, 5*time.Minute),
 	}
-	st.udpKeys = buildUDPKeySet(cfg)
-	st.newBatcher = &newCommandBatcher{
-		notify: make(chan struct{}, 1),
-		flush:  make(chan struct{}, 1),
-		st:     st,
-	}
+st.udpKeys = buildUDPKeySet(cfg)
 	return &Server{cfg: cfg, st: st}
 }
 
@@ -235,9 +230,6 @@ func (s *Server) Run(ctx context.Context) error {
 		st.publicUDP[x.name] = x.pc
 	}
 
-	// Start NEW command batcher
-	st.newBatcher.start(ctx)
-
 	// Start pending connection cleaner
 	go st.startPendingCleaner(ctx)
 
@@ -354,7 +346,6 @@ type serverState struct {
 	pending   map[string]pendingConn
 
 	// Parallelization structures
-	newBatcher    *newCommandBatcher
 	udpAgentJobs  chan udpJob
 	udpPublicJobs map[string]chan udpJob
 
@@ -371,85 +362,10 @@ type udpJob struct {
 	bufPtr *[]byte  // Pool buffer to return after processing (nil if data was copied)
 }
 
-type newCommandBatcher struct {
-	mu      sync.Mutex
-	pending []newCommand
-	notify  chan struct{}
-	flush   chan struct{}
-	st      *serverState
-}
-
-type newCommand struct {
-	id    string
-	route string
-}
-
 type pendingConn struct {
 	ch        chan net.Conn
 	routeName string
 	createdAt time.Time
-}
-
-func (b *newCommandBatcher) start(ctx context.Context) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-b.flush:
-				b.flushPending()
-			case <-b.notify:
-				// Flush immediately on first command - no artificial delay
-				b.flushPending()
-			}
-		}
-	}()
-}
-
-func (b *newCommandBatcher) add(id, route string) {
-	b.mu.Lock()
-	b.pending = append(b.pending, newCommand{id: id, route: route})
-	n := len(b.pending)
-	b.mu.Unlock()
-
-	if n >= 10 {
-		select {
-		case b.flush <- struct{}{}:
-		default:
-		}
-		return
-	}
-	if n == 1 {
-		select {
-		case b.notify <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (b *newCommandBatcher) flushPending() {
-	b.mu.Lock()
-	if len(b.pending) == 0 {
-		b.mu.Unlock()
-		return
-	}
-	batch := b.pending
-	b.pending = nil
-	b.mu.Unlock()
-
-	tracePairf("pair: flushing NEW batch size=%d", len(batch))
-
-	for _, cmd := range batch {
-		if err := b.st.agentWriteLinef(nil, "NEW %s %s", cmd.id, cmd.route); err != nil {
-			// This is high-signal: if NEW can't be delivered, pairing will always time out.
-			log.Error(logging.CatPairing, "NEW command write failed", logging.F(
-				"conn_id", cmd.id,
-				"route", cmd.route,
-				"error", err,
-			))
-			b.st.dashError(cmd.route, "error_new_send", "", cmd.id, err.Error())
-		}
-	}
 }
 
 func (st *serverState) hasAgent() bool {
@@ -1003,7 +919,23 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 	st.pendingMu.Unlock()
 	debugf("tunnel: NEW id=%s route=%s", id, routeName)
 
-	st.newBatcher.add(id, routeName)
+	// Send NEW command synchronously BEFORE starting the timeout.
+	// This ensures the agent receives the command immediately and the full
+	// PairTimeout is available for the agent to dial back.
+	if err := st.agentWriteLinef(nil, "NEW %s %s", id, routeName); err != nil {
+		log.Error(logging.CatPairing, "NEW command write failed", logging.F(
+			"conn_id", id,
+			"route", routeName,
+			"error", err,
+		))
+		st.dashError(routeName, "error_new_send", remoteIP, id, err.Error())
+		st.pendingMu.Lock()
+		delete(st.pending, id)
+		st.pendingMu.Unlock()
+		return
+	}
+	tracePairf("pair: sent NEW id=%s route=%s", id, routeName)
+
 	timeout := time.NewTimer(st.cfg.PairTimeout)
 	defer timeout.Stop()
 

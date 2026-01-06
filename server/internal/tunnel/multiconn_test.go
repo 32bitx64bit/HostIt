@@ -87,19 +87,16 @@ func TestServerMultiConn_PendingCleanupAndAgentRestart(t *testing.T) {
 	agentCtx, agentCancel := context.WithCancel(ctx)
 	go fakeAgent(agentCtx, controlAddr, dataAddr, echoLn.Addr().String(), "testtoken")
 
-	// Wait for readiness
+	// Wait for agent to connect before starting bursts
 	readyDeadline := time.Now().Add(2 * time.Second)
 	for {
 		if time.Now().After(readyDeadline) {
-			t.Fatalf("server never became ready")
+			t.Fatalf("agent never connected to server")
 		}
-		c, err := net.Dial("tcp", publicAddr)
-		if err != nil {
-			time.Sleep(25 * time.Millisecond)
-			continue
+		if srv.Status().AgentConnected {
+			break
 		}
-		_ = c.Close()
-		break
+		time.Sleep(25 * time.Millisecond)
 	}
 
 	burst := func(round string, clients int) {
