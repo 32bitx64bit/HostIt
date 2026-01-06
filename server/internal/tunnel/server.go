@@ -576,6 +576,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 			"remote_ip", remoteIP,
 			"error", err,
 		))
+		st.dashError(dashSystemRoute, "error_agent_hello_read", remoteIP, "", err.Error())
 		_ = rw.WriteLinef("ERR %s", "no hello")
 		_ = conn.Close()
 		return
@@ -587,6 +588,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 			"expected", "HELLO",
 			"got", cmd,
 		))
+		st.dashError(dashSystemRoute, "error_agent_bad_command", remoteIP, "", "expected HELLO, got "+cmd)
 		_ = rw.WriteLinef("ERR %s", "expected HELLO")
 		_ = conn.Close()
 		return
@@ -594,6 +596,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	expected := strings.TrimSpace(st.cfg.Token)
 	if expected == "" {
 		log.Error(logging.CatControl, "server token not configured")
+		st.dashError(dashSystemRoute, "error_server_no_token", remoteIP, "", "server token not configured")
 		_ = rw.WriteLinef("ERR %s", "server token not set")
 		_ = conn.Close()
 		return
@@ -602,37 +605,49 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 		log.Warn(logging.CatAuth, "agent authentication failed - bad token", logging.F(
 			"remote_ip", remoteIP,
 		))
+		st.dashError(dashSystemRoute, "error_agent_bad_token", remoteIP, "", "authentication failed")
 		_ = rw.WriteLinef("ERR %s", "bad token (agent token must match server token)")
 		_ = conn.Close()
 		return
 	}
 
+	// Check and close any existing agent connection BEFORE setting up the new one.
+	// We don't set agentConn until AFTER READY is sent to avoid a race condition
+	// where hasAgent() returns true but the agent isn't listening for NEW yet.
 	st.mu.Lock()
-	if st.agentConn != nil {
-		// Takeover: close the previous agent and accept the new one.
+	prevConn := st.agentConn
+	if prevConn != nil {
+		// Takeover: close the previous agent connection.
 		log.Info(logging.CatControl, "agent reconnected, closing previous connection", logging.F(
 			"remote_ip", remoteIP,
 		))
-		_ = st.agentConn.Close()
+		if st.dash != nil {
+			st.dash.addEvent(dashSystemRoute, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "agent_reconnect", RemoteIP: remoteIP, Detail: "closing previous connection"})
+		}
+		_ = prevConn.Close()
 		st.agentConn = nil
 		st.agentProto = nil
 		st.agentUDPAddr = nil
 		st.agentUDPKeyID = 0
 	}
-	st.agentConn = conn
-	st.agentProto = rw
 	st.mu.Unlock()
 
-	log.Info(logging.CatControl, "agent connected", logging.F(
-		"remote_ip", remoteIP,
-		"routes", len(st.cfg.Routes),
-	))
-
+	// Send all handshake messages BEFORE marking agent as connected.
+	// This prevents a race where handlePublicConn sees hasAgent()==true
+	// but the agent hasn't received READY and isn't listening for NEW yet.
 	insec := strings.TrimSpace(st.cfg.DataAddrInsecure)
 	if insec == "" {
 		insec = "-"
 	}
-	_ = st.agentWriteLinef(conn, "OK %s %s", st.cfg.DataAddr, insec)
+	// Write directly to conn since agentConn isn't set yet
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := rw.WriteLinef("OK %s %s", st.cfg.DataAddr, insec); err != nil {
+		_ = conn.SetWriteDeadline(time.Time{})
+		log.Error(logging.CatControl, "failed to send OK to agent", logging.F("error", err))
+		st.dashError(dashSystemRoute, "error_agent_send_ok", remoteIP, "", err.Error())
+		_ = conn.Close()
+		return
+	}
 	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
 	if st.cfg.DisableUDPEncryption {
 		mode = "none"
@@ -645,7 +660,13 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	if prevSalt == "" {
 		prevSalt = "-"
 	}
-	_ = st.agentWriteLinef(conn, "UDPSEC %s %d %s %d %s", mode, st.cfg.UDPKeyID, curSalt, st.cfg.UDPPrevKeyID, prevSalt)
+	if err := rw.WriteLinef("UDPSEC %s %d %s %d %s", mode, st.cfg.UDPKeyID, curSalt, st.cfg.UDPPrevKeyID, prevSalt); err != nil {
+		_ = conn.SetWriteDeadline(time.Time{})
+		log.Error(logging.CatControl, "failed to send UDPSEC to agent", logging.F("error", err))
+		st.dashError(dashSystemRoute, "error_agent_send_udpsec", remoteIP, "", err.Error())
+		_ = conn.Close()
+		return
+	}
 	for _, rt := range st.cfg.Routes {
 		noDelay := true
 		if rt.TCPNoDelay != nil {
@@ -667,14 +688,41 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 		if rt.Preconnect != nil {
 			pc = *rt.Preconnect
 		}
-		_ = st.agentWriteLinef(conn, "ROUTE %s %s %s nodelay=%d tls=%d preconnect=%d", rt.Name, rt.Proto, rt.PublicAddr, nd, tlsFlag, pc)
+		if err := rw.WriteLinef("ROUTE %s %s %s nodelay=%d tls=%d preconnect=%d", rt.Name, rt.Proto, rt.PublicAddr, nd, tlsFlag, pc); err != nil {
+			_ = conn.SetWriteDeadline(time.Time{})
+			log.Error(logging.CatControl, "failed to send ROUTE to agent", logging.F("route", rt.Name, "error", err))
+			st.dashError(dashSystemRoute, "error_agent_send_route", remoteIP, "", rt.Name+": "+err.Error())
+			_ = conn.Close()
+			return
+		}
 		log.Debug(logging.CatControl, "sent route to agent", logging.F(
 			"route", rt.Name,
 			"proto", rt.Proto,
 			"public_addr", rt.PublicAddr,
 		))
 	}
-	_ = st.agentWriteLinef(conn, "READY")
+	if err := rw.WriteLinef("READY"); err != nil {
+		_ = conn.SetWriteDeadline(time.Time{})
+		log.Error(logging.CatControl, "failed to send READY to agent", logging.F("error", err))
+		st.dashError(dashSystemRoute, "error_agent_send_ready", remoteIP, "", err.Error())
+		_ = conn.Close()
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	// NOW mark the agent as connected - after READY is sent and agent is listening
+	st.mu.Lock()
+	st.agentConn = conn
+	st.agentProto = rw
+	st.mu.Unlock()
+
+	log.Info(logging.CatControl, "agent connected and ready", logging.F(
+		"remote_ip", remoteIP,
+		"routes", len(st.cfg.Routes),
+	))
+	if st.dash != nil {
+		st.dash.addEvent(dashSystemRoute, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "agent_connected", RemoteIP: remoteIP, Detail: fmt.Sprintf("%d routes", len(st.cfg.Routes))})
+	}
 
 	// Heartbeat: server pings agent periodically; agent replies with PONG.
 	const pingEvery = 15 * time.Second
@@ -689,6 +737,7 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 			_ = conn.SetReadDeadline(time.Now().Add(deadAfter))
 			line, err := rw.ReadLine()
 			if err != nil {
+				st.dashError(dashSystemRoute, "agent_read_error", remoteIP, "", err.Error())
 				return
 			}
 			lastSeen.Store(time.Now().UnixNano())
@@ -716,11 +765,13 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 			case <-t.C:
 				ls := time.Unix(0, lastSeen.Load())
 				if time.Since(ls) > deadAfter {
+					st.dashError(dashSystemRoute, "agent_heartbeat_timeout", remoteIP, "", fmt.Sprintf("no response in %v", deadAfter))
 					st.clearAgent(conn)
 					_ = conn.Close()
 					return
 				}
 				if err := st.agentWriteLinef(conn, "PING %s", newID()); err != nil {
+					st.dashError(dashSystemRoute, "agent_ping_failed", remoteIP, "", err.Error())
 					st.clearAgent(conn)
 					_ = conn.Close()
 					return
@@ -731,7 +782,13 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 
 	select {
 	case <-ctx.Done():
+		if st.dash != nil {
+			st.dash.addEvent(dashSystemRoute, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "agent_disconnect", RemoteIP: remoteIP, Detail: "server shutdown"})
+		}
 	case <-done:
+		if st.dash != nil {
+			st.dash.addEvent(dashSystemRoute, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "agent_disconnect", RemoteIP: remoteIP, Detail: "connection closed"})
+		}
 	}
 	st.clearAgent(conn)
 	_ = conn.Close()
