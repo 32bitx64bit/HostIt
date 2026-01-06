@@ -22,6 +22,8 @@ Then run
    ```
 3. Open the dashboard (`http://<server-host>:7002`) to finish setup. First start shows the setup wizard, once finished the server has been setup.
 
+4. Optionally, run it as a service, via install-service.sh (Must be ran as sudo)
+
 ### Client
 
 #### Linux client
@@ -37,6 +39,7 @@ Then run
 
 4. Click "Save + restart agent", it should connect successfully to the server, unless something is misconfigured.
 
+5. Optionally run it as a service, via install-service.sh (must be ran as sudo)
 #### Windows client
 1. cd into the client dictory and run 
    ```powershell

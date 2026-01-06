@@ -360,6 +360,7 @@ func runBuild(ctx context.Context, moduleDir string, logw io.Writer) error {
 	cmd.Dir = moduleDir
 	cmd.Stdout = logw
 	cmd.Stderr = logw
+	cmd.Env = ensureGoBuildEnv(os.Environ(), moduleDir)
 	start := time.Now()
 	if err := cmd.Run(); err != nil {
 		_, _ = fmt.Fprintf(logw, "Build failed after %s\n", time.Since(start).Truncate(10*time.Millisecond))
@@ -367,4 +368,47 @@ func runBuild(ctx context.Context, moduleDir string, logw io.Writer) error {
 	}
 	_, _ = fmt.Fprintf(logw, "Build succeeded in %s\n", time.Since(start).Truncate(10*time.Millisecond))
 	return nil
+}
+
+func ensureGoBuildEnv(env []string, moduleDir string) []string {
+	get := func(key string) string {
+		prefix := key + "="
+		for i := len(env) - 1; i >= 0; i-- {
+			if strings.HasPrefix(env[i], prefix) {
+				return strings.TrimPrefix(env[i], prefix)
+			}
+		}
+		return ""
+	}
+	setIfMissing := func(key, val string) {
+		if strings.TrimSpace(val) == "" {
+			return
+		}
+		if strings.TrimSpace(get(key)) != "" {
+			return
+		}
+		env = append(env, key+"="+val)
+	}
+
+	home := strings.TrimSpace(get("HOME"))
+	if home == "" {
+		// systemd services often have HOME unset; Go 1.24+ needs a module cache.
+		// Use a writable fallback.
+		home = moduleDir
+	}
+	setIfMissing("HOME", home)
+
+	gopath := strings.TrimSpace(get("GOPATH"))
+	if gopath == "" {
+		gopath = filepath.Join(home, "go")
+	}
+	setIfMissing("GOPATH", gopath)
+
+	gomodcache := strings.TrimSpace(get("GOMODCACHE"))
+	if gomodcache == "" {
+		gomodcache = filepath.Join(gopath, "pkg", "mod")
+	}
+	setIfMissing("GOMODCACHE", gomodcache)
+
+	return env
 }
