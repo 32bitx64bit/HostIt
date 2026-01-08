@@ -67,5 +67,12 @@ type ServerConfig struct {
 	// UDPKeyCreatedUnix is when the current UDP key was generated (unix seconds).
 	UDPKeyCreatedUnix int64
 	PairTimeout       time.Duration
+	// MaxPendingConns limits the total number of pending connections waiting for agent
+	// attachment. This is a DoS protection measure. Default: 10000. Set to 0 to disable.
+	MaxPendingConns *int `json:",omitempty"`
+	// MaxPendingPerIP limits pending connections per source IP address.
+	// This prevents a single client from exhausting the pending connection pool.
+	// Default: 100. Set to 0 to disable.
+	MaxPendingPerIP *int `json:",omitempty"`
 	Routes            []RouteConfig
 }

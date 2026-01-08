@@ -36,9 +36,9 @@ var udpBufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
-// Maximum pending connections to prevent DoS
-const maxPendingConns = 10000
-const maxPendingPerIP = 100
+// Default limits for pending connections (used when config values are not set)
+const defaultMaxPendingConns = 10000
+const defaultMaxPendingPerIP = 100
 
 func tokensEqualCT(a, b string) bool {
 	a = strings.TrimSpace(a)
@@ -66,6 +66,15 @@ func NewServer(cfg ServerConfig) *Server {
 	_ = EnsureUDPKeys(&cfg, time.Now())
 	if cfg.PairTimeout == 0 {
 		cfg.PairTimeout = 15 * time.Second
+	}
+	// Apply default limits if not configured (nil means use default, 0 means no limit)
+	if cfg.MaxPendingConns == nil {
+		v := defaultMaxPendingConns
+		cfg.MaxPendingConns = &v
+	}
+	if cfg.MaxPendingPerIP == nil {
+		v := defaultMaxPendingPerIP
+		cfg.MaxPendingPerIP = &v
 	}
 	st := &serverState{
 		cfg:           cfg,
@@ -989,7 +998,10 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 	ch := make(chan net.Conn, 1)
 	st.pendingMu.Lock()
 	// DoS protection: limit total pending and per-IP pending connections
-	if len(st.pending) >= maxPendingConns {
+	// A config value of 0 means no limit (infinity)
+	maxConns := *st.cfg.MaxPendingConns
+	maxPerIP := *st.cfg.MaxPendingPerIP
+	if maxConns > 0 && len(st.pending) >= maxConns {
 		st.pendingMu.Unlock()
 		log.Warn(logging.CatPairing, "connection rejected: max pending connections reached", logging.F(
 			"route", routeName,
@@ -1000,7 +1012,7 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		}
 		return
 	}
-	if st.pendingByIP[remoteIP] >= maxPendingPerIP {
+	if maxPerIP > 0 && st.pendingByIP[remoteIP] >= maxPerIP {
 		st.pendingMu.Unlock()
 		log.Warn(logging.CatPairing, "connection rejected: max pending per IP reached", logging.F(
 			"route", routeName,
