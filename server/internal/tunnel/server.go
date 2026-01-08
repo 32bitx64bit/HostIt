@@ -2,12 +2,13 @@ package tunnel
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	mathrand "math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -35,8 +36,9 @@ var udpBufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
-var idSource = mathrand.NewSource(time.Now().UnixNano())
-var idMu sync.Mutex
+// Maximum pending connections to prevent DoS
+const maxPendingConns = 10000
+const maxPendingPerIP = 100
 
 func tokensEqualCT(a, b string) bool {
 	a = strings.TrimSpace(a)
@@ -68,6 +70,7 @@ func NewServer(cfg ServerConfig) *Server {
 	st := &serverState{
 		cfg:           cfg,
 		pending:       map[string]pendingConn{},
+		pendingByIP:   map[string]int{},
 		publicUDP:     map[string]net.PacketConn{},
 		dash:          newDashState(),
 		udpPublicJobs: make(map[string]chan udpJob),
@@ -342,8 +345,9 @@ type serverState struct {
 	udpData       net.PacketConn
 	publicUDP     map[string]net.PacketConn
 
-	pendingMu sync.Mutex
-	pending   map[string]pendingConn
+	pendingMu      sync.Mutex
+	pending        map[string]pendingConn
+	pendingByIP    map[string]int // track pending count per IP for DoS prevention
 
 	// Parallelization structures
 	udpAgentJobs  chan udpJob
@@ -366,6 +370,7 @@ type pendingConn struct {
 	ch        chan net.Conn
 	routeName string
 	createdAt time.Time
+	remoteIP  string // for DoS tracking
 }
 
 func (st *serverState) hasAgent() bool {
@@ -871,6 +876,12 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 	pend, ok := st.pending[id]
 	if ok {
 		delete(st.pending, id)
+		if pend.remoteIP != "" {
+			st.pendingByIP[pend.remoteIP]--
+			if st.pendingByIP[pend.remoteIP] <= 0 {
+				delete(st.pendingByIP, pend.remoteIP)
+			}
+		}
 	}
 	st.pendingMu.Unlock()
 	if !ok {
@@ -977,7 +988,31 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 
 	ch := make(chan net.Conn, 1)
 	st.pendingMu.Lock()
-	st.pending[id] = pendingConn{ch: ch, routeName: routeName, createdAt: start}
+	// DoS protection: limit total pending and per-IP pending connections
+	if len(st.pending) >= maxPendingConns {
+		st.pendingMu.Unlock()
+		log.Warn(logging.CatPairing, "connection rejected: max pending connections reached", logging.F(
+			"route", routeName,
+			"remote_ip", remoteIP,
+		))
+		if st.dash != nil {
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "reject_max_pending", RemoteIP: remoteIP, ConnID: id})
+		}
+		return
+	}
+	if st.pendingByIP[remoteIP] >= maxPendingPerIP {
+		st.pendingMu.Unlock()
+		log.Warn(logging.CatPairing, "connection rejected: max pending per IP reached", logging.F(
+			"route", routeName,
+			"remote_ip", remoteIP,
+		))
+		if st.dash != nil {
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "reject_rate_limit", RemoteIP: remoteIP, ConnID: id})
+		}
+		return
+	}
+	st.pending[id] = pendingConn{ch: ch, routeName: routeName, createdAt: start, remoteIP: remoteIP}
+	st.pendingByIP[remoteIP]++
 	st.pendingMu.Unlock()
 	debugf("tunnel: NEW id=%s route=%s", id, routeName)
 
@@ -993,6 +1028,10 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		st.dashError(routeName, "error_new_send", remoteIP, id, err.Error())
 		st.pendingMu.Lock()
 		delete(st.pending, id)
+		st.pendingByIP[remoteIP]--
+		if st.pendingByIP[remoteIP] <= 0 {
+			delete(st.pendingByIP, remoteIP)
+		}
 		st.pendingMu.Unlock()
 		return
 	}
@@ -1029,6 +1068,10 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		))
 		st.pendingMu.Lock()
 		delete(st.pending, id)
+		st.pendingByIP[remoteIP]--
+		if st.pendingByIP[remoteIP] <= 0 {
+			delete(st.pendingByIP, remoteIP)
+		}
 		st.pendingMu.Unlock()
 		if st.dash != nil {
 			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "pair_timeout", RemoteIP: remoteIP, ConnID: id, Detail: st.cfg.PairTimeout.String()})
@@ -1413,10 +1456,9 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 }
 
 func newID() string {
-	idMu.Lock()
-	v := idSource.Int63()
-	idMu.Unlock()
-	return fmt.Sprintf("%016x", v)
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 func setTCPKeepAlive(conn net.Conn, period time.Duration) {
@@ -1472,6 +1514,13 @@ func (st *serverState) cleanupOldPending(cutoff time.Time) {
 		}
 	}
 	for _, id := range toDelete {
+		pend := st.pending[id]
+		if pend.remoteIP != "" {
+			st.pendingByIP[pend.remoteIP]--
+			if st.pendingByIP[pend.remoteIP] <= 0 {
+				delete(st.pendingByIP, pend.remoteIP)
+			}
+		}
 		delete(st.pending, id)
 	}
 	st.pendingMu.Unlock()

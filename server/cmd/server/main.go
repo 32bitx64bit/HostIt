@@ -57,7 +57,7 @@ func main() {
 	flag.StringVar(&webAddr, "web", "127.0.0.1:7002", "web dashboard listen address (empty to disable)")
 	flag.StringVar(&configPath, "config", "server.json", "path to server config JSON")
 	flag.StringVar(&authDBPath, "auth-db", "auth.db", "sqlite auth db path")
-	flag.BoolVar(&cookieSecure, "cookie-secure", false, "set Secure on cookies (recommended behind HTTPS)")
+	flag.BoolVar(&cookieSecure, "cookie-secure", true, "set Secure on cookies (enabled by default since dashboard uses HTTPS)")
 	flag.DurationVar(&sessionTTL, "session-ttl", 7*24*time.Hour, "session lifetime")
 	flag.Parse()
 
@@ -120,6 +120,35 @@ func main() {
 		}
 		_ = configio.Save(configPath, cfg)
 		slog.Info(logging.CatEncryption, "tunnel TLS enabled", serverlog.F("cert_sha256", fp))
+	}
+
+	// Enable WebHTTPS by default for new configurations and generate dashboard TLS cert
+	cfgDir := filepath.Dir(configPath)
+	if !cfg.WebHTTPS {
+		// Check if this is a fresh config (no dashboard cert exists yet) - enable HTTPS by default
+		webCert := strings.TrimSpace(cfg.WebTLSCertFile)
+		if webCert == "" {
+			webCert = filepath.Join(cfgDir, "web.crt")
+		}
+		if _, err := os.Stat(webCert); os.IsNotExist(err) {
+			cfg.WebHTTPS = true
+			slog.Info(logging.CatSystem, "enabling WebHTTPS by default for new installation")
+		}
+	}
+	if cfg.WebHTTPS {
+		if strings.TrimSpace(cfg.WebTLSCertFile) == "" {
+			cfg.WebTLSCertFile = filepath.Join(cfgDir, "web.crt")
+		}
+		if strings.TrimSpace(cfg.WebTLSKeyFile) == "" {
+			cfg.WebTLSKeyFile = filepath.Join(cfgDir, "web.key")
+		}
+		fp, err := tlsutil.EnsureSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
+		if err != nil {
+			slog.Error(logging.CatSystem, "dashboard TLS setup failed", serverlog.F("error", err))
+		} else {
+			_ = configio.Save(configPath, cfg)
+			slog.Info(logging.CatEncryption, "dashboard HTTPS enabled", serverlog.F("cert_sha256", fp))
+		}
 	}
 
 	runner := newServerRunner(ctx, cfg)
@@ -2317,8 +2346,17 @@ func clientIP(r *http.Request) string {
 	return strings.TrimSpace(r.RemoteAddr)
 }
 
+// Rate limiter for auth session lookups (prevents session brute-forcing)
+var authSessionLimiter = newIPRateLimiter(60, 1*time.Minute) // 60 requests per minute per IP
+
 func requireAuth(store *auth.Store, cookieSecure bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Rate limit session validation attempts
+		if !authSessionLimiter.Allow(clientIP(r)) {
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+
 		hasUsers, err := store.HasAnyUsers(r.Context())
 		if err != nil {
 			http.Error(w, "auth db error", http.StatusInternalServerError)

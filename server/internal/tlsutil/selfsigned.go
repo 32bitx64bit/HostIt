@@ -106,7 +106,7 @@ func writeSelfSigned(certFile, keyFile string, commonName string) (fingerprintHe
 			Organization: []string{"hostit"},
 		},
 		NotBefore:             now.Add(-1 * time.Hour),
-		NotAfter:              now.Add(3650 * 24 * time.Hour),
+		NotAfter:              now.Add(730 * 24 * time.Hour), // 2 years for security
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
