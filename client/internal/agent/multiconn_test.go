@@ -227,6 +227,12 @@ func (s *fakeDataServer) handleConn(c net.Conn) {
 		return
 	}
 
+	// Send PAIRED acknowledgment (matches real server protocol).
+	if _, err := io.WriteString(c, "PAIRED\n"); err != nil {
+		s.resCh <- err
+		return
+	}
+
 	if _, err := c.Write(payload); err != nil {
 		s.resCh <- err
 		return

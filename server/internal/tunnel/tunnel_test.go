@@ -261,6 +261,12 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, tok
 			drw := lineproto.New(dataConn, dataConn)
 			_ = drw.WriteLinef("CONN %s", id)
 
+			// Read PAIRED acknowledgment byte-by-byte to avoid buffering
+			// application data that follows.
+			if err := readPairedAckRaw(dataConn, 3*time.Second); err != nil {
+				return
+			}
+
 			localConn, err := net.Dial("tcp", localAddr)
 			if err != nil {
 				return
@@ -270,4 +276,28 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, tok
 			bidirPipe(localConn, dataConn)
 		}()
 	}
+}
+
+// readPairedAckRaw reads the "PAIRED\n" acknowledgment one byte at a time
+// so it doesn't over-buffer application data from the socket.
+func readPairedAckRaw(c net.Conn, timeout time.Duration) error {
+	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
+	var buf [32]byte
+	i := 0
+	for i < len(buf) {
+		_, err := c.Read(buf[i : i+1])
+		if err != nil {
+			return err
+		}
+		if buf[i] == '\n' {
+			line := strings.TrimSpace(string(buf[:i]))
+			if line == "PAIRED" {
+				return nil
+			}
+			return fmt.Errorf("unexpected ack: %q", line)
+		}
+		i++
+	}
+	return fmt.Errorf("ack too long")
 }

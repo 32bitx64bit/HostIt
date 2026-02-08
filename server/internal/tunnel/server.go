@@ -739,8 +739,11 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	}
 
 	// Heartbeat: server pings agent periodically; agent replies with PONG.
+	// A shorter deadAfter reduces the window where the server thinks an agent is
+	// connected but it's actually gone — during that window every NEW command is
+	// doomed to time out.
 	const pingEvery = 15 * time.Second
-	const deadAfter = 60 * time.Second
+	const deadAfter = 30 * time.Second
 	lastSeen := atomic.Int64{}
 	lastSeen.Store(time.Now().UnixNano())
 
@@ -810,17 +813,47 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 
 func (st *serverState) clearAgent(conn net.Conn) {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	if st.agentConn == nil {
+		st.mu.Unlock()
 		return
 	}
-	if conn == nil || st.agentConn == conn {
-		_ = st.agentConn.Close()
-		st.agentConn = nil
-		st.agentProto = nil
-		st.agentUDPAddr = nil
-		st.agentUDPKeyID = 0
+	if conn != nil && st.agentConn != conn {
+		st.mu.Unlock()
+		return
 	}
+	_ = st.agentConn.Close()
+	st.agentConn = nil
+	st.agentProto = nil
+	st.agentUDPAddr = nil
+	st.agentUDPKeyID = 0
+	st.mu.Unlock()
+
+	// Drain all pending connections immediately so public clients get rejected
+	// right away instead of waiting for PairTimeout. Without this, when the
+	// agent drops, every in-flight public connection hangs until the 15s pair
+	// timeout before getting rejected.
+	st.drainAllPending()
+}
+
+// drainAllPending rejects every outstanding pending pairing. Called when the
+// agent disconnects so public connections fail fast instead of timing out.
+func (st *serverState) drainAllPending() {
+	st.pendingMu.Lock()
+	for id, pend := range st.pending {
+		// Send nil to signal handlePublicConn that the pairing is dead.
+		select {
+		case pend.ch <- nil:
+		default:
+		}
+		if pend.remoteIP != "" {
+			st.pendingByIP[pend.remoteIP]--
+			if st.pendingByIP[pend.remoteIP] <= 0 {
+				delete(st.pendingByIP, pend.remoteIP)
+			}
+		}
+		delete(st.pending, id)
+	}
+	st.pendingMu.Unlock()
 }
 
 func (st *serverState) acceptData(ctx context.Context, ln net.Listener) error {
@@ -907,6 +940,21 @@ func (st *serverState) handleDataConn(conn net.Conn) {
 	if st.routeTCPNoDelay(pend.routeName) {
 		setTCPNoDelay(conn, true)
 		setTCPQuickACK(conn, true)
+	}
+
+	// Send PAIRED acknowledgment to the agent before forwarding the connection.
+	// This confirms to the agent that the CONN was matched successfully.
+	// Without this, the agent has no way to know whether its CONN write reached
+	// a live server — a stale/dead pool connection would silently fail, leading
+	// to the "sometimes it just doesn't work" pairing failures.
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err = conn.Write([]byte("PAIRED\n"))
+	_ = conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		tracePairf("pair: PAIRED write failed id=%s from=%v err=%v", id, conn.RemoteAddr(), err)
+		st.dashError(dashSystemRoute, "error_paired_write", hostFromAddr(conn.RemoteAddr()), id, err.Error())
+		_ = conn.Close()
+		return
 	}
 
 	select {
@@ -1085,6 +1133,16 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 			delete(st.pendingByIP, remoteIP)
 		}
 		st.pendingMu.Unlock()
+		// Drain any late-arriving matched connection to prevent leaks.
+		// This can happen if handleDataConn matched and sent PAIRED just as
+		// the timeout fired.
+		select {
+		case late := <-ch:
+			if late != nil {
+				_ = late.Close()
+			}
+		default:
+		}
 		if st.dash != nil {
 			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "pair_timeout", RemoteIP: remoteIP, ConnID: id, Detail: st.cfg.PairTimeout.String()})
 		}
@@ -1522,7 +1580,12 @@ func (st *serverState) cleanupOldPending(cutoff time.Time) {
 	for id, pend := range st.pending {
 		if pend.createdAt.Before(cutoff) {
 			toDelete = append(toDelete, id)
-			close(pend.ch)
+			// Send nil to signal rejection rather than close(), which could
+			// race with handleDataConn's send and panic.
+			select {
+			case pend.ch <- nil:
+			default:
+			}
 		}
 	}
 	for _, id := range toDelete {

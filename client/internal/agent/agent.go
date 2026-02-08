@@ -107,6 +107,65 @@ func tracePairf(format string, args ...any) {
 	log.Debugf(logging.CatPairing, format, args...)
 }
 
+// readPairedAck reads the PAIRED acknowledgment from the server on a data
+// connection after the agent sends CONN. Returns the (possibly wrapped)
+// connection to use for subsequent I/O — if any bytes beyond "PAIRED\n" were
+// consumed by the read, they are prepended to future reads via a wrapper.
+func readPairedAck(c net.Conn, timeout time.Duration) (net.Conn, error) {
+	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
+
+	var buf [64]byte
+	total := 0
+	for total < len(buf) {
+		n, err := c.Read(buf[total:])
+		total += n
+		// Check for newline in what we've read so far
+		for j := 0; j < total; j++ {
+			if buf[j] == '\n' {
+				line := strings.TrimSpace(string(buf[:j]))
+				if line == "PAIRED" {
+					// Handle over-read: if TCP coalesced PAIRED\n with
+					// subsequent application data, wrap the connection so
+					// the extra bytes are returned by future reads.
+					if j+1 < total {
+						leftover := make([]byte, total-j-1)
+						copy(leftover, buf[j+1:total])
+						return &prefixedConn{Conn: c, prefix: leftover}, nil
+					}
+					return c, nil
+				}
+				return c, fmt.Errorf("unexpected pair ack: %q", line)
+			}
+		}
+		if err != nil {
+			if total > 0 {
+				return c, fmt.Errorf("reading pair ack (partial=%q): %w", string(buf[:total]), err)
+			}
+			return c, fmt.Errorf("reading pair ack: %w", err)
+		}
+	}
+	return c, fmt.Errorf("pair ack too long (%d bytes, no newline)", total)
+}
+
+// prefixedConn wraps a net.Conn and prepends leftover bytes to the read stream.
+// This handles the case where readPairedAck consumed bytes beyond "PAIRED\n"
+// due to TCP coalescing.
+type prefixedConn struct {
+	net.Conn
+	prefix []byte
+	off    int
+}
+
+func (c *prefixedConn) Read(b []byte) (int, error) {
+	if c.off < len(c.prefix) {
+		n := copy(b, c.prefix[c.off:])
+		c.off += n
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
 func runOnce(ctx context.Context, cfg Config, hooks *Hooks) error {
 	if strings.TrimSpace(cfg.Token) == "" {
 		return fmt.Errorf("token is required")
@@ -271,7 +330,7 @@ ready:
 			return nil
 		default:
 		}
-		_ = controlConn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		_ = controlConn.SetReadDeadline(time.Now().Add(45 * time.Second))
 		line, err := rw.ReadLine()
 		if err != nil {
 			log.Warnf(logging.CatControl, "control connection lost: %v", err)
@@ -517,8 +576,18 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 			_, err := c.Write(connMsg)
 			_ = c.SetWriteDeadline(time.Time{})
 			if err == nil {
-				tracePairf("pair: attach success (pool) id=%s route=%s elapsed=%v", id, routeName, time.Since(attachStart))
-				dataConn = c
+				// Wait for server PAIRED acknowledgment to confirm the match.
+				// Without this, a stale pool connection silently drops the CONN
+				// and the pairing just never works.
+				wrapped, ackErr := readPairedAck(c, 3*time.Second)
+				if ackErr == nil {
+					tracePairf("pair: attach success (pool) id=%s route=%s elapsed=%v", id, routeName, time.Since(attachStart))
+					dataConn = wrapped
+				} else {
+					lastErr = ackErr
+					debugf("agent: pool PAIRED ack failed id=%s route=%s err=%v", id, routeName, ackErr)
+					_ = c.Close()
+				}
 			} else {
 				lastErr = err
 				debugf("agent: pool CONN write failed id=%s route=%s err=%v", id, routeName, err)
@@ -559,7 +628,15 @@ func handleOne(ctx context.Context, cfg Config, dataAddrTLS string, dataAddrInse
 				_ = c.Close()
 				continue
 			}
-			dataConn = c
+			// Wait for server PAIRED acknowledgment to confirm the match.
+			wrapped, ackErr := readPairedAck(c, 3*time.Second)
+			if ackErr != nil {
+				lastErr = ackErr
+				debugf("agent: attach PAIRED ack failed id=%s route=%s addr=%s tls=%v err=%v", id, routeName, cand.addr, cand.useTLS, ackErr)
+				_ = c.Close()
+				continue
+			}
+			dataConn = wrapped
 			break
 		}
 		if dataConn != nil {
