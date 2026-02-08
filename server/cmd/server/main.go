@@ -580,6 +580,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		}
 		resp := map[string]any{
 			"nowUnix":        snap.NowUnix,
+			"bucketSec":      snap.BucketSec,
 			"agentConnected": snap.AgentConnected,
 			"activeClients":  snap.ActiveClients,
 			"bytesTotal":     snap.BytesTotal,
@@ -850,14 +851,19 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
 			cfg, st, err := runner.Get()
+			dashInterval := cfg.DashboardInterval
+			if dashInterval <= 0 {
+				dashInterval = 30 * time.Second
+			}
 			data := map[string]any{
-				"Cfg":        cfg,
-				"Status":     st,
-				"ConfigPath": configPath,
-				"Msg":        getMsg(),
-				"Err":        err,
-				"CSRF":       csrf,
-				"Version":    version.Current,
+				"Cfg":          cfg,
+				"Status":       st,
+				"ConfigPath":   configPath,
+				"Msg":          getMsg(),
+				"Err":          err,
+				"CSRF":         csrf,
+				"Version":      version.Current,
+				"DashInterval": dashInterval.String(),
 			}
 			_ = tplControls.Execute(w, data)
 		})))
@@ -1006,6 +1012,43 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		}
 		http.Redirect(w, r, "/config", http.StatusSeeOther)
 	})))
+
+		// Dashboard interval update (protected)
+		mux.HandleFunc("/api/dashboard/interval", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			dur, err := time.ParseDuration(r.Form.Get("interval"))
+			if err != nil {
+				http.Error(w, "invalid interval: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if dur < 5*time.Second {
+				dur = 5 * time.Second
+			}
+			if dur > 10*time.Minute {
+				dur = 10 * time.Minute
+			}
+			cfg, _, _ := runner.Get()
+			cfg.DashboardInterval = dur
+			if err := configio.Save(configPath, cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			runner.Restart(cfg)
+			setMsg(fmt.Sprintf("Dashboard interval set to %s — restarted", dur))
+			http.Redirect(w, r, "/controls", http.StatusSeeOther)
+		})))
 
 		// Back-compat: old save endpoint
 		mux.HandleFunc("/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1207,635 +1250,711 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 }
 
 const serverStatsHTML = `<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Tunnel Server</title>
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; }
-		.wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 56px; }
-    .top { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-    h1 { margin: 0 0 8px; font-size: 22px; }
-    h2 { margin: 22px 0 10px; font-size: 16px; }
-    .muted { opacity: .8; }
-    .card { border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 14px; background: rgba(127,127,127,.06); }
-    .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
-    .row { margin-bottom: 10px; }
-    .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
-    button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
-    button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-    .pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
-    .ok { border-color: rgba(46, 160, 67, .55); background: rgba(46, 160, 67, .18); }
-    .bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
-    .flash { margin: 10px 0 0; }
-		.nav { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-		.nav a { text-decoration:none; padding: 6px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); }
-		.nav a.active { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		.updatePopup { position: fixed; right: 16px; bottom: 16px; max-width: 520px; width: calc(100% - 32px); z-index: 1000; display:none; }
-		.updatePopup pre { white-space: pre-wrap; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 220px; overflow:auto; }
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --bg: #0f1117; --bg2: #181b25; --bg3: #1e2230;
+      --surface: rgba(255,255,255,.04); --surfaceHover: rgba(255,255,255,.07);
+      --border: rgba(255,255,255,.08); --borderHover: rgba(255,255,255,.14);
+      --text: #e4e6ee; --textMuted: rgba(228,230,238,.55);
+      --accent: #5b8def; --accentDim: rgba(91,141,239,.18); --accentBorder: rgba(91,141,239,.35);
+      --green: #3fb950; --greenDim: rgba(63,185,80,.14); --greenBorder: rgba(63,185,80,.4);
+      --red: #f85149; --redDim: rgba(248,81,73,.12); --redBorder: rgba(248,81,73,.4);
+      --orange: #d29922; --orangeDim: rgba(210,153,34,.12); --orangeBorder: rgba(210,153,34,.4);
+      --purple: #a371f7; --purpleDim: rgba(163,113,247,.12);
+      --radius: 10px; --radiusLg: 14px;
+      --font: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      --mono: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+      color-scheme: dark;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f5f6fa; --bg2: #ebedf5; --bg3: #e2e4ee;
+        --surface: rgba(0,0,0,.03); --surfaceHover: rgba(0,0,0,.06);
+        --border: rgba(0,0,0,.10); --borderHover: rgba(0,0,0,.18);
+        --text: #1a1d28; --textMuted: rgba(26,29,40,.50);
+        --accentDim: rgba(91,141,239,.12); --greenDim: rgba(63,185,80,.10);
+        --redDim: rgba(248,81,73,.08); --orangeDim: rgba(210,153,34,.08);
+        --purpleDim: rgba(163,113,247,.08);
+        color-scheme: light;
+      }
+    }
+    body { font-family: var(--font); margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.5; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { font-family: var(--mono); font-size: .8em; background: var(--surface); padding: 2px 6px; border-radius: 4px; }
+    .wrap { max-width: 1060px; margin: 0 auto; padding: 20px 16px 60px; }
+    /* Navigation */
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    .topbar h1 { font-size: 18px; font-weight: 700; margin: 0; letter-spacing: -.02em; }
+    .topbar .subtitle { font-size: 12px; color: var(--textMuted); margin-top: 2px; }
+    .nav { display: flex; gap: 4px; }
+    .nav a, .nav button { font-family: var(--font); font-size: 13px; padding: 7px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; transition: all .15s; text-decoration: none; }
+    .nav a:hover, .nav button:hover { background: var(--surfaceHover); border-color: var(--borderHover); text-decoration: none; }
+    .nav a.active { background: var(--accentDim); border-color: var(--accentBorder); color: var(--accent); }
+    /* Cards */
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radiusLg); padding: 16px; transition: border-color .15s; }
+    .card:hover { border-color: var(--borderHover); }
+    /* Status grid */
+    .statusGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .stat { text-align: center; padding: 14px 10px; }
+    .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--textMuted); margin-bottom: 4px; }
+    .stat .value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    /* Pills */
+    .pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; border: 1px solid; }
+    .pill::before { content: ''; width: 6px; height: 6px; border-radius: 50%; }
+    .pill.ok { color: var(--green); border-color: var(--greenBorder); background: var(--greenDim); }
+    .pill.ok::before { background: var(--green); }
+    .pill.bad { color: var(--red); border-color: var(--redBorder); background: var(--redDim); }
+    .pill.bad::before { background: var(--red); }
+    .pill.warn { color: var(--orange); border-color: var(--orangeBorder); background: var(--orangeDim); }
+    .pill.warn::before { background: var(--orange); }
+    /* Grid / Flex */
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+    .flex { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    /* Section headers */
+    .secHead { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 24px 0 10px; }
+    .secHead h2 { font-size: 14px; font-weight: 600; margin: 0; text-transform: uppercase; letter-spacing: .05em; color: var(--textMuted); }
+    /* Buttons */
+    .btn { font-family: var(--font); font-size: 13px; padding: 7px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; transition: all .15s; }
+    .btn:hover { background: var(--surfaceHover); border-color: var(--borderHover); }
+    .btn.primary { background: var(--accentDim); border-color: var(--accentBorder); color: var(--accent); }
+    .btn.primary:hover { background: rgba(91,141,239,.25); }
+    .btn.sm { font-size: 12px; padding: 5px 10px; }
+    .btn[disabled] { opacity: .4; cursor: not-allowed; }
+    /* Charts */
+    .chartWrap { position: relative; }
+    .chartWrap canvas { width: 100%; height: 160px; display: block; border-radius: 8px; }
+    .chartLabel { font-size: 11px; color: var(--textMuted); margin-top: 4px; }
+    .chartControls { display: flex; gap: 4px; margin-bottom: 8px; }
+    .chartControls .btn { font-size: 11px; padding: 4px 10px; }
+    .chartControls .btn.active { background: var(--accentDim); border-color: var(--accentBorder); color: var(--accent); }
+    /* Route cards */
+    .routeCard { margin-top: 10px; }
+    .routeCard summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+    .routeCard summary::-webkit-details-marker { display: none; }
+    .routeCard summary::before { content: '▸'; font-size: 12px; color: var(--textMuted); transition: transform .15s; }
+    .routeCard[open] summary::before { transform: rotate(90deg); }
+    .routeCard .routeName { font-weight: 600; }
+    .routeCard .routeProto { font-size: 12px; padding: 2px 8px; border-radius: 4px; background: var(--purpleDim); color: var(--purple); }
+    .routeCard .routeAddr { font-family: var(--mono); font-size: 12px; color: var(--textMuted); }
+    .routeCard .routeActive { margin-left: auto; font-size: 12px; }
+    .routeConsole { font-family: var(--mono); font-size: 11px; line-height: 1.6; white-space: pre-wrap; margin: 10px 0 0; padding: 12px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); max-height: 280px; overflow: auto; color: var(--textMuted); }
+    .routeConsole .ev-connect { color: var(--green); }
+    .routeConsole .ev-disconnect { color: var(--textMuted); }
+    .routeConsole .ev-error { color: var(--red); }
+    .routeConsole .ev-udp { color: var(--purple); }
+    .routeConsole .ev-pair { color: var(--accent); }
+    /* Flash messages */
+    .flash { padding: 10px 14px; border-radius: var(--radius); font-size: 13px; margin-bottom: 16px; background: var(--greenDim); border: 1px solid var(--greenBorder); color: var(--green); }
+    /* Live indicator */
+    .liveIndicator { font-size: 11px; color: var(--textMuted); }
+    .liveIndicator .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); margin-right: 4px; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+    /* Update popup */
+    .popup { position: fixed; right: 16px; bottom: 16px; max-width: 420px; width: calc(100% - 32px); z-index: 1000; display: none; }
+    .popup pre { font-family: var(--mono); font-size: 11px; white-space: pre-wrap; margin: 8px 0 0; padding: 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); max-height: 200px; overflow: auto; }
+    /* Tooltip */
+    .tooltip { position: absolute; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 11px; pointer-events: none; z-index: 100; white-space: nowrap; opacity: 0; transition: opacity .1s; }
+    .tooltip.visible { opacity: 1; }
+    /* Row */
+    .row { margin-bottom: 8px; }
+    .row b { font-weight: 600; }
+    .small { font-size: 12px; color: var(--textMuted); }
+    .muted { color: var(--textMuted); }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="top">
+    <div class="topbar">
       <div>
         <h1>Tunnel Server</h1>
-				<div class="muted">Public routes that forward to one connected agent.</div>
+        <div class="subtitle">Forwarding public traffic to your connected agent</div>
       </div>
-      <div class="card">
-				<div class="nav">
-					<a class="active" href="/">Stats</a>
-					<a href="/config">Config</a>
-					<a href="/controls">Controls</a>
-					<form method="post" action="/logout" style="display:inline; margin: 0">
-						<input type="hidden" name="csrf" value="{{.CSRF}}" />
-						<button type="submit">Logout</button>
-					</form>
-				</div>
-        <div class="row"><b>Status:</b>
-          {{if .Status.AgentConnected}}<span class="pill ok">Agent connected</span>{{else}}<span class="pill bad">No agent</span>{{end}}
+      <div class="flex">
+        <div class="nav">
+          <a class="active" href="/">Dashboard</a>
+          <a href="/config">Config</a>
+          <a href="/controls">Controls</a>
         </div>
-        <div class="row"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
-        {{if .Err}}<div class="row"><b>Last server error:</b> <span class="muted">{{.Err}}</span></div>{{end}}
+        <form method="post" action="/logout" style="margin:0">
+          <input type="hidden" name="csrf" value="{{.CSRF}}" />
+          <button type="submit" class="btn sm">Logout</button>
+        </form>
       </div>
     </div>
 
-    {{if .Msg}}<div class="flash pill ok">{{.Msg}}</div>{{end}}
+    {{if .Msg}}<div class="flash">{{.Msg}}</div>{{end}}
 
-		<h2>Overview</h2>
-    <div class="card">
-			<div class="muted">Clients connect to a <b>Route</b> on this server. The server notifies the agent over <b>Control</b>. TCP is paired over <b>Data (TCP)</b>; UDP is relayed over <b>Data (UDP)</b>.</div>
+    <div class="statusGrid">
+      <div class="card stat">
+        <div class="label">Agent</div>
+        <div class="value"><span id="agentPill" class="pill {{if .Status.AgentConnected}}ok{{else}}bad{{end}}">{{if .Status.AgentConnected}}Connected{{else}}Disconnected{{end}}</span></div>
+      </div>
+      <div class="card stat">
+        <div class="label">Public Clients</div>
+        <div class="value" id="activeClientsVal">0</div>
+      </div>
+      <div class="card stat">
+        <div class="label">Bandwidth <span id="bwIntervalLabel">(interval)</span></div>
+        <div class="value" id="bw5mVal">—</div>
+      </div>
+      <div class="card stat">
+        <div class="label">Total Transferred</div>
+        <div class="value" id="bytesTotalVal">—</div>
+      </div>
+      <div class="card stat">
+        <div class="label">Routes</div>
+        <div class="value">{{.RouteCount}}</div>
+      </div>
     </div>
 
-		<h2>Statistics</h2>
-		<div class="grid">
-			<div class="card">
-				<div class="row"><b>Agent:</b>
-					<span id="agentPill" class="pill {{if .Status.AgentConnected}}ok{{else}}bad{{end}}">{{if .Status.AgentConnected}}Connected{{else}}Disconnected{{end}}</span>
-				</div>
-				<div class="row"><b>Public clients:</b> <span id="activeClientsVal">—</span></div>
-				<div class="row"><b>Bandwidth (last 5m):</b> <span id="bw5mVal">—</span></div>
-				<div class="row"><b>Total transferred:</b> <span id="bytesTotalVal">—</span></div>
-				<div class="row"><b>Routes:</b> {{.RouteCount}}</div>
-				<div class="row"><b>Control:</b> <code>{{.Cfg.ControlAddr}}</code></div>
-				<div class="row"><b>Data:</b> <code>{{.Cfg.DataAddr}}</code></div>
-				<div class="row" id="errRow" style="display:none"><b>Last server error:</b> <span class="muted" id="errText"></span></div>
-				<div class="row"><span class="muted" id="liveText">Updating…</span></div>
-			</div>
-			<div class="card">
-				<div class="muted">Edit server settings on the <a href="/config">Config</a> page.</div>
-			</div>
-		</div>
+    <div class="grid2">
+      <div>
+        <div class="secHead">
+          <h2>Bandwidth</h2>
+          <div class="chartControls">
+            <button class="btn sm" id="bwScale1h">1h</button>
+            <button class="btn sm" id="bwScale6h">6h</button>
+            <button class="btn sm" id="bwScale12h">12h</button>
+            <button class="btn sm active" id="bwScale24h">24h</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="chartWrap">
+            <canvas id="bwChart"></canvas>
+            <div id="bwTooltip" class="tooltip"></div>
+          </div>
+          <div class="chartLabel" id="bwChartLabel">Bytes transferred per interval</div>
+        </div>
+      </div>
+      <div>
+        <div class="secHead">
+          <h2>Connections</h2>
+          <div class="chartControls">
+            <button class="btn sm" id="connScale1h">1h</button>
+            <button class="btn sm" id="connScale6h">6h</button>
+            <button class="btn sm" id="connScale12h">12h</button>
+            <button class="btn sm active" id="connScale24h">24h</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="chartWrap">
+            <canvas id="connChart"></canvas>
+            <div id="connTooltip" class="tooltip"></div>
+          </div>
+          <div class="chartLabel" id="connChartLabel">New connections per interval (TCP + UDP)</div>
+        </div>
+      </div>
+    </div>
 
+    <div class="secHead">
+      <h2>Routes</h2>
+      <div class="liveIndicator"><span class="dot"></span><span id="liveText">Updating…</span></div>
+    </div>
 
-		<h2>Bandwidth</h2>
-		<div class="card">
-			<div class="btns" style="margin-top:0">
-				<button type="button" id="bwScale1h">1 hour</button>
-				<button type="button" id="bwScale6h">6 hours</button>
-				<button type="button" id="bwScale12h">12 hours</button>
-				<button type="button" id="bwScale24h">1 day</button>
-				<span class="muted" id="bwScaleLabel" style="align-self:center">—</span>
-			</div>
-			<canvas id="bwChart" width="880" height="160" style="width:100%; max-width:100%;"></canvas>
-			<div class="muted" style="margin-top:8px">Shows bytes transferred per 5-minute interval.</div>
-		</div>
+    {{if eq .RouteCount 0}}
+      <div class="card">
+        <div class="muted">No routes configured. <a href="/config">Add routes</a> to start accepting connections.</div>
+      </div>
+    {{end}}
+    {{range .Routes}}
+      <details class="card routeCard" data-route="{{.Name}}">
+        <summary>
+          <span class="routeName">{{.Name}}</span>
+          <span class="routeProto">{{.Proto}}</span>
+          <span class="routeAddr">{{.PublicAddr}}</span>
+          <span class="routeActive"><span data-route-active>0</span> active</span>
+        </summary>
+        <div style="margin-top: 10px">
+          <div data-route-console class="routeConsole">No events yet.</div>
+        </div>
+      </details>
+    {{end}}
 
-		<h2>Routes</h2>
-		{{if eq .RouteCount 0}}
-			<div class="card">
-				<div class="muted">No routes are configured. Add routes in <a href="/config">Config</a> to start accepting public connections.</div>
-			</div>
-		{{end}}
-		{{range .Routes}}
-			<details class="card" style="margin-top:12px" data-route="{{.Name}}">
-				<summary style="cursor:pointer">
-					<b>{{.Name}}</b> <span class="muted">({{.Proto}})</span> — <code>{{.PublicAddr}}</code>
-				</summary>
-				<div style="margin-top:10px">
-					<div class="row"><b>Active clients:</b> <span data-route-active>—</span></div>
-					<div class="row"><b>Recent events</b> <span class="muted">(newest first)</span></div>
-					<pre data-route-console style="white-space:pre-wrap; margin:0; padding:10px; border-radius:10px; border:1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 260px; overflow:auto;"></pre>
-				</div>
-			</details>
-		{{end}}
+    <div id="errRow" class="card" style="display:none; margin-top: 16px; background: var(--redDim); border-color: var(--redBorder);">
+      <b style="color:var(--red)">Error:</b> <span id="errText" class="muted"></span>
+    </div>
   </div>
-	<div id="updatePopup" class="card updatePopup">
-		<div class="row"><b>Update available</b> <span class="muted" id="updVer">—</span></div>
-		<div class="row muted" id="updInfo">Current: <code>{{.Version}}</code></div>
-		<div class="btns" style="margin-top:0">
-			<button type="button" id="updRemind">Remind later</button>
-			<button type="button" id="updSkip">Skip version</button>
-			<button type="button" class="primary" id="updApply">Update</button>
-		</div>
-		<pre id="updSteps" class="muted" style="display:none; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06);"></pre>
-		<pre id="updLog" style="display:none"></pre>
-	</div>
-	<div id="procPopup" class="card updatePopup" style="right: 16px; bottom: 162px; max-width: 360px;">
-		<div class="row"><b>Process</b> <span class="muted">(server)</span></div>
-		<div class="btns" style="margin-top:0">
-			<button type="button" id="procRestart">Restart</button>
-			<button type="button" id="procExit">Exit</button>
-		</div>
-		<div class="muted" style="margin-top:8px">If running under systemd, it will restart automatically.</div>
-	</div>
-	<script>
-		(function(){
-			var csrf = "{{.CSRF}}";
-			var procPopup = document.getElementById('procPopup');
-			var procRestart = document.getElementById('procRestart');
-			var procExit = document.getElementById('procExit');
-			var updPopup = document.getElementById('updatePopup');
-			var updVer = document.getElementById('updVer');
-			var updInfo = document.getElementById('updInfo');
-			var updSteps = document.getElementById('updSteps');
-			var updLog = document.getElementById('updLog');
-			var updRemind = document.getElementById('updRemind');
-			var updSkip = document.getElementById('updSkip');
-			var updApply = document.getElementById('updApply');
 
-			function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
-			async function postForm(path){
-				try {
-					return await fetch(path, {
-						method: 'POST',
-						headers: {'Content-Type':'application/x-www-form-urlencoded'},
-						body: 'csrf=' + encodeURIComponent(csrf)
-					});
-				} catch (e) {
-					return null;
-				}
-			}
-			async function postFormRaw(path){
-				return await postForm(path);
-			}
-			async function fetchUpdateStatus(){
-				try {
-					var res = await fetch('/api/update/status', {cache:'no-store'});
-					if(!res.ok) return null;
-					return await res.json();
-				} catch (e) {
-					return null;
-				}
-			}
-			function setPopupVisible(v){
-				if(!updPopup) return;
-				updPopup.style.display = v ? '' : 'none';
-			}
-			function renderUpdateSteps(st){
-				if(!updSteps) return;
-				var running = !!(st && st.job && st.job.state === 'running');
-				var log = (st && st.job && st.job.log) ? String(st.job.log) : '';
-				if(!running){
-					updSteps.style.display = 'none';
-					updSteps.textContent = '';
-					return;
-				}
-				var has = function(re){ try { return re.test(log); } catch(e){ return false; } };
-				var s1 = has(/Downloading:/) && has(/Downloaded\s+\d+\s+bytes/);
-				var s2 = has(/Extracted source:/) && has(/Applying into:/);
-				var s3 = has(/Running build\.sh/);
-				var s4 = has(/Build succeeded/) || has(/Build failed/);
-				var s5 = !!(st && st.job && st.job.restarting);
-				var fmt = function(done, label){ return (done ? '[x] ' : '[ ] ') + label; };
-				updSteps.textContent = [
-					fmt(s1, 'Download release assets'),
-					fmt(s2, 'Apply files'),
-					fmt(s3, 'Build'),
-					fmt(s4, 'Build finished'),
-					fmt(s5, 'Restarting'),
-				].join('\n');
-				updSteps.style.display = '';
-			}
-			function renderUpdate(st){
-				if(!st){
-					return;
-				}
-				var show = !!st.showPopup || (st.job && st.job.state && st.job.state !== 'idle');
-				setPopupVisible(show);
-				if(!show) return;
-				if(updVer) updVer.textContent = st.availableVersion ? ('→ ' + st.availableVersion) : '';
-				if(updInfo){
-					var s = 'Current: {{.Version}}';
-					if(st.availableURL){ s += ' · ' + st.availableURL; }
-					if(st.job && st.job.state === 'running') s = 'Updating…';
-					if(st.job && st.job.state === 'success') s = 'Update complete. Restarting…';
-					if(st.job && st.job.state === 'failed') s = 'Update failed.';
-					updInfo.textContent = s;
-				}
-				renderUpdateSteps(st);
-				if(updLog){
-					var log = (st.job && st.job.log) ? String(st.job.log) : '';
-					if(st.job && (st.job.state === 'failed' || st.job.state === 'success' || st.job.state === 'running')){
-						updLog.style.display = '';
-						updLog.textContent = log || '(no log)';
-					} else {
-						updLog.style.display = 'none';
-						updLog.textContent = '';
-					}
-				}
-				var busy = st.job && st.job.state === 'running';
-				if(updApply) updApply.disabled = busy;
-				if(updRemind) updRemind.disabled = busy;
-				if(updSkip) updSkip.disabled = busy;
-			}
-			async function pollUpdateUntilDone(){
-				for(;;){
-					var st = await fetchUpdateStatus();
-					if(st){
-						renderUpdate(st);
-						if(st.job && st.job.state && st.job.state !== 'running'){
-							break;
-						}
-					}
-					await sleep(500);
-				}
-				// If we successfully updated, the process may restart; wait until it comes back then reload.
-				for (var i=0;i<90;i++){
-					var st2 = await fetchUpdateStatus();
-					if(st2){
-						location.replace(location.pathname + '?r=' + Date.now());
-						return;
-					}
-					await sleep(1000);
-				}
-			}
+  <div id="updatePopup" class="card popup">
+    <div style="display:flex; justify-content:space-between; align-items:center">
+      <b>Update available</b>
+      <span class="muted small" id="updVer"></span>
+    </div>
+    <div class="muted small" id="updInfo" style="margin-top: 4px">Current: <code>{{.Version}}</code></div>
+    <div class="flex" style="margin-top: 10px">
+      <button class="btn sm" id="updRemind">Remind later</button>
+      <button class="btn sm" id="updSkip">Skip</button>
+      <button class="btn sm primary" id="updApply">Update now</button>
+    </div>
+    <pre id="updSteps" style="display:none"></pre>
+    <pre id="updLog" style="display:none"></pre>
+  </div>
 
-			if (updRemind) updRemind.addEventListener('click', async function(){
-				await postForm('/api/update/remind');
-				setPopupVisible(false);
-			});
-			if (updSkip) updSkip.addEventListener('click', async function(){
-				await postForm('/api/update/skip');
-				setPopupVisible(false);
-			});
-			if (updApply) updApply.addEventListener('click', async function(){
-				var res = await postForm('/api/update/apply');
-				if(res && (res.status === 202 || res.status === 409 || res.status === 204)){
-					pollUpdateUntilDone();
-					return;
-				}
-				await pollUpdateUntilDone();
-			});
+  <script>
+  (function(){
+    var csrf = "{{.CSRF}}";
+    function $(id){ return document.getElementById(id); }
+    function fmtBytes(n){
+      n = Number(n||0); if(!isFinite(n)||n<0) n=0;
+      var u=['B','KiB','MiB','GiB','TiB'], i=0;
+      while(n>=1024&&i<u.length-1){ n/=1024; i++; }
+      return (i===0?Math.round(n):n.toFixed(1))+' '+u[i];
+    }
+    function fmtNum(n){ return Number(n||0).toLocaleString(); }
+    function setPill(el,ok,t){
+      if(!el)return;
+      el.className='pill '+(ok?'ok':'bad');
+      el.textContent=t;
+    }
+    function sleep(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
+    async function postForm(p){
+      try{ return await fetch(p,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'csrf='+encodeURIComponent(csrf)}); }catch(e){ return null; }
+    }
 
-			if (procPopup) procPopup.style.display = '';
-			if (procRestart) procRestart.addEventListener('click', async function(){
-				await postFormRaw('/api/process/restart');
-				// Let the browser show something briefly then the server will go away.
-				setTimeout(function(){ location.replace(location.pathname + '?r=' + Date.now()); }, 1000);
-			});
-			if (procExit) procExit.addEventListener('click', async function(){
-				await postFormRaw('/api/process/exit');
-				setTimeout(function(){ location.replace(location.pathname + '?r=' + Date.now()); }, 1000);
-			});
+    // Chart rendering
+    function drawAreaChart(canvasId, tooltipId, series, scaleSec, valueKey, fmtFn, color){
+      var c = $(canvasId); if(!c||!c.getContext) return;
+      var tt = $(tooltipId);
+      var dpr = window.devicePixelRatio || 1;
+      var rect = c.getBoundingClientRect();
+      c.width = rect.width * dpr;
+      c.height = 160 * dpr;
+      c.style.height = '160px';
+      var ctx = c.getContext('2d');
+      ctx.scale(dpr, dpr);
+      var w = rect.width, h = 160;
+      ctx.clearRect(0,0,w,h);
+      if(!series||!series.length) return;
 
-			// initial load
-			fetchUpdateStatus().then(renderUpdate);
-			setInterval(function(){ fetchUpdateStatus().then(renderUpdate); }, 30000);
+      // Slice to window
+      var dt = 30;
+      if(window._bucketSec) dt = window._bucketSec;
+      else if(series.length>=2){ dt = Math.max(1, Number(series[1].t||0) - Number(series[0].t||0)); }
+      var n = Math.max(1, Math.min(series.length, Math.floor(scaleSec/dt)));
+      var data = series.slice(series.length - n);
+      var max = 0;
+      for(var i=0;i<data.length;i++) max = Math.max(max, Number(data[i][valueKey]||0));
+      if(max<=0) max = 1;
 
-			function fmtBytes(n){
-				n = Number(n||0);
-				if (!isFinite(n) || n < 0) n = 0;
-				var units = ['B','KiB','MiB','GiB','TiB'];
-				var u = 0;
-				while (n >= 1024 && u < units.length-1){ n /= 1024; u++; }
-				return (u === 0 ? String(Math.round(n)) : n.toFixed(2)) + ' ' + units[u];
-			}
-			function setPill(el, ok, text){
-				if(!el) return;
-				el.classList.remove('ok');
-				el.classList.remove('bad');
-				el.classList.add(ok ? 'ok' : 'bad');
-				el.textContent = text;
-			}
-			function drawChart(series){
-				var c = document.getElementById('bwChart');
-				if(!c || !c.getContext) return;
-				var ctx = c.getContext('2d');
-				var w = c.width, h = c.height;
-				ctx.clearRect(0,0,w,h);
-				if(!series || !series.length) return;
-				var max = 0;
-				for (var i=0;i<series.length;i++) max = Math.max(max, Number(series[i].bytes||0));
-				if (max <= 0) max = 1;
-				ctx.strokeStyle = 'rgba(46, 125, 255, .85)';
-				ctx.lineWidth = 2;
-				ctx.beginPath();
-				for (var i2=0;i2<series.length;i2++){
-					var x = (i2/(series.length-1)) * (w-2) + 1;
-					var y = h - ((Number(series[i2].bytes||0)/max) * (h-10)) - 5;
-					if(i2===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-				}
-				ctx.stroke();
-				ctx.strokeStyle = 'rgba(127,127,127,.35)';
-				ctx.lineWidth = 1;
-				ctx.strokeRect(0.5,0.5,w-1,h-1);
-			}
-			function bucketSeconds(series){
-				if(!series || series.length < 2) return 300;
-				var a = Number(series[0].t||0);
-				var b = Number(series[1].t||0);
-				var dt = b - a;
-				if(!isFinite(dt) || dt <= 0) return 300;
-				// clamp to something sane
-				if(dt > 3600) return 3600;
-				return dt;
-			}
-			function sliceWindow(series, windowSec){
-				if(!series || !series.length) return series;
-				windowSec = Number(windowSec||0);
-				if(!isFinite(windowSec) || windowSec <= 0) return series;
-				var dt = bucketSeconds(series);
-				var n = Math.floor(windowSec / dt);
-				if(n < 1) n = 1;
-				if(n > series.length) n = series.length;
-				return series.slice(series.length - n);
-			}
-			function renderRouteConsole(el, route){
-				if(!el) return;
-				var lines = [];
-				var ev = (route && route.events) ? route.events : [];
-				for (var i=ev.length-1;i>=0;i--){
-					var e = ev[i] || {};
-					var ts = e.t ? new Date(e.t*1000).toLocaleString() : '';
-					var s = ts + '  ' + (e.kind||'')
-						+ (e.ip ? ('  ip=' + e.ip) : '')
-						+ (e.id ? ('  id=' + e.id) : '')
-						+ (e.bytes ? ('  bytes=' + fmtBytes(e.bytes)) : '')
-						+ (e.durMs ? ('  dur=' + e.durMs + 'ms') : '')
-						+ (e.detail ? ('  ' + e.detail) : '');
-					lines.push(s);
-					if (lines.length >= 20) break;
-				}
-				el.textContent = lines.length ? lines.join('\n') : 'No events yet.';
-			}
+      var padL=48, padR=8, padT=8, padB=28;
+      var cw = w-padL-padR, ch = h-padT-padB;
 
-			var agentPill = document.getElementById('agentPill');
-			var activeClientsVal = document.getElementById('activeClientsVal');
-			var bw5mVal = document.getElementById('bw5mVal');
-			var bytesTotalVal = document.getElementById('bytesTotalVal');
-			var liveText = document.getElementById('liveText');
-			var errRow = document.getElementById('errRow');
-			var errText = document.getElementById('errText');
-			var lastSeries = null;
-			var bwScaleSec = 24 * 3600;
-			var bwScaleLabel = document.getElementById('bwScaleLabel');
-			var bwBtn1h = document.getElementById('bwScale1h');
-			var bwBtn6h = document.getElementById('bwScale6h');
-			var bwBtn12h = document.getElementById('bwScale12h');
-			var bwBtn24h = document.getElementById('bwScale24h');
+      // Grid lines & Y labels
+      ctx.strokeStyle = 'rgba(128,128,128,.12)';
+      ctx.lineWidth = 1;
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--textMuted').trim() || 'rgba(128,128,128,.5)';
+      ctx.font = '10px system-ui';
+      ctx.textAlign = 'right';
+      var gridLines = 4;
+      for(var g=0;g<=gridLines;g++){
+        var gy = padT + ch - (g/gridLines)*ch;
+        ctx.beginPath(); ctx.moveTo(padL,gy); ctx.lineTo(w-padR,gy); ctx.stroke();
+        var lbl = fmtFn(max * g / gridLines);
+        ctx.fillText(lbl, padL-6, gy+3);
+      }
 
-			function setScale(sec){
-				bwScaleSec = Number(sec||0);
-				if(!isFinite(bwScaleSec) || bwScaleSec <= 0) bwScaleSec = 24*3600;
-				var btns = [bwBtn1h,bwBtn6h,bwBtn12h,bwBtn24h];
-				for(var i=0;i<btns.length;i++){
-					var b = btns[i];
-					if(!b) continue;
-					b.classList.remove('primary');
-				}
-				if(bwScaleSec === 3600 && bwBtn1h) bwBtn1h.classList.add('primary');
-				else if(bwScaleSec === 6*3600 && bwBtn6h) bwBtn6h.classList.add('primary');
-				else if(bwScaleSec === 12*3600 && bwBtn12h) bwBtn12h.classList.add('primary');
-				else if(bwScaleSec === 24*3600 && bwBtn24h) bwBtn24h.classList.add('primary');
-				if(bwScaleLabel){
-					var txt = 'Range: ';
-					if(bwScaleSec === 3600) txt += '1 hour';
-					else if(bwScaleSec === 6*3600) txt += '6 hours';
-					else if(bwScaleSec === 12*3600) txt += '12 hours';
-					else if(bwScaleSec === 24*3600) txt += '1 day';
-					else txt += Math.round(bwScaleSec/3600) + 'h';
-					bwScaleLabel.textContent = txt;
-				}
-				if(lastSeries){
-					drawChart(sliceWindow(lastSeries, bwScaleSec));
-				}
-			}
+      // X labels
+      ctx.textAlign = 'center';
+      var xLabels = Math.min(6, data.length);
+      for(var xl=0;xl<xLabels;xl++){
+        var xi = Math.floor(xl * (data.length-1) / Math.max(1,xLabels-1));
+        var xp = padL + (xi/(data.length-1))*cw;
+        var d = new Date(Number(data[xi].t||0)*1000);
+        ctx.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'), xp, h-4);
+      }
 
-			function computeLast5m(series){
-				if(!series || !series.length) return 0;
-				var p = series[series.length-1];
-				return Number(p && p.bytes ? p.bytes : 0);
-			}
+      // Area fill
+      ctx.beginPath();
+      ctx.moveTo(padL, padT+ch);
+      for(var i2=0;i2<data.length;i2++){
+        var x = padL + (i2/(Math.max(1,data.length-1)))*cw;
+        var y = padT + ch - (Number(data[i2][valueKey]||0)/max)*ch;
+        ctx.lineTo(x,y);
+      }
+      ctx.lineTo(padL+cw, padT+ch);
+      ctx.closePath();
+      var grad = ctx.createLinearGradient(0,padT,0,padT+ch);
+      grad.addColorStop(0, color.replace('1)', '.25)'));
+      grad.addColorStop(1, color.replace('1)', '.02)'));
+      ctx.fillStyle = grad;
+      ctx.fill();
 
-			async function poll(){
-				try {
-					var res = await fetch('/api/stats', {cache:'no-store'});
-					if(!res.ok) throw new Error('http ' + res.status);
-					var j = await res.json();
-					setPill(agentPill, !!j.agentConnected, j.agentConnected ? 'Connected' : 'Disconnected');
-					if(activeClientsVal) activeClientsVal.textContent = String(j.activeClients == null ? '—' : j.activeClients);
-					if(bw5mVal) bw5mVal.textContent = fmtBytes(computeLast5m(j.series));
-					if(bytesTotalVal) bytesTotalVal.textContent = fmtBytes(j.bytesTotal || 0);
-					if(errRow && errText){
-						if(j.err){ errRow.style.display = ''; errText.textContent = j.err; }
-						else { errRow.style.display = 'none'; errText.textContent = ''; }
-					}
-					if(liveText) liveText.textContent = 'Last update: ' + new Date().toLocaleTimeString();
-					if(j.series && j.series !== lastSeries){
-						lastSeries = j.series;
-						drawChart(sliceWindow(j.series, bwScaleSec));
-					}
-					var routes = j.routes || [];
-					for (var i=0;i<routes.length;i++){
-						var rt = routes[i] || {};
-						var det = document.querySelector('details[data-route="' + (rt.name||'') + '"]');
-						if(!det) continue;
-						var a = det.querySelector('[data-route-active]');
-						if(a) a.textContent = String(rt.active == null ? '—' : rt.active);
-						var c = det.querySelector('[data-route-console]');
-						renderRouteConsole(c, rt);
-					}
-				} catch (e) {
-					if(liveText) liveText.textContent = 'Offline (' + (e && e.message ? e.message : 'error') + ')';
-				}
-			}
+      // Line
+      ctx.beginPath();
+      for(var i3=0;i3<data.length;i3++){
+        var x2 = padL + (i3/(Math.max(1,data.length-1)))*cw;
+        var y2 = padT + ch - (Number(data[i3][valueKey]||0)/max)*ch;
+        if(i3===0) ctx.moveTo(x2,y2); else ctx.lineTo(x2,y2);
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
 
-			if(bwBtn1h) bwBtn1h.addEventListener('click', function(){ setScale(3600); });
-			if(bwBtn6h) bwBtn6h.addEventListener('click', function(){ setScale(6*3600); });
-			if(bwBtn12h) bwBtn12h.addEventListener('click', function(){ setScale(12*3600); });
-			if(bwBtn24h) bwBtn24h.addEventListener('click', function(){ setScale(24*3600); });
-			setScale(24*3600);
-			poll();
-			setInterval(poll, 2000);
-		})();
-	</script>
+      // Tooltip on hover
+      c._chartData = data; c._chartMeta = {padL:padL,cw:cw,padT:padT,ch:ch,max:max,valueKey:valueKey,fmtFn:fmtFn};
+      if(!c._hasListener){
+        c._hasListener = true;
+        c.addEventListener('mousemove', function(e){
+          var r = c.getBoundingClientRect();
+          var mx = e.clientX - r.left;
+          var m = c._chartMeta; var d = c._chartData;
+          if(!m||!d) return;
+          var idx = Math.round(((mx-m.padL)/m.cw)*(d.length-1));
+          if(idx<0||idx>=d.length){ if(tt) tt.classList.remove('visible'); return; }
+          var pt = d[idx];
+          var dt2 = new Date(Number(pt.t||0)*1000);
+          var html = dt2.toLocaleTimeString()+' — '+m.fmtFn(Number(pt[m.valueKey]||0));
+          if(tt){ tt.textContent = html; tt.style.left = mx+'px'; tt.style.top = '0px'; tt.classList.add('visible'); }
+        });
+        c.addEventListener('mouseleave', function(){ if(tt) tt.classList.remove('visible'); });
+      }
+    }
+
+    // Bandwidth chart state
+    var lastSeries = null;
+    var bwScaleSec = 86400, connScaleSec = 86400;
+    function setBwScale(sec){
+      bwScaleSec = sec;
+      ['1h','6h','12h','24h'].forEach(function(k){
+        var b = $('bwScale'+k.replace('h','h'));
+        if(b) b.classList.remove('active');
+      });
+      var map = {3600:'bwScale1h',21600:'bwScale6h',43200:'bwScale12h',86400:'bwScale24h'};
+      if(map[sec]) $(map[sec]).classList.add('active');
+      if(lastSeries) drawAreaChart('bwChart','bwTooltip',lastSeries,bwScaleSec,'bytes',fmtBytes,'rgba(91,141,239,1)');
+    }
+    function setConnScale(sec){
+      connScaleSec = sec;
+      ['1h','6h','12h','24h'].forEach(function(k){
+        var b = $('connScale'+k.replace('h','h'));
+        if(b) b.classList.remove('active');
+      });
+      var map = {3600:'connScale1h',21600:'connScale6h',43200:'connScale12h',86400:'connScale24h'};
+      if(map[sec]) $(map[sec]).classList.add('active');
+      if(lastSeries) drawAreaChart('connChart','connTooltip',lastSeries,connScaleSec,'conns',fmtNum,'rgba(163,113,247,1)');
+    }
+    $('bwScale1h').onclick=function(){setBwScale(3600);};
+    $('bwScale6h').onclick=function(){setBwScale(21600);};
+    $('bwScale12h').onclick=function(){setBwScale(43200);};
+    $('bwScale24h').onclick=function(){setBwScale(86400);};
+    $('connScale1h').onclick=function(){setConnScale(3600);};
+    $('connScale6h').onclick=function(){setConnScale(21600);};
+    $('connScale12h').onclick=function(){setConnScale(43200);};
+    $('connScale24h').onclick=function(){setConnScale(86400);};
+
+    // Route console rendering
+    function evClass(kind){
+      if(!kind) return '';
+      if(kind.indexOf('connect')>=0||kind==='paired'||kind==='udp_session') return 'ev-connect';
+      if(kind.indexOf('disconnect')>=0) return 'ev-disconnect';
+      if(kind.indexOf('error')>=0||kind.indexOf('reject')>=0||kind.indexOf('timeout')>=0) return 'ev-error';
+      if(kind.indexOf('udp')>=0) return 'ev-udp';
+      if(kind.indexOf('pair')>=0) return 'ev-pair';
+      return '';
+    }
+    function renderRouteConsole(el, route){
+      if(!el) return;
+      var ev = (route && route.events) ? route.events : [];
+      if(!ev.length){ el.textContent = 'No events yet.'; return; }
+      el.innerHTML = '';
+      for(var i=Math.min(ev.length,30)-1;i>=0;i--){
+        var e = ev[ev.length-1-i]||{};
+        var ts = e.t ? new Date(e.t*1000).toLocaleTimeString() : '';
+        var parts = [ts, e.kind||''];
+        if(e.ip) parts.push('ip='+e.ip);
+        if(e.id) parts.push('id='+e.id.substring(0,8));
+        if(e.bytes) parts.push(fmtBytes(e.bytes));
+        if(e.durMs) parts.push(e.durMs+'ms');
+        if(e.detail) parts.push(e.detail);
+        var span = document.createElement('div');
+        span.className = evClass(e.kind);
+        span.textContent = parts.join('  ');
+        el.appendChild(span);
+      }
+    }
+
+    function computeLastBucket(s){ return s&&s.length ? Number(s[s.length-1].bytes||0) : 0; }
+
+    function fmtInterval(sec){
+      if(sec<60) return sec+'s';
+      if(sec<3600) return Math.round(sec/60)+'m';
+      return Math.round(sec/3600)+'h';
+    }
+    function fmtIntervalLong(sec){
+      if(sec<60) return sec+'-second';
+      if(sec<3600){ var m=Math.round(sec/60); return m+'-minute'; }
+      var h=Math.round(sec/3600); return h+'-hour';
+    }
+
+    async function poll(){
+      try {
+        var res = await fetch('/api/stats',{cache:'no-store'});
+        if(!res.ok) throw new Error('http '+res.status);
+        var j = await res.json();
+        if(j.bucketSec){
+          window._bucketSec = j.bucketSec;
+          var il = $('bwIntervalLabel'); if(il) il.textContent = '('+fmtInterval(j.bucketSec)+')';
+          var bl = $('bwChartLabel');  if(bl) bl.textContent = 'Bytes transferred per '+fmtIntervalLong(j.bucketSec)+' interval';
+          var cl = $('connChartLabel'); if(cl) cl.textContent = 'New connections per '+fmtIntervalLong(j.bucketSec)+' interval (TCP + UDP)';
+        }
+        setPill($('agentPill'),!!j.agentConnected,j.agentConnected?'Connected':'Disconnected');
+        if($('activeClientsVal')) $('activeClientsVal').textContent = fmtNum(j.activeClients);
+        if($('bw5mVal')) $('bw5mVal').textContent = fmtBytes(computeLastBucket(j.series));
+        if($('bytesTotalVal')) $('bytesTotalVal').textContent = fmtBytes(j.bytesTotal||0);
+        if(j.err){
+          $('errRow').style.display='';
+          $('errText').textContent=j.err;
+        } else {
+          $('errRow').style.display='none';
+        }
+        if($('liveText')) $('liveText').textContent = new Date().toLocaleTimeString();
+        if(j.series){
+          lastSeries = j.series;
+          drawAreaChart('bwChart','bwTooltip',j.series,bwScaleSec,'bytes',fmtBytes,'rgba(91,141,239,1)');
+          drawAreaChart('connChart','connTooltip',j.series,connScaleSec,'conns',fmtNum,'rgba(163,113,247,1)');
+        }
+        var routes = j.routes||[];
+        for(var i=0;i<routes.length;i++){
+          var rt = routes[i]||{};
+          var det = document.querySelector('details[data-route="'+(rt.name||'')+'"]');
+          if(!det) continue;
+          var a = det.querySelector('[data-route-active]');
+          if(a) a.textContent = String(rt.active==null?0:rt.active);
+          var c = det.querySelector('[data-route-console]');
+          renderRouteConsole(c, rt);
+        }
+      } catch(e){
+        if($('liveText')) $('liveText').textContent = 'Offline';
+      }
+    }
+    poll(); setInterval(poll, 2000);
+
+    // Redraw charts on resize
+    var resizeTimer;
+    window.addEventListener('resize', function(){
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function(){
+        if(lastSeries){
+          drawAreaChart('bwChart','bwTooltip',lastSeries,bwScaleSec,'bytes',fmtBytes,'rgba(91,141,239,1)');
+          drawAreaChart('connChart','connTooltip',lastSeries,connScaleSec,'conns',fmtNum,'rgba(163,113,247,1)');
+        }
+      }, 100);
+    });
+
+    // Updates
+    async function fetchUpd(){ try{ var r=await fetch('/api/update/status',{cache:'no-store'}); return r.ok?await r.json():null; }catch(e){return null;} }
+    function showUpd(st){
+      if(!st) return;
+      var show = !!st.showPopup || (st.job&&st.job.state&&st.job.state!=='idle');
+      $('updatePopup').style.display = show?'':'none';
+      if(!show) return;
+      $('updVer').textContent = st.availableVersion ? '→ '+st.availableVersion : '';
+      var info = 'Current: {{.Version}}';
+      if(st.job&&st.job.state==='running') info='Updating…';
+      if(st.job&&st.job.state==='success') info='Update complete. Restarting…';
+      if(st.job&&st.job.state==='failed') info='Update failed.';
+      $('updInfo').textContent = info;
+      var log = (st.job&&st.job.log)?String(st.job.log):'';
+      if(st.job&&(st.job.state==='failed'||st.job.state==='success'||st.job.state==='running')){
+        $('updLog').style.display=''; $('updLog').textContent=log||'(no log)';
+        // Steps
+        if(st.job.state==='running'){
+          var has=function(re){try{return re.test(log);}catch(e){return false;}};
+          var s1=has(/Downloading:/)&&has(/Downloaded\s+\d+\s+bytes/);
+          var s2=has(/Extracted source:/)&&has(/Applying into:/);
+          var s3=has(/Running build\.sh/);
+          var s4=has(/Build succeeded/)||has(/Build failed/);
+          var s5=!!(st.job&&st.job.restarting);
+          $('updSteps').style.display='';
+          $('updSteps').textContent=[s1?'[x]':'[ ]', 'Download', s2?'[x]':'[ ]', 'Apply', s3?'[x]':'[ ]', 'Build', s4?'[x]':'[ ]', 'Done', s5?'[x]':'[ ]', 'Restart'].join(' ');
+        } else { $('updSteps').style.display='none'; }
+      } else { $('updLog').style.display='none'; $('updSteps').style.display='none'; }
+      var busy = st.job&&st.job.state==='running';
+      $('updApply').disabled=busy; $('updRemind').disabled=busy; $('updSkip').disabled=busy;
+    }
+    async function pollUpdDone(){
+      for(;;){ var st=await fetchUpd(); if(st){showUpd(st);if(st.job&&st.job.state&&st.job.state!=='running')break;} await sleep(500); }
+      for(var i=0;i<90;i++){ var s=await fetchUpd(); if(s){location.replace(location.pathname+'?r='+Date.now());return;} await sleep(1000); }
+    }
+    $('updRemind').onclick=async function(){await postForm('/api/update/remind');$('updatePopup').style.display='none';};
+    $('updSkip').onclick=async function(){await postForm('/api/update/skip');$('updatePopup').style.display='none';};
+    $('updApply').onclick=async function(){await postForm('/api/update/apply');pollUpdDone();};
+    fetchUpd().then(showUpd);
+    setInterval(function(){fetchUpd().then(showUpd);},30000);
+  })();
+  </script>
 </body>
 </html>`
 
 const serverConfigHTML = `<!doctype html>
-<html>
+<html lang="en">
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
-	<title>Tunnel Server - Config</title>
+	<title>Tunnel Server — Config</title>
 	<style>
-		:root { color-scheme: light dark; }
-		body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; }
-		.wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 56px; }
-		.top { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-		h1 { margin: 0 0 8px; font-size: 22px; }
-		h2 { margin: 22px 0 10px; font-size: 16px; }
-		.muted { opacity: .8; }
-		.card { border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 14px; background: rgba(127,127,127,.06); }
-		.grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-		@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
-		label { font-weight: 600; display:block; margin: 0 0 4px; }
-		.help { font-size: 12px; margin: 0 0 8px; opacity: .85; line-height: 1.35; }
-		input, select { width: 100%; max-width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); }
-		.row { margin-bottom: 10px; }
-		.btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
-		button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
-		button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		.pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
-		.ok { border-color: rgba(46, 160, 67, .55); background: rgba(46, 160, 67, .18); }
-		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
-		code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
-		.flash { margin: 10px 0 0; }
-		.nav { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-		.nav a { text-decoration:none; padding: 6px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); }
-		.nav a.active { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		.route { margin-top: 12px; }
-		.routeHead { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--redDim:rgba(248,81,73,.08);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		code{font-family:var(--mono);font-size:.8em;background:var(--surface);padding:2px 6px;border-radius:4px}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 60px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0;letter-spacing:-.02em}
+		.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}
+		.nav a,.nav button{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;transition:all .15s;text-decoration:none}
+		.nav a:hover,.nav button:hover{background:var(--surfaceHover);border-color:var(--borderHover);text-decoration:none}
+		.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;transition:border-color .15s}
+		.card:hover{border-color:var(--borderHover)}
+		.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid}
+		.pill::before{content:'';width:6px;height:6px;border-radius:50%}
+		.pill.ok{color:var(--green);border-color:var(--greenBorder);background:var(--greenDim)}.pill.ok::before{background:var(--green)}
+		.pill.bad{color:var(--red);border-color:var(--redBorder);background:var(--redDim)}.pill.bad::before{background:var(--red)}
+		.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+		@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+		.flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.secHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:24px 0 10px}
+		.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		.btn{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;transition:all .15s}
+		.btn:hover{background:var(--surfaceHover);border-color:var(--borderHover)}
+		.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.btn.primary:hover{background:rgba(91,141,239,.25)}
+		.btn.warn{background:var(--redDim);border-color:var(--redBorder);color:var(--red)}
+		.btn.sm{font-size:12px;padding:5px 10px}
+		label{font-weight:600;display:block;margin:0 0 4px;font-size:13px}
+		.help{font-size:12px;margin:0 0 8px;color:var(--textMuted);line-height:1.35}
+		input,select{width:100%;max-width:100%;box-sizing:border-box;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:var(--font);font-size:13px}
+		input:focus,select:focus{outline:none;border-color:var(--accentBorder)}
+		input[type=checkbox]{width:auto}
+		.row{margin-bottom:8px}
+		.muted{color:var(--textMuted)}
+		.flash{padding:10px 14px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--greenDim);border:1px solid var(--greenBorder);color:var(--green)}
+		.routeCard{margin-top:10px}
+		.routeHead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
 	</style>
 </head>
 <body>
 	<div class="wrap">
-		<div class="top">
+		<div class="topbar">
 			<div>
 				<h1>Tunnel Server</h1>
-				<div class="muted">Configuration</div>
+				<div class="subtitle">Configuration</div>
 			</div>
-			<div class="card">
+			<div class="flex">
 				<div class="nav">
-					<a href="/">Stats</a>
+					<a href="/">Dashboard</a>
 					<a class="active" href="/config">Config</a>
 					<a href="/controls">Controls</a>
-					<form method="post" action="/logout" style="display:inline; margin: 0">
-						<input type="hidden" name="csrf" value="{{.CSRF}}" />
-						<button type="submit">Logout</button>
-					</form>
 				</div>
-				<div class="row"><b>Status:</b>
-					{{if .Status.AgentConnected}}<span class="pill ok">Agent connected</span>{{else}}<span class="pill bad">No agent</span>{{end}}
-				</div>
-				<div class="row"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
-				{{if .Err}}<div class="row"><b>Last server error:</b> <span class="muted">{{.Err}}</span></div>{{end}}
+				<form method="post" action="/logout" style="margin:0">
+					<input type="hidden" name="csrf" value="{{.CSRF}}" />
+					<button type="submit" class="btn sm">Logout</button>
+				</form>
 			</div>
 		</div>
 
-		{{if .Msg}}<div class="flash pill ok">{{.Msg}}</div>{{end}}
+		{{if .Msg}}<div class="flash">{{.Msg}}</div>{{end}}
 
 		<form method="post" action="/config/save" class="card">
 			<input type="hidden" name="csrf" value="{{.CSRF}}" />
 
-			<h2>Listeners</h2>
-			<div class="grid">
+			<div class="secHead" style="margin-top:0"><h2>Listeners</h2></div>
+			<div class="grid2">
 				<div>
 					<label>Control listen</label>
-					<div class="help">Where the agent connects for commands (e.g. <code>:7000</code>).</div>
+					<div class="help">Agent connects here for commands (e.g. <code>:7000</code>)</div>
 					<input name="control" value="{{.Cfg.ControlAddr}}" />
 				</div>
-
 				<div>
 					<label>Data listen</label>
-					<div class="help">Used for TCP pairing and UDP relay (same port, TCP+UDP).</div>
+					<div class="help">TCP pairing and UDP relay (same port)</div>
 					<input name="data" value="{{.Cfg.DataAddr}}" />
 				</div>
-
 				<div>
-					<label>Insecure data listen (optional)</label>
-					<div class="help">Optional plaintext TCP data listener for routes that disable tunnel TLS. Leave empty to disable (recommended).</div>
-					<input name="data_insecure" value="{{.Cfg.DataAddrInsecure}}" />
+					<label>Insecure data listen</label>
+					<div class="help">Optional plaintext TCP data listener for routes with TLS disabled</div>
+					<input name="data_insecure" value="{{.Cfg.DataAddrInsecure}}" placeholder="Leave empty to disable" />
 				</div>
-
 				<div>
 					<label>Pair timeout</label>
-					<div class="help">How long to wait for the agent to attach after a TCP client connects (e.g. <code>10s</code>).</div>
+					<div class="help">Max wait for agent to attach (e.g. <code>10s</code>)</div>
 					<input name="pair_timeout" value="{{.Cfg.PairTimeout}}" />
 				</div>
 			</div>
 
-			<h2>Security</h2>
-			<div class="grid">
+			<div class="secHead"><h2>Security</h2></div>
+			<div class="grid2">
 				<div>
-					<label>Token (optional)</label>
-					<div class="help">Shared secret the agent must provide.</div>
+					<label>Token</label>
+					<div class="help">Shared secret for agent authentication</div>
 					<input name="token" value="{{.Cfg.Token}}" />
 				</div>
 				<div>
-					<label>Generate token</label>
-					<div class="help">Generates a new random token and restarts the server.</div>
-					<div class="btns">
-						<button type="submit" formmethod="post" formaction="/gen-token">Generate token + restart</button>
-					</div>
+					<label>Actions</label>
+					<div class="help">Generate a new random token</div>
+					<button type="submit" class="btn" formmethod="post" formaction="/gen-token">Generate token + restart</button>
 				</div>
 				<div>
 					<label>Tunnel TLS</label>
 					{{if .Cfg.DisableTLS}}
 						<div class="help">TLS for agent↔server TCP is disabled.</div>
 					{{else}}
-						<div class="help">Regenerates the tunnel TLS certificate/private key and restarts the server. This changes the cert fingerprint (pinned agents must be updated).</div>
-						<div class="help">Cert: <code>{{.Cfg.TLSCertFile}}</code><br/>Key: <code>{{.Cfg.TLSKeyFile}}</code></div>
-						<div class="btns">
-							<button type="submit" name="tls_regen" value="1">Regenerate TLS cert/key + restart</button>
-						</div>
+						<div class="help">Cert: <code>{{.Cfg.TLSCertFile}}</code></div>
+						<button type="submit" class="btn" name="tls_regen" value="1">Regenerate TLS cert + restart</button>
 					{{end}}
 				</div>
 				<div>
-					<label>Dashboard HTTPS (self-signed)</label>
-					<div class="help">Serves this dashboard over HTTPS on the <code>-web</code> address. Browsers will show a warning for self-signed certs; that's expected.</div>
-					<label style="font-weight: 400; display:flex; gap:8px; align-items:center">
-						<input type="checkbox" name="web_https" value="1" style="width:auto" {{if .Cfg.WebHTTPS}}checked{{end}} />
-						<span>Enable HTTPS for dashboard</span>
+					<label>Dashboard HTTPS</label>
+					<div class="help">Self-signed HTTPS for this dashboard</div>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-bottom:8px">
+						<input type="checkbox" name="web_https" value="1" {{if .Cfg.WebHTTPS}}checked{{end}} />
+						<span>Enable HTTPS</span>
 					</label>
-					<div class="help" style="margin-top:8px">Cert: <code>{{.WebTLSCert}}</code><br/>Key: <code>{{.WebTLSKey}}</code>{{if .WebTLSFP}}<br/>Cert sha256: <code>{{.WebTLSFP}}</code>{{end}}</div>
-					<div class="btns">
-						<button type="submit" name="web_tls_regen" value="1">Regenerate dashboard cert/key</button>
-					</div>
+					<div class="help">{{if .WebTLSFP}}Cert sha256: <code>{{.WebTLSFP}}</code>{{end}}</div>
+					<button type="submit" class="btn sm" name="web_tls_regen" value="1">Regen dashboard cert</button>
 				</div>
 				<div>
 					<label>UDP Encryption</label>
-					<div class="help">Message-layer encryption for agent↔server UDP relay.</div>
+					<div class="help">Message-layer encryption for UDP relay</div>
 					<select name="udp_enc">
 						<option value="none" {{if eq .Cfg.UDPEncryptionMode "none"}}selected{{end}}>No encryption</option>
-						<option value="aes128" {{if eq .Cfg.UDPEncryptionMode "aes128"}}selected{{end}}>128-bit (AES-GCM)</option>
-						<option value="aes256" {{if or (eq .Cfg.UDPEncryptionMode "aes256") (eq .Cfg.UDPEncryptionMode "")}}selected{{end}}>256-bit (AES-GCM)</option>
+						<option value="aes128" {{if eq .Cfg.UDPEncryptionMode "aes128"}}selected{{end}}>AES-128-GCM</option>
+						<option value="aes256" {{if or (eq .Cfg.UDPEncryptionMode "aes256") (eq .Cfg.UDPEncryptionMode "")}}selected{{end}}>AES-256-GCM</option>
 					</select>
-					<div class="help" style="margin-top:8px">
-						Current key id: <code>{{.Cfg.UDPKeyID}}</code>{{if .UDPKeyCreated}} · created: <code>{{.UDPKeyCreated}}</code>{{end}}
-					</div>
+					<div class="help" style="margin-top:6px">Key ID: <code>{{.Cfg.UDPKeyID}}</code>{{if .UDPKeyCreated}} · <code>{{.UDPKeyCreated}}</code>{{end}}</div>
 				</div>
 				<div>
-					<label>Regenerate UDP keys</label>
-					<div class="help">Forces a new UDP key and restarts the server (agents will reconnect).</div>
-					<div class="btns">
-						<button type="submit" name="udp_regen" value="1">Regenerate UDP keys + restart</button>
-					</div>
+					<label>UDP Key Actions</label>
+					<div class="help">Force new UDP encryption key</div>
+					<button type="submit" class="btn" name="udp_regen" value="1">Regen UDP keys + restart</button>
 				</div>
 			</div>
 
-			<h2>Routes</h2>
-			<div class="help">Each route is a public entry. Route <b>Name</b> must match the client route name.</div>
+			<div class="secHead"><h2>Routes</h2></div>
+			<div class="help">Each route is a public listener. The agent forwards traffic to the local port.</div>
 
 			<input type="hidden" name="route_count" id="route_count" value="{{.RouteCount}}" />
 
 			<div id="routes">
 				{{range $i, $r := .Routes}}
-					<div class="card route" data-route>
+					<div class="card routeCard" data-route>
 						<div class="routeHead">
-							<div><b>Route</b></div>
-							<div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
-								<div class="muted">#{{$i}}</div>
-								<button type="button" data-remove-route>Remove</button>
-							</div>
+							<b>Route #{{$i}}</b>
+							<button type="button" class="btn sm warn" data-remove-route>Remove</button>
 						</div>
 						<input type="hidden" name="route_{{$i}}_delete" value="0" data-route-delete />
-						<div class="grid" style="margin-top:10px">
+						<div class="grid2" style="margin-top:10px">
 							<div>
 								<label>Name</label>
 								<input name="route_{{$i}}_name" value="{{$r.Name}}" />
@@ -1850,420 +1969,348 @@ const serverConfigHTML = `<!doctype html>
 							</div>
 							<div>
 								<label>Public address</label>
-								<div class="help">Listen address, e.g. <code>:25565</code> (TCP/UDP depending on protocol).</div>
-								<input name="route_{{$i}}_public" value="{{$r.PublicAddr}}" />
-							</div>
-							<div>
-								<label>Low latency</label>
-								<div class="help">Enables <code>TCP_NODELAY</code> for this route (reduces small-packet latency; recommended for games).</div>
-								<label style="font-weight: 400; display:flex; gap:8px; align-items:center">
-									<input type="checkbox" name="route_{{$i}}_nodelay" value="1" style="width:auto" {{if $r.TCPNoDelay}}checked{{end}} />
-									<span>Enable TCP_NODELAY</span>
-								</label>
-							</div>
-							<div>
-								<label>Data channel TLS</label>
-								<div class="help">Encrypts the agent↔server TCP data channel for this route. Disabling reduces overhead but exposes traffic/token to the network.</div>
-								<label style="font-weight: 400; display:flex; gap:8px; align-items:center">
-									<input type="checkbox" name="route_{{$i}}_tls" value="1" style="width:auto" {{if $r.TunnelTLS}}checked{{end}} />
-									<span>Enable TLS</span>
-								</label>
+								<input name="route_{{$i}}_public" value="{{$r.PublicAddr}}" placeholder=":25565" />
 							</div>
 							<div>
 								<label>Preconnect</label>
-								<div class="help">Number of ready data connections to keep warm for this route. <code>0</code> = on-demand.</div>
 								<input type="number" min="0" max="64" name="route_{{$i}}_preconnect" value="{{$r.Preconnect}}" />
+							</div>
+							<div>
+								<label style="font-weight:400;display:flex;gap:8px;align-items:center">
+									<input type="checkbox" name="route_{{$i}}_nodelay" value="1" {{if $r.TCPNoDelay}}checked{{end}} />
+									<span>TCP_NODELAY (low latency)</span>
+								</label>
+							</div>
+							<div>
+								<label style="font-weight:400;display:flex;gap:8px;align-items:center">
+									<input type="checkbox" name="route_{{$i}}_tls" value="1" {{if $r.TunnelTLS}}checked{{end}} />
+									<span>Data channel TLS</span>
+								</label>
 							</div>
 						</div>
 					</div>
 				{{end}}
 			</div>
 
-			<div class="btns">
-				<button type="button" id="addRoute">Add route</button>
-				<button type="submit" class="primary">Save + restart</button>
+			<div class="flex" style="margin-top:14px">
+				<button type="button" id="addRoute" class="btn">+ Add route</button>
+				<button type="submit" class="btn primary">Save + restart server</button>
 			</div>
 		</form>
 	</div>
 
 	<template id="routeTemplate">
-		<div class="card route" data-route>
+		<div class="card routeCard" data-route>
 			<div class="routeHead">
-				<div><b>Route</b></div>
-				<div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
-					<div class="muted">#IDX</div>
-					<button type="button" data-remove-route>Remove</button>
-				</div>
+				<b>Route #IDX</b>
+				<button type="button" class="btn sm warn" data-remove-route>Remove</button>
 			</div>
 			<input type="hidden" name="route_IDX_delete" value="0" data-route-delete />
-			<div class="grid" style="margin-top:10px">
-				<div>
-					<label>Name</label>
-					<input name="route_IDX_name" value="" />
-				</div>
-				<div>
-					<label>Protocol</label>
-					<select name="route_IDX_proto">
-						<option value="tcp" selected>tcp</option>
-						<option value="udp">udp</option>
-						<option value="both">both</option>
-					</select>
-				</div>
-				<div>
-					<label>Public address</label>
-					<div class="help">Listen address, e.g. <code>:25565</code>.</div>
-					<input name="route_IDX_public" value="" />
-				</div>
-				<div>
-					<label>Low latency</label>
-					<div class="help">Enables <code>TCP_NODELAY</code> for this route.</div>
-					<label style="font-weight: 400; display:flex; gap:8px; align-items:center">
-						<input type="checkbox" name="route_IDX_nodelay" value="1" style="width:auto" checked />
-						<span>Enable TCP_NODELAY</span>
-					</label>
-				</div>
-				<div>
-					<label>Data channel TLS</label>
-					<div class="help">Encrypts the agent↔server TCP data channel for this route.</div>
-					<label style="font-weight: 400; display:flex; gap:8px; align-items:center">
-						<input type="checkbox" name="route_IDX_tls" value="1" style="width:auto" checked />
-						<span>Enable TLS</span>
-					</label>
-				</div>
-				<div>
-					<label>Preconnect</label>
-					<div class="help">Number of ready data connections to keep warm for this route. <code>0</code> = on-demand.</div>
-					<input type="number" min="0" max="64" name="route_IDX_preconnect" value="4" />
-				</div>
+			<div class="grid2" style="margin-top:10px">
+				<div><label>Name</label><input name="route_IDX_name" value="" /></div>
+				<div><label>Protocol</label><select name="route_IDX_proto"><option value="tcp" selected>tcp</option><option value="udp">udp</option><option value="both">both</option></select></div>
+				<div><label>Public address</label><input name="route_IDX_public" value="" placeholder=":25565" /></div>
+				<div><label>Preconnect</label><input type="number" min="0" max="64" name="route_IDX_preconnect" value="4" /></div>
+				<div><label style="font-weight:400;display:flex;gap:8px;align-items:center"><input type="checkbox" name="route_IDX_nodelay" value="1" checked /><span>TCP_NODELAY</span></label></div>
+				<div><label style="font-weight:400;display:flex;gap:8px;align-items:center"><input type="checkbox" name="route_IDX_tls" value="1" checked /><span>Data channel TLS</span></label></div>
 			</div>
 		</div>
 	</template>
 
 	<script>
-		(function(){
-			var btn = document.getElementById('addRoute');
-			var routes = document.getElementById('routes');
-			var countEl = document.getElementById('route_count');
-			var tpl = document.getElementById('routeTemplate');
-			if (!btn || !routes || !countEl || !tpl) return;
-			routes.addEventListener('click', function(e){
-				var t = e.target;
-				if (!t || !t.matches || !t.matches('[data-remove-route]')) return;
-				e.preventDefault();
-				var card = t.closest ? t.closest('[data-route]') : null;
-				if (!card) return;
-				var del = card.querySelector ? card.querySelector('[data-route-delete]') : null;
-				if (del) del.value = '1';
-				card.style.display = 'none';
-			});
-			btn.addEventListener('click', function(){
-				var idx = parseInt(countEl.value || '0', 10);
-				var html = tpl.innerHTML.split('IDX').join(String(idx));
-				var wrap = document.createElement('div');
-				wrap.innerHTML = html;
-				routes.appendChild(wrap.firstElementChild);
-				countEl.value = String(idx + 1);
-			});
-		})();
+	(function(){
+		var btn=document.getElementById('addRoute'),routes=document.getElementById('routes'),cnt=document.getElementById('route_count'),tpl=document.getElementById('routeTemplate');
+		if(!btn||!routes||!cnt||!tpl)return;
+		routes.addEventListener('click',function(e){
+			var t=e.target;if(!t||!t.matches||!t.matches('[data-remove-route]'))return;
+			e.preventDefault();var c=t.closest('[data-route]');if(!c)return;
+			var d=c.querySelector('[data-route-delete]');if(d)d.value='1';c.style.display='none';
+		});
+		btn.addEventListener('click',function(){
+			var i=parseInt(cnt.value||'0',10);
+			var html=tpl.innerHTML.split('IDX').join(String(i));
+			var w=document.createElement('div');w.innerHTML=html;
+			routes.appendChild(w.firstElementChild);cnt.value=String(i+1);
+		});
+	})();
 	</script>
 </body>
 </html>`
-
 const serverControlsHTML = `<!doctype html>
-<html>
+<html lang="en">
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
-	<title>Tunnel Server - Controls</title>
+	<title>Tunnel Server — Controls</title>
 	<style>
-		:root { color-scheme: light dark; }
-		body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; }
-		.wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 56px; }
-		.top { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-		h1 { margin: 0 0 8px; font-size: 22px; }
-		h2 { margin: 22px 0 10px; font-size: 16px; }
-		.muted { opacity: .8; }
-		.card { border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 14px; background: rgba(127,127,127,.06); }
-		.grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-		@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
-		.row { margin-bottom: 10px; }
-		.btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
-		button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
-		button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		button[disabled] { opacity: .55; cursor: not-allowed; }
-		.pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
-		.ok { border-color: rgba(46, 160, 67, .55); background: rgba(46, 160, 67, .18); }
-		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
-		code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
-		.flash { margin: 10px 0 0; }
-		.nav { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-		.nav a { text-decoration:none; padding: 6px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); }
-		.nav a.active { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		pre { white-space: pre-wrap; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 220px; overflow:auto; }
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--redDim:rgba(248,81,73,.08);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		code{font-family:var(--mono);font-size:.8em;background:var(--surface);padding:2px 6px;border-radius:4px}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 60px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0}
+		.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}
+		.nav a,.nav button{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;transition:all .15s;text-decoration:none}
+		.nav a:hover,.nav button:hover{background:var(--surfaceHover);border-color:var(--borderHover);text-decoration:none}
+		.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;transition:border-color .15s}
+		.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid}
+		.pill::before{content:'';width:6px;height:6px;border-radius:50%}
+		.pill.ok{color:var(--green);border-color:var(--greenBorder);background:var(--greenDim)}.pill.ok::before{background:var(--green)}
+		.pill.bad{color:var(--red);border-color:var(--redBorder);background:var(--redDim)}.pill.bad::before{background:var(--red)}
+		.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+		@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+		.flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.secHead{margin:24px 0 10px}
+		.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		.btn{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;transition:all .15s}
+		.btn:hover{background:var(--surfaceHover);border-color:var(--borderHover)}
+		.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.btn[disabled]{opacity:.4;cursor:not-allowed}
+		.btn.sm{font-size:12px;padding:5px 10px}
+		.btn.warn{background:var(--redDim);border-color:var(--redBorder);color:var(--red)}
+		.row{margin-bottom:8px}
+		.muted{color:var(--textMuted)}
+		.flash{padding:10px 14px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--greenDim);border:1px solid var(--greenBorder);color:var(--green)}
+		pre{font-family:var(--mono);font-size:11px;white-space:pre-wrap;margin:8px 0 0;padding:10px;border-radius:8px;background:var(--bg);border:1px solid var(--border);max-height:200px;overflow:auto}
 	</style>
 </head>
 <body>
 	<div class="wrap">
-		<div class="top">
+		<div class="topbar">
 			<div>
 				<h1>Tunnel Server</h1>
-				<div class="muted">Server Controls</div>
+				<div class="subtitle">Server Controls</div>
 			</div>
-			<div class="card">
+			<div class="flex">
 				<div class="nav">
-					<a href="/">Stats</a>
+					<a href="/">Dashboard</a>
 					<a href="/config">Config</a>
 					<a class="active" href="/controls">Controls</a>
-					<form method="post" action="/logout" style="display:inline; margin: 0">
-						<input type="hidden" name="csrf" value="{{.CSRF}}" />
-						<button type="submit">Logout</button>
-					</form>
 				</div>
-				<div class="row"><b>Status:</b>
-					{{if .Status.AgentConnected}}<span class="pill ok">Agent connected</span>{{else}}<span class="pill bad">No agent</span>{{end}}
-				</div>
-				<div class="row"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
-				{{if .Err}}<div class="row"><b>Last server error:</b> <span class="muted">{{.Err}}</span></div>{{end}}
+				<form method="post" action="/logout" style="margin:0">
+					<input type="hidden" name="csrf" value="{{.CSRF}}" />
+					<button type="submit" class="btn sm">Logout</button>
+				</form>
 			</div>
 		</div>
 
-		{{if .Msg}}<div class="flash pill ok">{{.Msg}}</div>{{end}}
+		{{if .Msg}}<div class="flash">{{.Msg}}</div>{{end}}
 
-		<h2>Updates</h2>
-		<div class="card">
-			<div class="grid">
-				<div>
-					<div class="row"><b>Current version:</b> <code>{{.Version}}</code></div>
-					<div class="row"><b>Available version:</b> <code id="availableVersion">—</code></div>
-					<div class="btns">
-						<button id="checkNowBtn" type="button">Check for updates</button>
-						<button id="applyBtn" type="button" class="primary" disabled>Update</button>
-					</div>
-					<div class="row"><span class="muted" id="updateState">—</span></div>
+		<div class="grid2">
+			<div>
+				<div class="secHead"><h2>Dashboard</h2></div>
+				<div class="card">
+					<div class="row"><b>Stats Interval:</b> <code id="curInterval">{{.DashInterval}}</code></div>
+					<div class="muted" style="margin-bottom:8px;font-size:12px">Bucket width for bandwidth &amp; connection charts. Smaller = higher resolution but more memory. Requires restart.</div>
+					<form method="post" action="/api/dashboard/interval" style="margin:0">
+						<input type="hidden" name="csrf" value="{{.CSRF}}" />
+						<div class="flex">
+							<select name="interval" class="btn sm" style="appearance:auto;padding:5px 8px">
+								<option value="5s"{{if eq .DashInterval "5s"}} selected{{end}}>5 seconds</option>
+								<option value="10s"{{if eq .DashInterval "10s"}} selected{{end}}>10 seconds</option>
+								<option value="30s"{{if eq .DashInterval "30s"}} selected{{end}}>30 seconds</option>
+								<option value="1m0s"{{if eq .DashInterval "1m0s"}} selected{{end}}>1 minute</option>
+								<option value="2m0s"{{if eq .DashInterval "2m0s"}} selected{{end}}>2 minutes</option>
+								<option value="5m0s"{{if eq .DashInterval "5m0s"}} selected{{end}}>5 minutes</option>
+								<option value="10m0s"{{if eq .DashInterval "10m0s"}} selected{{end}}>10 minutes</option>
+							</select>
+							<button type="submit" class="btn sm primary">Apply &amp; Restart</button>
+						</div>
+					</form>
 				</div>
-				<div>
+
+				<div class="secHead"><h2>Updates</h2></div>
+				<div class="card">
+					<div class="row"><b>Current:</b> <code>{{.Version}}</code></div>
+					<div class="row"><b>Available:</b> <code id="availableVersion">—</code></div>
+					<div class="row muted" id="updateState">—</div>
+					<div class="flex" style="margin-top:8px">
+						<button class="btn sm" id="checkNowBtn">Check now</button>
+						<button class="btn sm primary" id="applyBtn" disabled>Update</button>
+					</div>
 					<pre id="updateLog" style="display:none"></pre>
 				</div>
 			</div>
-		</div>
+			<div>
+				<div class="secHead"><h2>systemd</h2></div>
+				<div class="card">
+					<div class="row"><b>Service:</b> <code>hostit-server.service</code></div>
+					<div class="row"><b>State:</b> <code id="systemdState">—</code></div>
+					<div class="row muted" id="systemdMsg">—</div>
+					<div class="flex" style="margin-top:8px">
+						<button class="btn sm" id="svcRestartBtn">Restart</button>
+						<button class="btn sm warn" id="svcStopBtn">Stop</button>
+					</div>
+				</div>
 
-		<h2>systemd</h2>
-		<div class="card">
-			<div class="row"><b>Service:</b> <code>hostit-server.service</code></div>
-			<div class="row"><b>State:</b> <code id="systemdState">—</code></div>
-			<div class="btns">
-				<button id="svcRestartBtn" type="button">Restart service</button>
-				<button id="svcStopBtn" type="button">Stop service</button>
+				<div class="secHead"><h2>Process</h2></div>
+				<div class="card">
+					<div class="muted" style="margin-bottom:8px;font-size:12px">Direct process control. Under systemd it will restart automatically.</div>
+					<div class="flex">
+						<button class="btn sm" id="procRestart">Restart process</button>
+						<button class="btn sm warn" id="procExit">Exit process</button>
+					</div>
+				</div>
 			</div>
-			<div class="row"><span class="muted" id="systemdMsg">—</span></div>
 		</div>
 	</div>
 
 	<script>
-		var csrf = {{printf "%q" .CSRF}};
-
-		function setUpdateStatus(st) {
-			if (!st) return;
-			var avail = document.getElementById('availableVersion');
-			var btn = document.getElementById('applyBtn');
-			var state = document.getElementById('updateState');
-			var log = document.getElementById('updateLog');
-			avail.textContent = st.latestVersion || '—';
-			btn.disabled = !st.updateAvailable;
-			state.textContent = st.updateAvailable ? 'Update available' : 'Up to date';
-			if (st.job && st.job.log) {
-				log.style.display = 'block';
-				log.textContent = st.job.log;
-			} else {
-				log.style.display = 'none';
-				log.textContent = '';
-			}
-		}
-
-		async function refreshUpdateStatus() {
-			var r = await fetch('/api/update/status', { method: 'GET', credentials: 'include' });
-			setUpdateStatus(await r.json());
-		}
-
-		async function checkNow() {
-			document.getElementById('updateState').textContent = 'Checking…';
-			var body = new URLSearchParams();
-			body.set('csrf', csrf);
-			var r = await fetch('/api/update/check-now', { method: 'POST', body: body, credentials: 'include', headers: { 'X-CSRF-Token': csrf } });
-			if (!r.ok) {
-				var t = '';
-				try { t = await r.text(); } catch (e) {}
-				document.getElementById('updateState').textContent = t ? ('Check failed: ' + t) : 'Check failed';
-				return;
-			}
-			setUpdateStatus(await r.json());
-		}
-
-		async function applyUpdate() {
-			document.getElementById('updateState').textContent = 'Starting update…';
-			var body = new URLSearchParams();
-			body.set('csrf', csrf);
-			var r = await fetch('/api/update/apply', { method: 'POST', body: body, credentials: 'include', headers: { 'X-CSRF-Token': csrf } });
-			if (!r.ok) {
-				var t = '';
-				try { t = await r.text(); } catch (e) {}
-				document.getElementById('updateState').textContent = t ? ('Update failed: ' + t) : 'Update failed to start';
-				return;
-			}
-			document.getElementById('updateState').textContent = 'Updating…';
-			await refreshUpdateStatus();
-		}
-
-		function setSystemdStatus(st) {
-			if (!st) return;
-			var msg = st.error ? st.error : '';
-			document.getElementById('systemdState').textContent = st.available ? (st.active || 'unknown') : 'unavailable';
-			document.getElementById('systemdMsg').textContent = msg || '—';
-		}
-
-		async function refreshSystemdStatus() {
-			var r = await fetch('/api/systemd/status', { method: 'GET', credentials: 'include' });
-			setSystemdStatus(await r.json());
-		}
-
-		async function systemdAction(path, progressText) {
-			document.getElementById('systemdMsg').textContent = progressText;
-			var body = new URLSearchParams();
-			body.set('csrf', csrf);
-			var r = await fetch(path, { method: 'POST', body: body, credentials: 'include', headers: { 'X-CSRF-Token': csrf } });
-			if (!r.ok) {
-				var t = '';
-				try { t = await r.text(); } catch (e) {}
-				document.getElementById('systemdMsg').textContent = t ? t : 'Action failed';
-				return;
-			}
-			document.getElementById('systemdMsg').textContent = 'OK';
-			await refreshSystemdStatus();
-		}
-
-		document.getElementById('checkNowBtn').addEventListener('click', function(){ checkNow(); });
-		document.getElementById('applyBtn').addEventListener('click', function(){ applyUpdate(); });
-		document.getElementById('svcRestartBtn').addEventListener('click', function(){ systemdAction('/api/systemd/restart', 'Restarting…'); });
-		document.getElementById('svcStopBtn').addEventListener('click', function(){ systemdAction('/api/systemd/stop', 'Stopping…'); });
-
-		refreshUpdateStatus();
-		refreshSystemdStatus();
+	var csrf = {{printf "%q" .CSRF}};
+	function body(){var b=new URLSearchParams();b.set('csrf',csrf);return b;}
+	function setUpd(st){
+		if(!st)return;
+		document.getElementById('availableVersion').textContent=st.latestVersion||st.availableVersion||'—';
+		document.getElementById('applyBtn').disabled=!st.updateAvailable;
+		document.getElementById('updateState').textContent=st.updateAvailable?'Update available':'Up to date';
+		var log=document.getElementById('updateLog');
+		if(st.job&&st.job.log){log.style.display='block';log.textContent=st.job.log;}else{log.style.display='none';}
+	}
+	async function refreshUpd(){var r=await fetch('/api/update/status',{credentials:'include'});if(r.ok)setUpd(await r.json());}
+	async function checkNow(){
+		document.getElementById('updateState').textContent='Checking…';
+		var r=await fetch('/api/update/check-now',{method:'POST',body:body(),credentials:'include'});
+		if(!r.ok){try{var t=await r.text();document.getElementById('updateState').textContent='Failed: '+t;}catch(e){}return;}
+		setUpd(await r.json());
+	}
+	async function applyUpd(){
+		document.getElementById('updateState').textContent='Starting…';
+		await fetch('/api/update/apply',{method:'POST',body:body(),credentials:'include'});
+		document.getElementById('updateState').textContent='Updating…';
+		await refreshUpd();
+	}
+	function setSys(st){
+		if(!st)return;
+		document.getElementById('systemdState').textContent=st.available?(st.active||'unknown'):'unavailable';
+		document.getElementById('systemdMsg').textContent=st.error||'—';
+	}
+	async function refreshSys(){var r=await fetch('/api/systemd/status',{credentials:'include'});if(r.ok)setSys(await r.json());}
+	async function sysAction(p,t){
+		document.getElementById('systemdMsg').textContent=t;
+		var r=await fetch(p,{method:'POST',body:body(),credentials:'include'});
+		if(!r.ok){try{var txt=await r.text();document.getElementById('systemdMsg').textContent=txt;}catch(e){}return;}
+		document.getElementById('systemdMsg').textContent='OK';
+		await refreshSys();
+	}
+	document.getElementById('checkNowBtn').onclick=checkNow;
+	document.getElementById('applyBtn').onclick=applyUpd;
+	document.getElementById('svcRestartBtn').onclick=function(){sysAction('/api/systemd/restart','Restarting…');};
+	document.getElementById('svcStopBtn').onclick=function(){sysAction('/api/systemd/stop','Stopping…');};
+	document.getElementById('procRestart').onclick=async function(){
+		await fetch('/api/process/restart',{method:'POST',body:body(),credentials:'include'});
+		setTimeout(function(){location.reload();},1000);
+	};
+	document.getElementById('procExit').onclick=async function(){
+		await fetch('/api/process/exit',{method:'POST',body:body(),credentials:'include'});
+		setTimeout(function(){location.reload();},1000);
+	};
+	refreshUpd();refreshSys();
 	</script>
 </body>
 </html>`
 
 const loginPageHTML = `<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Login</title>
+  <title>Login — Tunnel Server</title>
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; }
-    .wrap { max-width: 520px; margin: 0 auto; padding: 48px 16px; }
-    h1 { margin: 0 0 8px; font-size: 22px; }
-    .muted { opacity: .8; }
-    .card { margin-top: 18px; border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 14px; background: rgba(127,127,127,.06); }
-    label { font-weight: 600; display:block; margin: 0 0 4px; }
-    .help { font-size: 12px; margin: 0 0 8px; opacity: .85; }
-    input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); }
-    .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
-    button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
-    button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-    .pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
-    .bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
+    *,*::before,*::after{box-sizing:border-box}
+    :root{--bg:#0f1117;--bg2:#181b25;--surface:rgba(255,255,255,.04);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color-scheme:dark}
+    @media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--surface:rgba(0,0,0,.03);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--redDim:rgba(248,81,73,.08);color-scheme:light}}
+    body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center}
+    .wrap{width:100%;max-width:400px;padding:16px}
+    h1{margin:0 0 4px;font-size:20px;font-weight:700}
+    .sub{font-size:13px;color:var(--textMuted);margin-bottom:20px}
+    .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:20px}
+    label{font-size:12px;font-weight:600;display:block;margin:0 0 4px;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+    input{width:100%;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:var(--font);font-size:14px;transition:border-color .15s}
+    input:focus{outline:none;border-color:var(--accent)}
+    .gap{height:14px}
+    .btn{display:inline-flex;align-items:center;justify-content:center;width:100%;padding:10px;border-radius:var(--radius);border:1px solid var(--accentBorder);background:var(--accentDim);color:var(--accent);font-family:var(--font);font-size:14px;font-weight:600;cursor:pointer;transition:all .15s;margin-top:16px}
+    .btn:hover{background:rgba(91,141,239,.28)}
+    .err{padding:8px 12px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--redDim);border:1px solid var(--redBorder);color:var(--red)}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Login</h1>
-    <div class="muted">Sign in to manage your tunnel server.</div>
-    {{if .Msg}}<div class="pill bad" style="margin-top: 12px">{{.Msg}}</div>{{end}}
-
+    <h1>Tunnel Server</h1>
+    <div class="sub">Sign in to manage your server.</div>
+    {{if .Msg}}<div class="err">{{.Msg}}</div>{{end}}
     <form method="post" action="/login" class="card">
       <input type="hidden" name="csrf" value="{{.CSRF}}" />
-
       <label>Username</label>
-      <div class="help">Case-sensitive.</div>
-      <input name="username" autocomplete="username" />
-
-      <div style="height: 10px"></div>
-
+      <input name="username" autocomplete="username" autofocus />
+      <div class="gap"></div>
       <label>Password</label>
       <input name="password" type="password" autocomplete="current-password" />
-
-      <div class="btns">
-        <button type="submit" class="primary">Login</button>
-      </div>
+      <button type="submit" class="btn">Sign in</button>
     </form>
   </div>
 </body>
 </html>`
 
 const setupPageHTML = `<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>First-time Setup</title>
+  <title>First-time Setup — Tunnel Server</title>
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; }
-    .wrap { max-width: 620px; margin: 0 auto; padding: 48px 16px; }
-    h1 { margin: 0 0 8px; font-size: 22px; }
-    .muted { opacity: .8; }
-    .card { margin-top: 18px; border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 14px; background: rgba(127,127,127,.06); }
-    label { font-weight: 600; display:block; margin: 0 0 4px; }
-    .help { font-size: 12px; margin: 0 0 8px; opacity: .85; line-height: 1.35; }
-    input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); }
-		.inputErr { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .10); }
-    .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
-    button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
-    button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		.pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
-		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
+    *,*::before,*::after{box-sizing:border-box}
+    :root{--bg:#0f1117;--bg2:#181b25;--surface:rgba(255,255,255,.04);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color-scheme:dark}
+    @media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--surface:rgba(0,0,0,.03);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--redDim:rgba(248,81,73,.08);color-scheme:light}}
+    body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center}
+    .wrap{width:100%;max-width:440px;padding:16px}
+    h1{margin:0 0 4px;font-size:20px;font-weight:700}
+    .sub{font-size:13px;color:var(--textMuted);margin-bottom:20px}
+    .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:20px}
+    label{font-size:12px;font-weight:600;display:block;margin:0 0 4px;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+    .help{font-size:11px;color:var(--textMuted);margin:0 0 6px;line-height:1.4}
+    input{width:100%;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:var(--font);font-size:14px;transition:border-color .15s}
+    input:focus{outline:none;border-color:var(--accent)}
+    input.inputErr{border-color:var(--red);background:var(--redDim)}
+    .gap{height:14px}
+    .btn{display:inline-flex;align-items:center;justify-content:center;width:100%;padding:10px;border-radius:var(--radius);border:1px solid var(--accentBorder);background:var(--accentDim);color:var(--accent);font-family:var(--font);font-size:14px;font-weight:600;cursor:pointer;transition:all .15s;margin-top:16px}
+    .btn:hover{background:rgba(91,141,239,.28)}
+    .err{padding:8px 12px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--redDim);border:1px solid var(--redBorder);color:var(--red)}
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>First-time Setup</h1>
-    <div class="muted">Create the initial admin account for this server.</div>
-		{{if .Err}}<div class="pill bad" style="margin-top: 12px">{{.Err}}</div>{{end}}
-
+    <div class="sub">Create the initial admin account for this server.</div>
+    {{if .Err}}<div class="err">{{.Err}}</div>{{end}}
     <form method="post" action="/setup" class="card">
       <input type="hidden" name="csrf" value="{{.CSRF}}" />
-
       <label>Username</label>
-      <div class="help">Pick a unique username. This will be your admin login.</div>
-	<input name="username" autocomplete="username" value="{{.Username}}" class="{{if .ErrUsername}}inputErr{{end}}" />
-
-      <div style="height: 10px"></div>
-
+      <div class="help">Pick a unique username for the admin login.</div>
+      <input name="username" autocomplete="username" value="{{.Username}}" class="{{if .ErrUsername}}inputErr{{end}}" autofocus />
+      <div class="gap"></div>
       <label>Password</label>
-      <div class="help">Use a long password (minimum 10 characters). Use a password manager.</div>
-	<input name="password" type="password" autocomplete="new-password" class="{{if .ErrPassword}}inputErr{{end}}" />
-
-      <div style="height: 10px"></div>
-
+      <div class="help">Minimum 10 characters. Use a password manager.</div>
+      <input name="password" type="password" autocomplete="new-password" class="{{if .ErrPassword}}inputErr{{end}}" />
+      <div class="gap"></div>
       <label>Confirm password</label>
-	<input name="confirm" type="password" autocomplete="new-password" class="{{if .ErrConfirm}}inputErr{{end}}" />
-
-      <div class="btns">
-        <button type="submit" class="primary">Create account</button>
-      </div>
+      <input name="confirm" type="password" autocomplete="new-password" class="{{if .ErrConfirm}}inputErr{{end}}" />
+      <button type="submit" class="btn">Create account</button>
     </form>
   </div>
-	{{if .Err}}
-	<script>
-		(function(){
-			var p = document.querySelector('input[name="password"]');
-			var c = document.querySelector('input[name="confirm"]');
-			if (p) p.value = '';
-			if (c) c.value = '';
-		})();
-	</script>
-	{{end}}
+  {{if .Err}}
+  <script>
+    (function(){
+      var p=document.querySelector('input[name="password"]');
+      var c=document.querySelector('input[name="confirm"]');
+      if(p)p.value='';if(c)c.value='';
+    })();
+  </script>
+  {{end}}
 </body>
 </html>`
 

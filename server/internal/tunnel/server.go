@@ -81,7 +81,7 @@ func NewServer(cfg ServerConfig) *Server {
 		pending:       map[string]pendingConn{},
 		pendingByIP:   map[string]int{},
 		publicUDP:     map[string]net.PacketConn{},
-		dash:          newDashState(),
+		dash:          newDashStateWithInterval(cfg.DashboardInterval),
 		udpPublicJobs: make(map[string]chan udpJob),
 		errLast:       make(map[string]time.Time),
 		udpStats:      udputil.NewSessionStats(1000, 5*time.Minute),
@@ -1027,6 +1027,7 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 	id := newID()
 	if st.dash != nil {
 		st.dash.incActive(routeName)
+		st.dash.addConn(start)
 		st.dash.addEvent(routeName, DashboardEvent{TimeUnix: start.Unix(), Kind: "connect", RemoteIP: remoteIP, ConnID: id})
 		defer st.dash.decActive(routeName)
 	}
@@ -1361,6 +1362,8 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if _, err := pc2.WriteTo(payload, ua); err != nil {
 			traceUDPf("udp: DATA writeTo failed route=%s to=%v err=%v", route, ua, err)
 			st.dashErrorRateLimited(route, "error_udp_write_public", hostFromAddr(ua), client, err.Error(), 1*time.Second)
+		} else if st.dash != nil {
+			st.dash.addBytes(time.Now(), int64(len(payload)))
 		}
 	case udpproto.MsgDataEnc2:
 		if strings.EqualFold(mode, "none") {
@@ -1391,6 +1394,8 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if _, err := pc2.WriteTo(payload, ua); err != nil {
 			traceUDPf("udp: DATAEnc2 writeTo failed route=%s to=%v err=%v", route, ua, err)
 			st.dashErrorRateLimited(route, "error_udp_write_public", hostFromAddr(ua), client, err.Error(), 1*time.Second)
+		} else if st.dash != nil {
+			st.dash.addBytes(time.Now(), int64(len(payload)))
 		}
 	}
 }
@@ -1501,8 +1506,15 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 	if st.udpStats != nil {
 		clientIP := hostFromAddr(clientAddr)
 		sessionID := routeName + ":" + clientIP
-		st.udpStats.GetOrCreate(sessionID, routeName, clientIP, "")
+		info := st.udpStats.GetOrCreate(sessionID, routeName, clientIP, "")
 		st.udpStats.RecordReceive(sessionID, len(pkt))
+		// Log UDP client connections to dashboard (first-seen events)
+		if st.dash != nil {
+			if info.CreatedAt.Equal(info.LastActivity) || info.Stats.Snapshot().PacketsReceived <= 1 {
+				st.dash.addConn(time.Now())
+				st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "udp_session", RemoteIP: clientIP, Detail: "new UDP client"})
+			}
+		}
 	}
 	
 	var msg []byte
@@ -1522,6 +1534,9 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 	if _, err := st.udpData.WriteTo(msg, agent); err != nil {
 		st.dashErrorRateLimited(routeName, "error_udp_write_agent", hostFromAddr(agent), "", err.Error(), 1*time.Second)
 		log.Warnf(logging.CatUDP, "UDP write to agent failed route=%s: %v", routeName, err)
+	} else if st.dash != nil {
+		// Track UDP bytes for bandwidth graph
+		st.dash.addBytes(time.Now(), int64(len(pkt)))
 	}
 }
 

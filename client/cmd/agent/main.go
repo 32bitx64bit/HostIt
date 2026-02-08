@@ -632,80 +632,109 @@ func fileExists(p string) bool {
 }
 
 const agentHomeHTML = `<!doctype html>
-<html>
+<html lang="en">
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
 	<title>Tunnel Agent</title>
 	<style>
-		:root { color-scheme: light dark; }
-		body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; }
-		.wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 56px; }
-		.top { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-		h1 { margin: 0 0 8px; font-size: 22px; }
-		h2 { margin: 22px 0 10px; font-size: 16px; }
-		.muted { opacity: .8; }
-		.card { border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 14px; background: rgba(127,127,127,.06); }
-		.grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-		@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
-		label { font-weight: 600; display:block; margin: 0 0 4px; }
-		.help { font-size: 12px; margin: 0 0 8px; opacity: .85; line-height: 1.35; }
-		input { width: 100%; max-width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); }
-		.btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
-		button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
-		button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		button.warn { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .10); }
-		.pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
-		.ok { border-color: rgba(46, 160, 67, .55); background: rgba(46, 160, 67, .18); }
-		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
-		code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
-		.flash { margin: 10px 0 0; }
-		.row { margin-bottom: 10px; }
-		.small { font-size: 12px; opacity: .85; }
-		.nav { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-		.nav a { text-decoration:none; padding: 6px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); }
-		.nav a.active { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		.updatePopup { position: fixed; right: 16px; bottom: 16px; max-width: 520px; width: calc(100% - 32px); z-index: 1000; display:none; }
-		.updatePopup pre { white-space: pre-wrap; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 220px; overflow:auto; }
-		.procPopup { position: fixed; right: 16px; bottom: 162px; max-width: 360px; width: calc(100% - 32px); z-index: 1000; }
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--orange:#d29922;--orangeDim:rgba(210,153,34,.12);--orangeBorder:rgba(210,153,34,.4);--purple:#a371f7;--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--redDim:rgba(248,81,73,.08);--orangeDim:rgba(210,153,34,.08);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		code{font-family:var(--mono);font-size:.8em;background:var(--surface);padding:2px 6px;border-radius:4px}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 60px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0}
+		.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}
+		.nav a{font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);transition:all .15s;text-decoration:none}
+		.nav a:hover{background:var(--surfaceHover);border-color:var(--borderHover);text-decoration:none}
+		.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.statusGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:20px}
+		.sCard{padding:12px;border-radius:var(--radiusLg);border:1px solid var(--border);background:var(--surface);text-align:center}
+		.sCard .label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted);margin-bottom:4px}
+		.sCard .val{font-size:15px;font-weight:600}
+		.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid}
+		.pill::before{content:'';width:6px;height:6px;border-radius:50%}
+		.pill.ok{color:var(--green);border-color:var(--greenBorder);background:var(--greenDim)}.pill.ok::before{background:var(--green)}
+		.pill.bad{color:var(--red);border-color:var(--redBorder);background:var(--redDim)}.pill.bad::before{background:var(--red)}
+		.pill.warn{color:var(--orange);border-color:var(--orangeBorder);background:var(--orangeDim)}.pill.warn::before{background:var(--orange)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;transition:border-color .15s}
+		.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+		@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+		.secHead{margin:20px 0 10px}
+		.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		label{font-size:12px;font-weight:600;display:block;margin:0 0 4px;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		.help{font-size:11px;color:var(--textMuted);margin:0 0 6px;line-height:1.4}
+		input[type="text"],input:not([type]){width:100%;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:var(--font);font-size:14px;transition:border-color .15s}
+		input:focus{outline:none;border-color:var(--accent)}
+		.btn{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;transition:all .15s}
+		.btn:hover{background:var(--surfaceHover);border-color:var(--borderHover)}
+		.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.btn.warn{background:var(--redDim);border-color:var(--redBorder);color:var(--red)}
+		.btn.sm{font-size:12px;padding:5px 10px}
+		.flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.muted{color:var(--textMuted)}
+		.flash{padding:10px 14px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--greenDim);border:1px solid var(--greenBorder);color:var(--green)}
+		.errBox{font-size:12px;padding:8px 10px;margin-top:8px;border-radius:8px;background:var(--redDim);border:1px solid var(--redBorder);color:var(--red);word-break:break-all}
+		.routeRow{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)}
+		.routeRow:last-child{border-bottom:none}
+		.routeRow .rName{font-weight:600;min-width:80px}
+		.routeRow .rProto{font-size:11px;padding:2px 6px;border-radius:4px;text-transform:uppercase;font-weight:500}
+		.routeRow .rProto.tcp{background:var(--accentDim);color:var(--accent)}
+		.routeRow .rProto.udp{background:rgba(163,113,247,.14);color:var(--purple)}
+		.routeRow .rAddrs{font-size:12px;color:var(--textMuted)}
+		.updatePopup{position:fixed;right:16px;bottom:16px;max-width:460px;width:calc(100% - 32px);z-index:1000;display:none;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+		.updatePopup pre{font-family:var(--mono);font-size:11px;white-space:pre-wrap;margin:8px 0 0;padding:10px;border-radius:8px;background:var(--bg);border:1px solid var(--border);max-height:180px;overflow:auto}
 	</style>
 </head>
 <body>
 	<div class="wrap">
-		<div class="top">
+		<div class="topbar">
 			<div>
 				<h1>Tunnel Agent</h1>
-				<div class="muted">Connects outbound to your tunnel server and forwards based on server configuration.</div>
+				<div class="subtitle">Connects to your tunnel server and forwards traffic locally</div>
 			</div>
-			<div class="card">
-				<div class="nav" style="margin-bottom:10px">
-					<a class="active" href="/">Home</a>
-					<a href="/controls">Controls</a>
-				</div>
-				<div class="row"><b>Service:</b>
-					<span id="svcPill" class="pill {{if .Running}}ok{{else}}bad{{end}}">{{if .Running}}Running{{else}}Stopped{{end}}</span>
-				</div>
-				<div class="row"><b>Control:</b>
-					<span id="ctlPill" class="pill {{if .Connected}}ok{{else}}bad{{end}}">{{if .Connected}}Connected{{else}}Disconnected{{end}}</span>
-				</div>
-				<div class="row"><b>Server:</b> <code id="serverVal">{{.Cfg.Server}}</code></div>
-				<div class="row"><b>Token:</b> <span id="tokenPill" class="pill {{if .HasToken}}ok{{else}}bad{{end}}">{{if .HasToken}}Set{{else}}Missing{{end}}</span></div>
-				<div class="row"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
-				<div class="btns">
-					<button id="btnStart" type="button" class="primary">Start</button>
-					<button id="btnStop" type="button" class="warn">Stop</button>
-					<button id="btnRestart" type="button">Restart</button>
-				</div>
-				<div class="row small"><b>Live:</b> <span id="liveText">Updating…</span></div>
-				<div class="row" id="errRow" style="display:none"><b>Last error:</b> <span class="muted" id="errText"></span></div>
+			<div class="nav">
+				<a class="active" href="/">Home</a>
+				<a href="/controls">Controls</a>
 			</div>
 		</div>
 
-		{{if .Msg}}<div class="flash pill ok">{{.Msg}}</div>{{end}}
+		{{if .Msg}}<div class="flash">{{.Msg}}</div>{{end}}
 
+		<div class="statusGrid">
+			<div class="sCard">
+				<div class="label">Service</div>
+				<div class="val"><span id="svcPill" class="pill {{if .Running}}ok{{else}}bad{{end}}">{{if .Running}}Running{{else}}Stopped{{end}}</span></div>
+			</div>
+			<div class="sCard">
+				<div class="label">Connection</div>
+				<div class="val"><span id="ctlPill" class="pill {{if .Connected}}ok{{else}}bad{{end}}">{{if .Connected}}Connected{{else}}Disconnected{{end}}</span></div>
+			</div>
+			<div class="sCard">
+				<div class="label">Token</div>
+				<div class="val"><span id="tokenPill" class="pill {{if .HasToken}}ok{{else}}bad{{end}}">{{if .HasToken}}Set{{else}}Missing{{end}}</span></div>
+			</div>
+			<div class="sCard">
+				<div class="label">Server</div>
+				<div class="val" style="font-size:12px"><code id="serverVal">{{.Cfg.Server}}</code></div>
+			</div>
+		</div>
+
+		<div class="flex" style="margin-bottom:16px">
+			<button class="btn sm primary" id="btnStart">Start</button>
+			<button class="btn sm warn" id="btnStop">Stop</button>
+			<button class="btn sm" id="btnRestart">Restart</button>
+			<span class="muted" style="font-size:11px" id="liveText">Updating…</span>
+		</div>
+		<div id="errRow" style="display:none" class="errBox"><b>Last error:</b> <span id="errText"></span></div>
+
+		<div class="secHead"><h2>Connection</h2></div>
 		<form method="post" action="/save" class="card">
-			<h2>Connection</h2>
-			<div class="grid">
+			<div class="grid2">
 				<div>
 					<label>Server</label>
 					<div class="help">Tunnel server host/IP (defaults to ports 7000/7001).</div>
@@ -717,435 +746,296 @@ const agentHomeHTML = `<!doctype html>
 					<input name="token" value="{{.Cfg.Token}}" />
 				</div>
 			</div>
-			<div style="margin-top:12px" class="muted">This agent does not configure routes. Routes come from the server, and the agent forwards to <code>127.0.0.1:&lt;publicPort&gt;</code> on this machine.</div>
-			<div class="btns">
-				<button type="submit" class="primary">Save + restart agent</button>
+			<div style="margin-top:10px" class="muted" style="font-size:12px">Routes come from the server. The agent forwards to <code>127.0.0.1:&lt;publicPort&gt;</code>.</div>
+			<div class="flex" style="margin-top:12px">
+				<button type="submit" class="btn primary">Save &amp; restart</button>
 			</div>
 		</form>
 
-		<h2>Routes</h2>
+		<div class="secHead"><h2>Routes</h2></div>
 		<div class="card">
 			<div id="routesEmpty" class="muted" {{if .Connected}}style="display:none"{{end}}>Routes appear after the agent connects to the server.</div>
 			<div id="routesList">
 				{{range .RoutesView}}
-					<div class="row"><b>{{.Name}}</b> <span class="muted">({{.Proto}})</span> public: <code>{{.PublicAddr}}</code> local: <code>{{.LocalTarget}}</code></div>
+				<div class="routeRow">
+					<span class="rName">{{.Name}}</span>
+					<span class="rProto {{.Proto}}">{{.Proto}}</span>
+					<span class="rAddrs"><code>{{.PublicAddr}}</code> &rarr; <code>{{.LocalTarget}}</code></span>
+				</div>
 				{{end}}
 			</div>
 		</div>
 	</div>
-	<div id="updatePopup" class="card updatePopup">
-		<div class="row"><b>Update available</b> <span class="muted" id="updVer">—</span></div>
-		<div class="row muted" id="updInfo">Current: <code>{{.Version}}</code></div>
-		<div class="btns" style="margin-top:0">
-			<button type="button" id="updRemind">Remind later</button>
-			<button type="button" id="updSkip">Skip version</button>
-			<button type="button" class="primary" id="updApply">Update</button>
+
+	<div id="updatePopup" class="updatePopup">
+		<div style="margin-bottom:8px"><b>Update available</b> <span class="muted" id="updVer">—</span></div>
+		<div class="muted" style="font-size:12px;margin-bottom:8px" id="updInfo">Current: <code>{{.Version}}</code></div>
+		<div class="flex">
+			<button type="button" class="btn sm" id="updRemind">Later</button>
+			<button type="button" class="btn sm" id="updSkip">Skip</button>
+			<button type="button" class="btn sm primary" id="updApply">Update</button>
 		</div>
-		<pre id="updSteps" class="muted" style="display:none; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06);"></pre>
+		<pre id="updSteps" style="display:none"></pre>
 		<pre id="updLog" style="display:none"></pre>
 	</div>
-	<div id="procPopup" class="card procPopup">
-		<div class="row"><b>Process</b> <span class="muted">(agent)</span></div>
-		<div class="btns" style="margin-top:0">
-			<button type="button" id="procRestart">Restart</button>
-			<button type="button" id="procExit">Exit</button>
-		</div>
-		<div class="muted" style="margin-top:8px">If running under systemd, it will restart automatically.</div>
-	</div>
+
 	<script>
-		(function(){
-			var procRestart = document.getElementById('procRestart');
-			var procExit = document.getElementById('procExit');
-			var updPopup = document.getElementById('updatePopup');
-			var updVer = document.getElementById('updVer');
-			var updInfo = document.getElementById('updInfo');
-			var updSteps = document.getElementById('updSteps');
-			var updLog = document.getElementById('updLog');
-			var updRemind = document.getElementById('updRemind');
-			var updSkip = document.getElementById('updSkip');
-			var updApply = document.getElementById('updApply');
+	(function(){
+		var updPopup=document.getElementById('updatePopup');
+		var updVer=document.getElementById('updVer');
+		var updInfo=document.getElementById('updInfo');
+		var updSteps=document.getElementById('updSteps');
+		var updLog=document.getElementById('updLog');
+		function sleep(ms){return new Promise(function(r){setTimeout(r,ms)});}
+		async function postU(p){try{await fetch(p,{method:'POST'});}catch(_){}}
+		async function fetchUpd(){try{var r=await fetch('/api/update/status',{cache:'no-store'});if(!r.ok)return null;return await r.json();}catch(e){return null;}}
+		function setVis(v){if(updPopup)updPopup.style.display=v?'':'none';}
+		function renderSteps(st){
+			if(!updSteps)return;
+			var running=!!(st&&st.job&&st.job.state==='running');
+			var log=(st&&st.job&&st.job.log)?String(st.job.log):'';
+			if(!running){updSteps.style.display='none';return;}
+			var has=function(re){try{return re.test(log);}catch(e){return false;}};
+			var s1=has(/Downloading:/)&&has(/Downloaded\s+\d+\s+bytes/);
+			var s2=has(/Extracted source:/)&&has(/Applying into:/);
+			var s3=has(/Running build\.sh/);
+			var s4=has(/Build succeeded/)||has(/Build failed/);
+			var s5=!!(st&&st.job&&st.job.restarting);
+			var fmt=function(d,l){return(d?'[x] ':'[ ] ')+l;};
+			updSteps.textContent=[fmt(s1,'Download'),fmt(s2,'Apply files'),fmt(s3,'Build'),fmt(s4,'Build finished'),fmt(s5,'Restart')].join('\n');
+			updSteps.style.display='';
+		}
+		function renderUpd(st){
+			if(!st)return;
+			var show=!!st.showPopup||(st.job&&st.job.state&&st.job.state!=='idle');
+			setVis(show);if(!show)return;
+			if(updVer)updVer.textContent=st.availableVersion?('v'+st.availableVersion):'';
+			if(updInfo){
+				var s='Current: {{.Version}}';
+				if(st.job&&st.job.state==='running')s='Updating…';
+				if(st.job&&st.job.state==='success')s='Done. Restarting…';
+				if(st.job&&st.job.state==='failed')s='Update failed.';
+				updInfo.textContent=s;
+			}
+			renderSteps(st);
+			if(updLog){
+				var l=(st.job&&st.job.log)?String(st.job.log):'';
+				if(st.job&&(st.job.state==='failed'||st.job.state==='success'||st.job.state==='running')){updLog.style.display='';updLog.textContent=l||'(no log)';}
+				else{updLog.style.display='none';}
+			}
+			var busy=st.job&&st.job.state==='running';
+			var a=document.getElementById('updApply');if(a)a.disabled=busy;
+		}
+		async function pollDone(){
+			for(;;){var st=await fetchUpd();if(st){renderUpd(st);if(st.job&&st.job.state&&st.job.state!=='running')break;}await sleep(500);}
+			for(var i=0;i<90;i++){var s=await fetchUpd();if(s){location.replace('/?r='+Date.now());return;}await sleep(1000);}
+		}
+		document.getElementById('updRemind').onclick=async function(){await postU('/api/update/remind');setVis(false);};
+		document.getElementById('updSkip').onclick=async function(){await postU('/api/update/skip');setVis(false);};
+		document.getElementById('updApply').onclick=async function(){await postU('/api/update/apply');pollDone();};
+		fetchUpd().then(renderUpd);
+		setInterval(function(){fetchUpd().then(renderUpd);},30000);
 
-			function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
-			async function postUpdate(path){
-				try { await fetch(path, {method:'POST'}); } catch (_) {}
-			}
-			async function fetchUpdateStatus(){
-				try {
-					var res = await fetch('/api/update/status', {cache:'no-store'});
-					if(!res.ok) return null;
-					return await res.json();
-				} catch (e) {
-					return null;
-				}
-			}
-			function setPopupVisible(v){
-				if(!updPopup) return;
-				updPopup.style.display = v ? '' : 'none';
-			}
-			function renderUpdateSteps(st){
-				if(!updSteps) return;
-				var running = !!(st && st.job && st.job.state === 'running');
-				var log = (st && st.job && st.job.log) ? String(st.job.log) : '';
-				if(!running){
-					updSteps.style.display = 'none';
-					updSteps.textContent = '';
-					return;
-				}
-				var has = function(re){ try { return re.test(log); } catch(e){ return false; } };
-				var s1 = has(/Downloading:/) && has(/Downloaded\s+\d+\s+bytes/);
-				var s2 = has(/Extracted source:/) && has(/Applying into:/);
-				var s3 = has(/Running build\.sh/);
-				var s4 = has(/Build succeeded/) || has(/Build failed/);
-				var s5 = !!(st && st.job && st.job.restarting);
-				var fmt = function(done, label){ return (done ? '[x] ' : '[ ] ') + label; };
-				updSteps.textContent = [
-					fmt(s1, 'Download release assets'),
-					fmt(s2, 'Apply files'),
-					fmt(s3, 'Build'),
-					fmt(s4, 'Build finished'),
-					fmt(s5, 'Restarting'),
-				].join('\n');
-				updSteps.style.display = '';
-			}
-			function renderUpdate(st){
-				if(!st) return;
-				var show = !!st.showPopup || (st.job && st.job.state && st.job.state !== 'idle');
-				setPopupVisible(show);
-				if(!show) return;
-				if(updVer) updVer.textContent = st.availableVersion ? ('→ ' + st.availableVersion) : '';
-				if(updInfo){
-					var s = 'Current: {{.Version}}';
-					if(st.availableURL){ s += ' · ' + st.availableURL; }
-					if(st.job && st.job.state === 'running') s = 'Updating…';
-					if(st.job && st.job.state === 'success') s = 'Update complete. Restarting…';
-					if(st.job && st.job.state === 'failed') s = 'Update failed.';
-					updInfo.textContent = s;
-				}
-				renderUpdateSteps(st);
-				if(updLog){
-					var log = (st.job && st.job.log) ? String(st.job.log) : '';
-					if(st.job && (st.job.state === 'failed' || st.job.state === 'success' || st.job.state === 'running')){
-						updLog.style.display = '';
-						updLog.textContent = log || '(no log)';
-					} else {
-						updLog.style.display = 'none';
-						updLog.textContent = '';
-					}
-				}
-				var busy = st.job && st.job.state === 'running';
-				if(updApply) updApply.disabled = busy;
-				if(updRemind) updRemind.disabled = busy;
-				if(updSkip) updSkip.disabled = busy;
-			}
-			async function pollUpdateUntilDone(){
-				for(;;){
-					var st = await fetchUpdateStatus();
-					if(st){
-						renderUpdate(st);
-						if(st.job && st.job.state && st.job.state !== 'running') break;
-					}
-					await sleep(500);
-				}
-				for (var i=0;i<90;i++){
-					var st2 = await fetchUpdateStatus();
-					if(st2){ location.replace(location.pathname + '?r=' + Date.now()); return; }
-					await sleep(1000);
-				}
-			}
+		function setPill(el,ok,t){if(!el)return;el.classList.remove('ok','bad');el.classList.add(ok?'ok':'bad');el.textContent=t;}
+		function esc(s){return s==null?'':String(s);}
+		var svcPill=document.getElementById('svcPill');
+		var ctlPill=document.getElementById('ctlPill');
+		var tokenPill=document.getElementById('tokenPill');
+		var serverVal=document.getElementById('serverVal');
+		var liveText=document.getElementById('liveText');
+		var errRow=document.getElementById('errRow');
+		var errText=document.getElementById('errText');
+		var routesEmpty=document.getElementById('routesEmpty');
+		var routesList=document.getElementById('routesList');
 
-			if (updRemind) updRemind.addEventListener('click', async function(){
-				await postUpdate('/api/update/remind');
-				setPopupVisible(false);
-			});
-			if (updSkip) updSkip.addEventListener('click', async function(){
-				await postUpdate('/api/update/skip');
-				setPopupVisible(false);
-			});
-			if (updApply) updApply.addEventListener('click', async function(){
-				await postUpdate('/api/update/apply');
-				pollUpdateUntilDone();
-			});
+		async function post(p){try{await fetch(p,{method:'POST'});}catch(_){}await pollOnce();}
+		document.getElementById('btnStart').onclick=function(){post('/start');};
+		document.getElementById('btnStop').onclick=function(){post('/stop');};
+		document.getElementById('btnRestart').onclick=function(){post('/restart');};
 
-			fetchUpdateStatus().then(renderUpdate);
-			setInterval(function(){ fetchUpdateStatus().then(renderUpdate); }, 30000);
-
-			function setPill(el, ok, text){
-				if(!el) return;
-				el.classList.remove('ok');
-				el.classList.remove('bad');
-				el.classList.add(ok ? 'ok' : 'bad');
-				el.textContent = text;
+		function renderRoutes(routes){
+			if(!routesList)return;
+			routesList.innerHTML='';
+			if(!routes||!routes.length){if(routesEmpty)routesEmpty.style.display='';return;}
+			if(routesEmpty)routesEmpty.style.display='none';
+			for(var i=0;i<routes.length;i++){
+				var rt=routes[i]||{};
+				var row=document.createElement('div');row.className='routeRow';
+				var nm=document.createElement('span');nm.className='rName';nm.textContent=esc(rt.name);row.appendChild(nm);
+				var pr=document.createElement('span');pr.className='rProto '+(esc(rt.proto).toLowerCase());pr.textContent=esc(rt.proto);row.appendChild(pr);
+				var ad=document.createElement('span');ad.className='rAddrs';
+				var c1=document.createElement('code');c1.textContent=esc(rt.publicAddr);ad.appendChild(c1);
+				ad.appendChild(document.createTextNode(' \u2192 '));
+				var c2=document.createElement('code');c2.textContent=esc(rt.localTarget);ad.appendChild(c2);
+				row.appendChild(ad);
+				routesList.appendChild(row);
 			}
-			function escapeText(s){
-				return (s == null) ? '' : String(s);
-			}
-			var svcPill = document.getElementById('svcPill');
-			var ctlPill = document.getElementById('ctlPill');
-			var tokenPill = document.getElementById('tokenPill');
-			var serverVal = document.getElementById('serverVal');
-			var liveText = document.getElementById('liveText');
-			var errRow = document.getElementById('errRow');
-			var errText = document.getElementById('errText');
-			var routesEmpty = document.getElementById('routesEmpty');
-			var routesList = document.getElementById('routesList');
-			var btnStart = document.getElementById('btnStart');
-			var btnStop = document.getElementById('btnStop');
-			var btnRestart = document.getElementById('btnRestart');
+		}
 
-			async function post(path){
-				try {
-					await fetch(path, {method:'POST'});
-				} catch (_) {}
-				await pollOnce();
-			}
-			if (procRestart) procRestart.addEventListener('click', async function(){
-				await post('/api/process/restart');
-				setTimeout(function(){ location.replace(location.pathname + '?r=' + Date.now()); }, 1000);
-			});
-			if (procExit) procExit.addEventListener('click', async function(){
-				await post('/api/process/exit');
-				setTimeout(function(){ location.replace(location.pathname + '?r=' + Date.now()); }, 1000);
-			});
-
-			if (btnStart) btnStart.addEventListener('click', function(){ post('/start'); });
-			if (btnStop) btnStop.addEventListener('click', function(){ post('/stop'); });
-			if (btnRestart) btnRestart.addEventListener('click', function(){ post('/restart'); });
-
-			function renderRoutes(routes){
-				if(!routesList) return;
-				routesList.innerHTML = '';
-				if(!routes || !routes.length){
-					if (routesEmpty) routesEmpty.style.display = '';
-					return;
-				}
-				if (routesEmpty) routesEmpty.style.display = 'none';
-				for (var i=0;i<routes.length;i++){
-					var rt = routes[i] || {};
-					var row = document.createElement('div');
-					row.className = 'row';
-					var b = document.createElement('b');
-					b.textContent = escapeText(rt.name);
-					row.appendChild(b);
-					var sp = document.createElement('span');
-					sp.className = 'muted';
-					sp.textContent = ' (' + escapeText(rt.proto) + ') ';
-					row.appendChild(document.createTextNode(' '));
-					row.appendChild(sp);
-					row.appendChild(document.createTextNode(' public: '));
-					var c1 = document.createElement('code');
-					c1.textContent = escapeText(rt.publicAddr);
-					row.appendChild(c1);
-					row.appendChild(document.createTextNode(' local: '));
-					var c2 = document.createElement('code');
-					c2.textContent = escapeText(rt.localTarget);
-					row.appendChild(c2);
-					routesList.appendChild(row);
-				}
-			}
-
-			async function pollOnce(){
-				try {
-					var res = await fetch('/api/status', {cache:'no-store'});
-					if(!res.ok) throw new Error('http ' + res.status);
-					var j = await res.json();
-					setPill(svcPill, !!j.running, j.running ? 'Running' : 'Stopped');
-					setPill(ctlPill, !!j.connected, j.connected ? 'Connected' : 'Disconnected');
-					setPill(tokenPill, !!j.tokenSet, j.tokenSet ? 'Set' : 'Missing');
-					if(serverVal) serverVal.textContent = escapeText(j.server);
-					if(errRow && errText){
-						if(j.lastErr){
-							errRow.style.display = '';
-							errText.textContent = escapeText(j.lastErr);
-						} else {
-							errRow.style.display = 'none';
-							errText.textContent = '';
-						}
-					}
-					renderRoutes(j.routes);
-					if(liveText) liveText.textContent = 'Last update: ' + new Date().toLocaleTimeString();
-				} catch (e) {
-					if(liveText) liveText.textContent = 'Offline (' + (e && e.message ? e.message : 'error') + ')';
-				}
-			}
-
-			pollOnce();
-			setInterval(pollOnce, 2000);
-		})();
+		async function pollOnce(){
+			try{
+				var res=await fetch('/api/status',{cache:'no-store'});
+				if(!res.ok)throw new Error('http '+res.status);
+				var j=await res.json();
+				setPill(svcPill,!!j.running,j.running?'Running':'Stopped');
+				setPill(ctlPill,!!j.connected,j.connected?'Connected':'Disconnected');
+				setPill(tokenPill,!!j.tokenSet,j.tokenSet?'Set':'Missing');
+				if(serverVal)serverVal.textContent=esc(j.server);
+				if(errRow&&errText){if(j.lastErr){errRow.style.display='';errText.textContent=esc(j.lastErr);}else{errRow.style.display='none';}}
+				renderRoutes(j.routes);
+				if(liveText)liveText.textContent='Updated '+new Date().toLocaleTimeString();
+			}catch(e){if(liveText)liveText.textContent='Offline';}
+		}
+		pollOnce();setInterval(pollOnce,2000);
+	})();
 	</script>
 </body>
 </html>`
 
 const agentControlsHTML = `<!doctype html>
-<html>
+<html lang="en">
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
-	<title>Tunnel Agent - Controls</title>
+	<title>Tunnel Agent — Controls</title>
 	<style>
-		:root { color-scheme: light dark; }
-		body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 0; }
-		.wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 56px; }
-		.top { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-		h1 { margin: 0 0 8px; font-size: 22px; }
-		h2 { margin: 22px 0 10px; font-size: 16px; }
-		.muted { opacity: .8; }
-		.card { border: 1px solid rgba(127,127,127,.25); border-radius: 12px; padding: 14px; background: rgba(127,127,127,.06); }
-		.grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-		@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
-		.row { margin-bottom: 10px; }
-		.btns { display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }
-		button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.12); cursor: pointer; }
-		button.primary { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		button[disabled] { opacity: .55; cursor: not-allowed; }
-		.pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.35); background: rgba(127,127,127,.10); font-size: 12px; }
-		.ok { border-color: rgba(46, 160, 67, .55); background: rgba(46, 160, 67, .18); }
-		.bad { border-color: rgba(248, 81, 73, .55); background: rgba(248, 81, 73, .16); }
-		code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
-		.flash { margin: 10px 0 0; }
-		.nav { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-		.nav a { text-decoration:none; padding: 6px 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); }
-		.nav a.active { border-color: rgba(46, 125, 255, .55); background: rgba(46, 125, 255, .18); }
-		pre { white-space: pre-wrap; margin: 10px 0 0; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.25); background: rgba(127,127,127,.06); max-height: 220px; overflow:auto; }
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--redDim:rgba(248,81,73,.08);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		code{font-family:var(--mono);font-size:.8em;background:var(--surface);padding:2px 6px;border-radius:4px}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 60px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0}
+		.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}
+		.nav a{font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);transition:all .15s;text-decoration:none}
+		.nav a:hover{background:var(--surfaceHover);border-color:var(--borderHover);text-decoration:none}
+		.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;transition:border-color .15s}
+		.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid}
+		.pill::before{content:'';width:6px;height:6px;border-radius:50%}
+		.pill.ok{color:var(--green);border-color:var(--greenBorder);background:var(--greenDim)}.pill.ok::before{background:var(--green)}
+		.pill.bad{color:var(--red);border-color:var(--redBorder);background:var(--redDim)}.pill.bad::before{background:var(--red)}
+		.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+		@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+		.secHead{margin:24px 0 10px}
+		.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		.btn{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;transition:all .15s}
+		.btn:hover{background:var(--surfaceHover);border-color:var(--borderHover)}
+		.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.btn[disabled]{opacity:.4;cursor:not-allowed}
+		.btn.sm{font-size:12px;padding:5px 10px}
+		.btn.warn{background:var(--redDim);border-color:var(--redBorder);color:var(--red)}
+		.row{margin-bottom:8px}
+		.muted{color:var(--textMuted)}
+		.flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.flash{padding:10px 14px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--greenDim);border:1px solid var(--greenBorder);color:var(--green)}
+		pre{font-family:var(--mono);font-size:11px;white-space:pre-wrap;margin:8px 0 0;padding:10px;border-radius:8px;background:var(--bg);border:1px solid var(--border);max-height:200px;overflow:auto}
 	</style>
 </head>
 <body>
 	<div class="wrap">
-		<div class="top">
+		<div class="topbar">
 			<div>
 				<h1>Tunnel Agent</h1>
-				<div class="muted">Controls</div>
+				<div class="subtitle">Agent Controls</div>
 			</div>
-			<div class="card">
-				<div class="nav">
-					<a href="/">Home</a>
-					<a class="active" href="/controls">Controls</a>
-				</div>
-				<div class="row"><b>Service:</b>
-					<span class="pill {{if .Running}}ok{{else}}bad{{end}}">{{if .Running}}Running{{else}}Stopped{{end}}</span>
-				</div>
-				<div class="row"><b>Control:</b>
-					<span class="pill {{if .Connected}}ok{{else}}bad{{end}}">{{if .Connected}}Connected{{else}}Disconnected{{end}}</span>
-				</div>
-				<div class="row"><b>Server:</b> <code>{{.Cfg.Server}}</code></div>
-				<div class="row"><b>Config:</b> <code>{{.ConfigPath}}</code></div>
+			<div class="nav">
+				<a href="/">Home</a>
+				<a class="active" href="/controls">Controls</a>
 			</div>
 		</div>
 
-		{{if .Msg}}<div class="flash pill ok">{{.Msg}}</div>{{end}}
+		{{if .Msg}}<div class="flash">{{.Msg}}</div>{{end}}
 
-		<h2>Updates</h2>
-		<div class="card">
-			<div class="grid">
-				<div>
-					<div class="row"><b>Current version:</b> <code>{{.Version}}</code></div>
-					<div class="row"><b>Available version:</b> <code id="availableVersion">—</code></div>
-					<div class="btns">
-						<button id="checkNowBtn" type="button">Check for updates</button>
-						<button id="applyBtn" type="button" class="primary" disabled>Update</button>
+		<div class="grid2">
+			<div>
+				<div class="secHead"><h2>Updates</h2></div>
+				<div class="card">
+					<div class="row"><b>Current:</b> <code>{{.Version}}</code></div>
+					<div class="row"><b>Available:</b> <code id="availableVersion">—</code></div>
+					<div class="row muted" id="updateState">—</div>
+					<div class="flex" style="margin-top:8px">
+						<button class="btn sm" id="checkNowBtn">Check now</button>
+						<button class="btn sm primary" id="applyBtn" disabled>Update</button>
 					</div>
-					<div class="row"><span class="muted" id="updateState">—</span></div>
-				</div>
-				<div>
 					<pre id="updateLog" style="display:none"></pre>
 				</div>
 			</div>
-		</div>
+			<div>
+				<div class="secHead"><h2>systemd</h2></div>
+				<div class="card">
+					<div class="row"><b>Service:</b> <code>hostit-agent.service</code></div>
+					<div class="row"><b>State:</b> <code id="systemdState">—</code></div>
+					<div class="row muted" id="systemdMsg">—</div>
+					<div class="flex" style="margin-top:8px">
+						<button class="btn sm" id="svcRestartBtn">Restart</button>
+						<button class="btn sm warn" id="svcStopBtn">Stop</button>
+					</div>
+				</div>
 
-		<h2>systemd</h2>
-		<div class="card">
-			<div class="row"><b>Service:</b> <code>hostit-agent.service</code></div>
-			<div class="row"><b>State:</b> <code id="systemdState">—</code></div>
-			<div class="btns">
-				<button id="svcRestartBtn" type="button">Restart service</button>
-				<button id="svcStopBtn" type="button">Stop service</button>
+				<div class="secHead"><h2>Process</h2></div>
+				<div class="card">
+					<div class="muted" style="margin-bottom:8px;font-size:12px">Direct process control. Under systemd it will restart automatically.</div>
+					<div class="flex">
+						<button class="btn sm" id="procRestart">Restart process</button>
+						<button class="btn sm warn" id="procExit">Exit process</button>
+					</div>
+				</div>
 			</div>
-			<div class="row"><span class="muted" id="systemdMsg">—</span></div>
 		</div>
 	</div>
 
 	<script>
-		function setUpdateStatus(st) {
-			if (!st) return;
-			var avail = document.getElementById('availableVersion');
-			var btn = document.getElementById('applyBtn');
-			var state = document.getElementById('updateState');
-			var log = document.getElementById('updateLog');
-			avail.textContent = st.availableVersion || '—';
-			btn.disabled = !st.updateAvailable;
-			state.textContent = st.updateAvailable ? 'Update available' : 'Up to date';
-			if (st.job && st.job.log) {
-				log.style.display = 'block';
-				log.textContent = st.job.log;
-			} else {
-				log.style.display = 'none';
-				log.textContent = '';
-			}
-		}
-
-		async function refreshUpdateStatus() {
-			var r = await fetch('/api/update/status', { method: 'GET', cache: 'no-store' });
-			if (!r.ok) return;
-			setUpdateStatus(await r.json());
-		}
-
-		async function checkNow() {
-			document.getElementById('updateState').textContent = 'Checking…';
-			var r = await fetch('/api/update/check-now', { method: 'POST' });
-			if (!r.ok) {
-				var t = '';
-				try { t = await r.text(); } catch (e) {}
-				document.getElementById('updateState').textContent = t ? ('Check failed: ' + t) : 'Check failed';
-				return;
-			}
-			setUpdateStatus(await r.json());
-		}
-
-		async function applyUpdate() {
-			document.getElementById('updateState').textContent = 'Starting update…';
-			var r = await fetch('/api/update/apply', { method: 'POST' });
-			if (!r.ok) {
-				var t = '';
-				try { t = await r.text(); } catch (e) {}
-				document.getElementById('updateState').textContent = t ? ('Update failed: ' + t) : 'Update failed to start';
-				return;
-			}
-			document.getElementById('updateState').textContent = 'Updating…';
-			await refreshUpdateStatus();
-		}
-
-		function setSystemdStatus(st) {
-			if (!st) return;
-			var msg = st.error ? st.error : '';
-			document.getElementById('systemdState').textContent = st.available ? (st.active || 'unknown') : 'unavailable';
-			document.getElementById('systemdMsg').textContent = msg || '—';
-		}
-
-		async function refreshSystemdStatus() {
-			var r = await fetch('/api/systemd/status', { method: 'GET', cache: 'no-store' });
-			if (!r.ok) return;
-			setSystemdStatus(await r.json());
-		}
-
-		async function systemdAction(path, progressText) {
-			document.getElementById('systemdMsg').textContent = progressText;
-			var r = await fetch(path, { method: 'POST' });
-			if (!r.ok) {
-				var t = '';
-				try { t = await r.text(); } catch (e) {}
-				document.getElementById('systemdMsg').textContent = t ? t : 'Action failed';
-				return;
-			}
-			document.getElementById('systemdMsg').textContent = 'OK';
-			await refreshSystemdStatus();
-		}
-
-		document.getElementById('checkNowBtn').addEventListener('click', function(){ checkNow(); });
-		document.getElementById('applyBtn').addEventListener('click', function(){ applyUpdate(); });
-		document.getElementById('svcRestartBtn').addEventListener('click', function(){ systemdAction('/api/systemd/restart', 'Restarting…'); });
-		document.getElementById('svcStopBtn').addEventListener('click', function(){ systemdAction('/api/systemd/stop', 'Stopping…'); });
-
-		refreshUpdateStatus();
-		refreshSystemdStatus();
+	function setUpd(st){
+		if(!st)return;
+		document.getElementById('availableVersion').textContent=st.availableVersion||'—';
+		document.getElementById('applyBtn').disabled=!st.updateAvailable;
+		document.getElementById('updateState').textContent=st.updateAvailable?'Update available':'Up to date';
+		var log=document.getElementById('updateLog');
+		if(st.job&&st.job.log){log.style.display='block';log.textContent=st.job.log;}else{log.style.display='none';}
+	}
+	async function refreshUpd(){var r=await fetch('/api/update/status',{cache:'no-store'});if(r.ok)setUpd(await r.json());}
+	async function checkNow(){
+		document.getElementById('updateState').textContent='Checking…';
+		var r=await fetch('/api/update/check-now',{method:'POST'});
+		if(!r.ok){try{var t=await r.text();document.getElementById('updateState').textContent='Failed: '+t;}catch(e){}return;}
+		setUpd(await r.json());
+	}
+	async function applyUpd(){
+		document.getElementById('updateState').textContent='Starting…';
+		await fetch('/api/update/apply',{method:'POST'});
+		document.getElementById('updateState').textContent='Updating…';
+		await refreshUpd();
+	}
+	function setSys(st){
+		if(!st)return;
+		document.getElementById('systemdState').textContent=st.available?(st.active||'unknown'):'unavailable';
+		document.getElementById('systemdMsg').textContent=st.error||'—';
+	}
+	async function refreshSys(){var r=await fetch('/api/systemd/status',{cache:'no-store'});if(r.ok)setSys(await r.json());}
+	async function sysAction(p,t){
+		document.getElementById('systemdMsg').textContent=t;
+		var r=await fetch(p,{method:'POST'});
+		if(!r.ok){try{var txt=await r.text();document.getElementById('systemdMsg').textContent=txt;}catch(e){}return;}
+		document.getElementById('systemdMsg').textContent='OK';
+		await refreshSys();
+	}
+	document.getElementById('checkNowBtn').onclick=checkNow;
+	document.getElementById('applyBtn').onclick=applyUpd;
+	document.getElementById('svcRestartBtn').onclick=function(){sysAction('/api/systemd/restart','Restarting…');};
+	document.getElementById('svcStopBtn').onclick=function(){sysAction('/api/systemd/stop','Stopping…');};
+	document.getElementById('procRestart').onclick=async function(){
+		await fetch('/api/process/restart',{method:'POST'});
+		setTimeout(function(){location.reload();},1000);
+	};
+	document.getElementById('procExit').onclick=async function(){
+		await fetch('/api/process/exit',{method:'POST'});
+		setTimeout(function(){location.reload();},1000);
+	};
+	refreshUpd();refreshSys();
 	</script>
 </body>
 </html>`

@@ -74,5 +74,9 @@ type ServerConfig struct {
 	// This prevents a single client from exhausting the pending connection pool.
 	// Default: 100. Set to 0 to disable.
 	MaxPendingPerIP *int `json:",omitempty"`
+	// DashboardInterval controls the bucket width for the time-series dashboard.
+	// Smaller values give higher resolution at the cost of more memory.
+	// Default: 30s. Minimum: 5s. Maximum: 10m.
+	DashboardInterval time.Duration `json:",omitempty"`
 	Routes            []RouteConfig
 }
