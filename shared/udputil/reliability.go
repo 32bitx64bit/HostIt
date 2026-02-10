@@ -145,26 +145,92 @@ func (s *Stats) Reset() {
 }
 
 // SequenceTracker tracks packet sequence numbers to detect loss and reordering.
+// Uses a bitmap ring buffer instead of map for O(1) duplicate detection and
+// zero-alloc operation. The bitmap covers a sliding window of 'windowSize'
+// sequence numbers anchored at the highest seen sequence.
 type SequenceTracker struct {
-	mu            sync.Mutex
-	expectedSeq   uint32
-	highestSeen   uint32
-	windowSize    int
-	seen          map[uint32]bool // Sliding window of seen sequences
-	initialized   bool
-	stats         *Stats
+	mu          sync.Mutex
+	expectedSeq uint32
+	baseSeq     uint32   // lowest seq covered by the bitmap
+	highestSeen uint32
+	windowSize  int
+	bitmap      []uint64 // bitmap[i] covers 64 sequence numbers
+	initialized bool
+	stats       *Stats
 }
 
 // NewSequenceTracker creates a tracker with the given window size.
+// windowSize is rounded up to a multiple of 64 for bitmap alignment.
 func NewSequenceTracker(windowSize int, stats *Stats) *SequenceTracker {
 	if windowSize <= 0 {
 		windowSize = 1024
 	}
+	// Round up to multiple of 64.
+	windowSize = ((windowSize + 63) / 64) * 64
 	return &SequenceTracker{
 		windowSize: windowSize,
-		seen:       make(map[uint32]bool, windowSize),
+		bitmap:     make([]uint64, windowSize/64),
 		stats:      stats,
 	}
+}
+
+// bitmapSet sets the bit for seq in the bitmap. Returns true if already set (duplicate).
+func (t *SequenceTracker) bitmapTest(seq uint32) bool {
+	offset := int(seq - t.baseSeq)
+	if offset < 0 || offset >= t.windowSize {
+		return false
+	}
+	word := offset / 64
+	bit := uint(offset % 64)
+	return t.bitmap[word]&(1<<bit) != 0
+}
+
+func (t *SequenceTracker) bitmapSet(seq uint32) {
+	offset := int(seq - t.baseSeq)
+	if offset < 0 || offset >= t.windowSize {
+		return
+	}
+	word := offset / 64
+	bit := uint(offset % 64)
+	t.bitmap[word] |= 1 << bit
+}
+
+// bitmapAdvance shifts the window forward so that newHighest is within the window.
+func (t *SequenceTracker) bitmapAdvance(newHighest uint32) {
+	newBase := newHighest - uint32(t.windowSize) + 1
+	shift := int(newBase - t.baseSeq)
+	if shift <= 0 {
+		return
+	}
+	words := len(t.bitmap)
+	wordShift := shift / 64
+	bitShift := uint(shift % 64)
+
+	if wordShift >= words {
+		// Entire window is past — clear everything.
+		for i := range t.bitmap {
+			t.bitmap[i] = 0
+		}
+	} else if bitShift == 0 {
+		// Word-aligned shift — just move words.
+		copy(t.bitmap, t.bitmap[wordShift:])
+		for i := words - wordShift; i < words; i++ {
+			t.bitmap[i] = 0
+		}
+	} else {
+		// Sub-word shift.
+		for i := 0; i < words; i++ {
+			src := i + wordShift
+			if src >= words {
+				t.bitmap[i] = 0
+			} else if src+1 < words {
+				t.bitmap[i] = (t.bitmap[src] >> bitShift) | (t.bitmap[src+1] << (64 - bitShift))
+			} else {
+				t.bitmap[i] = t.bitmap[src] >> bitShift
+			}
+		}
+	}
+	t.baseSeq = newBase
 }
 
 // Track processes a received sequence number.
@@ -172,70 +238,78 @@ func NewSequenceTracker(windowSize int, stats *Stats) *SequenceTracker {
 func (t *SequenceTracker) Track(seq uint32) (isNew bool, isOutOfOrder bool, lostCount uint32) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if !t.initialized {
 		t.initialized = true
+		t.baseSeq = seq
 		t.expectedSeq = seq + 1
 		t.highestSeen = seq
-		t.seen[seq] = true
+		t.bitmapSet(seq)
 		if t.stats != nil {
 			t.stats.PacketsReceived.Add(1)
 		}
 		return true, false, 0
 	}
-	
-	// Check for duplicate
-	if t.seen[seq] {
+
+	// Packet is too old (before the window).
+	if int32(seq-t.baseSeq) < 0 {
 		if t.stats != nil {
 			t.stats.RecordDuplicate()
 		}
 		return false, false, 0
 	}
-	
-	// Mark as seen
-	t.seen[seq] = true
+
+	// Packet is within the window — check for duplicate.
+	if int(seq-t.baseSeq) < t.windowSize {
+		if t.bitmapTest(seq) {
+			if t.stats != nil {
+				t.stats.RecordDuplicate()
+			}
+			return false, false, 0
+		}
+		t.bitmapSet(seq)
+		if t.stats != nil {
+			t.stats.PacketsReceived.Add(1)
+		}
+		if seq == t.expectedSeq {
+			t.expectedSeq = seq + 1
+			if seq > t.highestSeen {
+				t.highestSeen = seq
+			}
+			return true, false, 0
+		}
+		if seq > t.expectedSeq {
+			gap := seq - t.expectedSeq
+			if t.stats != nil {
+				t.stats.RecordLoss(uint64(gap))
+			}
+			t.expectedSeq = seq + 1
+			if seq > t.highestSeen {
+				t.highestSeen = seq
+			}
+			return true, false, gap
+		}
+		// seq < expectedSeq — out-of-order (late arrival that fills an earlier gap).
+		if t.stats != nil {
+			t.stats.RecordOutOfOrder()
+		}
+		return true, true, 0
+	}
+
+	// Packet is beyond the window — advance the window.
+	t.bitmapAdvance(seq)
+	t.bitmapSet(seq)
 	if t.stats != nil {
 		t.stats.PacketsReceived.Add(1)
 	}
-	
-	// Cleanup old entries outside window
-	if len(t.seen) > t.windowSize {
-		minSeq := t.highestSeen - uint32(t.windowSize)
-		for s := range t.seen {
-			if s < minSeq {
-				delete(t.seen, s)
-			}
-		}
+
+	gap := seq - t.expectedSeq
+	if t.stats != nil && gap > 0 {
+		t.stats.RecordLoss(uint64(gap))
 	}
-	
-	// Check for gaps (loss) and out-of-order
-	if seq == t.expectedSeq {
-		// Perfect - in order
-		t.expectedSeq = seq + 1
-		if seq > t.highestSeen {
-			t.highestSeen = seq
-		}
-		return true, false, 0
-	}
-	
-	if seq > t.expectedSeq {
-		// Gap detected - packets may be lost
-		gap := seq - t.expectedSeq
-		if t.stats != nil {
-			t.stats.RecordLoss(uint64(gap))
-		}
-		t.expectedSeq = seq + 1
-		if seq > t.highestSeen {
-			t.highestSeen = seq
-		}
-		return true, false, gap
-	}
-	
-	// seq < expectedSeq: out of order (late arrival)
-	if t.stats != nil {
-		t.stats.RecordOutOfOrder()
-	}
-	return true, true, 0
+	t.expectedSeq = seq + 1
+	t.highestSeen = seq
+	return true, false, gap
 }
 
 // ExpectedSeq returns the next expected sequence number.

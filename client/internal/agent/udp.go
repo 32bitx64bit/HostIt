@@ -74,9 +74,16 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			_ = c.Close()
 			return
 		}
-		// Larger UDP buffers reduce drops/jitter for high-bitrate UDP workloads.
-		_ = uc.SetReadBuffer(4 * 1024 * 1024)
-		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+		// Set large UDP buffers with kernel verification.
+		const wantBuf = 8 * 1024 * 1024
+		actualR, actualW := trySetUDPBuffers(uc, wantBuf)
+		log.Infof(logging.CatUDP, "UDP buffers [server]: read=%d write=%d (requested %d)", actualR, actualW, wantBuf)
+		if actualR > 0 && actualR < wantBuf/2 {
+			log.Warnf(logging.CatUDP, "UDP read buffer is only %d bytes (wanted %d). Run: sysctl -w net.core.rmem_max=%d", actualR, wantBuf, wantBuf)
+		}
+		if actualW > 0 && actualW < wantBuf/2 {
+			log.Warnf(logging.CatUDP, "UDP write buffer is only %d bytes (wanted %d). Run: sysctl -w net.core.wmem_max=%d", actualW, wantBuf, wantBuf)
+		}
 
 		// Register so the server learns our UDP address.
 		ks := sec.Get()
@@ -166,24 +173,37 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				// Re-check periodically rather than on every packet.
 				cachedKS := sec.Get()
 				pktCount := 0
+
+				// Use a timer-based idle timeout instead of SetReadDeadline per
+				// packet. This eliminates 2 syscalls (time.Now + setsockopt) on
+				// every read in the hot path. The timer resets after each packet.
+				idleTimer := time.AfterFunc(idle, func() {
+					s.close.Do(func() { _ = lconn.Close() })
+				})
+				defer idleTimer.Stop()
+
 				for {
-					// Use a long idle timeout; only reset after actual timeout, not every read.
-					_ = lconn.SetReadDeadline(time.Now().Add(idle))
 					n, err := lconn.Read(localBuf)
 					if err != nil {
 						break
 					}
-					stats.RecordSend(n)
+					idleTimer.Reset(idle)
 					// Refresh KeySet every ~1000 packets to pick up rotations without per-packet RLock.
 					pktCount++
 					if pktCount >= 1000 {
 						cachedKS = sec.Get()
 						pktCount = 0
 					}
+					var writeErr error
 					if cachedKS.Enabled() {
-						_, _ = uc.Write(udpproto.EncodeDataEnc2ForKeyID(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n]))
+						_, writeErr = uc.Write(udpproto.EncodeDataEnc2ForKeyID(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n]))
 					} else {
-						_, _ = uc.Write(udpproto.EncodeData(routeName, clientAddr, localBuf[:n]))
+						_, writeErr = uc.Write(udpproto.EncodeData(routeName, clientAddr, localBuf[:n]))
+					}
+					if writeErr != nil {
+						stats.RecordLoss(1)
+					} else {
+						stats.RecordSend(n)
 					}
 				}
 
@@ -206,12 +226,86 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 
 		readBufPtr := udpBufPool.Get().(*[]byte)
 		readBuf := *readBufPtr
+
+		// Worker pool for incoming packets — parallelizes decrypt + route + write
+		// so the reader goroutine can return to Read() as fast as possible.
+		type inJob struct {
+			data   []byte
+			len    int
+			bufPtr *[]byte
+		}
+		inJobs := make(chan inJob, 2048)
+		const inWorkers = 4
+		var inWg sync.WaitGroup
+		inWg.Add(inWorkers)
+		for i := 0; i < inWorkers; i++ {
+			go func() {
+				defer inWg.Done()
+				cachedKS := sec.Get()
+				pkts := 0
+				for job := range inJobs {
+					pkt := job.data[:job.len]
+					pkts++
+					if pkts >= 1000 {
+						cachedKS = sec.Get()
+						pkts = 0
+					}
+					var (
+						routeName  string
+						clientAddr string
+						payload    []byte
+						ok         bool
+					)
+					if cachedKS.Enabled() {
+						routeName, clientAddr, payload, _, ok = udpproto.DecodeDataEnc2(cachedKS, pkt)
+						if !ok {
+							stats.RecordLoss(1)
+							udpBufPool.Put(job.bufPtr)
+							continue
+						}
+					} else {
+						routeName, clientAddr, payload, ok = udpproto.DecodeData(pkt)
+						if !ok {
+							stats.RecordLoss(1)
+							udpBufPool.Put(job.bufPtr)
+							continue
+						}
+					}
+					rt, ok := routesByName[routeName]
+					if !ok || !routeHasUDP(rt.Proto) {
+						stats.RecordLoss(1)
+						log.Debugf(logging.CatUDP, "UDP packet dropped: unknown route=%s", routeName)
+						udpBufPool.Put(job.bufPtr)
+						continue
+					}
+					localTarget, ok := localTargetFromPublicAddr(rt.PublicAddr)
+					if !ok {
+						stats.RecordLoss(1)
+						udpBufPool.Put(job.bufPtr)
+						continue
+					}
+					s, ok := getOrCreate(routeName, clientAddr, localTarget)
+					if !ok || s == nil {
+						stats.RecordLoss(1)
+						udpBufPool.Put(job.bufPtr)
+						continue
+					}
+					if _, err := s.conn.Write(payload); err != nil {
+						stats.RecordLoss(1)
+					} else {
+						stats.RecordReceive(len(payload))
+					}
+					udpBufPool.Put(job.bufPtr)
+				}
+			}()
+		}
+
 		readErr := func() error {
+			// Return the initial readBuf we got before the loop.
 			defer udpBufPool.Put(readBufPtr)
 			for {
 				// No per-read deadline: the keepalive goroutine already re-registers
-				// every 5 seconds, so the server always has our address. Removing
-				// SetReadDeadline avoids 2 syscalls (time.Now + setsockopt) per packet.
+				// every 5 seconds, so the server always has our address.
 				n, err := uc.Read(readBuf)
 				if err != nil {
 					if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -225,46 +319,23 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 					}
 					return err
 				}
-				stats.RecordReceive(n)
-				ks := sec.Get()
-				var (
-					routeName  string
-					clientAddr string
-					payload    []byte
-					ok         bool
-				)
-				if ks.Enabled() {
-					routeName, clientAddr, payload, _, ok = udpproto.DecodeDataEnc2(ks, readBuf[:n])
-					if !ok {
-						stats.RecordLoss(1)
-						continue
-					}
-				} else {
-					routeName, clientAddr, payload, ok = udpproto.DecodeData(readBuf[:n])
-					if !ok {
-						stats.RecordLoss(1)
-						continue
-					}
-				}
-				rt, ok := routesByName[routeName]
-				if !ok || !routeHasUDP(rt.Proto) {
+				// Dispatch to worker — copy into a pool buffer so the reader
+				// can immediately start the next Read.
+				jobBufPtr := udpBufPool.Get().(*[]byte)
+				jobBuf := *jobBufPtr
+				copy(jobBuf[:n], readBuf[:n])
+				select {
+				case inJobs <- inJob{data: jobBuf, len: n, bufPtr: jobBufPtr}:
+				default:
+					// Workers overwhelmed — drop packet.
 					stats.RecordLoss(1)
-					log.Debugf(logging.CatUDP, "UDP packet dropped: unknown route=%s", routeName)
-					continue
+					udpBufPool.Put(jobBufPtr)
 				}
-				localTarget, ok := localTargetFromPublicAddr(rt.PublicAddr)
-				if !ok {
-					stats.RecordLoss(1)
-					continue
-				}
-				s, ok := getOrCreate(routeName, clientAddr, localTarget)
-				if !ok || s == nil {
-					stats.RecordLoss(1)
-					continue
-				}
-				_, _ = s.conn.Write(payload)
 			}
 		}()
+
+		close(inJobs)
+		inWg.Wait()
 
 		close(kaDone)
 		_ = uc.Close()

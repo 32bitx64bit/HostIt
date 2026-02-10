@@ -192,8 +192,9 @@ func EncodeDataEnc2ForKeyID(ks KeySet, keyID uint32, route string, client string
 	}
 
 	// Build plaintext using pooled buffer to reduce allocations.
-	rb := []byte(route)
-	cb := []byte(client)
+	// Use strings directly with copy() to avoid []byte() heap allocations.
+	rb := route
+	cb := client
 	if len(rb) > 255 {
 		rb = rb[:255]
 	}

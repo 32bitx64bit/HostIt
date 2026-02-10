@@ -37,6 +37,30 @@ var udpBufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
+// logUDPBuf logs socket buffer sizes and warns if the kernel capped them.
+func logUDPBuf(label string, actualRead, actualWrite, wanted int) {
+	log.Infof(logging.CatUDP, "UDP buffers [%s]: read=%d write=%d (requested %d)", label, actualRead, actualWrite, wanted)
+	if actualRead > 0 && actualRead < wanted/2 {
+		log.Warnf(logging.CatUDP, "UDP read buffer [%s] is only %d bytes (wanted %d). "+
+			"Run: sysctl -w net.core.rmem_max=%d", label, actualRead, wanted, wanted)
+	}
+	if actualWrite > 0 && actualWrite < wanted/2 {
+		log.Warnf(logging.CatUDP, "UDP write buffer [%s] is only %d bytes (wanted %d). "+
+			"Run: sysctl -w net.core.wmem_max=%d", label, actualWrite, wanted, wanted)
+	}
+}
+
+// addrEqual compares two net.Addr values without string formatting.
+func addrEqual(a, b net.Addr) bool {
+	ua, ok1 := a.(*net.UDPAddr)
+	ub, ok2 := b.(*net.UDPAddr)
+	if ok1 && ok2 {
+		return ua.Port == ub.Port && ua.IP.Equal(ub.IP)
+	}
+	// Fallback for non-UDP addresses.
+	return a.String() == b.String()
+}
+
 // Default limits for pending connections (used when config values are not set)
 const defaultMaxPendingConns = 10000
 const defaultMaxPendingPerIP = 100
@@ -190,10 +214,10 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen data udp: %w", err)
 	}
+	const wantBuf = 8 * 1024 * 1024 // 8 MB — needs rmem_max/wmem_max >= this
 	if uc, ok := udpDataConn.(*net.UDPConn); ok {
-		// Larger UDP buffers reduce drops/jitter for high-bitrate UDP workloads.
-		_ = uc.SetReadBuffer(4 * 1024 * 1024)
-		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+		ar, aw := trySetUDPBuffers(uc, wantBuf)
+		logUDPBuf("data", ar, aw, wantBuf)
 	}
 	defer udpDataConn.Close()
 
@@ -238,8 +262,8 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("listen public udp (%s=%s): %w", rt.Name, rt.PublicAddr, err)
 		}
 		if uc, ok := pc.(*net.UDPConn); ok {
-			_ = uc.SetReadBuffer(4 * 1024 * 1024)
-			_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+			ar, aw := trySetUDPBuffers(uc, wantBuf)
+			logUDPBuf("public/"+rt.Name, ar, aw, wantBuf)
 		}
 		publicUDP = append(publicUDP, publicUDPListener{name: rt.Name, pc: pc})
 	}
@@ -1417,7 +1441,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		oldAddr := st.getAgentUDPAddr()
 		st.setAgentUDPAddr(addr)
 		st.setAgentUDPKeyID(0)
-		if oldAddr == nil || oldAddr.String() != addr.String() {
+		if oldAddr == nil || !addrEqual(oldAddr, addr) {
 			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=plaintext", addr)
 		}
 	case udpproto.MsgRegEnc2:
@@ -1440,7 +1464,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		oldAddr := st.getAgentUDPAddr()
 		st.setAgentUDPAddr(addr)
 		st.setAgentUDPKeyID(kid)
-		if oldAddr == nil || oldAddr.String() != addr.String() {
+		if oldAddr == nil || !addrEqual(oldAddr, addr) {
 			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=encrypted keyID=%d", addr, kid)
 		}
 	case udpproto.MsgData:
@@ -1454,7 +1478,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			return
 		}
 		agent := st.getAgentUDPAddr()
-		if agent == nil || agent.String() != addr.String() {
+		if agent == nil || !addrEqual(agent, addr) {
 			return
 		}
 		pc2 := st.publicUDP[route]
@@ -1486,7 +1510,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			return
 		}
 		agent := st.getAgentUDPAddr()
-		if agent == nil || agent.String() != addr.String() {
+		if agent == nil || !addrEqual(agent, addr) {
 			return
 		}
 		pc2 := st.publicUDP[route]
@@ -1637,23 +1661,6 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 		return
 	}
 
-	now := time.Now()
-	
-	// Track UDP session stats
-	if st.udpStats != nil {
-		clientIP := hostFromAddr(clientAddr)
-		sessionID := routeName + ":" + clientIP
-		info := st.udpStats.GetOrCreate(sessionID, routeName, clientIP, "")
-		st.udpStats.RecordReceive(sessionID, len(pkt))
-		// Log UDP client connections to dashboard (first-seen events)
-		if st.dash != nil {
-			if info.CreatedAt.Equal(info.LastActivityTime()) || info.Stats.Snapshot().PacketsReceived <= 1 {
-				st.dash.addConn(now)
-				st.dash.addEvent(routeName, DashboardEvent{TimeUnix: now.Unix(), Kind: "udp_session", RemoteIP: clientIP, Detail: "new UDP client"})
-			}
-		}
-	}
-	
 	var msg []byte
 	clientAddrStr := clientAddr.String()
 	if st.encryptionNone || !st.udpKeys.Enabled() {
@@ -1668,9 +1675,28 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 	if _, err := st.udpData.WriteTo(msg, agent); err != nil {
 		st.dashErrorRateLimited(routeName, "error_udp_write_agent", hostFromAddr(agent), "", err.Error(), 1*time.Second)
 		log.Warnf(logging.CatUDP, "UDP write to agent failed route=%s: %v", routeName, err)
-	} else if st.dash != nil {
-		// Track UDP bytes for bandwidth graph
+		return
+	}
+
+	// Stats + dashboard tracking — kept off the critical write path.
+	// Only call time.Now() once, and only when dashboard is active.
+	if st.dash != nil {
+		now := time.Now()
 		st.dash.addBytes(now, int64(len(pkt)))
+	}
+	if st.udpStats != nil {
+		// Track session stats with single lock acquisition.
+		clientIP := hostFromAddr(clientAddr)
+		sessionID := routeName + ":" + clientIP
+		info := st.udpStats.GetOrCreate(sessionID, routeName, clientIP, "")
+		info.Stats.RecordReceive(len(pkt))
+		info.TouchActivity()
+		// Log first-seen events to dashboard.
+		if st.dash != nil && info.Stats.PacketsReceived.Load() <= 1 {
+			now := time.Now()
+			st.dash.addConn(now)
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: now.Unix(), Kind: "udp_session", RemoteIP: clientIP, Detail: "new UDP client"})
+		}
 	}
 }
 

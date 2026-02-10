@@ -36,8 +36,8 @@ func (si *SessionInfo) LastActivityTime() time.Time {
 	return time.Unix(0, n)
 }
 
-// touchActivity updates the last activity timestamp atomically.
-func (si *SessionInfo) touchActivity() {
+// TouchActivity updates the last activity timestamp atomically.
+func (si *SessionInfo) TouchActivity() {
 	si.lastActivity.Store(time.Now().UnixNano())
 }
 
@@ -62,7 +62,7 @@ func (s *SessionStats) GetOrCreate(id, route, remoteAddr, localTarget string) *S
 	// Fast path: read lock only (common case — session already exists).
 	s.mu.RLock()
 	if info, ok := s.sessions[id]; ok {
-		info.touchActivity()
+		info.TouchActivity()
 		s.mu.RUnlock()
 		return info
 	}
@@ -74,7 +74,7 @@ func (s *SessionStats) GetOrCreate(id, route, remoteAddr, localTarget string) *S
 
 	// Double-check after acquiring write lock.
 	if info, ok := s.sessions[id]; ok {
-		info.touchActivity()
+		info.TouchActivity()
 		return info
 	}
 	
@@ -117,7 +117,7 @@ func (s *SessionStats) RecordSend(id string, bytes int) {
 	s.globalStats.RecordSend(bytes)
 	if info, ok := s.Get(id); ok {
 		info.Stats.RecordSend(bytes)
-		info.touchActivity()
+		info.TouchActivity()
 	}
 }
 
@@ -126,7 +126,7 @@ func (s *SessionStats) RecordReceive(id string, bytes int) {
 	s.globalStats.RecordReceive(bytes)
 	if info, ok := s.Get(id); ok {
 		info.Stats.RecordReceive(bytes)
-		info.touchActivity()
+		info.TouchActivity()
 	}
 }
 
