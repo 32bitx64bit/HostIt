@@ -110,23 +110,35 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			}
 		}()
 
-		sessionsMu := sync.Mutex{}
+		sessionsMu := sync.RWMutex{}
 		sessions := map[string]map[string]*udpSession{} // route -> client -> session
 
 		getOrCreate := func(routeName, clientAddr, localTarget string) (*udpSession, bool) {
+			// RLock fast-path: most packets go to existing sessions.
+			sessionsMu.RLock()
+			if m := sessions[routeName]; m != nil {
+				if s := m[clientAddr]; s != nil {
+					sessionsMu.RUnlock()
+					return s, true
+				}
+			}
+			sessionsMu.RUnlock()
+
+			// Slow path: create new session under write lock with double-check.
 			sessionsMu.Lock()
-			defer sessionsMu.Unlock()
 			m := sessions[routeName]
 			if m == nil {
 				m = map[string]*udpSession{}
 				sessions[routeName] = m
 			}
 			if s := m[clientAddr]; s != nil {
+				sessionsMu.Unlock()
 				return s, true
 			}
 
 			raddr, err := net.ResolveUDPAddr("udp", localTarget)
 			if err != nil {
+				sessionsMu.Unlock()
 				log.Warnf(logging.CatUDP, "UDP resolve failed route=%s client=%s target=%s: %v", routeName, clientAddr, localTarget, err)
 				stats.RecordLoss(1)
 				return nil, false
@@ -134,6 +146,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			lc := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 			lconn, err := net.DialUDP("udp", lc, raddr)
 			if err != nil {
+				sessionsMu.Unlock()
 				log.Warnf(logging.CatUDP, "UDP local dial failed route=%s target=%s: %v", routeName, localTarget, err)
 				stats.RecordLoss(1)
 				return nil, false
@@ -142,22 +155,33 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			_ = lconn.SetWriteBuffer(4 * 1024 * 1024)
 			s := &udpSession{conn: lconn, route: routeName, client: clientAddr}
 			m[clientAddr] = s
+			sessionsMu.Unlock()
 			log.Debugf(logging.CatUDP, "new UDP session route=%s client=%s target=%s", routeName, clientAddr, localTarget)
 
 			go func() {
 				localBufPtr := udpBufPool.Get().(*[]byte)
 				localBuf := *localBufPtr
 				defer udpBufPool.Put(localBufPtr)
+				// Cache the KeySet — it rarely changes (only on key rotation).
+				// Re-check periodically rather than on every packet.
+				cachedKS := sec.Get()
+				pktCount := 0
 				for {
+					// Use a long idle timeout; only reset after actual timeout, not every read.
 					_ = lconn.SetReadDeadline(time.Now().Add(idle))
 					n, err := lconn.Read(localBuf)
 					if err != nil {
 						break
 					}
 					stats.RecordSend(n)
-					ks := sec.Get()
-					if ks.Enabled() {
-						_, _ = uc.Write(udpproto.EncodeDataEnc2ForKeyID(ks, ks.CurID, routeName, clientAddr, localBuf[:n]))
+					// Refresh KeySet every ~1000 packets to pick up rotations without per-packet RLock.
+					pktCount++
+					if pktCount >= 1000 {
+						cachedKS = sec.Get()
+						pktCount = 0
+					}
+					if cachedKS.Enabled() {
+						_, _ = uc.Write(udpproto.EncodeDataEnc2ForKeyID(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n]))
 					} else {
 						_, _ = uc.Write(udpproto.EncodeData(routeName, clientAddr, localBuf[:n]))
 					}
@@ -185,7 +209,9 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		readErr := func() error {
 			defer udpBufPool.Put(readBufPtr)
 			for {
-				_ = uc.SetReadDeadline(time.Now().Add(30 * time.Second))
+				// No per-read deadline: the keepalive goroutine already re-registers
+				// every 5 seconds, so the server always has our address. Removing
+				// SetReadDeadline avoids 2 syscalls (time.Now + setsockopt) per packet.
 				n, err := uc.Read(readBuf)
 				if err != nil {
 					if ne, ok := err.(net.Error); ok && ne.Timeout() {

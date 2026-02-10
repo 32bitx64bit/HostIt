@@ -8,10 +8,36 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"crypto/sha256"
 	"golang.org/x/crypto/hkdf"
 )
+
+// Counter-based nonce generation — avoids crypto/rand.Read syscall per packet.
+// The nonce is 12 bytes: 4-byte random prefix (set once at init) + 8-byte atomic counter.
+// This guarantees uniqueness without any syscall on the hot path.
+var (
+	noncePrefix  [4]byte
+	nonceCounter atomic.Uint64
+)
+
+func init() {
+	_, _ = rand.Read(noncePrefix[:])
+}
+
+func fillNonce(dst []byte) {
+	// dst must be at least 12 bytes (standard AES-GCM nonce size).
+	copy(dst[:4], noncePrefix[:])
+	binary.LittleEndian.PutUint64(dst[4:12], nonceCounter.Add(1))
+}
+
+// Pooled plaintext buffer to avoid per-packet allocation in encrypt path.
+var ptPool = sync.Pool{New: func() any {
+	b := make([]byte, 2048)
+	return &b
+}}
 
 const (
 	MsgReg      byte = 1
@@ -159,15 +185,48 @@ func EncodeDataEnc2ForKeyID(ks KeySet, keyID uint32, route string, client string
 			return EncodeData(route, client, payload)
 		}
 	}
-	pt := encodeDataPayload(route, client, payload)
-	nonce := make([]byte, aead.NonceSize())
-	_, _ = rand.Read(nonce)
-	ct := aead.Seal(nil, nonce, pt, nil)
-	b := make([]byte, 1+4+len(nonce)+len(ct))
+
+	// Build plaintext in a pooled buffer to avoid per-packet allocation.
+	rb := route
+	if len(rb) > 255 {
+		rb = rb[:255]
+	}
+	cb := client
+	if len(cb) > 65535 {
+		cb = cb[:65535]
+	}
+	ptLen := 1 + len(rb) + 2 + len(cb) + len(payload)
+	ptBufPtr := ptPool.Get().(*[]byte)
+	ptBuf := *ptBufPtr
+	if cap(ptBuf) < ptLen {
+		ptBuf = make([]byte, ptLen)
+	} else {
+		ptBuf = ptBuf[:ptLen]
+	}
+	ptBuf[0] = byte(len(rb))
+	o := 1
+	copy(ptBuf[o:], rb)
+	o += len(rb)
+	binary.BigEndian.PutUint16(ptBuf[o:o+2], uint16(len(cb)))
+	o += 2
+	copy(ptBuf[o:], cb)
+	o += len(cb)
+	copy(ptBuf[o:], payload)
+
+	// Single output allocation: header(5) + nonce(12) + ciphertext(ptLen + overhead).
+	ns := aead.NonceSize()
+	total := 1 + 4 + ns + ptLen + aead.Overhead()
+	b := make([]byte, total)
 	b[0] = MsgDataEnc2
 	binary.BigEndian.PutUint32(b[1:5], keyID)
-	copy(b[5:], nonce)
-	copy(b[5+len(nonce):], ct)
+	nonce := b[5 : 5+ns]
+	fillNonce(nonce)
+	aead.Seal(b[5+ns:5+ns:total], nonce, ptBuf, nil)
+
+	// Return plaintext buffer to pool.
+	*ptBufPtr = ptBuf
+	ptPool.Put(ptBufPtr)
+
 	return b
 }
 
@@ -186,7 +245,8 @@ func DecodeDataEnc2(ks KeySet, b []byte) (route string, client string, payload [
 	}
 	nonce := b[5 : 5+ns]
 	ct := b[5+ns:]
-	pt, err := aead.Open(nil, nonce, ct, nil)
+	// Decrypt in-place: reuse the ciphertext slice for plaintext output.
+	pt, err := aead.Open(ct[:0], nonce, ct, nil)
 	if err != nil {
 		return "", "", nil, 0, false
 	}
@@ -260,10 +320,27 @@ func DecodeReg(b []byte) (token string, ok bool) {
 }
 
 func EncodeData(route string, client string, payload []byte) []byte {
-	pt := encodeDataPayload(route, client, payload)
-	b := make([]byte, 1+len(pt))
+	// Single-allocation version: write type byte + payload into one buffer.
+	rb := route
+	if len(rb) > 255 {
+		rb = rb[:255]
+	}
+	cb := client
+	if len(cb) > 65535 {
+		cb = cb[:65535]
+	}
+	total := 1 + 1 + len(rb) + 2 + len(cb) + len(payload)
+	b := make([]byte, total)
 	b[0] = MsgData
-	copy(b[1:], pt)
+	b[1] = byte(len(rb))
+	o := 2
+	copy(b[o:], rb)
+	o += len(rb)
+	binary.BigEndian.PutUint16(b[o:o+2], uint16(len(cb)))
+	o += 2
+	copy(b[o:], cb)
+	o += len(cb)
+	copy(b[o:], payload)
 	return b
 }
 

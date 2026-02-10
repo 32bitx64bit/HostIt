@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"io"
 	"net"
 	"sync"
@@ -44,7 +45,7 @@ func closeRead(c net.Conn) {
 	}
 }
 
-func bidirPipeCount(a net.Conn, b net.Conn) (aToB int64, bToA int64) {
+func bidirPipeCount(ctx context.Context, a net.Conn, b net.Conn) (aToB int64, bToA int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -53,6 +54,13 @@ func bidirPipeCount(a net.Conn, b net.Conn) (aToB int64, bToA int64) {
 		_ = a.Close()
 		_ = b.Close()
 	}
+
+	// When the context is cancelled (e.g. agent disconnected), close both
+	// connections immediately so the io.Copy goroutines unblock and exit.
+	go func() {
+		<-ctx.Done()
+		once.Do(closeBoth)
+	}()
 
 	var n1 atomic.Int64
 	var n2 atomic.Int64
@@ -81,5 +89,5 @@ func bidirPipeCount(a net.Conn, b net.Conn) (aToB int64, bToA int64) {
 }
 
 func bidirPipe(a net.Conn, b net.Conn) {
-	_, _ = bidirPipeCount(a, b)
+	_, _ = bidirPipeCount(context.Background(), a, b)
 }

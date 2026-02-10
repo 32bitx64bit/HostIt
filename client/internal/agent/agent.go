@@ -71,26 +71,32 @@ func RunWithHooks(ctx context.Context, cfg Config, hooks *Hooks) error {
 	}
 }
 
+// Cached env-var checks — evaluated once to avoid os.Getenv + string ops per call.
+var (
+	debugEnabledOnce     sync.Once
+	debugEnabledVal      bool
+	tracePairEnabledOnce sync.Once
+	tracePairEnabledVal  bool
+)
+
+func envBool(names ...string) bool {
+	for _, name := range names {
+		v := strings.TrimSpace(os.Getenv(name))
+		if v != "" && v != "0" {
+			return true
+		}
+	}
+	return false
+}
+
 func debugEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("HOSTIT_DEBUG"))
-	if v == "" {
-		v = strings.TrimSpace(os.Getenv("PLAYIT_DEBUG"))
-	}
-	if v == "" || v == "0" {
-		return false
-	}
-	return true
+	debugEnabledOnce.Do(func() { debugEnabledVal = envBool("HOSTIT_DEBUG", "PLAYIT_DEBUG") })
+	return debugEnabledVal
 }
 
 func tracePairEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("HOSTIT_TRACE_PAIR"))
-	if v == "" {
-		v = strings.TrimSpace(os.Getenv("PLAYIT_TRACE_PAIR"))
-	}
-	if v == "" || v == "0" {
-		return false
-	}
-	return true
+	tracePairEnabledOnce.Do(func() { tracePairEnabledVal = envBool("HOSTIT_TRACE_PAIR", "PLAYIT_TRACE_PAIR") })
+	return tracePairEnabledVal
 }
 
 func debugf(format string, args ...any) {
@@ -330,7 +336,9 @@ ready:
 			return nil
 		default:
 		}
-		_ = controlConn.SetReadDeadline(time.Now().Add(45 * time.Second))
+		// Server pings every 5s. If we haven't received anything in 15s,
+		// the connection is dead. Fail fast so we can reconnect promptly.
+		_ = controlConn.SetReadDeadline(time.Now().Add(15 * time.Second))
 		line, err := rw.ReadLine()
 		if err != nil {
 			log.Warnf(logging.CatControl, "control connection lost: %v", err)
@@ -517,6 +525,7 @@ func setTCPKeepAlive(conn net.Conn, period time.Duration) {
 	}
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(period)
+	setTCPUserTimeout(tc, 15*time.Second)
 }
 
 func unwrapTCPConn(conn net.Conn) *net.TCPConn {

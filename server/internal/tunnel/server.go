@@ -362,6 +362,8 @@ type serverState struct {
 	agentConn     net.Conn
 	agentProto    *lineproto.RW
 	agentWriteMu  sync.Mutex
+	agentCancel   context.CancelFunc // cancels all active pipes tied to the current agent
+	agentCtx      context.Context    // derived context for the current agent session
 	udpData       net.PacketConn
 	publicUDP     map[string]net.PacketConn
 
@@ -415,6 +417,21 @@ func (st *serverState) hasAgent() bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.agentConn != nil && st.agentProto != nil
+}
+
+// getAgentCtx returns the context for the current agent session.
+// When the agent disconnects, this context is cancelled, which terminates
+// all active pipe connections tied to it.
+func (st *serverState) getAgentCtx() context.Context {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.agentCtx != nil {
+		return st.agentCtx
+	}
+	// No agent connected — return an already-cancelled context.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
 }
 
 func (st *serverState) agentWriteLinef(expectedConn net.Conn, format string, args ...any) error {
@@ -666,10 +683,19 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 		_ = prevConn.Close()
 		st.agentConn = nil
 		st.agentProto = nil
+		// Cancel all active pipes from the previous agent session.
+		if st.agentCancel != nil {
+			st.agentCancel()
+			st.agentCancel = nil
+			st.agentCtx = nil
+		}
 		st.setAgentUDPAddr(nil)
 		st.agentUDPKeyID.Store(0)
 	}
 	st.mu.Unlock()
+	if prevConn != nil {
+		st.drainAllPending()
+	}
 
 	// Send all handshake messages BEFORE marking agent as connected.
 	// This prevents a race where handlePublicConn sees hasAgent()==true
@@ -749,10 +775,15 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	}
 	_ = conn.SetWriteDeadline(time.Time{})
 
-	// NOW mark the agent as connected - after READY is sent and agent is listening
+	// NOW mark the agent as connected - after READY is sent and agent is listening.
+	// Create a per-agent context so all active pipes tied to this agent can be
+	// cancelled instantly when the agent disconnects.
+	agentCtx, agentCancel := context.WithCancel(ctx)
 	st.mu.Lock()
 	st.agentConn = conn
 	st.agentProto = rw
+	st.agentCtx = agentCtx
+	st.agentCancel = agentCancel
 	st.mu.Unlock()
 
 	log.Info(logging.CatControl, "agent connected and ready", logging.F(
@@ -767,8 +798,8 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	// A shorter deadAfter reduces the window where the server thinks an agent is
 	// connected but it's actually gone — during that window every NEW command is
 	// doomed to time out.
-	const pingEvery = 15 * time.Second
-	const deadAfter = 30 * time.Second
+	const pingEvery = 5 * time.Second
+	const deadAfter = 10 * time.Second
 	lastSeen := atomic.Int64{}
 	lastSeen.Store(time.Now().UnixNano())
 
@@ -849,9 +880,18 @@ func (st *serverState) clearAgent(conn net.Conn) {
 	_ = st.agentConn.Close()
 	st.agentConn = nil
 	st.agentProto = nil
+	// Cancel the agent context — this immediately terminates all active
+	// bidirPipe goroutines that are proxying traffic for this agent.
+	if st.agentCancel != nil {
+		st.agentCancel()
+		st.agentCancel = nil
+		st.agentCtx = nil
+	}
 	st.setAgentUDPAddr(nil)
 	st.agentUDPKeyID.Store(0)
 	st.mu.Unlock()
+
+	log.Info(logging.CatControl, "agent cleared, draining pending connections")
 
 	// Drain all pending connections immediately so public clients get rejected
 	// right away instead of waiting for PairTimeout. Without this, when the
@@ -1138,7 +1178,10 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		if st.dash != nil {
 			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "paired", RemoteIP: remoteIP, ConnID: id})
 		}
-		a2b, b2a := bidirPipeCount(clientConn, agentConn)
+		// Use the agent-scoped context: if the agent disconnects, all active
+		// pipes are terminated immediately instead of hanging until TCP timeout.
+		agentCtx := st.getAgentCtx()
+		a2b, b2a := bidirPipeCount(agentCtx, clientConn, agentConn)
 		if st.dash != nil {
 			bytes := a2b + b2a
 			st.dash.addBytes(time.Now(), bytes)
@@ -1644,6 +1687,10 @@ func setTCPKeepAlive(conn net.Conn, period time.Duration) {
 	}
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(period)
+	// Tune kernel-level keepalive probes for faster dead-connection detection.
+	// Without this, even with a 30s keepalive period the OS retries 9 times at
+	// 75s intervals (Linux default) = 11+ minutes before a dead peer is detected.
+	setTCPUserTimeout(tc, 15*time.Second)
 }
 
 func unwrapTCPConn(conn net.Conn) *net.TCPConn {
