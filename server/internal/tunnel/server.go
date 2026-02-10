@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,17 +77,29 @@ func NewServer(cfg ServerConfig) *Server {
 		v := defaultMaxPendingPerIP
 		cfg.MaxPendingPerIP = &v
 	}
-	st := &serverState{
-		cfg:           cfg,
-		pending:       map[string]pendingConn{},
-		pendingByIP:   map[string]int{},
-		publicUDP:     map[string]net.PacketConn{},
-		dash:          newDashStateWithInterval(cfg.DashboardInterval),
-		udpPublicJobs: make(map[string]chan udpJob),
-		errLast:       make(map[string]time.Time),
-		udpStats:      udputil.NewSessionStats(1000, 5*time.Minute),
+	noDelay := make(map[string]bool, len(cfg.Routes))
+	for _, rt := range cfg.Routes {
+		if rt.TCPNoDelay == nil {
+			noDelay[rt.Name] = true
+		} else {
+			noDelay[rt.Name] = *rt.TCPNoDelay
+		}
 	}
-st.udpKeys = buildUDPKeySet(cfg)
+
+	st := &serverState{
+		cfg:            cfg,
+		pending:        map[string]pendingConn{},
+		pendingByIP:    map[string]int{},
+		publicUDP:      map[string]net.PacketConn{},
+		dash:           newDashStateWithInterval(cfg.DashboardInterval),
+		udpPublicJobs:  make(map[string]chan udpJob),
+		errLast:        make(map[string]time.Time),
+		udpStats:       udputil.NewSessionStats(1000, 5*time.Minute),
+		encryptionNone: cfg.DisableUDPEncryption || strings.EqualFold(strings.TrimSpace(cfg.UDPEncryptionMode), "none"),
+		resolvedAddrs:  make(map[string]*net.UDPAddr),
+		noDelayByRoute: noDelay,
+	}
+	st.udpKeys = buildUDPKeySet(cfg)
 	return &Server{cfg: cfg, st: st}
 }
 
@@ -349,10 +362,18 @@ type serverState struct {
 	agentConn     net.Conn
 	agentProto    *lineproto.RW
 	agentWriteMu  sync.Mutex
-	agentUDPAddr  net.Addr
-	agentUDPKeyID uint32
 	udpData       net.PacketConn
 	publicUDP     map[string]net.PacketConn
+
+	// Lock-free agent UDP state (hot path — read on every packet)
+	agentUDPAddr  atomic.Value // stores net.Addr (nil = not registered)
+	agentUDPKeyID atomic.Uint32
+
+	// Cached encryption mode (computed once at creation, avoids per-packet string ops)
+	encryptionNone bool
+
+	// Precomputed route properties (avoids linear scan per connection).
+	noDelayByRoute map[string]bool
 
 	pendingMu      sync.Mutex
 	pending        map[string]pendingConn
@@ -364,6 +385,14 @@ type serverState struct {
 
 	// UDP statistics
 	udpStats *udputil.SessionStats
+
+	// UDP drop counters (atomic, for diagnostics)
+	udpAgentDrops  atomic.Int64
+	udpPublicDrops atomic.Int64
+
+	// Resolved-address cache for outbound UDP replies (avoids net.ResolveUDPAddr per packet).
+	resolvedMu    sync.RWMutex
+	resolvedAddrs map[string]*net.UDPAddr
 }
 
 const dashSystemRoute = "_system"
@@ -411,37 +440,39 @@ func (st *serverState) agentWriteLinef(expectedConn net.Conn, format string, arg
 	return err
 }
 
+// Cached env-var checks — evaluated once to avoid os.Getenv + string ops per call.
+var (
+	debugEnabledOnce     sync.Once
+	debugEnabledVal      bool
+	tracePairEnabledOnce sync.Once
+	tracePairEnabledVal  bool
+	traceUDPEnabledOnce  sync.Once
+	traceUDPEnabledVal   bool
+)
+
+func envBool(names ...string) bool {
+	for _, name := range names {
+		v := strings.TrimSpace(os.Getenv(name))
+		if v != "" && v != "0" {
+			return true
+		}
+	}
+	return false
+}
+
 func debugEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("HOSTIT_DEBUG"))
-	if v == "" {
-		v = strings.TrimSpace(os.Getenv("PLAYIT_DEBUG"))
-	}
-	if v == "" || v == "0" {
-		return false
-	}
-	return true
+	debugEnabledOnce.Do(func() { debugEnabledVal = envBool("HOSTIT_DEBUG", "PLAYIT_DEBUG") })
+	return debugEnabledVal
 }
 
 func tracePairEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("HOSTIT_TRACE_PAIR"))
-	if v == "" {
-		v = strings.TrimSpace(os.Getenv("PLAYIT_TRACE_PAIR"))
-	}
-	if v == "" || v == "0" {
-		return false
-	}
-	return true
+	tracePairEnabledOnce.Do(func() { tracePairEnabledVal = envBool("HOSTIT_TRACE_PAIR", "PLAYIT_TRACE_PAIR") })
+	return tracePairEnabledVal
 }
 
 func traceUDPEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("HOSTIT_TRACE_UDP"))
-	if v == "" {
-		v = strings.TrimSpace(os.Getenv("PLAYIT_TRACE_UDP"))
-	}
-	if v == "" || v == "0" {
-		return false
-	}
-	return true
+	traceUDPEnabledOnce.Do(func() { traceUDPEnabledVal = envBool("HOSTIT_TRACE_UDP", "PLAYIT_TRACE_UDP") })
+	return traceUDPEnabledVal
 }
 
 func debugf(format string, args ...any) {
@@ -525,16 +556,10 @@ func (st *serverState) dashErrorRateLimited(routeName, kind, remoteIP, connID, d
 }
 
 func (st *serverState) routeTCPNoDelay(routeName string) bool {
-	for _, rt := range st.cfg.Routes {
-		if rt.Name != routeName {
-			continue
-		}
-		if rt.TCPNoDelay == nil {
-			return true
-		}
-		return *rt.TCPNoDelay
+	if v, ok := st.noDelayByRoute[routeName]; ok {
+		return v
 	}
-	return true
+	return true // default
 }
 
 func (st *serverState) acceptControl(ctx context.Context, ln net.Listener) error {
@@ -641,8 +666,8 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 		_ = prevConn.Close()
 		st.agentConn = nil
 		st.agentProto = nil
-		st.agentUDPAddr = nil
-		st.agentUDPKeyID = 0
+		st.setAgentUDPAddr(nil)
+		st.agentUDPKeyID.Store(0)
 	}
 	st.mu.Unlock()
 
@@ -824,8 +849,8 @@ func (st *serverState) clearAgent(conn net.Conn) {
 	_ = st.agentConn.Close()
 	st.agentConn = nil
 	st.agentProto = nil
-	st.agentUDPAddr = nil
-	st.agentUDPKeyID = 0
+	st.setAgentUDPAddr(nil)
+	st.agentUDPKeyID.Store(0)
 	st.mu.Unlock()
 
 	// Drain all pending connections immediately so public clients get rejected
@@ -1157,28 +1182,27 @@ func (st *serverState) getAgentProto() *lineproto.RW {
 	return st.agentProto
 }
 
+// addrHolder wraps net.Addr for atomic.Value storage (which cannot store nil directly).
+type addrHolder struct{ addr net.Addr }
+
 func (st *serverState) getAgentUDPAddr() net.Addr {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.agentUDPAddr
+	v := st.agentUDPAddr.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(addrHolder).addr
 }
 
 func (st *serverState) getAgentUDPKeyID() uint32 {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.agentUDPKeyID
+	return st.agentUDPKeyID.Load()
 }
 
 func (st *serverState) setAgentUDPAddr(addr net.Addr) {
-	st.mu.Lock()
-	st.agentUDPAddr = addr
-	st.mu.Unlock()
+	st.agentUDPAddr.Store(addrHolder{addr})
 }
 
 func (st *serverState) setAgentUDPKeyID(id uint32) {
-	st.mu.Lock()
-	st.agentUDPKeyID = id
-	st.mu.Unlock()
+	st.agentUDPKeyID.Store(id)
 }
 
 func (st *serverState) acceptAgentUDP(ctx context.Context) error {
@@ -1187,21 +1211,45 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		return nil
 	}
 
-	// Determine worker count from environment or default to CPU count
-	workers := 4
+	// Determine worker count from environment or default to NumCPU
+	workers := runtime.NumCPU()
+	if workers < 4 {
+		workers = 4
+	}
 	if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
 		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 64 {
 			workers = n
 		}
 	}
 
-	jobs := make(chan udpJob, workers*10)
+	// Large buffer to absorb bursts without dropping packets.
+	const jobBufSize = 4096
+	jobs := make(chan udpJob, jobBufSize)
 	st.udpAgentJobs = jobs
 
 	// Start worker pool
 	for i := 0; i < workers; i++ {
 		go st.udpAgentWorker(ctx, jobs)
 	}
+
+	// Periodic drop-rate logger
+	go func() {
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		var prevDrops int64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				d := st.udpAgentDrops.Load()
+				if d > prevDrops {
+					log.Warnf(logging.CatUDP, "UDP agent queue drops: %d total (%d new)", d, d-prevDrops)
+				}
+				prevDrops = d
+			}
+		}
+	}()
 
 	// Single reader distributes packets to workers
 	backoff := 50 * time.Millisecond
@@ -1249,9 +1297,31 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		case jobs <- udpJob{data: buf, len: n, addr: addr, bufPtr: bufPtr}:
 		default:
 			// Drop packet if workers overwhelmed, return buffer to pool
+			st.udpAgentDrops.Add(1)
 			udpBufPool.Put(bufPtr)
 		}
 	}
+}
+
+// resolveUDP caches resolved UDP addresses to avoid net.ResolveUDPAddr per packet.
+func (st *serverState) resolveUDP(addr string) (*net.UDPAddr, error) {
+	st.resolvedMu.RLock()
+	ua, ok := st.resolvedAddrs[addr]
+	st.resolvedMu.RUnlock()
+	if ok {
+		return ua, nil
+	}
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	st.resolvedMu.Lock()
+	// Cap cache size to prevent unbounded memory growth.
+	if len(st.resolvedAddrs) < 100000 {
+		st.resolvedAddrs[addr] = ua
+	}
+	st.resolvedMu.Unlock()
+	return ua, nil
 }
 
 func (st *serverState) udpAgentWorker(ctx context.Context, jobs <-chan udpJob) {
@@ -1280,13 +1350,10 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 	if len(pkt) == 0 {
 		return
 	}
-	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
-	if st.cfg.DisableUDPEncryption {
-		mode = "none"
-	}
+	encNone := st.encryptionNone
 	switch pkt[0] {
 	case udpproto.MsgReg:
-		if !strings.EqualFold(mode, "none") {
+		if !encNone {
 			return
 		}
 		tok, ok := udpproto.DecodeReg(pkt)
@@ -1311,7 +1378,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=plaintext", addr)
 		}
 	case udpproto.MsgRegEnc2:
-		if strings.EqualFold(mode, "none") {
+		if encNone {
 			return
 		}
 		expected := strings.TrimSpace(st.cfg.Token)
@@ -1334,7 +1401,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=encrypted keyID=%d", addr, kid)
 		}
 	case udpproto.MsgData:
-		if !strings.EqualFold(mode, "none") {
+		if !encNone {
 			return
 		}
 		route, client, payload, ok := udpproto.DecodeData(pkt)
@@ -1353,7 +1420,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			st.dashErrorRateLimited(route, "error_udp_unknown_route", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
-		ua, err := net.ResolveUDPAddr("udp", client)
+		ua, err := st.resolveUDP(client)
 		if err != nil {
 			traceUDPf("udp: DATA bad client addr=%q route=%s err=%v", client, route, err)
 			st.dashErrorRateLimited(route, "error_udp_bad_client", hostFromAddr(addr), client, err.Error(), 1*time.Second)
@@ -1366,7 +1433,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			st.dash.addBytes(time.Now(), int64(len(payload)))
 		}
 	case udpproto.MsgDataEnc2:
-		if strings.EqualFold(mode, "none") {
+		if encNone {
 			return
 		}
 		route, client, payload, _, ok := udpproto.DecodeDataEnc2(st.udpKeys, pkt)
@@ -1385,7 +1452,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			st.dashErrorRateLimited(route, "error_udp_unknown_route", hostFromAddr(addr), "", "", 1*time.Second)
 			return
 		}
-		ua, err := net.ResolveUDPAddr("udp", client)
+		ua, err := st.resolveUDP(client)
 		if err != nil {
 			traceUDPf("udp: DATAEnc2 bad client addr=%q route=%s err=%v", client, route, err)
 			st.dashErrorRateLimited(route, "error_udp_bad_client", hostFromAddr(addr), client, err.Error(), 1*time.Second)
@@ -1402,14 +1469,19 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 
 func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, routeName string) error {
 	// Determine worker count
-	workers := 4
+	workers := runtime.NumCPU()
+	if workers < 4 {
+		workers = 4
+	}
 	if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
 		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 64 {
 			workers = n
 		}
 	}
 
-	jobs := make(chan udpJob, workers*10)
+	// Large buffer to absorb bursts without dropping packets.
+	const jobBufSize = 4096
+	jobs := make(chan udpJob, jobBufSize)
 	st.mu.Lock()
 	if st.udpPublicJobs == nil {
 		st.udpPublicJobs = make(map[string]chan udpJob)
@@ -1421,6 +1493,25 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 	for i := 0; i < workers; i++ {
 		go st.udpPublicWorker(ctx, jobs, routeName)
 	}
+
+	// Periodic drop-rate logger
+	go func() {
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		var prevDrops int64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				d := st.udpPublicDrops.Load()
+				if d > prevDrops {
+					log.Warnf(logging.CatUDP, "UDP public queue drops (route=%s): %d total (%d new)", routeName, d, d-prevDrops)
+				}
+				prevDrops = d
+			}
+		}
+	}()
 
 	// Single reader distributes packets to workers
 	backoff := 50 * time.Millisecond
@@ -1468,6 +1559,7 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 		case jobs <- udpJob{data: buf, len: n, addr: clientAddr, bufPtr: bufPtr}:
 		default:
 			// Drop if workers overwhelmed, return buffer to pool
+			st.udpPublicDrops.Add(1)
 			udpBufPool.Put(bufPtr)
 		}
 	}
@@ -1501,6 +1593,8 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 		st.dashErrorRateLimited(routeName, "error_udp_no_agent", "", "", "", 1*time.Second)
 		return
 	}
+
+	now := time.Now()
 	
 	// Track UDP session stats
 	if st.udpStats != nil {
@@ -1510,33 +1604,30 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 		st.udpStats.RecordReceive(sessionID, len(pkt))
 		// Log UDP client connections to dashboard (first-seen events)
 		if st.dash != nil {
-			if info.CreatedAt.Equal(info.LastActivity) || info.Stats.Snapshot().PacketsReceived <= 1 {
-				st.dash.addConn(time.Now())
-				st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "udp_session", RemoteIP: clientIP, Detail: "new UDP client"})
+			if info.CreatedAt.Equal(info.LastActivityTime()) || info.Stats.Snapshot().PacketsReceived <= 1 {
+				st.dash.addConn(now)
+				st.dash.addEvent(routeName, DashboardEvent{TimeUnix: now.Unix(), Kind: "udp_session", RemoteIP: clientIP, Detail: "new UDP client"})
 			}
 		}
 	}
 	
 	var msg []byte
-	mode := strings.TrimSpace(st.cfg.UDPEncryptionMode)
-	if st.cfg.DisableUDPEncryption {
-		mode = "none"
-	}
-	if strings.EqualFold(mode, "none") || !st.udpKeys.Enabled() {
-		msg = udpproto.EncodeData(routeName, clientAddr.String(), pkt)
+	clientAddrStr := clientAddr.String()
+	if st.encryptionNone || !st.udpKeys.Enabled() {
+		msg = udpproto.EncodeData(routeName, clientAddrStr, pkt)
 	} else {
 		kid := st.getAgentUDPKeyID()
 		if kid == 0 {
 			kid = st.cfg.UDPKeyID
 		}
-		msg = udpproto.EncodeDataEnc2ForKeyID(st.udpKeys, kid, routeName, clientAddr.String(), pkt)
+		msg = udpproto.EncodeDataEnc2ForKeyID(st.udpKeys, kid, routeName, clientAddrStr, pkt)
 	}
 	if _, err := st.udpData.WriteTo(msg, agent); err != nil {
 		st.dashErrorRateLimited(routeName, "error_udp_write_agent", hostFromAddr(agent), "", err.Error(), 1*time.Second)
 		log.Warnf(logging.CatUDP, "UDP write to agent failed route=%s: %v", routeName, err)
 	} else if st.dash != nil {
 		// Track UDP bytes for bandwidth graph
-		st.dash.addBytes(time.Now(), int64(len(pkt)))
+		st.dash.addBytes(now, int64(len(pkt)))
 	}
 }
 

@@ -2,6 +2,7 @@ package udputil
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,9 +22,23 @@ type SessionInfo struct {
 	RemoteAddr    string    `json:"remote_addr"`
 	LocalTarget   string    `json:"local_target"`
 	CreatedAt     time.Time `json:"created_at"`
-	LastActivity  time.Time `json:"last_activity"`
+	lastActivity  atomic.Int64 // unix nano, use LastActivityTime()
 	Stats         *Stats    `json:"-"`
 	StatsSnapshot StatsSnapshot `json:"stats"`
+}
+
+// LastActivityTime returns the last activity time.
+func (si *SessionInfo) LastActivityTime() time.Time {
+	n := si.lastActivity.Load()
+	if n == 0 {
+		return si.CreatedAt
+	}
+	return time.Unix(0, n)
+}
+
+// touchActivity updates the last activity timestamp atomically.
+func (si *SessionInfo) touchActivity() {
+	si.lastActivity.Store(time.Now().UnixNano())
 }
 
 // NewSessionStats creates a session statistics tracker.
@@ -44,11 +59,22 @@ func NewSessionStats(maxSessions int, sessionTTL time.Duration) *SessionStats {
 
 // GetOrCreate gets or creates a session.
 func (s *SessionStats) GetOrCreate(id, route, remoteAddr, localTarget string) *SessionInfo {
+	// Fast path: read lock only (common case — session already exists).
+	s.mu.RLock()
+	if info, ok := s.sessions[id]; ok {
+		info.touchActivity()
+		s.mu.RUnlock()
+		return info
+	}
+	s.mu.RUnlock()
+
+	// Slow path: write lock to create.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
+	// Double-check after acquiring write lock.
 	if info, ok := s.sessions[id]; ok {
-		info.LastActivity = time.Now()
+		info.touchActivity()
 		return info
 	}
 	
@@ -57,15 +83,16 @@ func (s *SessionStats) GetOrCreate(id, route, remoteAddr, localTarget string) *S
 		s.cleanupOldestLocked()
 	}
 	
+	now := time.Now()
 	info := &SessionInfo{
 		ID:           id,
 		Route:        route,
 		RemoteAddr:   remoteAddr,
 		LocalTarget:  localTarget,
-		CreatedAt:    time.Now(),
-		LastActivity: time.Now(),
+		CreatedAt:    now,
 		Stats:        NewStats(),
 	}
+	info.lastActivity.Store(now.UnixNano())
 	s.sessions[id] = info
 	return info
 }
@@ -90,7 +117,7 @@ func (s *SessionStats) RecordSend(id string, bytes int) {
 	s.globalStats.RecordSend(bytes)
 	if info, ok := s.Get(id); ok {
 		info.Stats.RecordSend(bytes)
-		info.LastActivity = time.Now()
+		info.touchActivity()
 	}
 }
 
@@ -99,7 +126,7 @@ func (s *SessionStats) RecordReceive(id string, bytes int) {
 	s.globalStats.RecordReceive(bytes)
 	if info, ok := s.Get(id); ok {
 		info.Stats.RecordReceive(bytes)
-		info.LastActivity = time.Now()
+		info.touchActivity()
 	}
 }
 
@@ -120,11 +147,19 @@ func (s *SessionStats) ActiveSessions() []SessionInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	
-	result := make([]SessionInfo, 0, len(s.sessions))
+	result := make([]SessionInfo, len(s.sessions))
+	i := 0
 	for _, info := range s.sessions {
-		infoCopy := *info
-		infoCopy.StatsSnapshot = info.Stats.Snapshot()
-		result = append(result, infoCopy)
+		r := &result[i]
+		r.ID = info.ID
+		r.Route = info.Route
+		r.RemoteAddr = info.RemoteAddr
+		r.LocalTarget = info.LocalTarget
+		r.CreatedAt = info.CreatedAt
+		r.Stats = info.Stats
+		r.StatsSnapshot = info.Stats.Snapshot()
+		r.lastActivity.Store(info.lastActivity.Load())
+		i++
 	}
 	return result
 }
@@ -137,7 +172,7 @@ func (s *SessionStats) Cleanup() int {
 	cutoff := time.Now().Add(-s.sessionTTL)
 	removed := 0
 	for id, info := range s.sessions {
-		if info.LastActivity.Before(cutoff) {
+		if info.LastActivityTime().Before(cutoff) {
 			delete(s.sessions, id)
 			removed++
 		}
@@ -159,7 +194,7 @@ func (s *SessionStats) cleanupOldestLocked() {
 	}
 	var oldest []aged
 	for id, info := range s.sessions {
-		oldest = append(oldest, aged{id, info.LastActivity})
+		oldest = append(oldest, aged{id, info.LastActivityTime()})
 	}
 	
 	// Sort by activity time (simple selection for small N)

@@ -256,27 +256,30 @@ func (l *Logger) log(level Level, cat Category, msg string, fields map[string]an
 		Category:  cat,
 		Component: l.component,
 		Message:   msg,
-		Fields:    make(map[string]any),
 	}
 
 	// Copy logger fields
 	l.mu.RLock()
-	for k, v := range l.fields {
-		entry.Fields[k] = v
-	}
+	loggerFields := l.fields
 	hooks := l.hooks
 	l.mu.RUnlock()
 
-	// Add call-specific fields
-	for k, v := range fields {
-		if k == "error" {
-			if err, ok := v.(error); ok {
-				entry.Error = err
-				entry.ErrorStr = err.Error()
-				continue
-			}
+	// Only allocate Fields map when there are actual fields to merge.
+	if len(loggerFields) > 0 || len(fields) > 0 {
+		entry.Fields = make(map[string]any, len(loggerFields)+len(fields))
+		for k, v := range loggerFields {
+			entry.Fields[k] = v
 		}
-		entry.Fields[k] = v
+		for k, v := range fields {
+			if k == "error" {
+				if err, ok := v.(error); ok {
+					entry.Error = err
+					entry.ErrorStr = err.Error()
+					continue
+				}
+			}
+			entry.Fields[k] = v
+		}
 	}
 
 	// Add caller info if enabled
@@ -397,22 +400,37 @@ func (l *Logger) Fatal(cat Category, msg string, fields ...map[string]any) {
 // Convenience methods with formatted messages
 
 func (l *Logger) Tracef(cat Category, format string, args ...any) {
+	if LevelTrace < Level(l.level.Load()) {
+		return
+	}
 	l.Trace(cat, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Debugf(cat Category, format string, args ...any) {
+	if LevelDebug < Level(l.level.Load()) {
+		return
+	}
 	l.Debug(cat, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Infof(cat Category, format string, args ...any) {
+	if LevelInfo < Level(l.level.Load()) {
+		return
+	}
 	l.Info(cat, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Warnf(cat Category, format string, args ...any) {
+	if LevelWarn < Level(l.level.Load()) {
+		return
+	}
 	l.Warn(cat, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Errorf(cat Category, format string, args ...any) {
+	if LevelError < Level(l.level.Load()) {
+		return
+	}
 	l.Error(cat, fmt.Sprintf(format, args...))
 }
 

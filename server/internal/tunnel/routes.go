@@ -76,7 +76,8 @@ func normalizeRoutes(cfg *ServerConfig) {
 }
 
 func routeHasTCP(proto string) bool {
-	switch strings.ToLower(strings.TrimSpace(proto)) {
+	// proto is already normalized (lowercase, trimmed) by normalizeRoutes.
+	switch proto {
 	case "tcp", "both":
 		return true
 	default:
@@ -85,7 +86,8 @@ func routeHasTCP(proto string) bool {
 }
 
 func routeHasUDP(proto string) bool {
-	switch strings.ToLower(strings.TrimSpace(proto)) {
+	// proto is already normalized (lowercase, trimmed) by normalizeRoutes.
+	switch proto {
 	case "udp", "both":
 		return true
 	default:
