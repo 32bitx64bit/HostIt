@@ -42,35 +42,60 @@ func main() {
 
 	cfg := agent.Config{}
 	loaded, _ := configio.Load(configPath, &cfg)
-	if !loaded && strings.TrimSpace(cfg.Server) == "" {
-		// First-run convenience: if no config file exists, default to localhost.
-		cfg.Server = "127.0.0.1"
+
+	// Log configuration status
+	if loaded {
+		log.Printf("Loaded configuration from: %s", configPath)
+	} else {
+		log.Printf("No configuration file found at: %s (will create on save)", configPath)
 	}
+
+	// First-run convenience: if no config file exists, default to localhost.
+	if !loaded && strings.TrimSpace(cfg.Server) == "" {
+		cfg.Server = "127.0.0.1"
+		log.Printf("First run: using default server: %s", cfg.Server)
+	}
+
+	// Override with command-line arguments
 	if strings.TrimSpace(token) != "" {
 		cfg.Token = token
+		log.Printf("Using token from command-line argument")
 	}
 	if strings.TrimSpace(serverHost) != "" {
 		cfg.Server = serverHost
+		log.Printf("Using server from command-line argument: %s", serverHost)
 	}
 
+	// Validate configuration
 	if strings.TrimSpace(cfg.Server) == "" {
 		if webAddr == "" {
-			log.Fatalf("agent server is required (set -server or agent.json Server)")
+			log.Fatalf("ERROR: agent server is required (set -server or agent.json Server)")
 		}
 		autostart = false
-		log.Printf("agent server not set; web UI is available to configure it")
+		log.Printf("WARNING: agent server not configured; web UI is available to configure it")
 	}
 	if strings.TrimSpace(cfg.Token) == "" {
 		if webAddr == "" {
-			log.Fatalf("agent token is required (set -token or agent.json Token)")
+			log.Fatalf("ERROR: agent token is required (set -token or agent.json Token)")
 		}
 		autostart = false
-		log.Printf("agent token not set; web UI is available to configure it")
+		log.Printf("WARNING: agent token not configured; web UI is available to configure it")
 	}
 
 	ctrl := newAgentController(ctx, cfg)
 	if autostart {
+		log.Printf("=== Auto-starting agent ===")
+		log.Printf("Server: %s", cfg.Server)
+		log.Printf("Control address: %s", cfg.ControlAddr())
+		log.Printf("Data address: %s", cfg.DataAddr())
+		log.Printf("TLS enabled: %v", !cfg.DisableTLS)
 		ctrl.Start()
+	} else {
+		log.Printf("=== Agent not auto-started ===")
+		log.Printf("Reason: server or token not configured")
+		if webAddr != "" {
+			log.Printf("Configure via web UI at: http://%s", webAddr)
+		}
 	}
 
 	if webAddr != "" {
@@ -248,26 +273,36 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentClient, "client.zip", moduleDir, updStatePath)
 	upd.PreservePaths = []string{absCfg}
 	upd.Restart = func() error {
+		log.Printf("=== Update complete, restarting agent ===")
 		ctrl.Stop()
 		bin := upd.BuiltBinaryPath()
 		if _, err := os.Stat(bin); err != nil {
+			log.Printf("ERROR: Built binary not found: %s", bin)
 			return err
 		}
+		log.Printf("Built binary: %s", bin)
+
 		// If we're running under systemd, restart the service (or exit and let systemd restart).
 		if runningUnderSystemd() {
+			log.Printf("Running under systemd - restarting service")
 			if systemctlAvailable() {
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
 				cmd := exec.CommandContext(ctx2, "systemctl", "restart", "--no-block", "hostit-agent.service")
 				out, err := cmd.CombinedOutput()
 				if err == nil {
+					log.Printf("Systemd restart command sent successfully")
 					return nil
 				}
-				_ = out
+				log.Printf("Systemctl restart failed: %v, output: %s", err, string(out))
 			}
+			log.Printf("Sending SIGTERM to let systemd restart")
 			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 			return nil
 		}
+
+		log.Printf("Not running under systemd - executing binary replacement")
+		log.Printf("Agent will auto-reconnect using configuration from: %s", configPath)
 		return updater.ExecReplace(bin, os.Args[1:])
 	}
 	upd.Start(ctx)
@@ -324,15 +359,15 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			outRoutes = append(outRoutes, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, LocalTarget: localTargetFromPublicAddr(rt.PublicAddr)})
 		}
 		resp := map[string]any{
-			"running":     running,
-			"connected":   connected,
-			"lastErr":     lastErr,
-			"server":      cfg.Server,
-			"tokenSet":    strings.TrimSpace(cfg.Token) != "",
-			"configPath":  configPath,
-			"nowUnix":     time.Now().Unix(),
-			"routes":      outRoutes,
-			"routeCount":  len(outRoutes),
+			"running":    running,
+			"connected":  connected,
+			"lastErr":    lastErr,
+			"server":     cfg.Server,
+			"tokenSet":   strings.TrimSpace(cfg.Token) != "",
+			"configPath": configPath,
+			"nowUnix":    time.Now().Unix(),
+			"routes":     outRoutes,
+			"routeCount": len(outRoutes),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)

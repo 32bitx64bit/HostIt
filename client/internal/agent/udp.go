@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -29,7 +31,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 
 	// UDP stats for monitoring
 	stats := udputil.NewStats()
-	
+
 	// Log stats periodically
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -41,7 +43,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			case <-ticker.C:
 				s := stats.Snapshot()
 				if s.PacketsReceived > 0 || s.PacketsSent > 0 {
-					log.Infof(logging.CatUDP, "UDP stats: sent=%d recv=%d lost=%d loss=%.2f%%", 
+					log.Infof(logging.CatUDP, "UDP stats: sent=%d recv=%d lost=%d loss=%.2f%%",
 						s.PacketsSent, s.PacketsReceived, s.PacketsLost, s.LossRate*100)
 				}
 			}
@@ -234,8 +236,18 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			len    int
 			bufPtr *[]byte
 		}
-		inJobs := make(chan inJob, 2048)
-		const inWorkers = 4
+		// Increased queue size from 2048 to 8192 to handle high-load scenarios
+		// (e.g., Sunshine streaming with multiple ports)
+		inJobs := make(chan inJob, 8192)
+
+		// Increased worker count from 4 to 16 for better parallelization
+		// under high load. Can be overridden via HOSTIT_UDP_WORKERS env var.
+		inWorkers := 16
+		if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
+			if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 64 {
+				inWorkers = n
+			}
+		}
 		var inWg sync.WaitGroup
 		inWg.Add(inWorkers)
 		for i := 0; i < inWorkers; i++ {

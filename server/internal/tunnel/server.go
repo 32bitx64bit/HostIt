@@ -165,7 +165,7 @@ func (s *Server) Dashboard(now time.Time) DashboardSnapshot {
 		return DashboardSnapshot{NowUnix: now.Unix(), AgentConnected: agentConnected}
 	}
 	snap := s.st.dash.snapshot(now, agentConnected)
-	
+
 	// Add UDP stats if available
 	if s.st.udpStats != nil {
 		summary := s.st.udpStats.Summary()
@@ -177,7 +177,7 @@ func (s *Server) Dashboard(now time.Time) DashboardSnapshot {
 			ActiveRoutes: len(summary.ByRoute),
 		}
 	}
-	
+
 	return snap
 }
 
@@ -382,14 +382,14 @@ type serverState struct {
 	errMu   sync.Mutex
 	errLast map[string]time.Time
 
-	mu            sync.Mutex
-	agentConn     net.Conn
-	agentProto    *lineproto.RW
-	agentWriteMu  sync.Mutex
-	agentCancel   context.CancelFunc // cancels all active pipes tied to the current agent
-	agentCtx      context.Context    // derived context for the current agent session
-	udpData       net.PacketConn
-	publicUDP     map[string]net.PacketConn
+	mu           sync.Mutex
+	agentConn    net.Conn
+	agentProto   *lineproto.RW
+	agentWriteMu sync.Mutex
+	agentCancel  context.CancelFunc // cancels all active pipes tied to the current agent
+	agentCtx     context.Context    // derived context for the current agent session
+	udpData      net.PacketConn
+	publicUDP    map[string]net.PacketConn
 
 	// Lock-free agent UDP state (hot path — read on every packet)
 	agentUDPAddr  atomic.Value // stores net.Addr (nil = not registered)
@@ -401,9 +401,9 @@ type serverState struct {
 	// Precomputed route properties (avoids linear scan per connection).
 	noDelayByRoute map[string]bool
 
-	pendingMu      sync.Mutex
-	pending        map[string]pendingConn
-	pendingByIP    map[string]int // track pending count per IP for DoS prevention
+	pendingMu   sync.Mutex
+	pending     map[string]pendingConn
+	pendingByIP map[string]int // track pending count per IP for DoS prevention
 
 	// Parallelization structures
 	udpAgentJobs  chan udpJob
@@ -425,9 +425,9 @@ const dashSystemRoute = "_system"
 
 type udpJob struct {
 	data   []byte
-	len    int      // Actual data length (data may be from pool with larger capacity)
+	len    int // Actual data length (data may be from pool with larger capacity)
 	addr   net.Addr
-	bufPtr *[]byte  // Pool buffer to return after processing (nil if data was copied)
+	bufPtr *[]byte // Pool buffer to return after processing (nil if data was copied)
 }
 
 type pendingConn struct {
@@ -1278,19 +1278,22 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		return nil
 	}
 
-	// Determine worker count from environment or default to NumCPU
-	workers := runtime.NumCPU()
-	if workers < 4 {
-		workers = 4
+	// Determine worker count from environment or default to NumCPU * 2
+	// Increased minimum from 4 to 8 and default multiplier to 2 for better
+	// parallelization under high load (e.g., multiple streaming ports)
+	workers := runtime.NumCPU() * 2
+	if workers < 8 {
+		workers = 8
 	}
 	if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
-		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 64 {
+		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 128 {
 			workers = n
 		}
 	}
 
 	// Large buffer to absorb bursts without dropping packets.
-	const jobBufSize = 4096
+	// Increased from 4096 to 16384 for high-load scenarios.
+	const jobBufSize = 16384
 	jobs := make(chan udpJob, jobBufSize)
 	st.udpAgentJobs = jobs
 
@@ -1536,18 +1539,21 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 
 func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, routeName string) error {
 	// Determine worker count
-	workers := runtime.NumCPU()
-	if workers < 4 {
-		workers = 4
+	// Increased minimum from 4 to 8 and default multiplier to 2 for better
+	// parallelization under high load (e.g., multiple streaming ports)
+	workers := runtime.NumCPU() * 2
+	if workers < 8 {
+		workers = 8
 	}
 	if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
-		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 64 {
+		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 128 {
 			workers = n
 		}
 	}
 
 	// Large buffer to absorb bursts without dropping packets.
-	const jobBufSize = 4096
+	// Increased from 4096 to 16384 for high-load scenarios.
+	const jobBufSize = 16384
 	jobs := make(chan udpJob, jobBufSize)
 	st.mu.Lock()
 	if st.udpPublicJobs == nil {
