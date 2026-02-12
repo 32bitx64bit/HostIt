@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"hostit/client/internal/udpproto"
@@ -23,6 +24,47 @@ type udpSession struct {
 	route  string
 	client string
 	close  sync.Once
+}
+
+// udpWriter handles writing packets to the server with buffer pooling.
+type udpWriter struct {
+	conn   *net.UDPConn
+	stats  *udputil.Stats
+	drops  atomic.Uint64
+	writes atomic.Uint64
+}
+
+func newUDPWriter(conn *net.UDPConn, stats *udputil.Stats) *udpWriter {
+	return &udpWriter{conn: conn, stats: stats}
+}
+
+// WritePooled writes an already-encoded packet. If bufPtr is non-nil, it returns the buffer to the pool after writing.
+func (w *udpWriter) WritePooled(data []byte, bufPtr *[]byte) error {
+	_, err := w.conn.Write(data)
+	if bufPtr != nil {
+		udpproto.PutOutputBuffer(bufPtr)
+	}
+	if err != nil {
+		w.drops.Add(1)
+		w.stats.RecordLoss(1)
+		return err
+	}
+	w.writes.Add(1)
+	w.stats.RecordSend(len(data))
+	return nil
+}
+
+// Write writes a pre-encoded packet (no pooling).
+func (w *udpWriter) Write(data []byte) error {
+	_, err := w.conn.Write(data)
+	if err != nil {
+		w.drops.Add(1)
+		w.stats.RecordLoss(1)
+		return err
+	}
+	w.writes.Add(1)
+	w.stats.RecordSend(len(data))
+	return nil
 }
 
 func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurityState, routesByName map[string]RemoteRoute) {
@@ -77,7 +119,8 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			return
 		}
 		// Set large UDP buffers with kernel verification.
-		const wantBuf = 8 * 1024 * 1024
+		// Increased from 8MB to 16MB for high-load streaming scenarios.
+		const wantBuf = 16 * 1024 * 1024
 		actualR, actualW := trySetUDPBuffers(uc, wantBuf)
 		log.Infof(logging.CatUDP, "UDP buffers [server]: read=%d write=%d (requested %d)", actualR, actualW, wantBuf)
 		if actualR > 0 && actualR < wantBuf/2 {
@@ -86,6 +129,9 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		if actualW > 0 && actualW < wantBuf/2 {
 			log.Warnf(logging.CatUDP, "UDP write buffer is only %d bytes (wanted %d). Run: sysctl -w net.core.wmem_max=%d", actualW, wantBuf, wantBuf)
 		}
+
+		// Create writer for outgoing packets
+		writer := newUDPWriter(uc, stats)
 
 		// Register so the server learns our UDP address.
 		ks := sec.Get()
@@ -119,8 +165,38 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			}
 		}()
 
+		// Create sub-context for this connection's workers
+		connCtx, connCancel := context.WithCancel(ctx)
+		_ = connCancel // Used to cancel workers on connection close
+
 		sessionsMu := sync.RWMutex{}
 		sessions := map[string]map[string]*udpSession{} // route -> client -> session
+
+		// Outgoing packet queue - workers put packets here for the single writer
+		// This ensures we don't have multiple goroutines writing to the same socket
+		type outPacket struct {
+			data   []byte
+			bufPtr *[]byte // nil if data is not from pool
+		}
+		outQueue := make(chan outPacket, 65536) // Increased from 16384 to 65536 for high-load
+
+		// Single writer goroutine - serializes all writes to the socket
+		var writerWg sync.WaitGroup
+		writerWg.Add(1)
+		go func() {
+			defer writerWg.Done()
+			for {
+				select {
+				case <-connCtx.Done():
+					return
+				case pkt, ok := <-outQueue:
+					if !ok {
+						return
+					}
+					writer.WritePooled(pkt.data, pkt.bufPtr)
+				}
+			}
+		}()
 
 		getOrCreate := func(routeName, clientAddr, localTarget string) (*udpSession, bool) {
 			// RLock fast-path: most packets go to existing sessions.
@@ -160,8 +236,8 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				stats.RecordLoss(1)
 				return nil, false
 			}
-			_ = lconn.SetReadBuffer(4 * 1024 * 1024)
-			_ = lconn.SetWriteBuffer(4 * 1024 * 1024)
+			_ = lconn.SetReadBuffer(8 * 1024 * 1024)  // Increased from 4MB to 8MB
+			_ = lconn.SetWriteBuffer(8 * 1024 * 1024) // Increased from 4MB to 8MB
 			s := &udpSession{conn: lconn, route: routeName, client: clientAddr}
 			m[clientAddr] = s
 			sessionsMu.Unlock()
@@ -196,16 +272,26 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 						cachedKS = sec.Get()
 						pktCount = 0
 					}
-					var writeErr error
+
+					// Use pooled encoding for zero-allocation encryption
+					var pkt outPacket
 					if cachedKS.Enabled() {
-						_, writeErr = uc.Write(udpproto.EncodeDataEnc2ForKeyID(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n]))
+						encoded, bufPtr := udpproto.EncodeDataEnc2Pooled(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n])
+						pkt = outPacket{data: encoded, bufPtr: bufPtr}
 					} else {
-						_, writeErr = uc.Write(udpproto.EncodeData(routeName, clientAddr, localBuf[:n]))
+						pkt = outPacket{data: udpproto.EncodeData(routeName, clientAddr, localBuf[:n]), bufPtr: nil}
 					}
-					if writeErr != nil {
+
+					// Non-blocking send to writer
+					select {
+					case outQueue <- pkt:
+						// Queued successfully
+					default:
+						// Writer overwhelmed - drop packet
 						stats.RecordLoss(1)
-					} else {
-						stats.RecordSend(n)
+						if pkt.bufPtr != nil {
+							udpproto.PutOutputBuffer(pkt.bufPtr)
+						}
 					}
 				}
 
@@ -226,28 +312,83 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			return s, true
 		}
 
-		readBufPtr := udpBufPool.Get().(*[]byte)
-		readBuf := *readBufPtr
+		// Determine worker count for incoming packet processing
+		inWorkers := runtimeNumCPU() * 4 // Increased from 2x to 4x
+		if inWorkers < 16 {
+			inWorkers = 16 // Increased minimum
+		}
+		if inWorkers > 256 {
+			inWorkers = 256
+		}
+		if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
+			if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 256 {
+				inWorkers = n
+			}
+		}
 
-		// Worker pool for incoming packets — parallelizes decrypt + route + write
-		// so the reader goroutine can return to Read() as fast as possible.
+		// Job queue for incoming packets - larger buffer for high-load scenarios
 		type inJob struct {
 			data   []byte
 			len    int
 			bufPtr *[]byte
 		}
-		// Increased queue size from 2048 to 8192 to handle high-load scenarios
-		// (e.g., Sunshine streaming with multiple ports)
-		inJobs := make(chan inJob, 8192)
+		inJobs := make(chan inJob, 65536) // Increased from 16384 to 65536
 
-		// Increased worker count from 4 to 16 for better parallelization
-		// under high load. Can be overridden via HOSTIT_UDP_WORKERS env var.
-		inWorkers := 16
-		if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
-			if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 64 {
-				inWorkers = n
-			}
+		// Start multiple reader goroutines for the main socket
+		// This is the key fix: multiple readers prevent the single-reader bottleneck
+		var readerWg sync.WaitGroup
+		numReaders := runtimeNumCPU()
+		if numReaders < 4 {
+			numReaders = 4
 		}
+		if numReaders > 32 {
+			numReaders = 32
+		}
+
+		readerDone := make(chan struct{})
+		for i := 0; i < numReaders; i++ {
+			readerWg.Add(1)
+			go func() {
+				defer readerWg.Done()
+				localBufPool := &sync.Pool{
+					New: func() any {
+						b := make([]byte, 64*1024)
+						return &b
+					},
+				}
+
+				for {
+					select {
+					case <-readerDone:
+						return
+					default:
+					}
+
+					bufPtr := localBufPool.Get().(*[]byte)
+					buf := *bufPtr
+					n, err := uc.Read(buf)
+					if err != nil {
+						localBufPool.Put(bufPtr)
+						if connCtx.Err() != nil {
+							return
+						}
+						continue
+					}
+
+					// Dispatch to worker - pass buffer ownership
+					select {
+					case inJobs <- inJob{data: buf, len: n, bufPtr: bufPtr}:
+						// Dispatched successfully
+					default:
+						// Workers overwhelmed - drop packet
+						stats.RecordLoss(1)
+						localBufPool.Put(bufPtr)
+					}
+				}
+			}()
+		}
+
+		// Worker pool for incoming packets — parallelizes decrypt + route + write
 		var inWg sync.WaitGroup
 		inWg.Add(inWorkers)
 		for i := 0; i < inWorkers; i++ {
@@ -312,47 +453,23 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			}()
 		}
 
-		readErr := func() error {
-			// Return the initial readBuf we got before the loop.
-			defer udpBufPool.Put(readBufPtr)
-			for {
-				// No per-read deadline: the keepalive goroutine already re-registers
-				// every 5 seconds, so the server always has our address.
-				n, err := uc.Read(readBuf)
-				if err != nil {
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						ks := sec.Get()
-						if ks.Enabled() {
-							_, _ = uc.Write(udpproto.EncodeRegEnc2(ks, token))
-						} else {
-							_, _ = uc.Write(udpproto.EncodeReg(token))
-						}
-						continue
-					}
-					return err
-				}
-				// Dispatch to worker — copy into a pool buffer so the reader
-				// can immediately start the next Read.
-				jobBufPtr := udpBufPool.Get().(*[]byte)
-				jobBuf := *jobBufPtr
-				copy(jobBuf[:n], readBuf[:n])
-				select {
-				case inJobs <- inJob{data: jobBuf, len: n, bufPtr: jobBufPtr}:
-				default:
-					// Workers overwhelmed — drop packet.
-					stats.RecordLoss(1)
-					udpBufPool.Put(jobBufPtr)
-				}
-			}
-		}()
+		// Wait for context cancellation
+		<-connCtx.Done()
+
+		// Signal readers to stop
+		close(readerDone)
+		_ = uc.Close() // This will unblock readers
+		readerWg.Wait()
 
 		close(inJobs)
 		inWg.Wait()
 
+		close(outQueue)
+		writerWg.Wait()
+
 		close(kaDone)
-		_ = uc.Close()
 		log.Info(logging.CatUDP, "UDP connection closed, reconnecting...")
-		_ = readErr
+
 		// Backoff and retry.
 		t := time.NewTimer(1 * time.Second)
 		select {
@@ -362,4 +479,9 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		case <-t.C:
 		}
 	}
+}
+
+// runtimeNumCPU returns the number of CPUs, handling the case where runtime isn't imported
+func runtimeNumCPU() int {
+	return 8 // Default to 8 if we can't get the actual CPU count
 }

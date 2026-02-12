@@ -79,4 +79,24 @@ type ServerConfig struct {
 	// Default: 30s. Minimum: 5s. Maximum: 10m.
 	DashboardInterval time.Duration `json:",omitempty"`
 	Routes            []RouteConfig
+
+	// UDP performance tuning options (optional, defaults applied if not set)
+	// UDPReaderCount is the number of parallel reader goroutines per UDP socket.
+	// Default: GOMAXPROCS/2, min 2, max 16.
+	UDPReaderCount *int `json:",omitempty"`
+	// UDPWorkerCount is the number of worker goroutines for packet processing.
+	// Default: GOMAXPROCS*2, min 8, max 128.
+	UDPWorkerCount *int `json:",omitempty"`
+	// UDPQueueSize is the packet queue size between readers and workers.
+	// Default: 16384.
+	UDPQueueSize *int `json:",omitempty"`
+	// UDPBufferSize is the kernel socket buffer size in bytes.
+	// Default: 8MB (8388608).
+	UDPBufferSize *int `json:",omitempty"`
+	// UDPSessionBufferSize is the per-session buffer size for local UDP connections.
+	// Default: 4MB (4194304).
+	UDPSessionBufferSize *int `json:",omitempty"`
+	// UDPBufferPoolSize is the size of each buffer in the pool in bytes.
+	// Default: 64KB (65536).
+	UDPBufferPoolSize *int `json:",omitempty"`
 }

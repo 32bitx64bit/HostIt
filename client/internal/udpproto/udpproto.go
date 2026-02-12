@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"crypto/sha256"
+
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -38,6 +39,24 @@ var ptPool = sync.Pool{New: func() any {
 	b := make([]byte, 2048)
 	return &b
 }}
+
+// Pooled output buffer for encrypted packets - avoids per-packet allocation.
+// Sized for max UDP packet (64KB) + encryption overhead.
+var outPool = sync.Pool{New: func() any {
+	b := make([]byte, 70*1024) // 70KB to account for encryption overhead
+	return &b
+}}
+
+// GetOutputBuffer returns a buffer from the output pool.
+// Caller takes ownership and must return it via PutOutputBuffer.
+func GetOutputBuffer() *[]byte {
+	return outPool.Get().(*[]byte)
+}
+
+// PutOutputBuffer returns a buffer to the output pool.
+func PutOutputBuffer(buf *[]byte) {
+	outPool.Put(buf)
+}
 
 const (
 	MsgReg      byte = 1
@@ -228,6 +247,77 @@ func EncodeDataEnc2ForKeyID(ks KeySet, keyID uint32, route string, client string
 	ptPool.Put(ptBufPtr)
 
 	return b
+}
+
+// EncodeDataEnc2Pooled is a zero-allocation version that writes to a pooled buffer.
+// Returns the encoded packet and a buffer pointer that MUST be returned to the pool
+// via PutOutputBuffer after the packet is sent.
+func EncodeDataEnc2Pooled(ks KeySet, keyID uint32, route string, client string, payload []byte) ([]byte, *[]byte) {
+	if !ks.Enabled() {
+		b := EncodeData(route, client, payload)
+		return b, nil // No pool buffer used for unencrypted
+	}
+	aead, ok := ks.aeadFor(keyID)
+	if !ok {
+		aead = ks.Cur
+		keyID = ks.CurID
+		if aead == nil {
+			b := EncodeData(route, client, payload)
+			return b, nil
+		}
+	}
+
+	// Build plaintext in a pooled buffer
+	rb := route
+	if len(rb) > 255 {
+		rb = rb[:255]
+	}
+	cb := client
+	if len(cb) > 65535 {
+		cb = cb[:65535]
+	}
+	ptLen := 1 + len(rb) + 2 + len(cb) + len(payload)
+	ptBufPtr := ptPool.Get().(*[]byte)
+	ptBuf := *ptBufPtr
+	if cap(ptBuf) < ptLen {
+		ptBuf = make([]byte, ptLen)
+	} else {
+		ptBuf = ptBuf[:ptLen]
+	}
+	ptBuf[0] = byte(len(rb))
+	o := 1
+	copy(ptBuf[o:], rb)
+	o += len(rb)
+	binary.BigEndian.PutUint16(ptBuf[o:o+2], uint16(len(cb)))
+	o += 2
+	copy(ptBuf[o:], cb)
+	o += len(cb)
+	copy(ptBuf[o:], payload)
+
+	// Use pooled output buffer
+	ns := aead.NonceSize()
+	total := 1 + 4 + ns + ptLen + aead.Overhead()
+	outBufPtr := outPool.Get().(*[]byte)
+	outBuf := *outBufPtr
+	if cap(outBuf) < total {
+		// Rare case: packet larger than pool size
+		outBuf = make([]byte, total)
+	}
+	outBuf = outBuf[:total]
+	outBuf[0] = MsgDataEnc2
+	binary.BigEndian.PutUint32(outBuf[1:5], keyID)
+	nonce := outBuf[5 : 5+ns]
+	fillNonce(nonce)
+	aead.Seal(outBuf[5+ns:5+ns:total], nonce, ptBuf, nil)
+
+	// Return plaintext buffer to pool
+	*ptBufPtr = ptBuf
+	ptPool.Put(ptBufPtr)
+
+	// Update the pool buffer slice for return
+	*outBufPtr = outBuf
+
+	return outBuf, outBufPtr
 }
 
 func DecodeDataEnc2(ks KeySet, b []byte) (route string, client string, payload []byte, keyID uint32, ok bool) {

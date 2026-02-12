@@ -210,11 +210,16 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 
+	// Use larger buffer sizes for high-throughput scenarios
+	wantBuf := 16 * 1024 * 1024 // 16 MB — increased for high-load streaming
+	if s.cfg.UDPBufferSize != nil && *s.cfg.UDPBufferSize > 0 {
+		wantBuf = *s.cfg.UDPBufferSize
+	}
+
 	udpDataConn, err := net.ListenPacket("udp", s.cfg.DataAddr)
 	if err != nil {
 		return fmt.Errorf("listen data udp: %w", err)
 	}
-	const wantBuf = 8 * 1024 * 1024 // 8 MB — needs rmem_max/wmem_max >= this
 	if uc, ok := udpDataConn.(*net.UDPConn); ok {
 		ar, aw := trySetUDPBuffers(uc, wantBuf)
 		logUDPBuf("data", ar, aw, wantBuf)
@@ -1278,22 +1283,28 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		return nil
 	}
 
-	// Determine worker count from environment or default to NumCPU * 2
-	// Increased minimum from 4 to 8 and default multiplier to 2 for better
-	// parallelization under high load (e.g., multiple streaming ports)
-	workers := runtime.NumCPU() * 2
-	if workers < 8 {
-		workers = 8
+	// Determine worker count from config, environment, or defaults
+	workers := runtime.NumCPU() * 4 // Increased from 2x to 4x for high-load
+	if workers < 16 {
+		workers = 16 // Increased minimum
 	}
-	if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
-		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 128 {
+	if workers > 256 {
+		workers = 256 // Increased max
+	}
+	if st.cfg.UDPWorkerCount != nil && *st.cfg.UDPWorkerCount > 0 {
+		workers = *st.cfg.UDPWorkerCount
+	} else if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
+		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 256 {
 			workers = n
 		}
 	}
 
 	// Large buffer to absorb bursts without dropping packets.
-	// Increased from 4096 to 16384 for high-load scenarios.
-	const jobBufSize = 16384
+	// Increased from 16384 to 65536 for high-load scenarios like streaming.
+	jobBufSize := 65536
+	if st.cfg.UDPQueueSize != nil && *st.cfg.UDPQueueSize > 0 {
+		jobBufSize = *st.cfg.UDPQueueSize
+	}
 	jobs := make(chan udpJob, jobBufSize)
 	st.udpAgentJobs = jobs
 
@@ -1321,56 +1332,77 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		}
 	}()
 
-	// Single reader distributes packets to workers
-	backoff := 50 * time.Millisecond
-	for {
-		select {
-		case <-ctx.Done():
-			close(jobs)
-			return nil
-		default:
-		}
-		bufPtr := udpBufPool.Get().(*[]byte)
-		buf := *bufPtr
-		n, addr, err := pc.ReadFrom(buf)
-		if err != nil {
-			udpBufPool.Put(bufPtr)
-			if errors.Is(err, net.ErrClosed) {
-				close(jobs)
-				return nil
-			}
-			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
-				t := time.NewTimer(backoff)
-				select {
-				case <-ctx.Done():
-					t.Stop()
-					close(jobs)
-					return nil
-				case <-t.C:
-				}
-				if backoff < 1*time.Second {
-					backoff *= 2
-					if backoff > 1*time.Second {
-						backoff = 1 * time.Second
-					}
-				}
-				continue
-			}
-			st.dashError(dashSystemRoute, "error_accept_agent_udp", hostFromAddr(addr), "", err.Error())
-			close(jobs)
-			return err
-		}
-		backoff = 50 * time.Millisecond
-
-		// Pass pool buffer directly to worker - worker returns it after processing
-		select {
-		case jobs <- udpJob{data: buf, len: n, addr: addr, bufPtr: bufPtr}:
-		default:
-			// Drop packet if workers overwhelmed, return buffer to pool
-			st.udpAgentDrops.Add(1)
-			udpBufPool.Put(bufPtr)
-		}
+	// Multiple readers to avoid single-reader bottleneck
+	// Increased reader count for better parallelism
+	numReaders := runtime.NumCPU()
+	if numReaders < 4 {
+		numReaders = 4
 	}
+	if numReaders > 32 {
+		numReaders = 32 // Increased cap
+	}
+	if st.cfg.UDPReaderCount != nil && *st.cfg.UDPReaderCount > 0 {
+		numReaders = *st.cfg.UDPReaderCount
+	}
+
+	readerDone := make(chan struct{})
+	var readerWg sync.WaitGroup
+
+	for i := 0; i < numReaders; i++ {
+		readerWg.Add(1)
+		go func() {
+			defer readerWg.Done()
+			// Per-reader buffer pool to avoid contention
+			localPool := &sync.Pool{
+				New: func() any {
+					b := make([]byte, 64*1024)
+					return &b
+				},
+			}
+
+			for {
+				select {
+				case <-readerDone:
+					return
+				default:
+				}
+
+				bufPtr := localPool.Get().(*[]byte)
+				buf := *bufPtr
+				n, addr, err := pc.ReadFrom(buf)
+				if err != nil {
+					localPool.Put(bufPtr)
+					if ctx.Err() != nil {
+						return
+					}
+					if errors.Is(err, net.ErrClosed) {
+						return
+					}
+					if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
+						continue
+					}
+					st.dashError(dashSystemRoute, "error_accept_agent_udp", hostFromAddr(addr), "", err.Error())
+					return
+				}
+
+				// Pass pool buffer directly to worker - worker returns it after processing
+				select {
+				case jobs <- udpJob{data: buf, len: n, addr: addr, bufPtr: bufPtr}:
+				default:
+					// Drop packet if workers overwhelmed, return buffer to pool
+					st.udpAgentDrops.Add(1)
+					localPool.Put(bufPtr)
+				}
+			}
+		}()
+	}
+
+	// Wait for context cancellation
+	<-ctx.Done()
+	close(readerDone)
+	readerWg.Wait()
+	close(jobs)
+	return nil
 }
 
 // resolveUDP caches resolved UDP addresses to avoid net.ResolveUDPAddr per packet.
@@ -1538,22 +1570,28 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 }
 
 func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, routeName string) error {
-	// Determine worker count
-	// Increased minimum from 4 to 8 and default multiplier to 2 for better
-	// parallelization under high load (e.g., multiple streaming ports)
-	workers := runtime.NumCPU() * 2
-	if workers < 8 {
-		workers = 8
+	// Determine worker count from config, environment, or defaults
+	workers := runtime.NumCPU() * 4 // Increased from 2x to 4x for high-load
+	if workers < 16 {
+		workers = 16 // Increased minimum
 	}
-	if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
-		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 128 {
+	if workers > 256 {
+		workers = 256 // Increased max
+	}
+	if st.cfg.UDPWorkerCount != nil && *st.cfg.UDPWorkerCount > 0 {
+		workers = *st.cfg.UDPWorkerCount
+	} else if numWorkers := os.Getenv("HOSTIT_UDP_WORKERS"); numWorkers != "" {
+		if n, err := strconv.Atoi(numWorkers); err == nil && n > 0 && n <= 256 {
 			workers = n
 		}
 	}
 
 	// Large buffer to absorb bursts without dropping packets.
-	// Increased from 4096 to 16384 for high-load scenarios.
-	const jobBufSize = 16384
+	// Increased from 16384 to 65536 for high-load scenarios like streaming.
+	jobBufSize := 65536
+	if st.cfg.UDPQueueSize != nil && *st.cfg.UDPQueueSize > 0 {
+		jobBufSize = *st.cfg.UDPQueueSize
+	}
 	jobs := make(chan udpJob, jobBufSize)
 	st.mu.Lock()
 	if st.udpPublicJobs == nil {
@@ -1586,56 +1624,77 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 		}
 	}()
 
-	// Single reader distributes packets to workers
-	backoff := 50 * time.Millisecond
-	for {
-		select {
-		case <-ctx.Done():
-			close(jobs)
-			return nil
-		default:
-		}
-		bufPtr := udpBufPool.Get().(*[]byte)
-		buf := *bufPtr
-		n, clientAddr, err := pc.ReadFrom(buf)
-		if err != nil {
-			udpBufPool.Put(bufPtr)
-			if errors.Is(err, net.ErrClosed) {
-				close(jobs)
-				return nil
-			}
-			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
-				t := time.NewTimer(backoff)
-				select {
-				case <-ctx.Done():
-					t.Stop()
-					close(jobs)
-					return nil
-				case <-t.C:
-				}
-				if backoff < 1*time.Second {
-					backoff *= 2
-					if backoff > 1*time.Second {
-						backoff = 1 * time.Second
-					}
-				}
-				continue
-			}
-			st.dashError(routeName, "error_accept_public_udp", "", "", err.Error())
-			close(jobs)
-			return err
-		}
-		backoff = 50 * time.Millisecond
-
-		// Pass pool buffer directly to worker - worker returns it after processing
-		select {
-		case jobs <- udpJob{data: buf, len: n, addr: clientAddr, bufPtr: bufPtr}:
-		default:
-			// Drop if workers overwhelmed, return buffer to pool
-			st.udpPublicDrops.Add(1)
-			udpBufPool.Put(bufPtr)
-		}
+	// Multiple readers to avoid single-reader bottleneck
+	// Increased reader count for better parallelism
+	numReaders := runtime.NumCPU()
+	if numReaders < 4 {
+		numReaders = 4
 	}
+	if numReaders > 32 {
+		numReaders = 32 // Increased cap
+	}
+	if st.cfg.UDPReaderCount != nil && *st.cfg.UDPReaderCount > 0 {
+		numReaders = *st.cfg.UDPReaderCount
+	}
+
+	readerDone := make(chan struct{})
+	var readerWg sync.WaitGroup
+
+	for i := 0; i < numReaders; i++ {
+		readerWg.Add(1)
+		go func() {
+			defer readerWg.Done()
+			// Per-reader buffer pool to avoid contention
+			localPool := &sync.Pool{
+				New: func() any {
+					b := make([]byte, 64*1024)
+					return &b
+				},
+			}
+
+			for {
+				select {
+				case <-readerDone:
+					return
+				default:
+				}
+
+				bufPtr := localPool.Get().(*[]byte)
+				buf := *bufPtr
+				n, clientAddr, err := pc.ReadFrom(buf)
+				if err != nil {
+					localPool.Put(bufPtr)
+					if ctx.Err() != nil {
+						return
+					}
+					if errors.Is(err, net.ErrClosed) {
+						return
+					}
+					if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
+						continue
+					}
+					st.dashError(routeName, "error_accept_public_udp", "", "", err.Error())
+					return
+				}
+
+				// Pass pool buffer directly to worker - worker returns it after processing
+				select {
+				case jobs <- udpJob{data: buf, len: n, addr: clientAddr, bufPtr: bufPtr}:
+				default:
+					// Drop if workers overwhelmed, return buffer to pool
+					st.udpPublicDrops.Add(1)
+					localPool.Put(bufPtr)
+				}
+			}
+		}()
+	}
+
+	// Wait for context cancellation
+	<-ctx.Done()
+	close(readerDone)
+	readerWg.Wait()
+	close(jobs)
+	return nil
 }
 
 func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, routeName string) {
@@ -1668,6 +1727,7 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 	}
 
 	var msg []byte
+	var bufPtr *[]byte // For pooled encoding
 	clientAddrStr := clientAddr.String()
 	if st.encryptionNone || !st.udpKeys.Enabled() {
 		msg = udpproto.EncodeData(routeName, clientAddrStr, pkt)
@@ -1676,9 +1736,18 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 		if kid == 0 {
 			kid = st.cfg.UDPKeyID
 		}
-		msg = udpproto.EncodeDataEnc2ForKeyID(st.udpKeys, kid, routeName, clientAddrStr, pkt)
+		// Use pooled encoding for zero-allocation encryption
+		msg, bufPtr = udpproto.EncodeDataEnc2Pooled(st.udpKeys, kid, routeName, clientAddrStr, pkt)
 	}
-	if _, err := st.udpData.WriteTo(msg, agent); err != nil {
+
+	_, err := st.udpData.WriteTo(msg, agent)
+
+	// Return buffer to pool if pooled encoding was used
+	if bufPtr != nil {
+		udpproto.PutOutputBuffer(bufPtr)
+	}
+
+	if err != nil {
 		st.dashErrorRateLimited(routeName, "error_udp_write_agent", hostFromAddr(agent), "", err.Error(), 1*time.Second)
 		log.Warnf(logging.CatUDP, "UDP write to agent failed route=%s: %v", routeName, err)
 		return
