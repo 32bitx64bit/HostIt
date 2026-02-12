@@ -111,17 +111,18 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 
 	st := &serverState{
-		cfg:            cfg,
-		pending:        map[string]pendingConn{},
-		pendingByIP:    map[string]int{},
-		publicUDP:      map[string]net.PacketConn{},
-		dash:           newDashStateWithInterval(cfg.DashboardInterval),
-		udpPublicJobs:  make(map[string]chan udpJob),
-		errLast:        make(map[string]time.Time),
-		udpStats:       udputil.NewSessionStats(1000, 5*time.Minute),
-		encryptionNone: cfg.DisableUDPEncryption || strings.EqualFold(strings.TrimSpace(cfg.UDPEncryptionMode), "none"),
-		resolvedAddrs:  make(map[string]*net.UDPAddr),
-		noDelayByRoute: noDelay,
+		cfg:              cfg,
+		pending:          map[string]pendingConn{},
+		pendingByIP:      map[string]int{},
+		publicUDP:        map[string]net.PacketConn{},
+		dash:             newDashStateWithInterval(cfg.DashboardInterval),
+		udpPublicJobs:    make(map[string]chan udpJob),
+		udpPublicWriters: make(map[string]chan udpWriteJob),
+		errLast:          make(map[string]time.Time),
+		udpStats:         udputil.NewSessionStats(1000, 5*time.Minute),
+		encryptionNone:   cfg.DisableUDPEncryption || strings.EqualFold(strings.TrimSpace(cfg.UDPEncryptionMode), "none"),
+		resolvedAddrs:    make(map[string]*net.UDPAddr),
+		noDelayByRoute:   noDelay,
 	}
 	st.udpKeys = buildUDPKeySet(cfg)
 	return &Server{cfg: cfg, st: st}
@@ -284,6 +285,25 @@ func (s *Server) Run(ctx context.Context) error {
 		st.publicUDP[x.name] = x.pc
 	}
 
+	// Start async UDP writers for each public route (server→public client path)
+	// This prevents blocking on slow clients and absorbs traffic bursts
+	for _, x := range publicUDP {
+		writeQueue := make(chan udpWriteJob, 65536) // Match the read queue size
+		st.udpPublicWriters[x.name] = writeQueue
+
+		// Start multiple writer goroutines per route for parallel writes to different clients
+		numWriters := runtime.NumCPU()
+		if numWriters < 2 {
+			numWriters = 2
+		}
+		if numWriters > 16 {
+			numWriters = 16
+		}
+		for i := 0; i < numWriters; i++ {
+			go st.udpPublicWriter(ctx, x.pc, writeQueue, x.name)
+		}
+	}
+
 	// Start pending connection cleaner
 	go st.startPendingCleaner(ctx)
 
@@ -414,6 +434,10 @@ type serverState struct {
 	udpAgentJobs  chan udpJob
 	udpPublicJobs map[string]chan udpJob
 
+	// Async write queues for server→public client path (prevents blocking on slow clients)
+	udpPublicWriters    map[string]chan udpWriteJob // route -> write queue
+	udpPublicWriteDrops atomic.Int64
+
 	// UDP statistics
 	udpStats *udputil.SessionStats
 
@@ -424,6 +448,13 @@ type serverState struct {
 	// Resolved-address cache for outbound UDP replies (avoids net.ResolveUDPAddr per packet).
 	resolvedMu    sync.RWMutex
 	resolvedAddrs map[string]*net.UDPAddr
+}
+
+// udpWriteJob represents a packet to write to a public client
+type udpWriteJob struct {
+	data   []byte
+	addr   net.Addr
+	bufPtr *[]byte // Pool buffer to return after writing (nil if data was copied)
 }
 
 const dashSystemRoute = "_system"
@@ -1318,6 +1349,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		tick := time.NewTicker(10 * time.Second)
 		defer tick.Stop()
 		var prevDrops int64
+		var prevWriteDrops int64
 		for {
 			select {
 			case <-ctx.Done():
@@ -1328,6 +1360,12 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 					log.Warnf(logging.CatUDP, "UDP agent queue drops: %d total (%d new)", d, d-prevDrops)
 				}
 				prevDrops = d
+
+				wd := st.udpPublicWriteDrops.Load()
+				if wd > prevWriteDrops {
+					log.Warnf(logging.CatUDP, "UDP public write queue drops: %d total (%d new)", wd, wd-prevWriteDrops)
+				}
+				prevWriteDrops = wd
 			}
 		}
 	}()
@@ -1516,8 +1554,8 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if agent == nil || !addrEqual(agent, addr) {
 			return
 		}
-		pc2 := st.publicUDP[route]
-		if pc2 == nil {
+		writeQueue := st.udpPublicWriters[route]
+		if writeQueue == nil {
 			traceUDPf("udp: DATA unknown route=%s from=%v", route, addr)
 			st.dashErrorRateLimited(route, "error_udp_unknown_route", hostFromAddr(addr), "", "", 1*time.Second)
 			return
@@ -1528,11 +1566,15 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			st.dashErrorRateLimited(route, "error_udp_bad_client", hostFromAddr(addr), client, err.Error(), 1*time.Second)
 			return
 		}
-		if _, err := pc2.WriteTo(payload, ua); err != nil {
-			traceUDPf("udp: DATA writeTo failed route=%s to=%v err=%v", route, ua, err)
-			st.dashErrorRateLimited(route, "error_udp_write_public", hostFromAddr(ua), client, err.Error(), 1*time.Second)
-		} else if st.dash != nil {
-			st.dash.addBytes(time.Now(), int64(len(payload)))
+		// Copy payload since the original buffer will be returned to pool
+		payloadCopy := make([]byte, len(payload))
+		copy(payloadCopy, payload)
+		select {
+		case writeQueue <- udpWriteJob{data: payloadCopy, addr: ua}:
+		default:
+			// Queue full - drop packet rather than blocking
+			st.udpPublicWriteDrops.Add(1)
+			traceUDPf("udp: DATA write queue full route=%s to=%v", route, ua)
 		}
 	case udpproto.MsgDataEnc2:
 		if encNone {
@@ -1548,8 +1590,8 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if agent == nil || !addrEqual(agent, addr) {
 			return
 		}
-		pc2 := st.publicUDP[route]
-		if pc2 == nil {
+		writeQueue := st.udpPublicWriters[route]
+		if writeQueue == nil {
 			traceUDPf("udp: DATAEnc2 unknown route=%s from=%v", route, addr)
 			st.dashErrorRateLimited(route, "error_udp_unknown_route", hostFromAddr(addr), "", "", 1*time.Second)
 			return
@@ -1560,11 +1602,15 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			st.dashErrorRateLimited(route, "error_udp_bad_client", hostFromAddr(addr), client, err.Error(), 1*time.Second)
 			return
 		}
-		if _, err := pc2.WriteTo(payload, ua); err != nil {
-			traceUDPf("udp: DATAEnc2 writeTo failed route=%s to=%v err=%v", route, ua, err)
-			st.dashErrorRateLimited(route, "error_udp_write_public", hostFromAddr(ua), client, err.Error(), 1*time.Second)
-		} else if st.dash != nil {
-			st.dash.addBytes(time.Now(), int64(len(payload)))
+		// Copy payload since the original buffer will be returned to pool
+		payloadCopy := make([]byte, len(payload))
+		copy(payloadCopy, payload)
+		select {
+		case writeQueue <- udpWriteJob{data: payloadCopy, addr: ua}:
+		default:
+			// Queue full - drop packet rather than blocking
+			st.udpPublicWriteDrops.Add(1)
+			traceUDPf("udp: DATAEnc2 write queue full route=%s to=%v", route, ua)
 		}
 	}
 }
@@ -1712,6 +1758,31 @@ func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, 
 			}
 			st.processPublicUDPPacket(pkt, job.addr, routeName)
 			// Return buffer to pool after processing
+			if job.bufPtr != nil {
+				udpBufPool.Put(job.bufPtr)
+			}
+		}
+	}
+}
+
+// udpPublicWriter handles async writes to public clients (server→public path)
+// This prevents blocking on slow clients and absorbs traffic bursts
+func (st *serverState) udpPublicWriter(ctx context.Context, pc net.PacketConn, jobs <-chan udpWriteJob, routeName string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			_, err := pc.WriteTo(job.data, job.addr)
+			if err != nil {
+				traceUDPf("udp: public write failed route=%s to=%v err=%v", routeName, job.addr, err)
+			} else if st.dash != nil {
+				st.dash.addBytes(time.Now(), int64(len(job.data)))
+			}
+			// Return buffer to pool if it came from one
 			if job.bufPtr != nil {
 				udpBufPool.Put(job.bufPtr)
 			}
