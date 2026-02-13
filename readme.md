@@ -57,7 +57,8 @@ Then run
 
 ## Run in the background (daemon) on Linux
 
-If you launch the server/agent from an SSH session in the foreground, it will exit when the SSH session closes.
+If you launch the server from a SSH, it will close when the SSH tunnel is terminated / closed. If you launch the client from the terminal, and it closes, the client will close.
+
 Use systemd so it keeps running in the background and can auto-restart.
 
 ### Server systemd service
@@ -80,6 +81,3 @@ Both dashboards now include **Process → Restart / Exit**.
 - When running under systemd, clicking these will terminate the process and systemd will bring it back.
 - If not running under systemd, it will just exit.
 
-
-# Additional note 
-You CAN NOT connect via the server with your VPS IP if you're on the same NAT network, especially in games. Weird networking crap. Just connect locally.
