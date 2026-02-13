@@ -23,6 +23,18 @@ import (
 	"hostit/shared/version"
 )
 
+// ShutdownTimeout is the maximum time to wait for graceful shutdown.
+// Can be overridden via the HOSTIT_SHUTDOWN_TIMEOUT environment variable.
+var shutdownTimeout = 5 * time.Second
+
+func init() {
+	if v := os.Getenv("HOSTIT_SHUTDOWN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			shutdownTimeout = d
+		}
+	}
+}
+
 func main() {
 	var serverHost string
 	var token string
@@ -255,7 +267,7 @@ func (a *agentController) Stop() {
 	if done != nil {
 		select {
 		case <-done:
-		case <-time.After(2 * time.Second):
+		case <-time.After(shutdownTimeout):
 		}
 	}
 }
@@ -602,7 +614,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	h := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		<-ctx.Done()
-		ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx2, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		_ = h.Shutdown(ctx2)
 	}()

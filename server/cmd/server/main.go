@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"encoding/hex"
-	"fmt"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"html/template"
 	"log"
 	"net"
@@ -373,109 +373,151 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 
 		// Setup: only available if no users exist.
 		mux.HandleFunc("/setup", securityHeaders(cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		hasUsers, err := store.HasAnyUsers(r.Context())
-		if err != nil {
-			http.Error(w, "auth db error", http.StatusInternalServerError)
-			return
-		}
-		csrf := ensureCSRF(w, r, cookieSecure)
-		render := func(errMsg string, username string, errUser bool, errPass bool, errConfirm bool) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_ = tplSetup.Execute(w, map[string]any{
-				"CSRF":       csrf,
-				"Msg":        getMsg(),
-				"Err":        errMsg,
-				"Username":   username,
-				"ErrUsername": errUser,
-				"ErrPassword": errPass,
-				"ErrConfirm":  errConfirm,
-			})
-		}
-		if hasUsers {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-
-		switch r.Method {
-		case http.MethodGet:
-			render("", "", false, false, false)
-			return
-		case http.MethodPost:
-			if !lim.Allow(clientIP(r)) {
-				render("Too many attempts. Please wait a moment and try again.", "", false, false, false)
-				return
-			}
-			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-			if err := r.ParseForm(); err != nil {
-				render("Invalid form input.", "", false, false, false)
-				return
-			}
-			if !checkCSRF(r) {
-				render("Session expired. Please refresh and try again.", "", false, false, false)
-				return
-			}
-			username := strings.TrimSpace(r.Form.Get("username"))
-			password := r.Form.Get("password")
-			confirm := r.Form.Get("confirm")
-			errUser := username == ""
-			errPass := len(password) < 10
-			errConfirm := password != confirm
-			if errUser || errPass || errConfirm {
-				errMsg := "Please fix the highlighted fields."
-				if errPass {
-					errMsg = "Password must be at least 10 characters."
-				}
-				if errConfirm {
-					// If both are true, this message is more actionable.
-					errMsg = "Passwords must match."
-				}
-				render(errMsg, username, errUser, errPass, errConfirm)
-				return
-			}
-			if err := store.CreateUser(r.Context(), username, password); err != nil {
-				render("Create account failed. Please try a different username.", username, true, false, false)
-				return
-			}
-			userID, ok, err := store.Authenticate(r.Context(), username, password)
-			if err != nil || !ok {
-				render("Account was created, but login failed. Please try logging in.", username, false, false, false)
-				return
-			}
-			sid, err := store.CreateSession(r.Context(), userID, sessionTTL)
+			hasUsers, err := store.HasAnyUsers(r.Context())
 			if err != nil {
-				http.Error(w, "session failed", http.StatusInternalServerError)
+				http.Error(w, "auth db error", http.StatusInternalServerError)
 				return
 			}
-			setSessionCookie(w, sid, cookieSecure)
-			setMsg("")
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+			csrf := ensureCSRF(w, r, cookieSecure)
+			render := func(errMsg string, username string, errUser bool, errPass bool, errConfirm bool) {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				_ = tplSetup.Execute(w, map[string]any{
+					"CSRF":        csrf,
+					"Msg":         getMsg(),
+					"Err":         errMsg,
+					"Username":    username,
+					"ErrUsername": errUser,
+					"ErrPassword": errPass,
+					"ErrConfirm":  errConfirm,
+				})
+			}
+			if hasUsers {
+				http.Redirect(w, r, "/login", http.StatusSeeOther)
+				return
+			}
+
+			switch r.Method {
+			case http.MethodGet:
+				render("", "", false, false, false)
+				return
+			case http.MethodPost:
+				if !lim.Allow(clientIP(r)) {
+					render("Too many attempts. Please wait a moment and try again.", "", false, false, false)
+					return
+				}
+				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+				if err := r.ParseForm(); err != nil {
+					render("Invalid form input.", "", false, false, false)
+					return
+				}
+				if !checkCSRF(r) {
+					render("Session expired. Please refresh and try again.", "", false, false, false)
+					return
+				}
+				username := strings.TrimSpace(r.Form.Get("username"))
+				password := r.Form.Get("password")
+				confirm := r.Form.Get("confirm")
+				errUser := username == ""
+				errPass := len(password) < 10
+				errConfirm := password != confirm
+				if errUser || errPass || errConfirm {
+					errMsg := "Please fix the highlighted fields."
+					if errPass {
+						errMsg = "Password must be at least 10 characters."
+					}
+					if errConfirm {
+						// If both are true, this message is more actionable.
+						errMsg = "Passwords must match."
+					}
+					render(errMsg, username, errUser, errPass, errConfirm)
+					return
+				}
+				if err := store.CreateUser(r.Context(), username, password); err != nil {
+					render("Create account failed. Please try a different username.", username, true, false, false)
+					return
+				}
+				userID, ok, err := store.Authenticate(r.Context(), username, password)
+				if err != nil || !ok {
+					render("Account was created, but login failed. Please try logging in.", username, false, false, false)
+					return
+				}
+				sid, err := store.CreateSession(r.Context(), userID, sessionTTL)
+				if err != nil {
+					http.Error(w, "session failed", http.StatusInternalServerError)
+					return
+				}
+				setSessionCookie(w, sid, cookieSecure)
+				setMsg("")
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+				return
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
 		}))
 
 		// Login.
 		mux.HandleFunc("/login", securityHeaders(cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		hasUsers, err := store.HasAnyUsers(r.Context())
-		if err != nil {
-			http.Error(w, "auth db error", http.StatusInternalServerError)
-			return
-		}
-		if !hasUsers {
-			http.Redirect(w, r, "/setup", http.StatusSeeOther)
-			return
-		}
-		csrf := ensureCSRF(w, r, cookieSecure)
+			hasUsers, err := store.HasAnyUsers(r.Context())
+			if err != nil {
+				http.Error(w, "auth db error", http.StatusInternalServerError)
+				return
+			}
+			if !hasUsers {
+				http.Redirect(w, r, "/setup", http.StatusSeeOther)
+				return
+			}
+			csrf := ensureCSRF(w, r, cookieSecure)
 
-		switch r.Method {
-		case http.MethodGet:
-			_ = tplLogin.Execute(w, map[string]any{"CSRF": csrf, "Msg": getMsg()})
-			return
-		case http.MethodPost:
-			if !lim.Allow(clientIP(r)) {
-				http.Error(w, "too many attempts", http.StatusTooManyRequests)
+			switch r.Method {
+			case http.MethodGet:
+				_ = tplLogin.Execute(w, map[string]any{"CSRF": csrf, "Msg": getMsg()})
+				return
+			case http.MethodPost:
+				if !lim.Allow(clientIP(r)) {
+					http.Error(w, "too many attempts", http.StatusTooManyRequests)
+					return
+				}
+				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+				if err := r.ParseForm(); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if !checkCSRF(r) {
+					http.Error(w, "csrf", http.StatusBadRequest)
+					return
+				}
+				username := strings.TrimSpace(r.Form.Get("username"))
+				password := r.Form.Get("password")
+				userID, ok, err := store.Authenticate(r.Context(), username, password)
+				if err != nil {
+					http.Error(w, "auth error", http.StatusInternalServerError)
+					return
+				}
+				if !ok {
+					setMsg("Bad username or password")
+					http.Redirect(w, r, "/login", http.StatusSeeOther)
+					return
+				}
+				sid, err := store.CreateSession(r.Context(), userID, sessionTTL)
+				if err != nil {
+					http.Error(w, "session failed", http.StatusInternalServerError)
+					return
+				}
+				setSessionCookie(w, sid, cookieSecure)
+				setMsg("")
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+				return
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+		}))
+
+		// Logout.
+		mux.HandleFunc("/logout", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
 			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -487,114 +529,72 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "csrf", http.StatusBadRequest)
 				return
 			}
-			username := strings.TrimSpace(r.Form.Get("username"))
-			password := r.Form.Get("password")
-			userID, ok, err := store.Authenticate(r.Context(), username, password)
-			if err != nil {
-				http.Error(w, "auth error", http.StatusInternalServerError)
-				return
+			if sid, ok := readSessionCookie(r); ok {
+				_ = store.DeleteSession(r.Context(), sid)
 			}
-			if !ok {
-				setMsg("Bad username or password")
-				http.Redirect(w, r, "/login", http.StatusSeeOther)
-				return
-			}
-			sid, err := store.CreateSession(r.Context(), userID, sessionTTL)
-			if err != nil {
-				http.Error(w, "session failed", http.StatusInternalServerError)
-				return
-			}
-			setSessionCookie(w, sid, cookieSecure)
-			setMsg("")
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		}))
-
-		// Logout.
-		mux.HandleFunc("/logout", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if !checkCSRF(r) {
-			http.Error(w, "csrf", http.StatusBadRequest)
-			return
-		}
-		if sid, ok := readSessionCookie(r); ok {
-			_ = store.DeleteSession(r.Context(), sid)
-		}
-		clearSessionCookie(w, cookieSecure)
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+			clearSessionCookie(w, cookieSecure)
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
 		})))
 
 		// Stats (protected)
 		mux.HandleFunc("/", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		csrf := ensureCSRF(w, r, cookieSecure)
-		cfg, st, err := runner.Get()
-		routes := cfg.Routes
-		data := map[string]any{
-			"Cfg":        cfg,
-			"Status":     st,
-			"ConfigPath": configPath,
-			"Msg":        getMsg(),
-			"Err":        err,
-			"CSRF":       csrf,
-			"Routes":     routes,
-			"RouteCount": len(routes),
-			"WebHTTPS":   webHTTPS,
-		}
-		_ = tplStats.Execute(w, data)
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			csrf := ensureCSRF(w, r, cookieSecure)
+			cfg, st, err := runner.Get()
+			routes := cfg.Routes
+			data := map[string]any{
+				"Cfg":        cfg,
+				"Status":     st,
+				"ConfigPath": configPath,
+				"Msg":        getMsg(),
+				"Err":        err,
+				"CSRF":       csrf,
+				"Routes":     routes,
+				"RouteCount": len(routes),
+				"WebHTTPS":   webHTTPS,
+			}
+			_ = tplStats.Execute(w, data)
 		})))
 
 		// Live stats API (protected)
 		mux.HandleFunc("/api/stats", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		cfg, _, snap, err := runner.Dashboard(time.Now())
-		type routeOut struct {
-			Name       string               `json:"name"`
-			Proto      string               `json:"proto"`
-			PublicAddr string               `json:"publicAddr"`
-			Active     int64                `json:"active"`
-			Events     []tunnel.DashboardEvent `json:"events"`
-		}
-		outRoutes := make([]routeOut, 0, len(cfg.Routes))
-		for _, rt := range cfg.Routes {
-			rs := snap.Routes[rt.Name]
-			outRoutes = append(outRoutes, routeOut{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, Active: rs.ActiveClients, Events: rs.Events})
-		}
-		resp := map[string]any{
-			"nowUnix":        snap.NowUnix,
-			"bucketSec":      snap.BucketSec,
-			"agentConnected": snap.AgentConnected,
-			"activeClients":  snap.ActiveClients,
-			"bytesTotal":     snap.BytesTotal,
-			"series":         snap.Series,
-			"routes":         outRoutes,
-			"err": func() string {
-				if err == nil {
-					return ""
-				}
-				return err.Error()
-			}(),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			cfg, _, snap, err := runner.Dashboard(time.Now())
+			type routeOut struct {
+				Name       string                  `json:"name"`
+				Proto      string                  `json:"proto"`
+				PublicAddr string                  `json:"publicAddr"`
+				Active     int64                   `json:"active"`
+				Events     []tunnel.DashboardEvent `json:"events"`
+			}
+			outRoutes := make([]routeOut, 0, len(cfg.Routes))
+			for _, rt := range cfg.Routes {
+				rs := snap.Routes[rt.Name]
+				outRoutes = append(outRoutes, routeOut{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, Active: rs.ActiveClients, Events: rs.Events})
+			}
+			resp := map[string]any{
+				"nowUnix":        snap.NowUnix,
+				"bucketSec":      snap.BucketSec,
+				"agentConnected": snap.AgentConnected,
+				"activeClients":  snap.ActiveClients,
+				"bytesTotal":     snap.BytesTotal,
+				"series":         snap.Series,
+				"routes":         outRoutes,
+				"err": func() string {
+					if err == nil {
+						return ""
+					}
+					return err.Error()
+				}(),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
 		})))
 
 		// Manual update check (protected)
@@ -783,64 +783,64 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 
 		// Config (protected)
 		mux.HandleFunc("/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		csrf := ensureCSRF(w, r, cookieSecure)
-		cfg, st, err := runner.Get()
-		routes := cfg.Routes
-		type routeView struct {
-			Name       string
-			Proto      string
-			PublicAddr string
-			TCPNoDelay bool
-			TunnelTLS  bool
-			Preconnect int
-		}
-		routeViews := make([]routeView, 0, len(routes))
-		for _, rt := range routes {
-			noDelay := true
-			if rt.TCPNoDelay != nil {
-				noDelay = *rt.TCPNoDelay
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
 			}
-			tlsOn := true
-			if rt.TunnelTLS != nil {
-				tlsOn = *rt.TunnelTLS
+			csrf := ensureCSRF(w, r, cookieSecure)
+			cfg, st, err := runner.Get()
+			routes := cfg.Routes
+			type routeView struct {
+				Name       string
+				Proto      string
+				PublicAddr string
+				TCPNoDelay bool
+				TunnelTLS  bool
+				Preconnect int
 			}
-			pc := 0
-			if rt.Preconnect != nil {
-				pc = *rt.Preconnect
-			} else {
-				p := strings.ToLower(strings.TrimSpace(rt.Proto))
-				if p == "tcp" || p == "both" {
-					pc = 4
+			routeViews := make([]routeView, 0, len(routes))
+			for _, rt := range routes {
+				noDelay := true
+				if rt.TCPNoDelay != nil {
+					noDelay = *rt.TCPNoDelay
 				}
-			}
-			routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, TCPNoDelay: noDelay, TunnelTLS: tlsOn, Preconnect: pc})
-		}
-		data := map[string]any{
-			"Cfg":        cfg,
-			"Status":     st,
-			"ConfigPath": configPath,
-			"Msg":        getMsg(),
-			"Err":        err,
-			"CSRF":       csrf,
-			"Version":    version.Current,
-			"Routes":     routeViews,
-			"RouteCount": len(routeViews),
-			"WebHTTPS":   webHTTPS,
-			"WebTLSCert": webCertFile,
-			"WebTLSKey":  webKeyFile,
-			"WebTLSFP":   webFingerprint,
-			"UDPKeyCreated": func() string {
-				if cfg.UDPKeyCreatedUnix == 0 {
-					return ""
+				tlsOn := true
+				if rt.TunnelTLS != nil {
+					tlsOn = *rt.TunnelTLS
 				}
-				return time.Unix(cfg.UDPKeyCreatedUnix, 0).Format(time.RFC3339)
-			}(),
-		}
-		_ = tplConfig.Execute(w, data)
+				pc := 0
+				if rt.Preconnect != nil {
+					pc = *rt.Preconnect
+				} else {
+					p := strings.ToLower(strings.TrimSpace(rt.Proto))
+					if p == "tcp" || p == "both" {
+						pc = 4
+					}
+				}
+				routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, TCPNoDelay: noDelay, TunnelTLS: tlsOn, Preconnect: pc})
+			}
+			data := map[string]any{
+				"Cfg":        cfg,
+				"Status":     st,
+				"ConfigPath": configPath,
+				"Msg":        getMsg(),
+				"Err":        err,
+				"CSRF":       csrf,
+				"Version":    version.Current,
+				"Routes":     routeViews,
+				"RouteCount": len(routeViews),
+				"WebHTTPS":   webHTTPS,
+				"WebTLSCert": webCertFile,
+				"WebTLSKey":  webKeyFile,
+				"WebTLSFP":   webFingerprint,
+				"UDPKeyCreated": func() string {
+					if cfg.UDPKeyCreatedUnix == 0 {
+						return ""
+					}
+					return time.Unix(cfg.UDPKeyCreatedUnix, 0).Format(time.RFC3339)
+				}(),
+			}
+			_ = tplConfig.Execute(w, data)
 		})))
 
 		// Controls (protected)
@@ -869,68 +869,93 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		mux.HandleFunc("/config/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if !checkCSRF(r) {
-			http.Error(w, "csrf", http.StatusBadRequest)
-			return
-		}
-		pt, err := time.ParseDuration(r.Form.Get("pair_timeout"))
-		if err != nil {
-			http.Error(w, "invalid pair timeout", http.StatusBadRequest)
-			return
-		}
-
-		msgs := make([]string, 0, 3)
-		addMsg := func(s string) {
-			if strings.TrimSpace(s) == "" {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			msgs = append(msgs, s)
-		}
-		old, _, _ := runner.Get()
-		cfg := old
-		oldEnc := strings.TrimSpace(cfg.UDPEncryptionMode)
-		webWas := cfg.WebHTTPS
-		cfg.ControlAddr = r.Form.Get("control")
-		cfg.DataAddr = r.Form.Get("data")
-		cfg.DataAddrInsecure = r.Form.Get("data_insecure")
-		cfg.Token = strings.TrimSpace(r.Form.Get("token"))
-		cfg.PairTimeout = pt
-		cfg.WebHTTPS = strings.TrimSpace(r.Form.Get("web_https")) != ""
-		if cfg.Token == "" {
-			cfg.Token = genToken()
-			addMsg("Token was empty; generated a new token")
-		}
-		cfg.Routes = parseServerRoutesForm(r)
+			r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			pt, err := time.ParseDuration(r.Form.Get("pair_timeout"))
+			if err != nil {
+				http.Error(w, "invalid pair timeout", http.StatusBadRequest)
+				return
+			}
+			// Validate pair_timeout bounds: minimum 1 second, maximum 5 minutes
+			if pt < 1*time.Second {
+				http.Error(w, "pair timeout must be at least 1 second", http.StatusBadRequest)
+				return
+			}
+			if pt > 5*time.Minute {
+				http.Error(w, "pair timeout must be at most 5 minutes", http.StatusBadRequest)
+				return
+			}
 
-		// UDP encryption config
-		cfg.UDPEncryptionMode = strings.TrimSpace(r.Form.Get("udp_enc"))
-		if strings.EqualFold(cfg.UDPEncryptionMode, "none") {
-			cfg.DisableUDPEncryption = true
-		} else {
-			cfg.DisableUDPEncryption = false
-		}
-		if strings.TrimSpace(r.Form.Get("udp_regen")) != "" {
-			tunnel.RotateUDPKeys(&cfg, time.Now())
-			addMsg("Regenerated UDP keys")
-		} else if strings.TrimSpace(oldEnc) != strings.TrimSpace(cfg.UDPEncryptionMode) {
-			// Mode changed: regenerate keys to force a clean cutover.
-			tunnel.RotateUDPKeys(&cfg, time.Now())
-			addMsg("UDP encryption changed; regenerated UDP keys")
-		}
-		_ = tunnel.EnsureUDPKeys(&cfg, time.Now())
-		if strings.TrimSpace(r.Form.Get("tls_regen")) != "" {
-			if cfg.DisableTLS {
-				addMsg("TLS is disabled; skipped TLS cert/key regeneration")
+			msgs := make([]string, 0, 3)
+			addMsg := func(s string) {
+				if strings.TrimSpace(s) == "" {
+					return
+				}
+				msgs = append(msgs, s)
+			}
+			old, _, _ := runner.Get()
+			cfg := old
+			oldEnc := strings.TrimSpace(cfg.UDPEncryptionMode)
+			webWas := cfg.WebHTTPS
+			cfg.ControlAddr = r.Form.Get("control")
+			cfg.DataAddr = r.Form.Get("data")
+			cfg.DataAddrInsecure = r.Form.Get("data_insecure")
+			cfg.Token = strings.TrimSpace(r.Form.Get("token"))
+			cfg.PairTimeout = pt
+			cfg.WebHTTPS = strings.TrimSpace(r.Form.Get("web_https")) != ""
+			if cfg.Token == "" {
+				cfg.Token = genToken()
+				addMsg("Token was empty; generated a new token")
+			}
+			cfg.Routes = parseServerRoutesForm(r)
+
+			// UDP encryption config
+			cfg.UDPEncryptionMode = strings.TrimSpace(r.Form.Get("udp_enc"))
+			if strings.EqualFold(cfg.UDPEncryptionMode, "none") {
+				cfg.DisableUDPEncryption = true
 			} else {
+				cfg.DisableUDPEncryption = false
+			}
+			if strings.TrimSpace(r.Form.Get("udp_regen")) != "" {
+				tunnel.RotateUDPKeys(&cfg, time.Now())
+				addMsg("Regenerated UDP keys")
+			} else if strings.TrimSpace(oldEnc) != strings.TrimSpace(cfg.UDPEncryptionMode) {
+				// Mode changed: regenerate keys to force a clean cutover.
+				tunnel.RotateUDPKeys(&cfg, time.Now())
+				addMsg("UDP encryption changed; regenerated UDP keys")
+			}
+			_ = tunnel.EnsureUDPKeys(&cfg, time.Now())
+			if strings.TrimSpace(r.Form.Get("tls_regen")) != "" {
+				if cfg.DisableTLS {
+					addMsg("TLS is disabled; skipped TLS cert/key regeneration")
+				} else {
+					cfgDir := filepath.Dir(configPath)
+					if strings.TrimSpace(cfg.TLSCertFile) == "" {
+						cfg.TLSCertFile = filepath.Join(cfgDir, "server.crt")
+					}
+					if strings.TrimSpace(cfg.TLSKeyFile) == "" {
+						cfg.TLSKeyFile = filepath.Join(cfgDir, "server.key")
+					}
+					fp, err := tlsutil.RegenerateSelfSigned(cfg.TLSCertFile, cfg.TLSKeyFile)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+					log.Printf("tunnel tls regenerated; cert sha256=%s", fp)
+					addMsg("Regenerated TLS cert/key; new cert sha256=" + fp)
+				}
+			} else if !cfg.DisableTLS {
 				cfgDir := filepath.Dir(configPath)
 				if strings.TrimSpace(cfg.TLSCertFile) == "" {
 					cfg.TLSCertFile = filepath.Join(cfgDir, "server.crt")
@@ -938,80 +963,64 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				if strings.TrimSpace(cfg.TLSKeyFile) == "" {
 					cfg.TLSKeyFile = filepath.Join(cfgDir, "server.key")
 				}
-				fp, err := tlsutil.RegenerateSelfSigned(cfg.TLSCertFile, cfg.TLSKeyFile)
+				fp, err := tlsutil.EnsureSelfSigned(cfg.TLSCertFile, cfg.TLSKeyFile)
 				if err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				log.Printf("tunnel tls regenerated; cert sha256=%s", fp)
-				addMsg("Regenerated TLS cert/key; new cert sha256=" + fp)
+				log.Printf("tunnel tls enabled; cert sha256=%s", fp)
 			}
-		} else if !cfg.DisableTLS {
+
+			// Dashboard HTTPS (self-signed)
 			cfgDir := filepath.Dir(configPath)
-			if strings.TrimSpace(cfg.TLSCertFile) == "" {
-				cfg.TLSCertFile = filepath.Join(cfgDir, "server.crt")
+			if strings.TrimSpace(cfg.WebTLSCertFile) == "" {
+				cfg.WebTLSCertFile = filepath.Join(cfgDir, "web.crt")
 			}
-			if strings.TrimSpace(cfg.TLSKeyFile) == "" {
-				cfg.TLSKeyFile = filepath.Join(cfgDir, "server.key")
+			if strings.TrimSpace(cfg.WebTLSKeyFile) == "" {
+				cfg.WebTLSKeyFile = filepath.Join(cfgDir, "web.key")
 			}
-			fp, err := tlsutil.EnsureSelfSigned(cfg.TLSCertFile, cfg.TLSKeyFile)
-			if err != nil {
+			if strings.TrimSpace(r.Form.Get("web_tls_regen")) != "" {
+				fp, err := tlsutil.RegenerateSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				addMsg("Regenerated dashboard HTTPS cert/key; cert sha256=" + fp)
+			}
+			if cfg.WebHTTPS {
+				fp, err := tlsutil.EnsureSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				addMsg("Dashboard HTTPS enabled (self-signed); cert sha256=" + fp)
+			}
+
+			if err := configio.Save(configPath, cfg); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			log.Printf("tunnel tls enabled; cert sha256=%s", fp)
-		}
+			runner.Restart(cfg)
+			addMsg("Saved + restarted")
+			setMsg(strings.Join(msgs, " · "))
 
-		// Dashboard HTTPS (self-signed)
-		cfgDir := filepath.Dir(configPath)
-		if strings.TrimSpace(cfg.WebTLSCertFile) == "" {
-			cfg.WebTLSCertFile = filepath.Join(cfgDir, "web.crt")
-		}
-		if strings.TrimSpace(cfg.WebTLSKeyFile) == "" {
-			cfg.WebTLSKeyFile = filepath.Join(cfgDir, "web.key")
-		}
-		if strings.TrimSpace(r.Form.Get("web_tls_regen")) != "" {
-			fp, err := tlsutil.RegenerateSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+			webNow := cfg.WebHTTPS
+			needsWebRestart := webWas != webNow || strings.TrimSpace(r.Form.Get("web_tls_regen")) != ""
+			if needsWebRestart {
+				requestRestart()
+			}
+			if webWas != webNow {
+				scheme := "http"
+				if webNow {
+					scheme = "https"
+				}
+				target := scheme + "://" + r.Host + "/config"
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				_, _ = fmt.Fprintf(w, "<!doctype html><html><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>Redirect</title></head><body style=\"font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px\"><h2>Dashboard HTTPS updated</h2><p>Open: <a href=\"%s\">%s</a></p><p style=\"opacity:.8\">Self-signed certs will show a browser warning; that's expected.</p></body></html>", target, target)
 				return
 			}
-			addMsg("Regenerated dashboard HTTPS cert/key; cert sha256=" + fp)
-		}
-		if cfg.WebHTTPS {
-			fp, err := tlsutil.EnsureSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			addMsg("Dashboard HTTPS enabled (self-signed); cert sha256=" + fp)
-		}
-
-		if err := configio.Save(configPath, cfg); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		runner.Restart(cfg)
-		addMsg("Saved + restarted")
-		setMsg(strings.Join(msgs, " · "))
-
-		webNow := cfg.WebHTTPS
-		needsWebRestart := webWas != webNow || strings.TrimSpace(r.Form.Get("web_tls_regen")) != ""
-		if needsWebRestart {
-			requestRestart()
-		}
-		if webWas != webNow {
-			scheme := "http"
-			if webNow {
-				scheme = "https"
-			}
-			target := scheme + "://" + r.Host + "/config"
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = fmt.Fprintf(w, "<!doctype html><html><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>Redirect</title></head><body style=\"font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px\"><h2>Dashboard HTTPS updated</h2><p>Open: <a href=\"%s\">%s</a></p><p style=\"opacity:.8\">Self-signed certs will show a browser warning; that's expected.</p></body></html>", target, target)
-			return
-		}
-		http.Redirect(w, r, "/config", http.StatusSeeOther)
-	})))
+			http.Redirect(w, r, "/config", http.StatusSeeOther)
+		})))
 
 		// Dashboard interval update (protected)
 		mux.HandleFunc("/api/dashboard/interval", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1052,32 +1061,32 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 
 		// Back-compat: old save endpoint
 		mux.HandleFunc("/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/config", http.StatusSeeOther)
+			http.Redirect(w, r, "/config", http.StatusSeeOther)
 		})))
 
 		mux.HandleFunc("/gen-token", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if !checkCSRF(r) {
-			http.Error(w, "csrf", http.StatusBadRequest)
-			return
-		}
-		cfg, _, _ := runner.Get()
-		cfg.Token = genToken()
-		if err := configio.Save(configPath, cfg); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		runner.Restart(cfg)
-		setMsg("Generated token + restarted")
-		http.Redirect(w, r, "/config", http.StatusSeeOther)
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			cfg, _, _ := runner.Get()
+			cfg.Token = genToken()
+			if err := configio.Save(configPath, cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			runner.Restart(cfg)
+			setMsg("Generated token + restarted")
+			http.Redirect(w, r, "/config", http.StatusSeeOther)
 		})))
 
 		return mux
@@ -1156,7 +1165,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			return err
 		}
-		
+
 	next:
 		continue
 	}

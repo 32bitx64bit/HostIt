@@ -16,10 +16,10 @@ import (
 type ApplyOptions struct {
 	AssetURL       string
 	ModuleDir      string
-	ExpectedFolder string // "server" or "client"; empty means module root
+	ExpectedFolder string   // "server" or "client"; empty means module root
 	PreservePath   string   // legacy single absolute path to preserve (e.g. config file)
 	PreservePaths  []string // additional absolute paths to preserve (files or directories)
-	SharedDestDir  string // optional absolute path to shared module destination
+	SharedDestDir  string   // optional absolute path to shared module destination
 }
 
 func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) error {
@@ -65,7 +65,7 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 			_, _ = fmt.Fprintf(logw, "Shared source not found in zip (continuing): %v\n", err)
 		} else {
 			_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDest)
-				if err := syncDir(sharedSrc, sharedDest, nil, logw); err != nil {
+			if err := syncDir(sharedSrc, sharedDest, nil, logw); err != nil {
 				return err
 			}
 		}
@@ -312,6 +312,106 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 
 	skipPrefixes := []string{".git", "bin"}
 
+	// First pass: collect all relative paths from source
+	srcRelPaths := make(map[string]struct{})
+	err := filepath.WalkDir(srcRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		rel = filepath.Clean(rel)
+		parts := strings.Split(rel, string(os.PathSeparator))
+		if len(parts) > 0 {
+			for _, sp := range skipPrefixes {
+				if parts[0] == sp {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+		}
+		srcRelPaths[rel] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Second pass: delete files in dst that don't exist in src
+	dstAbs, err := filepath.Abs(dstRoot)
+	if err != nil {
+		return err
+	}
+	dstAbs = filepath.Clean(dstAbs)
+
+	toDelete := make([]string, 0)
+	err = filepath.WalkDir(dstRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		rel, err := filepath.Rel(dstRoot, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		rel = filepath.Clean(rel)
+		parts := strings.Split(rel, string(os.PathSeparator))
+		if len(parts) > 0 {
+			for _, sp := range skipPrefixes {
+				if parts[0] == sp {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+		}
+
+		abs := filepath.Clean(path)
+
+		// Check if this path should be preserved
+		if _, ok := preserveFiles[abs]; ok {
+			return nil
+		}
+		for _, dirPrefix := range preserveDirs {
+			if strings.HasPrefix(abs+string(os.PathSeparator), dirPrefix) {
+				return nil
+			}
+		}
+
+		// If not in source, mark for deletion
+		if _, exists := srcRelPaths[rel]; !exists {
+			toDelete = append(toDelete, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Delete files/directories not in source (delete in reverse order for dirs)
+	for i := len(toDelete) - 1; i >= 0; i-- {
+		path := toDelete[i]
+		if err := os.RemoveAll(path); err != nil {
+			_, _ = fmt.Fprintf(logw, "Warning: failed to remove %s: %v\n", path, err)
+		} else {
+			_, _ = fmt.Fprintf(logw, "Removed stale file: %s\n", path)
+		}
+	}
+
+	// Third pass: copy files from source to destination
 	return filepath.WalkDir(srcRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err

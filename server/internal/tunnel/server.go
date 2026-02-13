@@ -117,11 +117,11 @@ func NewServer(cfg ServerConfig) *Server {
 		publicUDP:        map[string]net.PacketConn{},
 		dash:             newDashStateWithInterval(cfg.DashboardInterval),
 		udpPublicJobs:    make(map[string]chan udpJob),
-		udpPublicWriters: make(map[string]chan udpWriteJob),
+		udpPublicWriters: make(map[string]*udpWriteQueueWithBackpressure),
 		errLast:          make(map[string]time.Time),
 		udpStats:         udputil.NewSessionStats(1000, 5*time.Minute),
 		encryptionNone:   cfg.DisableUDPEncryption || strings.EqualFold(strings.TrimSpace(cfg.UDPEncryptionMode), "none"),
-		resolvedAddrs:    make(map[string]*net.UDPAddr),
+		resolvedAddrs:    make(map[string]*resolvedAddr),
 		noDelayByRoute:   noDelay,
 	}
 	st.udpKeys = buildUDPKeySet(cfg)
@@ -288,7 +288,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// Start async UDP writers for each public route (server→public client path)
 	// This prevents blocking on slow clients and absorbs traffic bursts
 	for _, x := range publicUDP {
-		writeQueue := make(chan udpWriteJob, 65536) // Match the read queue size
+		writeQueue := newUDPWriteQueueWithBackpressure(65536) // Match the read queue size
 		st.udpPublicWriters[x.name] = writeQueue
 
 		// Start multiple writer goroutines per route for parallel writes to different clients
@@ -435,7 +435,7 @@ type serverState struct {
 	udpPublicJobs map[string]chan udpJob
 
 	// Async write queues for server→public client path (prevents blocking on slow clients)
-	udpPublicWriters    map[string]chan udpWriteJob // route -> write queue
+	udpPublicWriters    map[string]*udpWriteQueueWithBackpressure // route -> write queue
 	udpPublicWriteDrops atomic.Int64
 
 	// UDP statistics
@@ -447,14 +447,157 @@ type serverState struct {
 
 	// Resolved-address cache for outbound UDP replies (avoids net.ResolveUDPAddr per packet).
 	resolvedMu    sync.RWMutex
-	resolvedAddrs map[string]*net.UDPAddr
+	resolvedAddrs map[string]*resolvedAddr
+}
+
+// resolvedAddr caches a resolved UDP address with its creation time for eviction.
+type resolvedAddr struct {
+	addr    *net.UDPAddr
+	created time.Time
 }
 
 // udpWriteJob represents a packet to write to a public client
 type udpWriteJob struct {
-	data   []byte
-	addr   net.Addr
-	bufPtr *[]byte // Pool buffer to return after writing (nil if data was copied)
+	data    []byte
+	addr    net.Addr
+	bufPtr  *[]byte   // Pool buffer to return after writing (nil if data was copied)
+	enqueue time.Time // When the job was enqueued (for latency tracking)
+}
+
+// udpWriteQueueWithBackpressure is a write queue with backpressure support.
+type udpWriteQueueWithBackpressure struct {
+	queue       chan udpWriteJob
+	capacity    int
+	depth       atomic.Int32
+	drops       atomic.Uint64
+	avgLatency  atomic.Int64 // Average queue latency in nanoseconds
+	totalBytes  atomic.Uint64
+	totalWrites atomic.Uint64
+
+	// Congestion control
+	congestionMode    atomic.Bool
+	lastDropTime      atomic.Int64
+	congestionBackoff atomic.Int64 // nanoseconds to wait between sends
+}
+
+func newUDPWriteQueueWithBackpressure(capacity int) *udpWriteQueueWithBackpressure {
+	return &udpWriteQueueWithBackpressure{
+		queue:    make(chan udpWriteJob, capacity),
+		capacity: capacity,
+	}
+}
+
+// TryEnqueue attempts to enqueue without blocking. Returns false if dropped.
+func (q *udpWriteQueueWithBackpressure) TryEnqueue(data []byte, addr net.Addr, bufPtr *[]byte) bool {
+	job := udpWriteJob{
+		data:    data,
+		addr:    addr,
+		bufPtr:  bufPtr,
+		enqueue: time.Now(),
+	}
+	select {
+	case q.queue <- job:
+		q.depth.Add(1)
+		return true
+	default:
+		q.drops.Add(1)
+		q.enterCongestionMode()
+		if bufPtr != nil {
+			udpBufPool.Put(bufPtr)
+		}
+		return false
+	}
+}
+
+// EnqueueWithTimeout enqueues with a timeout for backpressure.
+func (q *udpWriteQueueWithBackpressure) EnqueueWithTimeout(ctx context.Context, data []byte, addr net.Addr, bufPtr *[]byte, timeout time.Duration) error {
+	job := udpWriteJob{
+		data:    data,
+		addr:    addr,
+		bufPtr:  bufPtr,
+		enqueue: time.Now(),
+	}
+
+	var timer *time.Timer
+	var timerChan <-chan time.Time
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		defer timer.Stop()
+		timerChan = timer.C
+	}
+
+	select {
+	case q.queue <- job:
+		q.depth.Add(1)
+		return nil
+	case <-ctx.Done():
+		if bufPtr != nil {
+			udpBufPool.Put(bufPtr)
+		}
+		return ctx.Err()
+	case <-timerChan:
+		if bufPtr != nil {
+			udpBufPool.Put(bufPtr)
+		}
+		q.drops.Add(1)
+		q.enterCongestionMode()
+		return context.DeadlineExceeded
+	}
+}
+
+// Dequeue returns the next job to process.
+func (q *udpWriteQueueWithBackpressure) Dequeue(ctx context.Context) (udpWriteJob, bool) {
+	select {
+	case job := <-q.queue:
+		q.depth.Add(-1)
+		// Track latency
+		if !job.enqueue.IsZero() {
+			latency := time.Since(job.enqueue).Nanoseconds()
+			oldAvg := q.avgLatency.Load()
+			if oldAvg == 0 {
+				q.avgLatency.Store(latency)
+			} else {
+				newAvg := oldAvg - oldAvg/10 + latency/10
+				q.avgLatency.Store(newAvg)
+			}
+		}
+		return job, true
+	case <-ctx.Done():
+		return udpWriteJob{}, false
+	}
+}
+
+func (q *udpWriteQueueWithBackpressure) enterCongestionMode() {
+	q.lastDropTime.Store(time.Now().UnixNano())
+	if !q.congestionMode.Swap(true) {
+		q.congestionBackoff.Store(100 * 1000) // 100 microseconds
+		log.Warn(logging.CatUDP, "UDP write queue entering congestion mode")
+	}
+}
+
+func (q *udpWriteQueueWithBackpressure) maybeExitCongestionMode() {
+	if !q.congestionMode.Load() {
+		return
+	}
+	lastDrop := q.lastDropTime.Load()
+	if time.Since(time.Unix(0, lastDrop)) > 5*time.Second {
+		q.congestionMode.Store(false)
+		q.congestionBackoff.Store(0)
+		log.Info(logging.CatUDP, "UDP write queue exited congestion mode")
+		return
+	}
+	// Gradually reduce backoff
+	currentBackoff := q.congestionBackoff.Load()
+	if currentBackoff > 1000 {
+		newBackoff := currentBackoff - currentBackoff/10
+		q.congestionBackoff.Store(newBackoff)
+	}
+}
+
+// Stats returns queue statistics.
+func (q *udpWriteQueueWithBackpressure) Stats() (depth, capacity int, drops, totalBytes, totalWrites uint64, avgLatency time.Duration, inCongestion bool) {
+	return int(q.depth.Load()), q.capacity, q.drops.Load(), q.totalBytes.Load(), q.totalWrites.Load(),
+		time.Duration(q.avgLatency.Load()), q.congestionMode.Load()
 }
 
 const dashSystemRoute = "_system"
@@ -463,7 +606,8 @@ type udpJob struct {
 	data   []byte
 	len    int // Actual data length (data may be from pool with larger capacity)
 	addr   net.Addr
-	bufPtr *[]byte // Pool buffer to return after processing (nil if data was copied)
+	bufPtr *[]byte    // Pool buffer to return after processing (nil if data was copied)
+	pool   *sync.Pool // Pool to return buffer to (must match the pool it came from)
 }
 
 type pendingConn struct {
@@ -937,7 +1081,9 @@ func (st *serverState) clearAgent(conn net.Conn) {
 		st.mu.Unlock()
 		return
 	}
-	_ = st.agentConn.Close()
+	// Capture the connection to close outside the lock to avoid potential deadlock
+	// if Close() blocks on I/O operations.
+	connToClose := st.agentConn
 	st.agentConn = nil
 	st.agentProto = nil
 	// Cancel the agent context — this immediately terminates all active
@@ -950,6 +1096,11 @@ func (st *serverState) clearAgent(conn net.Conn) {
 	st.setAgentUDPAddr(nil)
 	st.agentUDPKeyID.Store(0)
 	st.mu.Unlock()
+
+	// Close the connection outside the mutex lock to prevent deadlock.
+	if connToClose != nil {
+		_ = connToClose.Close()
+	}
 
 	log.Info(logging.CatControl, "agent cleared, draining pending connections")
 
@@ -1425,7 +1576,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 
 				// Pass pool buffer directly to worker - worker returns it after processing
 				select {
-				case jobs <- udpJob{data: buf, len: n, addr: addr, bufPtr: bufPtr}:
+				case jobs <- udpJob{data: buf, len: n, addr: addr, bufPtr: bufPtr, pool: localPool}:
 				default:
 					// Drop packet if workers overwhelmed, return buffer to pool
 					st.udpAgentDrops.Add(1)
@@ -1444,21 +1595,31 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 }
 
 // resolveUDP caches resolved UDP addresses to avoid net.ResolveUDPAddr per packet.
+// Entries older than 5 minutes are evicted to prevent unbounded memory growth.
+const resolvedAddrTTL = 5 * time.Minute
+
 func (st *serverState) resolveUDP(addr string) (*net.UDPAddr, error) {
 	st.resolvedMu.RLock()
-	ua, ok := st.resolvedAddrs[addr]
+	cached, ok := st.resolvedAddrs[addr]
 	st.resolvedMu.RUnlock()
-	if ok {
-		return ua, nil
+	if ok && time.Since(cached.created) < resolvedAddrTTL {
+		return cached.addr, nil
 	}
 	ua, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
 	st.resolvedMu.Lock()
-	// Cap cache size to prevent unbounded memory growth.
+	// Evict entries older than TTL to prevent unbounded memory growth.
+	now := time.Now()
+	for k, v := range st.resolvedAddrs {
+		if now.Sub(v.created) > resolvedAddrTTL {
+			delete(st.resolvedAddrs, k)
+		}
+	}
+	// Cap cache size as a safety measure (should rarely trigger with TTL eviction).
 	if len(st.resolvedAddrs) < 100000 {
-		st.resolvedAddrs[addr] = ua
+		st.resolvedAddrs[addr] = &resolvedAddr{addr: ua, created: now}
 	}
 	st.resolvedMu.Unlock()
 	return ua, nil
@@ -1478,9 +1639,9 @@ func (st *serverState) udpAgentWorker(ctx context.Context, jobs <-chan udpJob) {
 				pkt = pkt[:job.len]
 			}
 			st.processAgentUDPPacket(pkt, job.addr)
-			// Return buffer to pool after processing
-			if job.bufPtr != nil {
-				udpBufPool.Put(job.bufPtr)
+			// Return buffer to the correct pool after processing
+			if job.bufPtr != nil && job.pool != nil {
+				job.pool.Put(job.bufPtr)
 			}
 		}
 	}
@@ -1569,9 +1730,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		// Copy payload since the original buffer will be returned to pool
 		payloadCopy := make([]byte, len(payload))
 		copy(payloadCopy, payload)
-		select {
-		case writeQueue <- udpWriteJob{data: payloadCopy, addr: ua}:
-		default:
+		if !writeQueue.TryEnqueue(payloadCopy, ua, nil) {
 			// Queue full - drop packet rather than blocking
 			st.udpPublicWriteDrops.Add(1)
 			traceUDPf("udp: DATA write queue full route=%s to=%v", route, ua)
@@ -1605,9 +1764,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		// Copy payload since the original buffer will be returned to pool
 		payloadCopy := make([]byte, len(payload))
 		copy(payloadCopy, payload)
-		select {
-		case writeQueue <- udpWriteJob{data: payloadCopy, addr: ua}:
-		default:
+		if !writeQueue.TryEnqueue(payloadCopy, ua, nil) {
 			// Queue full - drop packet rather than blocking
 			st.udpPublicWriteDrops.Add(1)
 			traceUDPf("udp: DATAEnc2 write queue full route=%s to=%v", route, ua)
@@ -1725,7 +1882,7 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 
 				// Pass pool buffer directly to worker - worker returns it after processing
 				select {
-				case jobs <- udpJob{data: buf, len: n, addr: clientAddr, bufPtr: bufPtr}:
+				case jobs <- udpJob{data: buf, len: n, addr: clientAddr, bufPtr: bufPtr, pool: localPool}:
 				default:
 					// Drop if workers overwhelmed, return buffer to pool
 					st.udpPublicDrops.Add(1)
@@ -1757,9 +1914,9 @@ func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, 
 				pkt = pkt[:job.len]
 			}
 			st.processPublicUDPPacket(pkt, job.addr, routeName)
-			// Return buffer to pool after processing
-			if job.bufPtr != nil {
-				udpBufPool.Put(job.bufPtr)
+			// Return buffer to the correct pool after processing
+			if job.bufPtr != nil && job.pool != nil {
+				job.pool.Put(job.bufPtr)
 			}
 		}
 	}
@@ -1767,25 +1924,32 @@ func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, 
 
 // udpPublicWriter handles async writes to public clients (server→public path)
 // This prevents blocking on slow clients and absorbs traffic bursts
-func (st *serverState) udpPublicWriter(ctx context.Context, pc net.PacketConn, jobs <-chan udpWriteJob, routeName string) {
+func (st *serverState) udpPublicWriter(ctx context.Context, pc net.PacketConn, queue *udpWriteQueueWithBackpressure, routeName string) {
 	for {
-		select {
-		case <-ctx.Done():
+		job, ok := queue.Dequeue(ctx)
+		if !ok {
 			return
-		case job, ok := <-jobs:
-			if !ok {
-				return
-			}
-			_, err := pc.WriteTo(job.data, job.addr)
-			if err != nil {
-				traceUDPf("udp: public write failed route=%s to=%v err=%v", routeName, job.addr, err)
-			} else if st.dash != nil {
+		}
+
+		// Apply congestion backoff if needed
+		if backoff := queue.congestionBackoff.Load(); backoff > 0 {
+			time.Sleep(time.Duration(backoff))
+		}
+
+		_, err := pc.WriteTo(job.data, job.addr)
+		if err != nil {
+			traceUDPf("udp: public write failed route=%s to=%v err=%v", routeName, job.addr, err)
+		} else {
+			queue.totalBytes.Add(uint64(len(job.data)))
+			queue.totalWrites.Add(1)
+			queue.maybeExitCongestionMode()
+			if st.dash != nil {
 				st.dash.addBytes(time.Now(), int64(len(job.data)))
 			}
-			// Return buffer to pool if it came from one
-			if job.bufPtr != nil {
-				udpBufPool.Put(job.bufPtr)
-			}
+		}
+		// Return buffer to pool if it came from one
+		if job.bufPtr != nil {
+			udpBufPool.Put(job.bufPtr)
 		}
 	}
 }

@@ -27,15 +27,12 @@ fi
 
 if [ -n "${TOKEN}" ]; then
 	args="${args} -token ${TOKEN}"
-	# With an explicit token, we can autostart.
-	if [ -x ./bin/tunnel-agent ]; then
-		exec ./bin/tunnel-agent ${args}
-	fi
-	exec go run ./cmd/agent ${args}
 fi
 
-# No token provided; run UI-only mode.
+# Let the agent decide whether to autostart based on config file contents.
+# The agent will check if server/token are configured (either via flags or config file)
+# and auto-start if both are present.
 if [ -x ./bin/tunnel-agent ]; then
-	exec ./bin/tunnel-agent ${args} -autostart=false
+	exec ./bin/tunnel-agent ${args}
 fi
-exec go run ./cmd/agent ${args} -autostart=false
+exec go run ./cmd/agent ${args}

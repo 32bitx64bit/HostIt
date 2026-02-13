@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -163,18 +164,7 @@ func IsUniqueConstraint(err error) bool {
 		return false
 	}
 	// modernc sqlite returns errors with text including "UNIQUE constraint failed"
-	return errors.Is(err, sql.ErrNoRows) || (err != nil && contains(err.Error(), "UNIQUE constraint failed"))
-}
-
-func contains(s string, substr string) bool {
-	return len(substr) == 0 || (len(s) >= len(substr) && (func() bool {
-		for i := 0; i+len(substr) <= len(s); i++ {
-			if s[i:i+len(substr)] == substr {
-				return true
-			}
-		}
-		return false
-	})())
+	return errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 var ErrBadInput = fmt.Errorf("bad input")

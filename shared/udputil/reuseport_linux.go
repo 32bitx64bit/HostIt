@@ -1,88 +1,99 @@
 //go:build linux
-// +build linux
 
 package udputil
 
 import (
 	"net"
 	"os"
+	"sync"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-// ListenUDPReusePort creates a UDP listener with SO_REUSEPORT enabled.
-// This allows multiple goroutines to bind to the same port, distributing
-// incoming packets across them for better parallelism on multi-core systems.
-func ListenUDPReusePort(network, addr string) (*net.UDPConn, error) {
-	// Parse the address
-	udpAddr, err := net.ResolveUDPAddr(network, addr)
-	if err != nil {
-		return nil, err
+// reusePortEnabled indicates whether SO_REUSEPORT is available and enabled.
+var reusePortEnabled bool
+var reusePortOnce sync.Once
+
+// IsReusePortAvailable returns true if SO_REUSEPORT is available on this system.
+func IsReusePortAvailable() bool {
+	reusePortOnce.Do(func() {
+		// Check kernel version - SO_REUSEPORT is available since Linux 3.9
+		// but we want 4.5+ for proper load balancing
+		reusePortEnabled = true // Assume available on modern Linux
+		if env := os.Getenv("HOSTIT_DISABLE_REUSEPORT"); env != "" && env != "0" {
+			reusePortEnabled = false
+		}
+	})
+	return reusePortEnabled
+}
+
+// ListenUDPWithReusePort creates a UDP listener with SO_REUSEPORT enabled.
+// This allows multiple sockets to bind to the same port, enabling true
+// parallel processing at the kernel level.
+func ListenUDPWithReusePort(network, addr string) (*net.UDPConn, error) {
+	if !IsReusePortAvailable() {
+		return net.ListenUDP(network, mustResolveUDPAddr(network, addr))
 	}
 
 	// Create socket with SO_REUSEPORT
-	sockFamily := syscall.AF_INET
-	if len(udpAddr.IP) > 4 {
-		sockFamily = syscall.AF_INET6
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			err := c.Control(func(fd uintptr) {
+				// Enable SO_REUSEPORT for load balancing across multiple sockets
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+				if opErr != nil {
+					return
+				}
+				// Also set SO_REUSEADDR for good measure
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+			})
+			if err != nil {
+				return err
+			}
+			return opErr
+		},
 	}
 
-	// Create socket
-	fd, err := syscall.Socket(sockFamily, syscall.SOCK_DGRAM, 0)
+	conn, err := lc.ListenPacket(nil, network, addr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Set SO_REUSEPORT
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, unixSO_REUSEPORT, 1); err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-
-	// Set SO_REUSEADDR as well for good measure
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-
-	// Bind
-	var sa syscall.Sockaddr
-	if sockFamily == syscall.AF_INET6 {
-		var addrBytes [16]byte
-		copy(addrBytes[:], udpAddr.IP.To16())
-		sa = &syscall.SockaddrInet6{
-			Port: udpAddr.Port,
-			Addr: addrBytes,
-		}
-	} else {
-		var addrBytes [4]byte
-		copy(addrBytes[:], udpAddr.IP.To4())
-		sa = &syscall.SockaddrInet4{
-			Port: udpAddr.Port,
-			Addr: addrBytes,
-		}
-	}
-
-	if err := syscall.Bind(fd, sa); err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-
-	// Convert to net.UDPConn
-	file := os.NewFile(uintptr(fd), "udp-socket")
-	defer file.Close()
-
-	conn, err := net.FileConn(file)
-	if err != nil {
-		return nil, err
-	}
-
-	udpConn, ok := conn.(*net.UDPConn)
-	if !ok {
-		conn.Close()
-		return nil, net.UnknownNetworkError(network)
-	}
-
-	return udpConn, nil
+	return conn.(*net.UDPConn), nil
 }
 
-// SO_REUSEPORT constant for Linux
-const unixSO_REUSEPORT = 15
+// ListenPacketWithReusePort creates a PacketConn with SO_REUSEPORT enabled.
+func ListenPacketWithReusePort(network, addr string) (net.PacketConn, error) {
+	if !IsReusePortAvailable() {
+		return net.ListenPacket(network, addr)
+	}
+
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			err := c.Control(func(fd uintptr) {
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+				if opErr != nil {
+					return
+				}
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+			})
+			if err != nil {
+				return err
+			}
+			return opErr
+		},
+	}
+
+	return lc.ListenPacket(nil, network, addr)
+}
+
+func mustResolveUDPAddr(network, addr string) *net.UDPAddr {
+	a, err := net.ResolveUDPAddr(network, addr)
+	if err != nil {
+		panic(err)
+	}
+	return a
+}

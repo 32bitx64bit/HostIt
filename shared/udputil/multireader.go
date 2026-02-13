@@ -95,7 +95,7 @@ func (mr *MultiReaderUDP) Start(handler PacketHandler) error {
 		var err error
 
 		if mr.cfg.UseReusePort {
-			conn, err = ListenUDPReusePort("udp", mr.cfg.Addr)
+			conn, err = ListenUDPWithReusePort("udp", mr.cfg.Addr)
 		} else {
 			var udpAddr *net.UDPAddr
 			udpAddr, err = net.ResolveUDPAddr("udp", mr.cfg.Addr)
@@ -175,8 +175,8 @@ func (mr *MultiReaderUDP) readerLoop(readerID int, conn *net.UDPConn, handler Pa
 }
 
 // Stats returns current statistics.
-func (mr *MultiReaderUDP) Stats() MultiReaderStats {
-	return mr.stats
+func (mr *MultiReaderUDP) Stats() *MultiReaderStats {
+	return &mr.stats
 }
 
 // Stop gracefully shuts down the reader.
@@ -340,8 +340,8 @@ func (d *DialerUDP) StartReaders(handler PacketHandler) {
 }
 
 // Stats returns current statistics.
-func (d *DialerUDP) Stats() MultiReaderStats {
-	return d.stats
+func (d *DialerUDP) Stats() *MultiReaderStats {
+	return &d.stats
 }
 
 // Stop gracefully shuts down the dialer.

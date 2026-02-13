@@ -59,12 +59,14 @@ func PutOutputBuffer(buf *[]byte) {
 }
 
 const (
-	MsgReg      byte = 1
-	MsgData     byte = 2
-	MsgRegEnc   byte = 3 // legacy (unused)
-	MsgDataEnc  byte = 4 // legacy (unused)
-	MsgRegEnc2  byte = 5
-	MsgDataEnc2 byte = 6
+	MsgReg         byte = 1
+	MsgData        byte = 2
+	MsgRegEnc      byte = 3 // legacy (unused)
+	MsgDataEnc     byte = 4 // legacy (unused)
+	MsgRegEnc2     byte = 5
+	MsgDataEnc2    byte = 6
+	MsgDataSeq     byte = 7 // DATA with sequence number for loss detection
+	MsgDataEnc2Seq byte = 8 // DATAEnc2 with sequence number for loss detection
 )
 
 type Mode string
@@ -440,4 +442,162 @@ func DecodeData(b []byte) (route string, client string, payload []byte, ok bool)
 	}
 	route, client, payload, ok = decodeDataPayload(b[1:])
 	return route, client, payload, ok
+}
+
+// SequenceCounter provides atomic sequence number generation for loss detection.
+type SequenceCounter struct {
+	seq atomic.Uint32
+}
+
+// Next returns the next sequence number (starting at 1).
+func (s *SequenceCounter) Next() uint32 {
+	return s.seq.Add(1)
+}
+
+// Current returns the current sequence number without incrementing.
+func (s *SequenceCounter) Current() uint32 {
+	return s.seq.Load()
+}
+
+// EncodeDataWithSeq encodes a DATA packet with a sequence number for loss detection.
+// Format: [MsgDataSeq:1][seq:4][route_len:1][route][client_len:2][client][payload]
+func EncodeDataWithSeq(seq uint32, route string, client string, payload []byte) []byte {
+	rb := route
+	if len(rb) > 255 {
+		rb = rb[:255]
+	}
+	cb := client
+	if len(cb) > 65535 {
+		cb = cb[:65535]
+	}
+	total := 1 + 4 + 1 + len(rb) + 2 + len(cb) + len(payload)
+	b := make([]byte, total)
+	b[0] = MsgDataSeq
+	binary.BigEndian.PutUint32(b[1:5], seq)
+	b[5] = byte(len(rb))
+	o := 6
+	copy(b[o:], rb)
+	o += len(rb)
+	binary.BigEndian.PutUint16(b[o:o+2], uint16(len(cb)))
+	o += 2
+	copy(b[o:], cb)
+	o += len(cb)
+	copy(b[o:], payload)
+	return b
+}
+
+// DecodeDataWithSeq decodes a DATA packet with sequence number.
+// Returns sequence number, route, client, payload, and ok.
+func DecodeDataWithSeq(b []byte) (seq uint32, route string, client string, payload []byte, ok bool) {
+	if len(b) < 1+4+1+2 || b[0] != MsgDataSeq {
+		return 0, "", "", nil, false
+	}
+	seq = binary.BigEndian.Uint32(b[1:5])
+	route, client, payload, ok = decodeDataPayload(b[5:])
+	return seq, route, client, payload, ok
+}
+
+// EncodeDataEnc2PooledWithSeq encodes an encrypted DATA packet with sequence number.
+// Format: [MsgDataEnc2Seq:1][keyID:4][seq:4][nonce:12][ciphertext]
+func EncodeDataEnc2PooledWithSeq(ks KeySet, keyID uint32, seq uint32, route string, client string, payload []byte) ([]byte, *[]byte) {
+	if !ks.Enabled() {
+		b := EncodeDataWithSeq(seq, route, client, payload)
+		return b, nil
+	}
+	aead, ok := ks.aeadFor(keyID)
+	if !ok {
+		aead = ks.Cur
+		keyID = ks.CurID
+		if aead == nil {
+			b := EncodeDataWithSeq(seq, route, client, payload)
+			return b, nil
+		}
+	}
+
+	// Build plaintext: [seq:4][route_len:1][route][client_len:2][client][payload]
+	rb := route
+	if len(rb) > 255 {
+		rb = rb[:255]
+	}
+	cb := client
+	if len(cb) > 65535 {
+		cb = cb[:65535]
+	}
+	ptLen := 4 + 1 + len(rb) + 2 + len(cb) + len(payload)
+	ptBufPtr := ptPool.Get().(*[]byte)
+	ptBuf := *ptBufPtr
+	if cap(ptBuf) < ptLen {
+		ptBuf = make([]byte, ptLen)
+	} else {
+		ptBuf = ptBuf[:ptLen]
+	}
+	binary.BigEndian.PutUint32(ptBuf[0:4], seq)
+	ptBuf[4] = byte(len(rb))
+	o := 5
+	copy(ptBuf[o:], rb)
+	o += len(rb)
+	binary.BigEndian.PutUint16(ptBuf[o:o+2], uint16(len(cb)))
+	o += 2
+	copy(ptBuf[o:], cb)
+	o += len(cb)
+	copy(ptBuf[o:], payload)
+
+	// Use pooled output buffer
+	ns := aead.NonceSize()
+	total := 1 + 4 + 4 + ns + ptLen + aead.Overhead()
+	outBufPtr := outPool.Get().(*[]byte)
+	outBuf := *outBufPtr
+	if cap(outBuf) < total {
+		outBuf = make([]byte, total)
+	}
+	outBuf = outBuf[:total]
+	outBuf[0] = MsgDataEnc2Seq
+	binary.BigEndian.PutUint32(outBuf[1:5], keyID)
+	binary.BigEndian.PutUint32(outBuf[5:9], seq)
+	nonce := outBuf[9 : 9+ns]
+	fillNonce(nonce)
+	aead.Seal(outBuf[9+ns:9+ns:total], nonce, ptBuf, nil)
+
+	// Return plaintext buffer to pool
+	*ptBufPtr = ptBuf
+	ptPool.Put(ptBufPtr)
+
+	// Update the pool buffer slice for return
+	*outBufPtr = outBuf
+
+	return outBuf, outBufPtr
+}
+
+// DecodeDataEnc2WithSeq decodes an encrypted DATA packet with sequence number.
+func DecodeDataEnc2WithSeq(ks KeySet, b []byte) (seq uint32, route string, client string, payload []byte, keyID uint32, ok bool) {
+	if len(b) < 1+4+4 || b[0] != MsgDataEnc2Seq {
+		return 0, "", "", nil, 0, false
+	}
+	keyID = binary.BigEndian.Uint32(b[1:5])
+	seq = binary.BigEndian.Uint32(b[5:9])
+	aead, ok := ks.aeadFor(keyID)
+	if !ok {
+		return 0, "", "", nil, 0, false
+	}
+	ns := aead.NonceSize()
+	if len(b) < 1+4+4+ns+aead.Overhead() {
+		return 0, "", "", nil, 0, false
+	}
+	nonce := b[9 : 9+ns]
+	ct := b[9+ns:]
+	pt, err := aead.Open(ct[:0], nonce, ct, nil)
+	if err != nil {
+		return 0, "", "", nil, 0, false
+	}
+	// Parse plaintext: [seq:4][route_len:1][route][client_len:2][client][payload]
+	if len(pt) < 4+1+2 {
+		return 0, "", "", nil, 0, false
+	}
+	route, client, payload, ok = decodeDataPayload(pt[4:])
+	return seq, route, client, payload, keyID, ok
+}
+
+// IsDataMsg returns true if the message type is any DATA variant.
+func IsDataMsg(msgType byte) bool {
+	return msgType == MsgData || msgType == MsgDataSeq || msgType == MsgDataEnc2 || msgType == MsgDataEnc2Seq
 }
