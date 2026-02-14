@@ -7,10 +7,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/klauspost/reedsolomon"
 )
 
 // FEC (Forward Error Correction) provides packet loss recovery without retransmission.
-// This implementation uses XOR-based Reed-Solomon-like erasure coding.
+// This implementation uses Reed-Solomon erasure coding for proper multi-packet recovery.
 
 // FECConfig configures the FEC encoder/decoder.
 type FECConfig struct {
@@ -97,20 +99,33 @@ func DecodeFECHeader(data []byte) (FECHeader, []byte, bool) {
 	return hdr, data[fecHeaderSize:], true
 }
 
-// FECEncoder encodes packets with forward error correction.
+// FECEncoder encodes packets with forward error correction using Reed-Solomon.
 type FECEncoder struct {
 	config   FECConfig
 	groupID  atomic.Uint32
 	groupBuf [][]byte
 	groupIdx int
 	mu       sync.Mutex
+
+	// Reed-Solomon encoder (cached for reuse)
+	encoder reedsolomon.Encoder
 }
 
 // NewFECEncoder creates a new FEC encoder.
 func NewFECEncoder(config FECConfig) *FECEncoder {
+	// Create Reed-Solomon encoder
+	enc, err := reedsolomon.New(config.DataShards, config.ParityShards)
+	if err != nil {
+		// Fallback to a safe default if config is invalid
+		enc, _ = reedsolomon.New(4, 2)
+		config.DataShards = 4
+		config.ParityShards = 2
+	}
+
 	return &FECEncoder{
 		config:   config,
 		groupBuf: make([][]byte, config.DataShards),
+		encoder:  enc,
 	}
 }
 
@@ -156,15 +171,80 @@ func (e *FECEncoder) Flush() [][]byte {
 
 func (e *FECEncoder) flushGroup() [][]byte {
 	groupID := e.groupID.Add(1) - 1
-	packets := make([][]byte, 0, e.groupIdx+e.config.ParityShards)
 
-	// Find max data length for parity calculation
+	// Find max data length for padding
 	maxLen := 0
 	for i := 0; i < e.groupIdx; i++ {
 		if len(e.groupBuf[i]) > maxLen {
 			maxLen = len(e.groupBuf[i])
 		}
 	}
+
+	// Pad all data shards to the same length (required by Reed-Solomon)
+	shards := make([][]byte, e.config.DataShards+e.config.ParityShards)
+	for i := 0; i < e.config.DataShards; i++ {
+		if i < e.groupIdx {
+			// Copy and pad existing data
+			shards[i] = make([]byte, maxLen)
+			copy(shards[i], e.groupBuf[i])
+		} else {
+			// Empty shard for incomplete group
+			shards[i] = make([]byte, maxLen)
+		}
+	}
+
+	// Allocate parity shards
+	for i := e.config.DataShards; i < e.config.DataShards+e.config.ParityShards; i++ {
+		shards[i] = make([]byte, maxLen)
+	}
+
+	// Encode parity using Reed-Solomon
+	if err := e.encoder.Encode(shards); err != nil {
+		// Fallback to XOR-only encoding on error
+		return e.flushGroupXOR(groupID, maxLen)
+	}
+
+	// Build output packets
+	packets := make([][]byte, 0, e.groupIdx+e.config.ParityShards)
+
+	// Add data packets
+	for i := 0; i < e.groupIdx; i++ {
+		hdr := FECHeader{
+			GroupID:   groupID,
+			Index:     uint8(i),
+			IsParity:  false,
+			DataLen:   uint16(len(e.groupBuf[i])),
+			TotalData: uint8(e.groupIdx),
+			TotalPar:  uint8(e.config.ParityShards),
+		}
+		packets = append(packets, EncodeFECPacket(hdr, e.groupBuf[i]))
+	}
+
+	// Add parity packets
+	for p := 0; p < e.config.ParityShards; p++ {
+		hdr := FECHeader{
+			GroupID:   groupID,
+			Index:     uint8(p),
+			IsParity:  true,
+			DataLen:   uint16(maxLen),
+			TotalData: uint8(e.groupIdx),
+			TotalPar:  uint8(e.config.ParityShards),
+		}
+		packets = append(packets, EncodeFECPacket(hdr, shards[e.config.DataShards+p]))
+	}
+
+	// Reset group buffer
+	e.groupIdx = 0
+	for i := range e.groupBuf {
+		e.groupBuf[i] = nil
+	}
+
+	return packets
+}
+
+// flushGroupXOR is a fallback for when Reed-Solomon encoding fails.
+func (e *FECEncoder) flushGroupXOR(groupID uint32, maxLen int) [][]byte {
+	packets := make([][]byte, 0, e.groupIdx+e.config.ParityShards)
 
 	// Encode data packets
 	for i := 0; i < e.groupIdx; i++ {
@@ -179,23 +259,12 @@ func (e *FECEncoder) flushGroup() [][]byte {
 		packets = append(packets, EncodeFECPacket(hdr, e.groupBuf[i]))
 	}
 
-	// Generate parity packets using XOR
+	// Generate parity packets using XOR (simple fallback)
 	for p := 0; p < e.config.ParityShards; p++ {
 		parity := make([]byte, maxLen)
 		for i := 0; i < e.groupIdx; i++ {
-			// XOR with data, padding with zeros if needed
 			for j := 0; j < len(e.groupBuf[i]); j++ {
 				parity[j] ^= e.groupBuf[i][j]
-			}
-			// Rotate data for next parity (simple rotation-based scheme)
-			if p > 0 {
-				rotated := make([]byte, len(e.groupBuf[i]))
-				for j := 0; j < len(e.groupBuf[i]); j++ {
-					rotated[(j+p)%len(e.groupBuf[i])] = e.groupBuf[i][j]
-				}
-				for j := 0; j < len(rotated); j++ {
-					parity[j] ^= rotated[j]
-				}
 			}
 		}
 
@@ -219,12 +288,15 @@ func (e *FECEncoder) flushGroup() [][]byte {
 	return packets
 }
 
-// FECDecoder decodes FEC-encoded packets and recovers lost data.
+// FECDecoder decodes FEC-encoded packets and recovers lost data using Reed-Solomon.
 type FECDecoder struct {
 	config     FECConfig
 	groups     map[uint32]*fecGroup
 	mu         sync.Mutex
 	maxLatency time.Duration
+
+	// Reed-Solomon decoder (cached for reuse)
+	decoder reedsolomon.Encoder
 
 	// Stats
 	recovered atomic.Uint64
@@ -238,14 +310,24 @@ type fecGroup struct {
 	totalData     uint8
 	totalPar      uint8
 	createdAt     time.Time
+	maxLen        int
 }
 
 // NewFECDecoder creates a new FEC decoder.
 func NewFECDecoder(config FECConfig) *FECDecoder {
+	// Create Reed-Solomon decoder (same interface as encoder)
+	dec, err := reedsolomon.New(config.DataShards, config.ParityShards)
+	if err != nil {
+		dec, _ = reedsolomon.New(4, 2)
+		config.DataShards = 4
+		config.ParityShards = 2
+	}
+
 	return &FECDecoder{
 		config:     config,
 		groups:     make(map[uint32]*fecGroup),
 		maxLatency: config.MaxLatency,
+		decoder:    dec,
 	}
 }
 
@@ -277,11 +359,17 @@ func (d *FECDecoder) Process(packet []byte) ([][]byte, bool, bool) {
 	if hdr.IsParity {
 		group.parityPackets[hdr.Index] = make([]byte, len(data))
 		copy(group.parityPackets[hdr.Index], data)
+		if len(data) > group.maxLen {
+			group.maxLen = len(data)
+		}
 	} else {
 		group.dataPackets[hdr.Index] = make([]byte, len(data))
 		copy(group.dataPackets[hdr.Index], data)
 		if group.dataLen == 0 {
 			group.dataLen = hdr.DataLen
+		}
+		if len(data) > group.maxLen {
+			group.maxLen = len(data)
 		}
 	}
 
@@ -299,11 +387,11 @@ func (d *FECDecoder) Process(packet []byte) ([][]byte, bool, bool) {
 	// Check if we can recover missing packets
 	missing := int(group.totalData) - len(group.dataPackets)
 	if missing > 0 && len(group.parityPackets) >= missing {
-		// Attempt recovery
+		// Attempt recovery using Reed-Solomon
 		recovered := d.recoverGroup(group)
 		if len(recovered) > 0 {
 			delete(d.groups, hdr.GroupID)
-			d.recovered.Add(uint64(len(recovered)))
+			d.recovered.Add(uint64(len(recovered) - len(group.dataPackets) + missing))
 			return recovered, true, true
 		}
 	}
@@ -319,8 +407,67 @@ func (d *FECDecoder) Process(packet []byte) ([][]byte, bool, bool) {
 }
 
 func (d *FECDecoder) recoverGroup(group *fecGroup) [][]byte {
-	// Simple XOR recovery - can only recover 1 packet with 1 parity
-	// For more complex recovery, would need proper Reed-Solomon
+	totalShards := int(group.totalData) + int(group.totalPar)
+	if totalShards == 0 {
+		return nil
+	}
+
+	// Build shard array for Reed-Solomon reconstruction
+	shards := make([][]byte, totalShards)
+
+	// Fill in data shards
+	for i := uint8(0); i < group.totalData; i++ {
+		if data, exists := group.dataPackets[i]; exists {
+			shards[i] = make([]byte, group.maxLen)
+			copy(shards[i], data)
+		}
+		// Missing shards remain nil (Reed-Solomon will reconstruct them)
+	}
+
+	// Fill in parity shards
+	for i := uint8(0); i < group.totalPar; i++ {
+		parityIdx := int(group.totalData) + int(i)
+		if data, exists := group.parityPackets[i]; exists {
+			shards[parityIdx] = make([]byte, group.maxLen)
+			copy(shards[parityIdx], data)
+		}
+	}
+
+	// Reconstruct missing data shards using Reed-Solomon
+	if err := d.decoder.Reconstruct(shards); err != nil {
+		// Fallback to XOR recovery for single packet loss
+		return d.recoverGroupXOR(group)
+	}
+
+	// Verify reconstruction is valid
+	ok, err := d.decoder.Verify(shards)
+	if err != nil || !ok {
+		// Fallback to XOR recovery
+		return d.recoverGroupXOR(group)
+	}
+
+	// Extract recovered data packets
+	result := make([][]byte, group.totalData)
+	for i := uint8(0); i < group.totalData; i++ {
+		if existing, exists := group.dataPackets[i]; exists {
+			result[i] = existing
+		} else if shards[i] != nil {
+			// Recovered packet - truncate to original length
+			dataLen := int(group.dataLen)
+			if dataLen > 0 && dataLen < len(shards[i]) {
+				result[i] = shards[i][:dataLen]
+			} else {
+				result[i] = shards[i]
+			}
+		}
+	}
+
+	return result
+}
+
+// recoverGroupXOR is a fallback for when Reed-Solomon reconstruction fails.
+// It can only recover a single missing packet per group.
+func (d *FECDecoder) recoverGroupXOR(group *fecGroup) [][]byte {
 	if len(group.parityPackets) == 0 {
 		return nil
 	}
@@ -334,7 +481,6 @@ func (d *FECDecoder) recoverGroup(group *fecGroup) [][]byte {
 	}
 
 	if len(missing) == 0 {
-		// No missing packets
 		result := make([][]byte, group.totalData)
 		for i := uint8(0); i < group.totalData; i++ {
 			result[i] = group.dataPackets[i]
@@ -342,39 +488,36 @@ func (d *FECDecoder) recoverGroup(group *fecGroup) [][]byte {
 		return result
 	}
 
-	// Can only recover if we have enough parity
-	if len(missing) > len(group.parityPackets) {
+	// XOR recovery only works for single missing packet
+	if len(missing) > 1 {
 		return nil
 	}
 
-	// Simple XOR recovery for single missing packet
-	if len(missing) == 1 {
-		// Get first parity packet
-		var parity []byte
-		for _, p := range group.parityPackets {
-			parity = p
-			break
-		}
-		if parity == nil {
-			return nil
-		}
-
-		// XOR all known data with parity to recover missing
-		recovered := make([]byte, len(parity))
-		copy(recovered, parity)
-		for _, data := range group.dataPackets {
-			for i := 0; i < len(data) && i < len(recovered); i++ {
-				recovered[i] ^= data[i]
-			}
-		}
-
-		// Truncate to original data length
-		if group.dataLen > 0 && int(group.dataLen) < len(recovered) {
-			recovered = recovered[:group.dataLen]
-		}
-
-		group.dataPackets[missing[0]] = recovered
+	// Get first parity packet
+	var parity []byte
+	for _, p := range group.parityPackets {
+		parity = p
+		break
 	}
+	if parity == nil {
+		return nil
+	}
+
+	// XOR all known data with parity to recover missing
+	recovered := make([]byte, len(parity))
+	copy(recovered, parity)
+	for _, data := range group.dataPackets {
+		for i := 0; i < len(data) && i < len(recovered); i++ {
+			recovered[i] ^= data[i]
+		}
+	}
+
+	// Truncate to original data length
+	if group.dataLen > 0 && int(group.dataLen) < len(recovered) {
+		recovered = recovered[:group.dataLen]
+	}
+
+	group.dataPackets[missing[0]] = recovered
 
 	// Return all data packets
 	result := make([][]byte, group.totalData)

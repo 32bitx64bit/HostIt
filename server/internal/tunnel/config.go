@@ -1,6 +1,23 @@
 package tunnel
 
-import "time"
+import (
+	"fmt"
+	"net"
+	"strings"
+	"time"
+)
+
+// Validation errors are returned as a single error with multiple messages.
+type ConfigValidationError struct {
+	Errors []string
+}
+
+func (e *ConfigValidationError) Error() string {
+	if len(e.Errors) == 1 {
+		return e.Errors[0]
+	}
+	return fmt.Sprintf("configuration validation failed: %v", e.Errors)
+}
 
 type RouteConfig struct {
 	Name       string
@@ -20,6 +37,46 @@ type RouteConfig struct {
 	// If nil, the default is 4 for TCP-capable routes.
 	// If 0, the agent dials on-demand.
 	Preconnect *int
+}
+
+// Validate validates the route configuration.
+func (r *RouteConfig) Validate() error {
+	var errs []string
+
+	// Name is required
+	if strings.TrimSpace(r.Name) == "" {
+		errs = append(errs, "route name is required")
+	}
+
+	// Proto must be valid
+	switch strings.ToLower(strings.TrimSpace(r.Proto)) {
+	case "tcp", "udp", "both":
+		// valid
+	case "":
+		errs = append(errs, fmt.Sprintf("route %q: proto is required", r.Name))
+	default:
+		errs = append(errs, fmt.Sprintf("route %q: invalid proto %q (must be tcp, udp, or both)", r.Name, r.Proto))
+	}
+
+	// PublicAddr is required and must be a valid address
+	if strings.TrimSpace(r.PublicAddr) == "" {
+		errs = append(errs, fmt.Sprintf("route %q: public_addr is required", r.Name))
+	} else if _, err := net.ResolveTCPAddr("tcp", r.PublicAddr); err != nil {
+		// Try UDP if TCP fails (for UDP-only routes)
+		if _, err := net.ResolveUDPAddr("udp", r.PublicAddr); err != nil {
+			errs = append(errs, fmt.Sprintf("route %q: invalid public_addr %q: %v", r.Name, r.PublicAddr, err))
+		}
+	}
+
+	// Preconnect must be non-negative
+	if r.Preconnect != nil && *r.Preconnect < 0 {
+		errs = append(errs, fmt.Sprintf("route %q: preconnect must be >= 0", r.Name))
+	}
+
+	if len(errs) > 0 {
+		return &ConfigValidationError{Errors: errs}
+	}
+	return nil
 }
 
 type ServerConfig struct {
@@ -99,4 +156,109 @@ type ServerConfig struct {
 	// UDPBufferPoolSize is the size of each buffer in the pool in bytes.
 	// Default: 64KB (65536).
 	UDPBufferPoolSize *int `json:",omitempty"`
+}
+
+// Validate validates the server configuration.
+func (c *ServerConfig) Validate() error {
+	var errs []string
+
+	// Token is required
+	if strings.TrimSpace(c.Token) == "" {
+		errs = append(errs, "token is required")
+	}
+
+	// ControlAddr is required
+	if strings.TrimSpace(c.ControlAddr) == "" {
+		errs = append(errs, "control_addr is required")
+	}
+
+	// DataAddr is required
+	if strings.TrimSpace(c.DataAddr) == "" {
+		errs = append(errs, "data_addr is required")
+	}
+
+	// TLS validation
+	if !c.DisableTLS {
+		if strings.TrimSpace(c.TLSCertFile) == "" {
+			errs = append(errs, "tls_cert_file is required when TLS is enabled")
+		}
+		if strings.TrimSpace(c.TLSKeyFile) == "" {
+			errs = append(errs, "tls_key_file is required when TLS is enabled")
+		}
+	}
+
+	// Web HTTPS validation
+	if c.WebHTTPS {
+		if strings.TrimSpace(c.WebTLSCertFile) == "" {
+			errs = append(errs, "web_tls_cert_file is required when web_https is enabled")
+		}
+		if strings.TrimSpace(c.WebTLSKeyFile) == "" {
+			errs = append(errs, "web_tls_key_file is required when web_https is enabled")
+		}
+	}
+
+	// UDP encryption mode validation
+	mode := strings.ToLower(strings.TrimSpace(c.UDPEncryptionMode))
+	if mode != "" && mode != "none" && mode != "aes128" && mode != "aes256" {
+		errs = append(errs, fmt.Sprintf("invalid udp_encryption_mode %q (must be none, aes128, or aes256)", c.UDPEncryptionMode))
+	}
+
+	// PairTimeout validation
+	if c.PairTimeout < 0 {
+		errs = append(errs, "pair_timeout must be >= 0")
+	}
+
+	// MaxPendingConns validation
+	if c.MaxPendingConns != nil && *c.MaxPendingConns < 0 {
+		errs = append(errs, "max_pending_conns must be >= 0")
+	}
+
+	// MaxPendingPerIP validation
+	if c.MaxPendingPerIP != nil && *c.MaxPendingPerIP < 0 {
+		errs = append(errs, "max_pending_per_ip must be >= 0")
+	}
+
+	// DashboardInterval validation
+	if c.DashboardInterval > 0 && c.DashboardInterval < 5*time.Second {
+		errs = append(errs, "dashboard_interval must be at least 5s")
+	}
+	if c.DashboardInterval > 10*time.Minute {
+		errs = append(errs, "dashboard_interval must be at most 10m")
+	}
+
+	// UDP tuning validation
+	if c.UDPReaderCount != nil && *c.UDPReaderCount < 1 {
+		errs = append(errs, "udp_reader_count must be >= 1")
+	}
+	if c.UDPWorkerCount != nil && *c.UDPWorkerCount < 1 {
+		errs = append(errs, "udp_worker_count must be >= 1")
+	}
+	if c.UDPQueueSize != nil && *c.UDPQueueSize < 1024 {
+		errs = append(errs, "udp_queue_size must be >= 1024")
+	}
+	if c.UDPBufferSize != nil && *c.UDPBufferSize < 65536 {
+		errs = append(errs, "udp_buffer_size must be >= 65536")
+	}
+
+	// Route validation
+	routeNames := make(map[string]bool)
+	for i := range c.Routes {
+		if err := c.Routes[i].Validate(); err != nil {
+			if ve, ok := err.(*ConfigValidationError); ok {
+				errs = append(errs, ve.Errors...)
+			} else {
+				errs = append(errs, err.Error())
+			}
+		}
+		// Check for duplicate route names
+		if routeNames[c.Routes[i].Name] {
+			errs = append(errs, fmt.Sprintf("duplicate route name %q", c.Routes[i].Name))
+		}
+		routeNames[c.Routes[i].Name] = true
+	}
+
+	if len(errs) > 0 {
+		return &ConfigValidationError{Errors: errs}
+	}
+	return nil
 }

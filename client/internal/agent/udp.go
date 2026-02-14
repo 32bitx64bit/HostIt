@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"hostit/client/internal/udpproto"
 	"hostit/shared/logging"
 	"hostit/shared/udputil"
 )
@@ -57,7 +56,7 @@ func (w *udpWriter) WritePooled(data []byte, bufPtr *[]byte) error {
 
 	_, err := w.conn.Write(data)
 	if bufPtr != nil {
-		udpproto.PutOutputBuffer(bufPtr)
+		udputil.PutOutputBuffer(bufPtr)
 	}
 	if err != nil {
 		w.drops.Add(1)
@@ -181,7 +180,7 @@ func (q *udpWriteQueue) TryEnqueue(data []byte, bufPtr *[]byte) bool {
 		q.drops.Add(1)
 		q.stats.RecordLoss(1)
 		if bufPtr != nil {
-			udpproto.PutOutputBuffer(bufPtr)
+			udputil.PutOutputBuffer(bufPtr)
 		}
 		return false
 	}
@@ -212,12 +211,12 @@ func (q *udpWriteQueue) EnqueueWithBackpressure(ctx context.Context, data []byte
 		return nil
 	case <-ctx.Done():
 		if bufPtr != nil {
-			udpproto.PutOutputBuffer(bufPtr)
+			udputil.PutOutputBuffer(bufPtr)
 		}
 		return ctx.Err()
 	case <-timerChan:
 		if bufPtr != nil {
-			udpproto.PutOutputBuffer(bufPtr)
+			udputil.PutOutputBuffer(bufPtr)
 		}
 		q.stats.RecordLoss(1)
 		return context.DeadlineExceeded
@@ -330,9 +329,9 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		// Register so the server learns our UDP address.
 		ks := sec.Get()
 		if ks.Enabled() {
-			_, _ = uc.Write(udpproto.EncodeRegEnc2(ks, token))
+			_, _ = uc.Write(udputil.EncodeRegEnc2(ks, token))
 		} else {
-			_, _ = uc.Write(udpproto.EncodeReg(token))
+			_, _ = uc.Write(udputil.EncodeReg(token))
 		}
 
 		// Keepalive: some NATs expire UDP mappings quickly (often ~10-30s) when idle
@@ -351,9 +350,9 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				case <-t.C:
 					ks := sec.Get()
 					if ks.Enabled() {
-						_, _ = uc.Write(udpproto.EncodeRegEnc2(ks, token))
+						_, _ = uc.Write(udputil.EncodeRegEnc2(ks, token))
 					} else {
-						_, _ = uc.Write(udpproto.EncodeReg(token))
+						_, _ = uc.Write(udputil.EncodeReg(token))
 					}
 				}
 			}
@@ -511,9 +510,9 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 					var encoded []byte
 					var bufPtr *[]byte
 					if cachedKS.Enabled() {
-						encoded, bufPtr = udpproto.EncodeDataEnc2Pooled(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n])
+						encoded, bufPtr = udputil.EncodeDataEnc2Pooled(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n])
 					} else {
-						encoded = udpproto.EncodeData(routeName, clientAddr, localBuf[:n])
+						encoded = udputil.EncodeData(routeName, clientAddr, localBuf[:n])
 						bufPtr = nil
 					}
 
@@ -648,7 +647,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 						ok         bool
 					)
 					if cachedKS.Enabled() {
-						routeName, clientAddr, payload, _, ok = udpproto.DecodeDataEnc2(cachedKS, pkt)
+						routeName, clientAddr, payload, _, ok = udputil.DecodeDataEnc2(cachedKS, pkt)
 						if !ok {
 							stats.RecordLoss(1)
 							if job.bufPtr != nil && job.pool != nil {
@@ -657,7 +656,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 							continue
 						}
 					} else {
-						routeName, clientAddr, payload, ok = udpproto.DecodeData(pkt)
+						routeName, clientAddr, payload, ok = udputil.DecodeData(pkt)
 						if !ok {
 							stats.RecordLoss(1)
 							if job.bufPtr != nil && job.pool != nil {

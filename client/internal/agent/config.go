@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -38,6 +39,39 @@ type Config struct {
 	// DisableUDPEncryption disables application-layer encryption for the agent<->server
 	// UDP data channel (used for UDP forwarding). By default it is enabled.
 	DisableUDPEncryption bool
+}
+
+// Validate validates the client configuration.
+func (c Config) Validate() error {
+	var errs []string
+
+	// Server is required
+	if strings.TrimSpace(c.Server) == "" {
+		errs = append(errs, "server address is required")
+	}
+
+	// Token is required
+	if strings.TrimSpace(c.Token) == "" {
+		errs = append(errs, "token is required")
+	}
+
+	// TLSPinSHA256 validation (if provided, must be valid hex and correct length)
+	if pin := strings.TrimSpace(c.TLSPinSHA256); pin != "" {
+		if len(pin) != 64 {
+			errs = append(errs, fmt.Sprintf("tls_pin_sha256 must be 64 characters (got %d)", len(pin)))
+		}
+		for _, r := range pin {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				errs = append(errs, "tls_pin_sha256 must be a valid hex string")
+				break
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("configuration validation failed: %v", errs)
+	}
+	return nil
 }
 
 func (c Config) ControlAddr() string {

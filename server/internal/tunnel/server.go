@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"hostit/server/internal/lineproto"
-	"hostit/server/internal/udpproto"
 	"hostit/shared/logging"
 	"hostit/shared/udputil"
 )
@@ -128,13 +127,13 @@ func NewServer(cfg ServerConfig) *Server {
 	return &Server{cfg: cfg, st: st}
 }
 
-func buildUDPKeySet(cfg ServerConfig) udpproto.KeySet {
-	mode := udpproto.NormalizeMode(cfg.UDPEncryptionMode)
+func buildUDPKeySet(cfg ServerConfig) udputil.KeySet {
+	mode := udputil.NormalizeMode(cfg.UDPEncryptionMode)
 	if cfg.DisableUDPEncryption {
-		mode = udpproto.ModeNone
+		mode = udputil.ModeNone
 	}
-	if mode == udpproto.ModeNone {
-		ks, _ := udpproto.NewKeySet(mode, "", 0, nil, 0, nil)
+	if mode == udputil.ModeNone {
+		ks, _ := udputil.NewKeySet(mode, "", 0, nil, 0, nil)
 		return ks
 	}
 	curSalt, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(cfg.UDPKeySaltB64))
@@ -145,9 +144,9 @@ func buildUDPKeySet(cfg ServerConfig) udpproto.KeySet {
 	if err != nil {
 		prevSalt = nil
 	}
-	ks, err := udpproto.NewKeySet(mode, strings.TrimSpace(cfg.Token), cfg.UDPKeyID, curSalt, cfg.UDPPrevKeyID, prevSalt)
+	ks, err := udputil.NewKeySet(mode, strings.TrimSpace(cfg.Token), cfg.UDPKeyID, curSalt, cfg.UDPPrevKeyID, prevSalt)
 	if err != nil {
-		ks, _ = udpproto.NewKeySet(udpproto.ModeNone, "", 0, nil, 0, nil)
+		ks, _ = udputil.NewKeySet(udputil.ModeNone, "", 0, nil, 0, nil)
 	}
 	return ks
 }
@@ -401,7 +400,7 @@ func listenMaybeTLS(cfg ServerConfig, addr string) (net.Listener, error) {
 
 type serverState struct {
 	cfg     ServerConfig
-	udpKeys udpproto.KeySet
+	udpKeys udputil.KeySet
 	dash    *dashState
 
 	errMu   sync.Mutex
@@ -1653,11 +1652,11 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 	}
 	encNone := st.encryptionNone
 	switch pkt[0] {
-	case udpproto.MsgReg:
+	case udputil.MsgReg:
 		if !encNone {
 			return
 		}
-		tok, ok := udpproto.DecodeReg(pkt)
+		tok, ok := udputil.DecodeReg(pkt)
 		if !ok {
 			traceUDPf("udp: REG decode failed from=%v", addr)
 			st.dashErrorRateLimited(dashSystemRoute, "error_udp_reg_decode", hostFromAddr(addr), "", "", 1*time.Second)
@@ -1678,7 +1677,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if oldAddr == nil || !addrEqual(oldAddr, addr) {
 			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=plaintext", addr)
 		}
-	case udpproto.MsgRegEnc2:
+	case udputil.MsgRegEnc2:
 		if encNone {
 			return
 		}
@@ -1686,7 +1685,7 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if expected == "" {
 			return
 		}
-		kid, ok := udpproto.DecodeRegEnc2(st.udpKeys, expected, pkt)
+		kid, ok := udputil.DecodeRegEnc2(st.udpKeys, expected, pkt)
 		if !ok {
 			traceUDPf("udp: REGEnc2 decode failed from=%v", addr)
 			st.dashErrorRateLimited(dashSystemRoute, "error_udp_regenc2_decode", hostFromAddr(addr), "", "", 1*time.Second)
@@ -1701,11 +1700,11 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		if oldAddr == nil || !addrEqual(oldAddr, addr) {
 			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=encrypted keyID=%d", addr, kid)
 		}
-	case udpproto.MsgData:
+	case udputil.MsgData:
 		if !encNone {
 			return
 		}
-		route, client, payload, ok := udpproto.DecodeData(pkt)
+		route, client, payload, ok := udputil.DecodeData(pkt)
 		if !ok {
 			traceUDPf("udp: DATA decode failed from=%v", addr)
 			st.dashErrorRateLimited(dashSystemRoute, "error_udp_data_decode", hostFromAddr(addr), "", "", 1*time.Second)
@@ -1735,11 +1734,11 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			st.udpPublicWriteDrops.Add(1)
 			traceUDPf("udp: DATA write queue full route=%s to=%v", route, ua)
 		}
-	case udpproto.MsgDataEnc2:
+	case udputil.MsgDataEnc2:
 		if encNone {
 			return
 		}
-		route, client, payload, _, ok := udpproto.DecodeDataEnc2(st.udpKeys, pkt)
+		route, client, payload, _, ok := udputil.DecodeDataEnc2(st.udpKeys, pkt)
 		if !ok {
 			traceUDPf("udp: DATAEnc2 decode failed from=%v", addr)
 			st.dashErrorRateLimited(dashSystemRoute, "error_udp_dataenc2_decode", hostFromAddr(addr), "", "", 1*time.Second)
@@ -1965,21 +1964,21 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 	var bufPtr *[]byte // For pooled encoding
 	clientAddrStr := clientAddr.String()
 	if st.encryptionNone || !st.udpKeys.Enabled() {
-		msg = udpproto.EncodeData(routeName, clientAddrStr, pkt)
+		msg = udputil.EncodeData(routeName, clientAddrStr, pkt)
 	} else {
 		kid := st.getAgentUDPKeyID()
 		if kid == 0 {
 			kid = st.cfg.UDPKeyID
 		}
 		// Use pooled encoding for zero-allocation encryption
-		msg, bufPtr = udpproto.EncodeDataEnc2Pooled(st.udpKeys, kid, routeName, clientAddrStr, pkt)
+		msg, bufPtr = udputil.EncodeDataEnc2Pooled(st.udpKeys, kid, routeName, clientAddrStr, pkt)
 	}
 
 	_, err := st.udpData.WriteTo(msg, agent)
 
 	// Return buffer to pool if pooled encoding was used
 	if bufPtr != nil {
-		udpproto.PutOutputBuffer(bufPtr)
+		udputil.PutOutputBuffer(bufPtr)
 	}
 
 	if err != nil {

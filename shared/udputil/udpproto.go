@@ -1,4 +1,6 @@
-package udpproto
+// Package udputil provides UDP protocol utilities including encryption,
+// encoding/decoding, and forward error correction for the HostIt tunneling system.
+package udputil
 
 import (
 	"crypto/aes"
@@ -61,6 +63,7 @@ func PutOutputBuffer(buf *[]byte) {
 	outPool.Put(buf)
 }
 
+// Message type constants for UDP protocol
 const (
 	MsgReg         byte = 1
 	MsgData        byte = 2
@@ -72,6 +75,7 @@ const (
 	MsgDataEnc2Seq byte = 8 // DATAEnc2 with sequence number for loss detection
 )
 
+// Mode represents the encryption mode for UDP packets.
 type Mode string
 
 const (
@@ -80,6 +84,7 @@ const (
 	ModeAES256 Mode = "aes256"
 )
 
+// NormalizeMode normalizes an encryption mode string.
 func NormalizeMode(s string) Mode {
 	m := Mode(strings.ToLower(strings.TrimSpace(s)))
 	switch m {
@@ -92,6 +97,7 @@ func NormalizeMode(s string) Mode {
 	}
 }
 
+// KeySet holds the current and previous encryption keys for key rotation.
 type KeySet struct {
 	Mode   Mode
 	CurID  uint32
@@ -100,10 +106,12 @@ type KeySet struct {
 	Prev   cipher.AEAD
 }
 
+// Enabled returns true if encryption is enabled.
 func (ks KeySet) Enabled() bool {
 	return ks.Mode == ModeAES128 || ks.Mode == ModeAES256
 }
 
+// NewKeySet creates a new KeySet from the given parameters.
 func NewKeySet(mode Mode, token string, curID uint32, curSalt []byte, prevID uint32, prevSalt []byte) (KeySet, error) {
 	mode = NormalizeMode(string(mode))
 	if mode == ModeNone {
@@ -199,6 +207,7 @@ func DecodeRegEnc2(ks KeySet, expectedToken string, b []byte) (keyID uint32, ok 
 	return keyID, true
 }
 
+// EncodeDataEnc2ForKeyID encrypts data with a specific key ID.
 func EncodeDataEnc2ForKeyID(ks KeySet, keyID uint32, route string, client string, payload []byte) []byte {
 	if !ks.Enabled() {
 		return EncodeData(route, client, payload)
@@ -328,6 +337,7 @@ func EncodeDataEnc2Pooled(ks KeySet, keyID uint32, route string, client string, 
 	return outBuf, outBufPtr
 }
 
+// DecodeDataEnc2 decrypts an encrypted data packet.
 func DecodeDataEnc2(ks KeySet, b []byte) (route string, client string, payload []byte, keyID uint32, ok bool) {
 	if len(b) < 1+4 || b[0] != MsgDataEnc2 {
 		return "", "", nil, 0, false
@@ -354,52 +364,7 @@ func DecodeDataEnc2(ks KeySet, b []byte) (route string, client string, payload [
 	return route, client, payload, keyID, ok
 }
 
-// Legacy chacha20poly1305-based helpers were removed in favor of AES-GCM modes.
-
-func encodeDataPayload(route string, client string, payload []byte) []byte {
-	rb := []byte(route)
-	cb := []byte(client)
-	if len(rb) > 255 {
-		rb = rb[:255]
-	}
-	if len(cb) > 65535 {
-		cb = cb[:65535]
-	}
-	b := make([]byte, 1+len(rb)+2+len(cb)+len(payload))
-	b[0] = byte(len(rb))
-	o := 1
-	copy(b[o:], rb)
-	o += len(rb)
-	binary.BigEndian.PutUint16(b[o:o+2], uint16(len(cb)))
-	o += 2
-	copy(b[o:], cb)
-	o += len(cb)
-	copy(b[o:], payload)
-	return b
-}
-
-func decodeDataPayload(b []byte) (route string, client string, payload []byte, ok bool) {
-	if len(b) < 1+2 {
-		return "", "", nil, false
-	}
-	rn := int(b[0])
-	o := 1
-	if rn < 0 || len(b) < o+rn+2 {
-		return "", "", nil, false
-	}
-	route = string(b[o : o+rn])
-	o += rn
-	cn := int(binary.BigEndian.Uint16(b[o : o+2]))
-	o += 2
-	if cn < 0 || len(b) < o+cn {
-		return "", "", nil, false
-	}
-	client = string(b[o : o+cn])
-	o += cn
-	payload = b[o:]
-	return route, client, payload, true
-}
-
+// EncodeReg encodes a registration packet (plaintext).
 func EncodeReg(token string) []byte {
 	b := make([]byte, 1+2+len(token))
 	b[0] = MsgReg
@@ -408,6 +373,7 @@ func EncodeReg(token string) []byte {
 	return b
 }
 
+// DecodeReg decodes a registration packet.
 func DecodeReg(b []byte) (token string, ok bool) {
 	if len(b) < 3 || b[0] != MsgReg {
 		return "", false
@@ -419,6 +385,7 @@ func DecodeReg(b []byte) (token string, ok bool) {
 	return string(b[3:]), true
 }
 
+// EncodeData encodes a data packet (plaintext).
 func EncodeData(route string, client string, payload []byte) []byte {
 	// Single-allocation version: write type byte + payload into one buffer.
 	rb := route
@@ -444,12 +411,35 @@ func EncodeData(route string, client string, payload []byte) []byte {
 	return b
 }
 
+// DecodeData decodes a data packet.
 func DecodeData(b []byte) (route string, client string, payload []byte, ok bool) {
 	if len(b) < 1+1+2 || b[0] != MsgData {
 		return "", "", nil, false
 	}
 	route, client, payload, ok = decodeDataPayload(b[1:])
 	return route, client, payload, ok
+}
+
+func decodeDataPayload(b []byte) (route string, client string, payload []byte, ok bool) {
+	if len(b) < 1+2 {
+		return "", "", nil, false
+	}
+	rn := int(b[0])
+	o := 1
+	if rn < 0 || len(b) < o+rn+2 {
+		return "", "", nil, false
+	}
+	route = string(b[o : o+rn])
+	o += rn
+	cn := int(binary.BigEndian.Uint16(b[o : o+2]))
+	o += 2
+	if cn < 0 || len(b) < o+cn {
+		return "", "", nil, false
+	}
+	client = string(b[o : o+cn])
+	o += cn
+	payload = b[o:]
+	return route, client, payload, true
 }
 
 // SequenceCounter provides atomic sequence number generation for loss detection.

@@ -6,25 +6,25 @@ import (
 	"strings"
 	"sync"
 
-	"hostit/client/internal/udpproto"
+	"hostit/shared/udputil"
 )
 
 type udpSecurityState struct {
 	mu sync.RWMutex
-	ks udpproto.KeySet
+	ks udputil.KeySet
 }
 
 func newUDPSecurityState() *udpSecurityState {
-	return &udpSecurityState{ks: udpproto.KeySet{Mode: udpproto.ModeNone}}
+	return &udpSecurityState{ks: udputil.KeySet{Mode: udputil.ModeNone}}
 }
 
 func (s *udpSecurityState) ForceNone() {
 	s.mu.Lock()
-	s.ks = udpproto.KeySet{Mode: udpproto.ModeNone}
+	s.ks = udputil.KeySet{Mode: udputil.ModeNone}
 	s.mu.Unlock()
 }
 
-func (s *udpSecurityState) Get() udpproto.KeySet {
+func (s *udpSecurityState) Get() udputil.KeySet {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.ks
@@ -36,8 +36,8 @@ func (s *udpSecurityState) UpdateFromLine(token string, rest string) {
 	if len(f) < 1 {
 		return
 	}
-	mode := udpproto.NormalizeMode(f[0])
-	if mode == udpproto.ModeNone {
+	mode := udputil.NormalizeMode(f[0])
+	if mode == udputil.ModeNone {
 		s.ForceNone()
 		return
 	}
@@ -65,7 +65,7 @@ func (s *udpSecurityState) UpdateFromLine(token string, rest string) {
 			prevSalt = b
 		}
 	}
-	ks, err := udpproto.NewKeySet(mode, token, keyID, curSalt, prevID, prevSalt)
+	ks, err := udputil.NewKeySet(mode, token, keyID, curSalt, prevID, prevSalt)
 	if err != nil {
 		return
 	}
