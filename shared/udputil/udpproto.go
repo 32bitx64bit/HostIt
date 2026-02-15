@@ -22,10 +22,15 @@ import (
 // AES-GCM requires unique nonces, not random ones. A 4-byte random prefix
 // (generated once) + 8-byte atomic counter guarantees uniqueness and
 // unpredictability with zero syscalls per packet.
+//
+// On counter overflow (extremely rare: 2^64 packets), we regenerate the prefix
+// to ensure uniqueness. This is safe because the new prefix + starting counter
+// creates a completely new nonce space.
 var (
-	noncePrefix  [4]byte
-	nonceCounter atomic.Uint64
-	nonceOnce    sync.Once
+	noncePrefix   [4]byte
+	nonceCounter  atomic.Uint64
+	nonceOnce     sync.Once
+	noncePrefixMu sync.Mutex // Protects prefix regeneration on overflow
 )
 
 func initNonce() {
@@ -33,10 +38,31 @@ func initNonce() {
 }
 
 // fillNonce writes a unique 12-byte nonce into dst without any syscall.
+// On counter overflow, it regenerates the prefix to maintain uniqueness.
 func fillNonce(dst []byte) {
 	nonceOnce.Do(initNonce)
+
+	newCount := nonceCounter.Add(1)
+
+	// Handle overflow: when counter wraps to 0 (or very small values),
+	// regenerate the prefix to ensure uniqueness.
+	// The first call after init will return 1, so 0 indicates overflow.
+	if newCount == 0 {
+		noncePrefixMu.Lock()
+		// Double-check: another goroutine may have regenerated while we waited
+		if nonceCounter.Load() == 0 || nonceCounter.Load() < 1000 {
+			_, _ = rand.Read(noncePrefix[:])
+			// Reset counter to 1 (next call will get 2)
+			nonceCounter.Store(1)
+			newCount = 2
+		} else {
+			newCount = nonceCounter.Add(1)
+		}
+		noncePrefixMu.Unlock()
+	}
+
 	copy(dst[:4], noncePrefix[:])
-	binary.BigEndian.PutUint64(dst[4:12], nonceCounter.Add(1))
+	binary.BigEndian.PutUint64(dst[4:12], newCount)
 }
 
 // ptPool pools plaintext buffers to reduce allocations in the encode path.

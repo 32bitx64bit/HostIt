@@ -1048,8 +1048,15 @@ func (st *serverState) handleControlConn(ctx context.Context, conn net.Conn) {
 	// A shorter deadAfter reduces the window where the server thinks an agent is
 	// connected but it's actually gone — during that window every NEW command is
 	// doomed to time out.
-	const pingEvery = 5 * time.Second
-	const deadAfter = 10 * time.Second
+	// Use configured values or defaults.
+	pingEvery := 5 * time.Second
+	if st.cfg.AgentHeartbeatInterval > 0 {
+		pingEvery = st.cfg.AgentHeartbeatInterval
+	}
+	deadAfter := 10 * time.Second
+	if st.cfg.AgentHeartbeatTimeout > 0 {
+		deadAfter = st.cfg.AgentHeartbeatTimeout
+	}
 	lastSeen := atomic.Int64{}
 	lastSeen.Store(time.Now().UnixNano())
 

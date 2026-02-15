@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Validation errors are returned as a single error with multiple messages.
@@ -51,13 +52,40 @@ func (r *RouteConfig) IsEnabled() bool {
 	return *r.Enabled
 }
 
+// validateRouteName validates that a route name contains only safe characters.
+// Route names are used in log messages, dashboard display, and map keys,
+// so we restrict them to alphanumeric characters, hyphens, and underscores.
+// This prevents log injection, display issues, and potential map key collisions.
+func validateRouteName(name string) error {
+	name = strings.TrimSpace(name)
+	if len(name) == 0 {
+		return fmt.Errorf("route name is required")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("route name must be at most 64 characters (got %d)", len(name))
+	}
+	for i, r := range name {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' {
+			return fmt.Errorf("route name contains invalid character %q at position %d (only letters, digits, hyphens, and underscores are allowed)", r, i)
+		}
+	}
+	// Prevent reserved names that could cause confusion
+	switch strings.ToLower(name) {
+	case "_system", "system", "default", "all", "any":
+		return fmt.Errorf("route name %q is reserved", name)
+	}
+	return nil
+}
+
 // Validate validates the route configuration.
 func (r *RouteConfig) Validate() error {
 	var errs []string
 
-	// Name is required
+	// Name is required and must be valid
 	if strings.TrimSpace(r.Name) == "" {
 		errs = append(errs, "route name is required")
+	} else if err := validateRouteName(r.Name); err != nil {
+		errs = append(errs, err.Error())
 	}
 
 	// Proto must be valid
@@ -172,6 +200,16 @@ type ServerConfig struct {
 	// QUIC provides better reliability and congestion control.
 	// Default is false (disabled).
 	QUICEnabled bool `json:",omitempty"`
+
+	// AgentHeartbeatInterval is the interval between heartbeat pings to the agent.
+	// Default: 5s. Minimum: 1s. Maximum: 30s.
+	AgentHeartbeatInterval time.Duration `json:",omitempty"`
+	// AgentHeartbeatTimeout is the time after which an unresponsive agent is disconnected.
+	// Default: 10s. Must be greater than AgentHeartbeatInterval.
+	AgentHeartbeatTimeout time.Duration `json:",omitempty"`
+	// UDPSessionIdleTimeout is the idle timeout for UDP sessions.
+	// Default: 5 minutes. Minimum: 1 minute. Maximum: 30 minutes.
+	UDPSessionIdleTimeout time.Duration `json:",omitempty"`
 }
 
 // Validate validates the server configuration.
@@ -254,6 +292,31 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.UDPBufferSize != nil && *c.UDPBufferSize < 65536 {
 		errs = append(errs, "udp_buffer_size must be >= 65536")
+	}
+
+	// Agent heartbeat validation
+	if c.AgentHeartbeatInterval > 0 && c.AgentHeartbeatInterval < 1*time.Second {
+		errs = append(errs, "agent_heartbeat_interval must be at least 1s")
+	}
+	if c.AgentHeartbeatInterval > 30*time.Second {
+		errs = append(errs, "agent_heartbeat_interval must be at most 30s")
+	}
+	if c.AgentHeartbeatTimeout > 0 && c.AgentHeartbeatTimeout < 2*time.Second {
+		errs = append(errs, "agent_heartbeat_timeout must be at least 2s")
+	}
+	if c.AgentHeartbeatTimeout > 60*time.Second {
+		errs = append(errs, "agent_heartbeat_timeout must be at most 60s")
+	}
+	if c.AgentHeartbeatInterval > 0 && c.AgentHeartbeatTimeout > 0 && c.AgentHeartbeatTimeout <= c.AgentHeartbeatInterval {
+		errs = append(errs, "agent_heartbeat_timeout must be greater than agent_heartbeat_interval")
+	}
+
+	// UDP session idle timeout validation
+	if c.UDPSessionIdleTimeout > 0 && c.UDPSessionIdleTimeout < 1*time.Minute {
+		errs = append(errs, "udp_session_idle_timeout must be at least 1m")
+	}
+	if c.UDPSessionIdleTimeout > 30*time.Minute {
+		errs = append(errs, "udp_session_idle_timeout must be at most 30m")
 	}
 
 	// Route validation

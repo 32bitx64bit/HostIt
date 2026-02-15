@@ -24,9 +24,12 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	// reasonable defaults for a tiny app
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// Increased from 1 to allow better concurrency under load.
+	// SQLite handles locking internally, and modernc.org/sqlite is pure Go
+	// so connection overhead is lower. 5 connections allows parallel reads
+	// while still being conservative for a small auth database.
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
 
 	s := &Store{db: db}
 	if err := s.migrate(context.Background()); err != nil {
