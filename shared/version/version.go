@@ -8,7 +8,7 @@ import (
 
 // Current is the currently running HostIt/Playit-prototype version.
 // Keep this in sync with your GitHub release tags.
-const Current = "1.8.6"
+const Current = "1.9.0"
 
 type Version struct {
 	Major int
