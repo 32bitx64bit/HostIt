@@ -295,6 +295,27 @@ func (r *serverRunner) Dashboard(now time.Time) (tunnel.ServerConfig, tunnel.Ser
 	return r.cfg, st, snap, r.err
 }
 
+// SetRouteEnabled toggles a route's enabled state at runtime.
+// Returns false if the route doesn't exist.
+func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.srv == nil {
+		return false
+	}
+	return r.srv.SetRouteEnabled(routeName, enabled)
+}
+
+// GetRouteEnabled returns the current enabled state of a route.
+func (r *serverRunner) GetRouteEnabled(routeName string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.srv == nil {
+		return true // default
+	}
+	return r.srv.GetRouteEnabled(routeName)
+}
+
 type ctxKey int
 
 const (
@@ -571,12 +592,20 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				Proto      string                  `json:"proto"`
 				PublicAddr string                  `json:"publicAddr"`
 				Active     int64                   `json:"active"`
+				Enabled    bool                    `json:"enabled"`
 				Events     []tunnel.DashboardEvent `json:"events"`
 			}
 			outRoutes := make([]routeOut, 0, len(cfg.Routes))
 			for _, rt := range cfg.Routes {
 				rs := snap.Routes[rt.Name]
-				outRoutes = append(outRoutes, routeOut{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, Active: rs.ActiveClients, Events: rs.Events})
+				outRoutes = append(outRoutes, routeOut{
+					Name:       rt.Name,
+					Proto:      rt.Proto,
+					PublicAddr: rt.PublicAddr,
+					Active:     rs.ActiveClients,
+					Enabled:    runner.GetRouteEnabled(rt.Name),
+					Events:     rs.Events,
+				})
 			}
 			resp := map[string]any{
 				"nowUnix":        snap.NowUnix,
@@ -1022,6 +1051,65 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/config", http.StatusSeeOther)
 		})))
 
+		// QUIC protocol toggle (protected)
+		mux.HandleFunc("/api/quic", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			enable := strings.TrimSpace(r.Form.Get("enabled")) != ""
+			cfg, _, _ := runner.Get()
+			cfg.QUICEnabled = enable
+			if err := configio.Save(configPath, cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			runner.Restart(cfg)
+			setMsg(fmt.Sprintf("QUIC %s — restarted", map[bool]string{true: "enabled", false: "disabled"}[enable]))
+			http.Redirect(w, r, "/controls", http.StatusSeeOther)
+		})))
+
+		// Route enable/disable toggle (protected) - runtime, no restart required
+		mux.HandleFunc("/api/routes/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			routeName := strings.TrimSpace(r.Form.Get("route"))
+			if routeName == "" {
+				http.Error(w, "route name required", http.StatusBadRequest)
+				return
+			}
+			enabled := strings.TrimSpace(r.Form.Get("enabled")) != ""
+			if !runner.SetRouteEnabled(routeName, enabled) {
+				http.Error(w, "route not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"route":   routeName,
+				"enabled": enabled,
+			})
+		})))
+
 		// Dashboard interval update (protected)
 		mux.HandleFunc("/api/dashboard/interval", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -1354,6 +1442,11 @@ const serverStatsHTML = `<!doctype html>
     .routeCard .routeProto { font-size: 12px; padding: 2px 8px; border-radius: 4px; background: var(--purpleDim); color: var(--purple); }
     .routeCard .routeAddr { font-family: var(--mono); font-size: 12px; color: var(--textMuted); }
     .routeCard .routeActive { margin-left: auto; font-size: 12px; }
+    .routeCard .routeDisabled { opacity: 0.5; }
+    .routeCard .routeDisabled .routeName { text-decoration: line-through; }
+    .routeToggle { font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid; cursor: pointer; margin-left: 8px; }
+    .routeToggle.on { color: var(--green); border-color: var(--greenBorder); background: var(--greenDim); }
+    .routeToggle.off { color: var(--red); border-color: var(--redBorder); background: var(--redDim); }
     .routeConsole { font-family: var(--mono); font-size: 11px; line-height: 1.6; white-space: pre-wrap; margin: 10px 0 0; padding: 12px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); max-height: 280px; overflow: auto; color: var(--textMuted); }
     .routeConsole .ev-connect { color: var(--green); }
     .routeConsole .ev-disconnect { color: var(--textMuted); }
@@ -1479,6 +1572,7 @@ const serverStatsHTML = `<!doctype html>
           <span class="routeName">{{.Name}}</span>
           <span class="routeProto">{{.Proto}}</span>
           <span class="routeAddr">{{.PublicAddr}}</span>
+          <button type="button" class="routeToggle on" data-route-toggle title="Click to enable/disable route">On</button>
           <span class="routeActive"><span data-route-active>0</span> active</span>
         </summary>
         <div style="margin-top: 10px">
@@ -1739,12 +1833,54 @@ const serverStatsHTML = `<!doctype html>
           if(a) a.textContent = String(rt.active==null?0:rt.active);
           var c = det.querySelector('[data-route-console]');
           renderRouteConsole(c, rt);
+          // Update enabled/disabled state
+          var toggle = det.querySelector('[data-route-toggle]');
+          if(toggle){
+            var enabled = rt.enabled !== false;
+            toggle.textContent = enabled ? 'On' : 'Off';
+            toggle.className = 'routeToggle ' + (enabled ? 'on' : 'off');
+            if(enabled){
+              det.classList.remove('routeDisabled');
+            } else {
+              det.classList.add('routeDisabled');
+            }
+          }
         }
       } catch(e){
         if($('liveText')) $('liveText').textContent = 'Offline';
       }
     }
     poll(); setInterval(poll, 2000);
+
+    // Route toggle click handler
+    document.addEventListener('click', function(e){
+      var t = e.target;
+      if(!t || !t.matches || !t.matches('[data-route-toggle]')) return;
+      e.preventDefault();
+      var det = t.closest('details[data-route]');
+      if(!det) return;
+      var routeName = det.getAttribute('data-route');
+      if(!routeName) return;
+      var curEnabled = t.textContent.trim() === 'On';
+      var newEnabled = !curEnabled;
+      var p = new URLSearchParams();
+      p.set('csrf', csrf);
+      p.set('route', routeName);
+      p.set('enabled', newEnabled ? '1' : '');
+      fetch('/api/routes/toggle', {method: 'POST', body: p, credentials: 'include'})
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){
+          if(d && d.enabled !== undefined){
+            t.textContent = d.enabled ? 'On' : 'Off';
+            t.className = 'routeToggle ' + (d.enabled ? 'on' : 'off');
+            if(d.enabled){
+              det.classList.remove('routeDisabled');
+            } else {
+              det.classList.add('routeDisabled');
+            }
+          }
+        });
+    });
 
     // Redraw charts on resize
     var resizeTimer;
@@ -2133,6 +2269,15 @@ const serverControlsHTML = `<!doctype html>
 					</form>
 				</div>
 
+				<div class="secHead"><h2>Protocol Options</h2></div>
+				<div class="card">
+					<div class="row"><b>QUIC Protocol:</b> <span id="quicStatus">{{if .Cfg.QUICEnabled}}Enabled{{else}}Disabled{{end}}</span></div>
+					<div class="muted" style="margin-bottom:8px;font-size:12px">QUIC provides better reliability and congestion control for UDP transport. Experimental feature.</div>
+					<div class="flex">
+						<button class="btn sm primary" id="quicToggleBtn">{{if .Cfg.QUICEnabled}}Disable QUIC{{else}}Enable QUIC{{end}}</button>
+					</div>
+				</div>
+
 				<div class="secHead"><h2>Updates</h2></div>
 				<div class="card">
 					<div class="row"><b>Current:</b> <code>{{.Version}}</code></div>
@@ -2216,6 +2361,13 @@ const serverControlsHTML = `<!doctype html>
 	};
 	document.getElementById('procExit').onclick=async function(){
 		await fetch('/api/process/exit',{method:'POST',body:body(),credentials:'include'});
+		setTimeout(function(){location.reload();},1000);
+	};
+	document.getElementById('quicToggleBtn').onclick=async function(){
+		var btn=this;
+		var cur=btn.textContent.indexOf('Enable')>=0;
+		var p=new URLSearchParams();p.set('csrf',csrf);p.set('enabled',cur?'1':'');
+		await fetch('/api/quic',{method:'POST',body:p,credentials:'include'});
 		setTimeout(function(){location.reload();},1000);
 	};
 	refreshUpd();refreshSys();

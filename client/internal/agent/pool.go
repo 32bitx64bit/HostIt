@@ -26,19 +26,26 @@ type dataConnPool struct {
 	totalReused    atomic.Int64 // Connections reused from pool
 	totalStale     atomic.Int64 // Connections discarded as stale
 	totalDialFails atomic.Int64 // Failed dial attempts
+
+	// Proactive health checking
+	healthChecker  *connutil.HealthChecker
+	avgRTT         atomic.Int64 // Average RTT in microseconds (for connection quality)
+	healthCheckInt time.Duration
 }
 
 // PoolStats returns current pool statistics for monitoring.
 type PoolStats struct {
-	Addr         string `json:"addr"`
-	UseTLS       bool   `json:"use_tls"`
-	Capacity     int32  `json:"capacity"`
-	CurrentSize  int32  `json:"current_size"`
-	TotalCreated int64  `json:"total_created"`
-	TotalReused  int64  `json:"total_reused"`
-	TotalStale   int64  `json:"total_stale"`
-	TotalDialFails int64 `json:"total_dial_fails"`
-	HitRate      float64 `json:"hit_rate"` // Percentage of requests served from pool
+	Addr           string  `json:"addr"`
+	UseTLS         bool    `json:"use_tls"`
+	Capacity       int32   `json:"capacity"`
+	CurrentSize    int32   `json:"current_size"`
+	TotalCreated   int64   `json:"total_created"`
+	TotalReused    int64   `json:"total_reused"`
+	TotalStale     int64   `json:"total_stale"`
+	TotalDialFails int64   `json:"total_dial_fails"`
+	HitRate        float64 `json:"hit_rate"`       // Percentage of requests served from pool
+	AvgRTT         int64   `json:"avg_rtt"`        // Average RTT in microseconds
+	HealthTracked  int     `json:"health_tracked"` // Connections being health-checked
 }
 
 func (p *dataConnPool) Stats() PoolStats {
@@ -49,20 +56,30 @@ func (p *dataConnPool) Stats() PoolStats {
 	if total > 0 {
 		hitRate = float64(reused) / float64(total) * 100
 	}
+	healthTracked := 0
+	if p.healthChecker != nil {
+		healthTracked = p.healthChecker.TrackedCount()
+	}
 	return PoolStats{
-		Addr:         p.addr,
-		UseTLS:       p.useTLS,
-		Capacity:     p.capacity,
-		CurrentSize:  p.size.Load(),
-		TotalCreated: created,
-		TotalReused:  reused,
-		TotalStale:   p.totalStale.Load(),
+		Addr:           p.addr,
+		UseTLS:         p.useTLS,
+		Capacity:       p.capacity,
+		CurrentSize:    p.size.Load(),
+		TotalCreated:   created,
+		TotalReused:    reused,
+		TotalStale:     p.totalStale.Load(),
 		TotalDialFails: p.totalDialFails.Load(),
-		HitRate:      hitRate,
+		HitRate:        hitRate,
+		AvgRTT:         p.avgRTT.Load(),
+		HealthTracked:  healthTracked,
 	}
 }
 
-const poolConnMaxAge = 30 * time.Second // Connections older than this are considered stale
+const (
+	poolConnMaxAge     = 30 * time.Second // Connections older than this are considered stale
+	healthCheckEnabled = true             // Set to false to disable proactive health checking
+	healthCheckInt     = 10 * time.Second // How often to check pooled connections
+)
 
 func startDataPools(ctx context.Context, cfg Config, routesByName map[string]RemoteRoute, dataAddrTLS string, dataAddrInsecure string) map[string]*dataConnPool {
 	pools := map[string]*dataConnPool{}
@@ -82,7 +99,25 @@ func startDataPools(ctx context.Context, cfg Config, routesByName map[string]Rem
 		if !useTLS {
 			addr = dataAddrInsecure
 		}
-		p := &dataConnPool{addr: addr, useTLS: useTLS, noDelay: rt.TCPNoDelay, ch: make(chan net.Conn, pc), capacity: int32(pc)}
+		p := &dataConnPool{
+			addr:           addr,
+			useTLS:         useTLS,
+			noDelay:        rt.TCPNoDelay,
+			ch:             make(chan net.Conn, pc),
+			capacity:       int32(pc),
+			healthCheckInt: healthCheckInt,
+		}
+
+		// Start proactive health checking if enabled
+		if healthCheckEnabled {
+			p.healthChecker = connutil.NewHealthChecker(healthCheckInt, func(conn net.Conn) {
+				// Called when a dead connection is detected
+				p.totalStale.Add(1)
+				log.Debugf(logging.CatData, "pool %s: proactive health check removed dead connection", p.addr)
+			})
+			p.healthChecker.Start(ctx)
+		}
+
 		pools[name] = p
 		// Warmup pool in parallel for faster startup
 		go p.warmup(ctx, cfg, pc)
@@ -91,10 +126,23 @@ func startDataPools(ctx context.Context, cfg Config, routesByName map[string]Rem
 	return pools
 }
 
+// UpdateRTT updates the average RTT metric for connection quality monitoring.
+// RTT is in microseconds.
+func (p *dataConnPool) UpdateRTT(rttMicros int64) {
+	// Exponential moving average with alpha=0.1
+	for {
+		old := p.avgRTT.Load()
+		newAvg := old + (rttMicros-old)/10
+		if p.avgRTT.CompareAndSwap(old, newAvg) {
+			break
+		}
+	}
+}
+
 func (p *dataConnPool) warmup(ctx context.Context, cfg Config, count int) {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 16) // Allow 16 concurrent handshakes
-	
+
 	for i := 0; i < count; i++ {
 		wg.Add(1)
 		go func() {
@@ -105,7 +153,7 @@ func (p *dataConnPool) warmup(ctx context.Context, cfg Config, count int) {
 			case sem <- struct{}{}:
 			}
 			defer func() { <-sem }()
-			
+
 			c, err := dialTCPData(ctx, cfg, p.addr, p.noDelay, p.useTLS)
 			if err != nil {
 				p.totalDialFails.Add(1)
@@ -221,7 +269,7 @@ func (p *dataConnPool) fillLoop(ctx context.Context, cfg Config) {
 		if missing > 4 {
 			missing = 4 // Limit parallel dials
 		}
-		
+
 		var wg sync.WaitGroup
 		dialFailures := int32(0)
 		for i := 0; i < missing; i++ {
@@ -247,7 +295,7 @@ func (p *dataConnPool) fillLoop(ctx context.Context, cfg Config) {
 			}()
 		}
 		wg.Wait()
-		
+
 		// Check if we successfully added any connections
 		if p.size.Load() < p.capacity {
 			// Still not full, backoff

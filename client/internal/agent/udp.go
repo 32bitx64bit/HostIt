@@ -365,30 +365,23 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		sessionsMu := sync.RWMutex{}
 		sessions := map[string]map[string]*udpSession{} // route -> client -> session
 
-		// Multiple parallel writers - prevents single-writer bottleneck
-		// Each writer pulls from the shared queue and writes to the socket
-		numWriters := runtimeNumCPU()
-		if numWriters < 2 {
-			numWriters = 2
-		}
-		if numWriters > 8 {
-			numWriters = 8 // Cap at 8 writers
-		}
-
+		// Single writer goroutine - ensures FIFO ordering of packets.
+		// Multiple writers from the same queue can cause reordering due to
+		// scheduler timing (goroutine B could write before goroutine A even
+		// though A dequeued first). A single writer preserves order while
+		// the queue provides backpressure absorption for bursty traffic.
 		var writerWg sync.WaitGroup
-		for i := 0; i < numWriters; i++ {
-			writerWg.Add(1)
-			go func() {
-				defer writerWg.Done()
-				for {
-					pkt, ok := writeQueue.Dequeue(connCtx)
-					if !ok {
-						return
-					}
-					writer.WritePooled(pkt.data, pkt.bufPtr)
+		writerWg.Add(1)
+		go func() {
+			defer writerWg.Done()
+			for {
+				pkt, ok := writeQueue.Dequeue(connCtx)
+				if !ok {
+					return
 				}
-			}()
-		}
+				writer.WritePooled(pkt.data, pkt.bufPtr)
+			}
+		}()
 
 		// Queue depth monitor - logs warnings when queue is getting full
 		go func() {

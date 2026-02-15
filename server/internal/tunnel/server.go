@@ -101,12 +101,14 @@ func NewServer(cfg ServerConfig) *Server {
 		cfg.MaxPendingPerIP = &v
 	}
 	noDelay := make(map[string]bool, len(cfg.Routes))
+	enabled := make(map[string]bool, len(cfg.Routes))
 	for _, rt := range cfg.Routes {
 		if rt.TCPNoDelay == nil {
 			noDelay[rt.Name] = true
 		} else {
 			noDelay[rt.Name] = *rt.TCPNoDelay
 		}
+		enabled[rt.Name] = rt.IsEnabled()
 	}
 
 	st := &serverState{
@@ -122,6 +124,7 @@ func NewServer(cfg ServerConfig) *Server {
 		encryptionNone:   cfg.DisableUDPEncryption || strings.EqualFold(strings.TrimSpace(cfg.UDPEncryptionMode), "none"),
 		resolvedAddrs:    make(map[string]*resolvedAddr),
 		noDelayByRoute:   noDelay,
+		enabledByRoute:   enabled,
 	}
 	st.udpKeys = buildUDPKeySet(cfg)
 	return &Server{cfg: cfg, st: st}
@@ -290,17 +293,12 @@ func (s *Server) Run(ctx context.Context) error {
 		writeQueue := newUDPWriteQueueWithBackpressure(65536) // Match the read queue size
 		st.udpPublicWriters[x.name] = writeQueue
 
-		// Start multiple writer goroutines per route for parallel writes to different clients
-		numWriters := runtime.NumCPU()
-		if numWriters < 2 {
-			numWriters = 2
-		}
-		if numWriters > 16 {
-			numWriters = 16
-		}
-		for i := 0; i < numWriters; i++ {
-			go st.udpPublicWriter(ctx, x.pc, writeQueue, x.name)
-		}
+		// Single writer goroutine per route - ensures FIFO ordering of packets.
+		// Multiple writers from the same queue can cause reordering due to
+		// scheduler timing (goroutine B could write before goroutine A even
+		// though A dequeued first). A single writer preserves order while
+		// the queue provides backpressure absorption for bursty traffic.
+		go st.udpPublicWriter(ctx, x.pc, writeQueue, x.name)
 	}
 
 	// Start pending connection cleaner
@@ -424,6 +422,7 @@ type serverState struct {
 
 	// Precomputed route properties (avoids linear scan per connection).
 	noDelayByRoute map[string]bool
+	enabledByRoute map[string]bool // route name -> enabled (can be toggled at runtime)
 
 	pendingMu   sync.Mutex
 	pending     map[string]pendingConn
@@ -780,6 +779,54 @@ func (st *serverState) routeTCPNoDelay(routeName string) bool {
 		return v
 	}
 	return true // default
+}
+
+// routeEnabled returns true if the route is enabled (can be toggled at runtime).
+func (st *serverState) routeEnabled(routeName string) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if v, ok := st.enabledByRoute[routeName]; ok {
+		return v
+	}
+	return true // default
+}
+
+// SetRouteEnabled toggles a route's enabled state at runtime.
+// Returns the new enabled state, or false if the route doesn't exist.
+func (s *Server) SetRouteEnabled(routeName string, enabled bool) bool {
+	s.st.mu.Lock()
+	defer s.st.mu.Unlock()
+
+	// Check if route exists
+	found := false
+	for _, rt := range s.st.cfg.Routes {
+		if rt.Name == routeName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+
+	// Update the enabled state
+	s.st.enabledByRoute[routeName] = enabled
+
+	// Update the config as well for persistence
+	for i := range s.st.cfg.Routes {
+		if s.st.cfg.Routes[i].Name == routeName {
+			s.st.cfg.Routes[i].Enabled = &enabled
+			break
+		}
+	}
+
+	log.Infof(logging.CatControl, "route %s %s", routeName, map[bool]string{true: "enabled", false: "disabled"}[enabled])
+	return true
+}
+
+// GetRouteEnabled returns the current enabled state of a route.
+func (s *Server) GetRouteEnabled(routeName string) bool {
+	return s.st.routeEnabled(routeName)
 }
 
 func (st *serverState) acceptControl(ctx context.Context, ln net.Listener) error {
@@ -1315,6 +1362,19 @@ func (st *serverState) handlePublicConn(ctx context.Context, clientConn net.Conn
 		))
 		if st.dash != nil {
 			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "reject_no_agent", RemoteIP: remoteIP, ConnID: id})
+		}
+		return
+	}
+
+	// Check if route is enabled
+	if !st.routeEnabled(routeName) {
+		log.Debug(logging.CatPairing, "public connection rejected: route disabled", logging.F(
+			"route", routeName,
+			"remote_ip", remoteIP,
+			"conn_id", id,
+		))
+		if st.dash != nil {
+			st.dash.addEvent(routeName, DashboardEvent{TimeUnix: time.Now().Unix(), Kind: "reject_route_disabled", RemoteIP: remoteIP, ConnID: id})
 		}
 		return
 	}
@@ -1954,6 +2014,11 @@ func (st *serverState) udpPublicWriter(ctx context.Context, pc net.PacketConn, q
 }
 
 func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, routeName string) {
+	// Check if route is enabled
+	if !st.routeEnabled(routeName) {
+		return // Silently drop packets for disabled routes
+	}
+
 	agent := st.getAgentUDPAddr()
 	if agent == nil {
 		st.dashErrorRateLimited(routeName, "error_udp_no_agent", "", "", "", 1*time.Second)

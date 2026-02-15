@@ -200,6 +200,7 @@ func (q *PriorityWriteQueue) Dequeue(ctx context.Context) (priorityPacket, bool)
 
 // DequeueBatch returns up to n packets for batch sending.
 // Control packets are always returned first.
+// This is a non-blocking call - it returns immediately with whatever packets are available.
 func (q *PriorityWriteQueue) DequeueBatch(ctx context.Context, n int) []priorityPacket {
 	if n <= 0 {
 		return nil
@@ -234,6 +235,64 @@ dataQueue:
 		default:
 			// No more data packets
 			return packets
+		}
+	}
+
+	return packets
+}
+
+// DequeueBatchBlocking returns up to n packets for batch sending, blocking until at least
+// one packet is available or the context is cancelled.
+// Control packets are always returned first.
+func (q *PriorityWriteQueue) DequeueBatchBlocking(ctx context.Context, n int) []priorityPacket {
+	if n <= 0 {
+		return nil
+	}
+
+	packets := make([]priorityPacket, 0, n)
+
+	// First, wait for at least one packet (blocking)
+	select {
+	case pkt := <-q.controlQueue:
+		q.depth.Add(-1)
+		q.controlDepth.Add(-1)
+		q.updateLatency(pkt)
+		packets = append(packets, pkt)
+	case pkt := <-q.dataQueue:
+		q.depth.Add(-1)
+		q.dataDepth.Add(-1)
+		q.updateLatency(pkt)
+		packets = append(packets, pkt)
+	case <-ctx.Done():
+		return nil
+	}
+
+	// Now drain remaining control queue (non-blocking)
+	for len(packets) < n {
+		select {
+		case pkt := <-q.controlQueue:
+			q.depth.Add(-1)
+			q.controlDepth.Add(-1)
+			q.updateLatency(pkt)
+			packets = append(packets, pkt)
+		default:
+			// No more control packets
+			break
+		}
+	}
+	q.controlPending.Store(false)
+
+	// Then drain data queue (non-blocking)
+	for len(packets) < n {
+		select {
+		case pkt := <-q.dataQueue:
+			q.depth.Add(-1)
+			q.dataDepth.Add(-1)
+			q.updateLatency(pkt)
+			packets = append(packets, pkt)
+		default:
+			// No more data packets
+			break
 		}
 	}
 
@@ -331,10 +390,9 @@ func NewBatchWriter(conn *net.UDPConn, queue *PriorityWriteQueue, batchSize int,
 }
 
 // Run starts the batch writer loop.
+// Control packets are always sent first (prioritized over data packets) to ensure
+// timely delivery of registration and keepalive messages.
 func (w *BatchWriter) Run(ctx context.Context) {
-	batchTimeout := time.NewTimer(100 * time.Microsecond) // Max wait time to fill a batch
-	defer batchTimeout.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -342,51 +400,19 @@ func (w *BatchWriter) Run(ctx context.Context) {
 		default:
 		}
 
-		// Reset timer for batch timeout
-		if !batchTimeout.Stop() {
-			select {
-			case <-batchTimeout.C:
-			default:
-			}
-		}
-		batchTimeout.Reset(100 * time.Microsecond)
-
-		// Collect a batch of packets
-		var packets []priorityPacket
-		var batchData [][]byte
-
-		// Wait for first packet
-		pkt, ok := w.queue.Dequeue(ctx)
-		if !ok {
+		// Use DequeueBatchBlocking which properly prioritizes control packets over data packets.
+		// This ensures control packets (registration, keepalives) are always sent first.
+		// It blocks until at least one packet is available, preventing a busy loop.
+		packets := w.queue.DequeueBatchBlocking(ctx, w.batchSize)
+		if len(packets) == 0 {
+			// Context was cancelled
 			return
 		}
-		packets = append(packets, pkt)
-		batchData = append(batchData, pkt.data)
 
-		// Collect more packets up to batch size or timeout
-		for len(packets) < w.batchSize {
-			select {
-			case pkt, ok := <-w.queue.dataQueue:
-				if !ok {
-					goto send
-				}
-				w.queue.depth.Add(-1)
-				w.queue.dataDepth.Add(-1)
-				w.queue.updateLatency(pkt)
-				packets = append(packets, pkt)
-				batchData = append(batchData, pkt.data)
-			case <-batchTimeout.C:
-				goto send
-			default:
-				// No more packets immediately available
-				goto send
-			}
-		}
-
-	send:
-		// Send batch using sendmmsg (or fallback on non-Linux)
-		if len(packets) == 0 {
-			continue
+		// Prepare batch data for sendmmsg
+		batchData := make([][]byte, len(packets))
+		for i, pkt := range packets {
+			batchData[i] = pkt.data
 		}
 
 		// For connected socket, addrs are nil

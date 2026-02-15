@@ -23,6 +23,10 @@ type RouteConfig struct {
 	Name       string
 	Proto      string // "tcp", "udp", or "both"
 	PublicAddr string // listen address (host:port)
+	// Enabled controls whether the route is active.
+	// If nil, the default is enabled (true).
+	// Disabled routes are not exposed and the client will not forward traffic.
+	Enabled *bool
 	// TCPNoDelay controls TCP_NODELAY for this route's TCP connections.
 	// If nil, the default is enabled (true).
 	TCPNoDelay *bool
@@ -37,6 +41,14 @@ type RouteConfig struct {
 	// If nil, the default is 4 for TCP-capable routes.
 	// If 0, the agent dials on-demand.
 	Preconnect *int
+}
+
+// IsEnabled returns true if the route is enabled (default is true).
+func (r *RouteConfig) IsEnabled() bool {
+	if r.Enabled == nil {
+		return true
+	}
+	return *r.Enabled
 }
 
 // Validate validates the route configuration.
@@ -156,6 +168,10 @@ type ServerConfig struct {
 	// UDPBufferPoolSize is the size of each buffer in the pool in bytes.
 	// Default: 64KB (65536).
 	UDPBufferPoolSize *int `json:",omitempty"`
+	// QUICEnabled enables QUIC protocol for UDP transport.
+	// QUIC provides better reliability and congestion control.
+	// Default is false (disabled).
+	QUICEnabled bool `json:",omitempty"`
 }
 
 // Validate validates the server configuration.
