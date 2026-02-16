@@ -1,15 +1,21 @@
-//go:build windows
-
 package updater
 
 import (
-	"errors"
+	"os"
+	"os/exec"
 )
 
-func SpawnNew(exe string, args []string) error {
-	return errors.New("SpawnNew not implemented on windows")
-}
-
-func ExecReplace(exe string, args []string) error {
-	return errors.New("ExecReplace not implemented on windows")
+// ExecReplace replaces the current process with a new instance of the binary.
+// On Windows, we spawn a new process and exit the current one.
+func ExecReplace(bin string, args []string) error {
+	cmd := exec.Command(bin, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	os.Exit(0)
+	return nil
 }

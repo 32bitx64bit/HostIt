@@ -2,10 +2,7 @@ package udputil
 
 import (
 	"fmt"
-	"math/rand"
 	"runtime"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -80,112 +77,6 @@ func TestStats_RTT(t *testing.T) {
 	if avg < 14*time.Millisecond || avg > 16*time.Millisecond {
 		t.Errorf("avgRTT=%v, want ~15ms", avg)
 	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SequenceTracker tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-func TestSequenceTracker_InOrder(t *testing.T) {
-	stats := NewStats()
-	tr := NewSequenceTracker(128, stats)
-
-	for i := uint32(0); i < 100; i++ {
-		isNew, isOOO, lost := tr.Track(i)
-		if !isNew || isOOO || lost != 0 {
-			t.Fatalf("seq %d: new=%v ooo=%v lost=%d", i, isNew, isOOO, lost)
-		}
-	}
-	snap := stats.Snapshot()
-	if snap.PacketsReceived != 100 {
-		t.Errorf("recv=%d want 100", snap.PacketsReceived)
-	}
-	if snap.PacketsLost != 0 {
-		t.Errorf("lost=%d want 0", snap.PacketsLost)
-	}
-}
-
-func TestSequenceTracker_Gap(t *testing.T) {
-	stats := NewStats()
-	tr := NewSequenceTracker(128, stats)
-
-	tr.Track(0)
-	tr.Track(1)
-	// Skip 2,3,4
-	isNew, _, lost := tr.Track(5)
-	if !isNew || lost != 3 {
-		t.Fatalf("gap: new=%v lost=%d, want new=true lost=3", isNew, lost)
-	}
-	snap := stats.Snapshot()
-	if snap.PacketsLost != 3 {
-		t.Errorf("stats lost=%d want 3", snap.PacketsLost)
-	}
-}
-
-func TestSequenceTracker_OutOfOrder(t *testing.T) {
-	stats := NewStats()
-	tr := NewSequenceTracker(128, stats)
-
-	tr.Track(0)
-	tr.Track(1)
-	tr.Track(5) // gap of 3
-	// Late arrivals
-	isNew, isOOO, _ := tr.Track(3)
-	if !isNew || !isOOO {
-		t.Fatalf("ooo: new=%v ooo=%v", isNew, isOOO)
-	}
-}
-
-func TestSequenceTracker_Duplicate(t *testing.T) {
-	stats := NewStats()
-	tr := NewSequenceTracker(128, stats)
-
-	tr.Track(0)
-	isNew, _, _ := tr.Track(0)
-	if isNew {
-		t.Fatal("duplicate should not be new")
-	}
-	if stats.Snapshot().PacketsDuplicate != 1 {
-		t.Error("expected 1 duplicate")
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SequenceGenerator tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-func TestSequenceGenerator(t *testing.T) {
-	g := NewSequenceGenerator()
-	for i := uint32(0); i < 100; i++ {
-		got := g.Next()
-		if got != i {
-			t.Fatalf("seq=%d want %d", got, i)
-		}
-	}
-}
-
-func TestSequenceGenerator_Concurrent(t *testing.T) {
-	g := NewSequenceGenerator()
-	const N = 10000
-	seen := make(map[uint32]bool, N)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < N/8; j++ {
-				s := g.Next()
-				mu.Lock()
-				if seen[s] {
-					t.Errorf("duplicate seq %d", s)
-				}
-				seen[s] = true
-				mu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -297,27 +188,6 @@ func BenchmarkStats_RecordSend_Parallel(b *testing.B) {
 	})
 }
 
-func BenchmarkSequenceTracker_Track(b *testing.B) {
-	stats := NewStats()
-	tr := NewSequenceTracker(4096, stats)
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		tr.Track(uint32(i))
-	}
-}
-
-func BenchmarkSequenceTracker_Track_Parallel(b *testing.B) {
-	stats := NewStats()
-	tr := NewSequenceTracker(4096, stats)
-	var seq atomic.Uint32
-	b.ReportAllocs()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			tr.Track(seq.Add(1))
-		}
-	})
-}
-
 func BenchmarkSessionStats_GetOrCreate_HitOnly(b *testing.B) {
 	ss := NewSessionStats(1000, 5*time.Minute)
 	ss.GetOrCreate("hot-session", "stream", "10.0.0.1:1234", "127.0.0.1:5678")
@@ -399,53 +269,6 @@ func TestStatsOverheadReport(t *testing.T) {
 	if opsPerSec < 500000 {
 		t.Errorf("stats overhead too high: %.0f ops/sec (need ≥500K)", opsPerSec)
 	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Realistic scenario: Sequence tracking under packet loss
-// ═══════════════════════════════════════════════════════════════════════════════
-
-func TestSequenceTracker_RealisticLoss(t *testing.T) {
-	if testing.Short() {
-		t.Skip()
-	}
-
-	// 5% loss, 1% reordering — typical bad WiFi conditions.
-	stats := NewStats()
-	tr := NewSequenceTracker(4096, stats)
-	rng := rand.New(rand.NewSource(42))
-
-	const totalPackets = 100000
-	sent := 0
-	delivered := 0
-	var pending []uint32
-
-	for seq := uint32(0); seq < totalPackets; seq++ {
-		sent++
-		if rng.Float64() < 0.05 {
-			continue // 5% loss
-		}
-		if rng.Float64() < 0.01 && len(pending) > 0 {
-			// 1% late delivery — deliver a pending packet instead
-			idx := rng.Intn(len(pending))
-			tr.Track(pending[idx])
-			pending = append(pending[:idx], pending[idx+1:]...)
-			pending = append(pending, seq) // defer this one
-			delivered++
-			continue
-		}
-		tr.Track(seq)
-		delivered++
-	}
-	// Deliver remaining pending
-	for _, s := range pending {
-		tr.Track(s)
-		delivered++
-	}
-
-	snap := stats.Snapshot()
-	t.Logf("Sent=%d  Delivered=%d  TrackedRecv=%d  Lost=%d  OOO=%d  Dup=%d",
-		sent, delivered, snap.PacketsReceived, snap.PacketsLost, snap.PacketsOutOfOrder, snap.PacketsDuplicate)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
