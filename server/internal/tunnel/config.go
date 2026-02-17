@@ -187,6 +187,9 @@ type ServerConfig struct {
 	// UDPQueueSize is the packet queue size between readers and workers.
 	// Default: 16384.
 	UDPQueueSize *int `json:",omitempty"`
+	// UDPMaxPayload caps forwarded UDP payload size in bytes.
+	// Default: 1400. Set to 0 to disable payload capping.
+	UDPMaxPayload *int `json:",omitempty"`
 	// UDPBufferSize is the kernel socket buffer size in bytes.
 	// Default: 8MB (8388608).
 	UDPBufferSize *int `json:",omitempty"`
@@ -289,6 +292,14 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.UDPQueueSize != nil && *c.UDPQueueSize < 1024 {
 		errs = append(errs, "udp_queue_size must be >= 1024")
+	}
+	if c.UDPMaxPayload != nil {
+		if *c.UDPMaxPayload < 0 {
+			errs = append(errs, "udp_max_payload must be >= 0")
+		}
+		if *c.UDPMaxPayload > 65507 {
+			errs = append(errs, "udp_max_payload must be <= 65507")
+		}
 	}
 	if c.UDPBufferSize != nil && *c.UDPBufferSize < 65536 {
 		errs = append(errs, "udp_buffer_size must be >= 65536")

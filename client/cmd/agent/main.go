@@ -316,7 +316,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 		log.Printf("Not running under systemd - executing binary replacement")
 		log.Printf("Agent will auto-reconnect using configuration from: %s", configPath)
-		return updater.ExecReplace(bin, os.Args[1:])
+		return updater.ExecReplace(bin, os.Args)
 	}
 	upd.Start(ctx)
 

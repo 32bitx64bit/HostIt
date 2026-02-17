@@ -528,7 +528,7 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 	// Delete files/directories not in source (delete in reverse order for dirs)
 	for i := len(toDelete) - 1; i >= 0; i-- {
 		path := toDelete[i]
-		if err := os.RemoveAll(path); err != nil {
+		if err := removeAllWritable(path, dstAbs); err != nil {
 			_, _ = fmt.Fprintf(logw, "Warning: failed to remove %s: %v\n", path, err)
 		} else {
 			_, _ = fmt.Fprintf(logw, "Removed stale file: %s\n", path)
@@ -574,7 +574,16 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 		}
 
 		if d.IsDir() {
-			return os.MkdirAll(dstPath, 0o755)
+			if err := os.MkdirAll(dstPath, 0o755); err != nil {
+				if os.IsPermission(err) {
+					_ = ensureWritablePath(filepath.Dir(dstPath), dstAbs)
+					if err2 := os.MkdirAll(dstPath, 0o755); err2 == nil {
+						return nil
+					}
+				}
+				return err
+			}
+			return nil
 		}
 
 		si, err := os.Stat(path)
@@ -582,7 +591,16 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 			return err
 		}
 		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-			return err
+			if os.IsPermission(err) {
+				_ = ensureWritablePath(filepath.Dir(dstPath), dstAbs)
+				if err2 := os.MkdirAll(filepath.Dir(dstPath), 0o755); err2 == nil {
+					// continue
+				} else {
+					return err
+				}
+			} else {
+				return err
+			}
 		}
 		in, err := os.Open(path)
 		if err != nil {
@@ -591,7 +609,14 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 		defer in.Close()
 		out, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, si.Mode())
 		if err != nil {
-			return err
+			if os.IsPermission(err) {
+				_ = ensureWritablePath(dstPath, dstAbs)
+				_ = ensureWritablePath(filepath.Dir(dstPath), dstAbs)
+				out, err = os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, si.Mode())
+			}
+			if err != nil {
+				return err
+			}
 		}
 		_, copyErr := io.Copy(out, in)
 		closeErr := out.Close()
@@ -603,6 +628,71 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 		}
 		return nil
 	})
+}
+
+func removeAllWritable(path string, dstRoot string) error {
+	if err := os.RemoveAll(path); err == nil {
+		return nil
+	} else if !os.IsPermission(err) {
+		return err
+	}
+
+	_ = ensureWritablePath(path, dstRoot)
+	_ = makeTreeWritable(path)
+	_ = ensureWritablePath(filepath.Dir(path), dstRoot)
+	return os.RemoveAll(path)
+}
+
+func makeTreeWritable(root string) error {
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		_ = makeWritable(path)
+		return nil
+	})
+}
+
+func ensureWritablePath(path string, dstRoot string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	abs = filepath.Clean(abs)
+	root := filepath.Clean(dstRoot)
+	if root != "" {
+		if abs != root && !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
+			return nil
+		}
+	}
+	return makeWritable(abs)
+}
+
+func makeWritable(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	mode := info.Mode()
+	if mode&os.ModeSymlink != 0 {
+		return nil
+	}
+	newMode := mode
+	if mode.IsDir() {
+		newMode = mode | 0o700
+	} else {
+		newMode = mode | 0o600
+	}
+	if newMode == mode {
+		return nil
+	}
+	return os.Chmod(path, newMode)
 }
 
 func runBuild(ctx context.Context, moduleDir string, logw io.Writer) error {

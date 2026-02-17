@@ -21,14 +21,14 @@ type DashboardPoint struct {
 }
 
 type DashboardEvent struct {
-	TimeUnix    int64  `json:"t"`
-	Kind        string `json:"kind"`
-	RemoteIP    string `json:"ip,omitempty"`
-	ConnID      string `json:"id,omitempty"`
-	Detail      string `json:"detail,omitempty"`
-	Bytes       int64  `json:"bytes,omitempty"`
-	DurationMS  int64  `json:"durMs,omitempty"`
-	Route       string `json:"route,omitempty"`
+	TimeUnix   int64  `json:"t"`
+	Kind       string `json:"kind"`
+	RemoteIP   string `json:"ip,omitempty"`
+	ConnID     string `json:"id,omitempty"`
+	Detail     string `json:"detail,omitempty"`
+	Bytes      int64  `json:"bytes,omitempty"`
+	DurationMS int64  `json:"durMs,omitempty"`
+	Route      string `json:"route,omitempty"`
 }
 
 type DashboardRoute struct {
@@ -38,22 +38,39 @@ type DashboardRoute struct {
 
 // UDPStats represents UDP traffic statistics for the dashboard.
 type UDPStats struct {
-	PacketsIn    int64 `json:"packetsIn"`
-	PacketsOut   int64 `json:"packetsOut"`
-	BytesIn      int64 `json:"bytesIn"`
-	BytesOut     int64 `json:"bytesOut"`
-	ActiveRoutes int   `json:"activeRoutes"`
+	PacketsIn            int64   `json:"packetsIn"`
+	PacketsOut           int64   `json:"packetsOut"`
+	BytesIn              int64   `json:"bytesIn"`
+	BytesOut             int64   `json:"bytesOut"`
+	ActiveRoutes         int     `json:"activeRoutes"`
+	LossPercent          float64 `json:"lossPercent"`
+	TotalDrops           int64   `json:"totalDrops"`
+	PublicQueueDrops     int64   `json:"publicQueueDrops"`
+	AgentQueueDrops      int64   `json:"agentQueueDrops"`
+	PublicWorkerDrops    int64   `json:"publicWorkerDrops"`
+	AgentWorkerDrops     int64   `json:"agentWorkerDrops"`
+	ResolveDrops         int64   `json:"resolveDrops"`
+	DecodeDrops          int64   `json:"decodeDrops"`
+	NoAgentDrops         int64   `json:"noAgentDrops"`
+	RouteDisabledDrops   int64   `json:"routeDisabledDrops"`
+	PayloadTooLargeDrops int64   `json:"payloadTooLargeDrops"`
+	PublicWriteErrors    int64   `json:"publicWriteErrors"`
+	AgentWriteErrors     int64   `json:"agentWriteErrors"`
+	PublicQueueDepth     int64   `json:"publicQueueDepth"`
+	PublicQueueCapacity  int64   `json:"publicQueueCapacity"`
+	AgentQueueDepth      int64   `json:"agentQueueDepth"`
+	AgentQueueCapacity   int64   `json:"agentQueueCapacity"`
 }
 
 type DashboardSnapshot struct {
-	NowUnix       int64                      `json:"nowUnix"`
-	BucketSec     int                        `json:"bucketSec"`
+	NowUnix        int64                     `json:"nowUnix"`
+	BucketSec      int                       `json:"bucketSec"`
 	AgentConnected bool                      `json:"agentConnected"`
-	ActiveClients int64                      `json:"activeClients"`
-	BytesTotal    int64                      `json:"bytesTotal"`
-	Series        []DashboardPoint           `json:"series"`
-	Routes        map[string]DashboardRoute  `json:"routes"`
-	UDP           *UDPStats                  `json:"udp,omitempty"`
+	ActiveClients  int64                     `json:"activeClients"`
+	BytesTotal     int64                     `json:"bytesTotal"`
+	Series         []DashboardPoint          `json:"series"`
+	Routes         map[string]DashboardRoute `json:"routes"`
+	UDP            *UDPStats                 `json:"udp,omitempty"`
 }
 
 type bucket struct {

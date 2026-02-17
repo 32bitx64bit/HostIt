@@ -296,6 +296,16 @@ func (r *serverRunner) Dashboard(now time.Time) (tunnel.ServerConfig, tunnel.Ser
 	return r.cfg, st, snap, r.err
 }
 
+func (r *serverRunner) RunAgentNettest(ctx context.Context, req tunnel.AgentNettestRequest) (tunnel.AgentNettestResult, error) {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return tunnel.AgentNettestResult{}, fmt.Errorf("server not running")
+	}
+	return srv.RunAgentNettest(ctx, req)
+}
+
 // SetRouteEnabled toggles a route's enabled state at runtime.
 // Returns false if the route doesn't exist.
 func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
@@ -327,6 +337,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 	tplStats := template.Must(template.New("stats").Parse(serverStatsHTML))
 	tplConfig := template.Must(template.New("config").Parse(serverConfigHTML))
 	tplControls := template.Must(template.New("controls").Parse(serverControlsHTML))
+	tplNetwork := template.Must(template.New("network").Parse(serverNetworkTestHTML))
 	tplLogin := template.Must(template.New("login").Parse(loginPageHTML))
 	tplSetup := template.Must(template.New("setup").Parse(setupPageHTML))
 
@@ -364,7 +375,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			return nil
 		}
 		// Non-systemd run: replace the current process so the restart is immediate.
-		return updater.ExecReplace(bin, os.Args[1:])
+		return updater.ExecReplace(bin, os.Args)
 	}
 	upd.Start(ctx)
 
@@ -581,6 +592,25 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplStats.Execute(w, data)
 		})))
 
+		// Network test page (protected)
+		mux.HandleFunc("/network-test", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			csrf := ensureCSRF(w, r, cookieSecure)
+			cfg, st, err := runner.Get()
+			data := map[string]any{
+				"Cfg":      cfg,
+				"Status":   st,
+				"CSRF":     csrf,
+				"Err":      err,
+				"Version":  version.Current,
+				"WebHTTPS": webHTTPS,
+			}
+			_ = tplNetwork.Execute(w, data)
+		})))
+
 		// Live stats API (protected)
 		mux.HandleFunc("/api/stats", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
@@ -614,6 +644,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"agentConnected": snap.AgentConnected,
 				"activeClients":  snap.ActiveClients,
 				"bytesTotal":     snap.BytesTotal,
+				"udp":            snap.UDP,
 				"series":         snap.Series,
 				"routes":         outRoutes,
 				"systemEvents":   snap.Routes["_system"].Events,
@@ -626,6 +657,123 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(resp)
+		})))
+
+		mux.HandleFunc("/api/nettest/ping", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"serverTimeUnixMs": time.Now().UnixMilli()})
+		})))
+
+		mux.HandleFunc("/api/nettest/direct-download", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			sz := 8 * 1024 * 1024
+			if raw := strings.TrimSpace(r.URL.Query().Get("bytes")); raw != "" {
+				if n, err := strconv.Atoi(raw); err == nil {
+					sz = n
+				}
+			}
+			if sz < 1024 {
+				sz = 1024
+			}
+			if sz > 64*1024*1024 {
+				sz = 64 * 1024 * 1024
+			}
+			buf := make([]byte, 32*1024)
+			_, _ = rand.Read(buf)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Length", strconv.Itoa(sz))
+			written := 0
+			for written < sz {
+				chunk := len(buf)
+				if remain := sz - written; remain < chunk {
+					chunk = remain
+				}
+				n, err := w.Write(buf[:chunk])
+				if err != nil {
+					return
+				}
+				written += n
+			}
+		})))
+
+		mux.HandleFunc("/api/nettest/direct-upload", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 128<<20)
+			start := time.Now()
+			n, err := io.Copy(io.Discard, r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			elapsed := time.Since(start)
+			if elapsed <= 0 {
+				elapsed = time.Millisecond
+			}
+			mbps := (float64(n) * 8.0 / elapsed.Seconds()) / 1e6
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"bytes":      n,
+				"durationMs": elapsed.Milliseconds(),
+				"mbps":       mbps,
+			})
+		})))
+
+		mux.HandleFunc("/api/nettest/agent", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			count := 40
+			if raw := strings.TrimSpace(r.Form.Get("count")); raw != "" {
+				if n, err := strconv.Atoi(raw); err == nil {
+					count = n
+				}
+			}
+			payload := 1024
+			if raw := strings.TrimSpace(r.Form.Get("payload_bytes")); raw != "" {
+				if n, err := strconv.Atoi(raw); err == nil {
+					payload = n
+				}
+			}
+			timeoutMs := 1500
+			if raw := strings.TrimSpace(r.Form.Get("timeout_ms")); raw != "" {
+				if n, err := strconv.Atoi(raw); err == nil {
+					timeoutMs = n
+				}
+			}
+			ctx2, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+			defer cancel()
+			result, err := runner.RunAgentNettest(ctx2, tunnel.AgentNettestRequest{
+				Count:        count,
+				PayloadBytes: payload,
+				Timeout:      time.Duration(timeoutMs) * time.Millisecond,
+			})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(result)
 		})))
 
 		// Manual update check (protected)
@@ -932,17 +1080,62 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			if dashInterval <= 0 {
 				dashInterval = 30 * time.Second
 			}
+			udpMaxPayload := 1400
+			if cfg.UDPMaxPayload != nil {
+				udpMaxPayload = *cfg.UDPMaxPayload
+			}
 			data := map[string]any{
-				"Cfg":          cfg,
-				"Status":       st,
-				"ConfigPath":   configPath,
-				"Msg":          getMsg(),
-				"Err":          err,
-				"CSRF":         csrf,
-				"Version":      version.Current,
-				"DashInterval": dashInterval.String(),
+				"Cfg":           cfg,
+				"Status":        st,
+				"ConfigPath":    configPath,
+				"Msg":           getMsg(),
+				"Err":           err,
+				"CSRF":          csrf,
+				"Version":       version.Current,
+				"DashInterval":  dashInterval.String(),
+				"UDPMaxPayload": udpMaxPayload,
 			}
 			_ = tplControls.Execute(w, data)
+		})))
+
+		// UDP max payload cap update (protected)
+		mux.HandleFunc("/api/udp/payload", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			raw := strings.TrimSpace(r.Form.Get("udp_max_payload"))
+			if raw == "" {
+				http.Error(w, "udp_max_payload required", http.StatusBadRequest)
+				return
+			}
+			n, err := strconv.Atoi(raw)
+			if err != nil {
+				http.Error(w, "invalid udp_max_payload", http.StatusBadRequest)
+				return
+			}
+			if n < 0 || n > 65507 {
+				http.Error(w, "udp_max_payload must be between 0 and 65507", http.StatusBadRequest)
+				return
+			}
+			cfg, _, _ := runner.Get()
+			cfg.UDPMaxPayload = &n
+			if err := configio.Save(configPath, cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			runner.Restart(cfg)
+			setMsg(fmt.Sprintf("UDP max payload set to %d bytes — restarted", n))
+			http.Redirect(w, r, "/controls", http.StatusSeeOther)
 		})))
 
 		mux.HandleFunc("/config/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1559,6 +1752,7 @@ const serverStatsHTML = `<!doctype html>
           <a class="active" href="/">Dashboard</a>
           <a href="/config">Config</a>
           <a href="/controls">Controls</a>
+					<a href="/network-test">Network Test</a>
         </div>
         <form method="post" action="/logout" style="margin:0">
           <input type="hidden" name="csrf" value="{{.CSRF}}" />
@@ -1590,6 +1784,18 @@ const serverStatsHTML = `<!doctype html>
         <div class="label">Routes</div>
         <div class="value">{{.RouteCount}}</div>
       </div>
+			<div class="card stat">
+				<div class="label">UDP Loss</div>
+				<div class="value" id="udpLossVal">—</div>
+			</div>
+			<div class="card stat">
+				<div class="label">UDP Drops</div>
+				<div class="value" id="udpDropsVal">—</div>
+			</div>
+			<div class="card stat">
+				<div class="label">UDP Queues</div>
+				<div class="value" id="udpQueueVal">—</div>
+			</div>
     </div>
 
     <div class="grid2">
@@ -1948,6 +2154,18 @@ const serverStatsHTML = `<!doctype html>
         if($('activeClientsVal')) $('activeClientsVal').textContent = fmtNum(j.activeClients);
         if($('bw5mVal')) $('bw5mVal').textContent = fmtBytes(computeLastBucket(j.series));
         if($('bytesTotalVal')) $('bytesTotalVal').textContent = fmtBytes(j.bytesTotal||0);
+				var udp = j.udp || null;
+				if($('udpLossVal')) $('udpLossVal').textContent = udp ? ((Number(udp.lossPercent||0)).toFixed(2)+'%') : '—';
+				if($('udpDropsVal')) $('udpDropsVal').textContent = udp ? fmtNum(udp.totalDrops||0) : '—';
+				if($('udpQueueVal')) {
+					if(udp){
+						var pq = fmtNum(udp.publicQueueDepth||0) + '/' + fmtNum(udp.publicQueueCapacity||0);
+						var aq = fmtNum(udp.agentQueueDepth||0) + '/' + fmtNum(udp.agentQueueCapacity||0);
+						$('udpQueueVal').textContent = 'P ' + pq + ' · A ' + aq;
+					} else {
+						$('udpQueueVal').textContent = '—';
+					}
+				}
         if(j.err){
           $('errRow').style.display='';
           $('errText').textContent=j.err;
@@ -2000,6 +2218,13 @@ const serverStatsHTML = `<!doctype html>
         }
 				globalUDP.sort(function(a,b){return Number(a.t||0)-Number(b.t||0);});
 				globalTCP.sort(function(a,b){return Number(a.t||0)-Number(b.t||0);});
+				if(udp){
+					globalUDP.push({
+						t: Math.floor(Date.now()/1000),
+						kind: 'udp_telemetry',
+						detail: 'loss='+Number(udp.lossPercent||0).toFixed(2)+'% drops='+fmtNum(udp.totalDrops||0)+' decode='+fmtNum(udp.decodeDrops||0)+' resolve='+fmtNum(udp.resolveDrops||0)+' writeErr='+(fmtNum((udp.publicWriteErrors||0)+(udp.agentWriteErrors||0)))
+					});
+				}
 				renderEventList($('udpGlobalLog'), globalUDP, 'No UDP events yet.');
 				renderEventList($('tcpGlobalLog'), globalTCP, 'No TCP events yet.');
       } catch(e){
@@ -2157,6 +2382,7 @@ const serverConfigHTML = `<!doctype html>
 					<a href="/">Dashboard</a>
 					<a class="active" href="/config">Config</a>
 					<a href="/controls">Controls</a>
+					<a href="/network-test">Network Test</a>
 				</div>
 				<form method="post" action="/logout" style="margin:0">
 					<input type="hidden" name="csrf" value="{{.CSRF}}" />
@@ -2392,6 +2618,7 @@ const serverControlsHTML = `<!doctype html>
 					<a href="/">Dashboard</a>
 					<a href="/config">Config</a>
 					<a class="active" href="/controls">Controls</a>
+					<a href="/network-test">Network Test</a>
 				</div>
 				<form method="post" action="/logout" style="margin:0">
 					<input type="hidden" name="csrf" value="{{.CSRF}}" />
@@ -2432,6 +2659,16 @@ const serverControlsHTML = `<!doctype html>
 					<div class="flex">
 						<button class="btn sm primary" id="quicToggleBtn">{{if .Cfg.QUICEnabled}}Disable QUIC{{else}}Enable QUIC{{end}}</button>
 					</div>
+					<hr style="border:0;border-top:1px solid var(--border);margin:12px 0" />
+					<div class="row"><b>UDP Max Payload:</b> <code>{{.UDPMaxPayload}} bytes</code></div>
+					<div class="muted" style="margin-bottom:8px;font-size:12px">Default internet-safe value is 1400. Lower reduces fragmentation risk. Set 0 to disable cap.</div>
+					<form method="post" action="/api/udp/payload" style="margin:0">
+						<input type="hidden" name="csrf" value="{{.CSRF}}" />
+						<div class="flex">
+							<input type="number" name="udp_max_payload" min="0" max="65507" value="{{.UDPMaxPayload}}" class="btn sm" style="appearance:auto;padding:5px 8px;width:140px" />
+							<button type="submit" class="btn sm primary">Apply &amp; Restart</button>
+						</div>
+					</form>
 				</div>
 
 				<div class="secHead"><h2>Updates</h2></div>
@@ -2553,6 +2790,190 @@ const serverControlsHTML = `<!doctype html>
 		setTimeout(function(){location.reload();},1000);
 	};
 	refreshUpd();refreshSys();
+	</script>
+</body>
+</html>`
+
+const serverNetworkTestHTML = `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Tunnel Server — Network Test</title>
+	<style>
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--redDim:rgba(248,81,73,.08);color-scheme:light}}
+		body{font-family:var(--font);margin:0;background:var(--bg);color:var(--text)}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 40px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{margin:0;font-size:18px}
+		.subtitle{font-size:12px;color:var(--textMuted)}
+		.nav{display:flex;gap:4px}
+		.nav a,.nav button{font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);text-decoration:none}
+		.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;margin-bottom:14px}
+		.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+		@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+		.btn{font-size:13px;padding:8px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer}
+		.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.btn[disabled]{opacity:.5;cursor:not-allowed}
+		.kv{display:grid;grid-template-columns:170px 1fr;gap:6px 12px;font-size:13px}
+		.k{color:var(--textMuted)}
+		.v{font-variant-numeric:tabular-nums}
+		.muted{color:var(--textMuted);font-size:12px}
+		.ok{color:var(--green)}
+		.bad{color:var(--red)}
+	</style>
+</head>
+<body>
+	<div class="wrap">
+		<div class="topbar">
+			<div>
+				<h1>Tunnel Server</h1>
+				<div class="subtitle">Network Test — direct and server↔agent path diagnostics</div>
+			</div>
+			<div class="nav">
+				<a href="/">Dashboard</a>
+				<a href="/config">Config</a>
+				<a href="/controls">Controls</a>
+				<a class="active" href="/network-test">Network Test</a>
+			</div>
+		</div>
+
+		<div class="grid2">
+			<div class="card">
+				<h3 style="margin:0 0 8px">Browser ↔ Server</h3>
+				<div class="muted" style="margin-bottom:12px">Measures from this browser to the dashboard server over HTTPS.</div>
+				<button id="runDirect" class="btn primary">Run Direct Test</button>
+				<div id="directStatus" class="muted" style="margin-top:8px">Idle</div>
+				<div class="kv" style="margin-top:12px">
+					<div class="k">Latency (avg)</div><div class="v" id="dLatency">—</div>
+					<div class="k">Packet loss</div><div class="v" id="dLoss">—</div>
+					<div class="k">Download speed</div><div class="v" id="dDown">—</div>
+					<div class="k">Upload speed</div><div class="v" id="dUp">—</div>
+				</div>
+			</div>
+
+			<div class="card">
+				<h3 style="margin:0 0 8px">Server ↔ Agent</h3>
+				<div class="muted" style="margin-bottom:12px">Control-channel ping/throughput test between tunnel server and connected agent.</div>
+				<button id="runAgent" class="btn primary">Run Agent Path Test</button>
+				<div id="agentStatus" class="muted" style="margin-top:8px">Idle</div>
+				<div class="kv" style="margin-top:12px">
+					<div class="k">Latency (avg/min/max)</div><div class="v" id="aLatency">—</div>
+					<div class="k">Jitter</div><div class="v" id="aJitter">—</div>
+					<div class="k">Packet loss</div><div class="v" id="aLoss">—</div>
+					<div class="k">Download speed</div><div class="v" id="aDown">—</div>
+					<div class="k">Upload speed</div><div class="v" id="aUp">—</div>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<script>
+	(function(){
+		var csrf = "{{.CSRF}}";
+		function $(id){ return document.getElementById(id); }
+		function fmtMs(v){ return (Number(v)||0).toFixed(2)+' ms'; }
+		function fmtPct(v){ return (Number(v)||0).toFixed(2)+'%'; }
+		function fmtMbps(v){ return (Number(v)||0).toFixed(2)+' Mbps'; }
+
+		async function pingOnce(timeoutMs){
+			var c = new AbortController();
+			var t = setTimeout(function(){ c.abort(); }, timeoutMs);
+			var s = performance.now();
+			try {
+				var r = await fetch('/api/nettest/ping', {cache:'no-store', signal:c.signal});
+				if(!r.ok) throw new Error('http '+r.status);
+				return performance.now()-s;
+			} finally {
+				clearTimeout(t);
+			}
+		}
+
+		async function runDirect(){
+			$('runDirect').disabled = true;
+			$('directStatus').textContent = 'Running latency and packet loss test...';
+			var total = 20, ok = 0, sum = 0;
+			for(var i=0;i<total;i++){
+				try { var ms = await pingOnce(2000); ok++; sum += ms; } catch(e) {}
+			}
+			var loss = total-ok;
+			var lossPct = total>0 ? (loss*100/total) : 0;
+			var avg = ok>0 ? (sum/ok) : 0;
+			$('dLatency').textContent = ok>0 ? fmtMs(avg) : 'timeout';
+			$('dLoss').textContent = fmtPct(lossPct)+' ('+loss+'/'+total+')';
+
+			$('directStatus').textContent = 'Running download speed test...';
+			var dlBytes = 16*1024*1024;
+			var ds = performance.now();
+			var dr = await fetch('/api/nettest/direct-download?bytes='+dlBytes, {cache:'no-store'});
+			if(!dr.ok) throw new Error('download http '+dr.status);
+			await dr.arrayBuffer();
+			var dt = (performance.now()-ds)/1000;
+			var dMbps = (dlBytes*8)/(dt*1e6);
+			$('dDown').textContent = fmtMbps(dMbps);
+
+			$('directStatus').textContent = 'Running upload speed test...';
+			var ulBytes = 8*1024*1024;
+			var payload = new Uint8Array(ulBytes);
+			for(var p=0; p<ulBytes; p+=65536){
+				var chunk = payload.subarray(p, Math.min(ulBytes, p+65536));
+				crypto.getRandomValues(chunk);
+			}
+			var us = performance.now();
+			var ur = await fetch('/api/nettest/direct-upload', {
+				method:'POST',
+				headers:{'Content-Type':'application/octet-stream'},
+				body: payload
+			});
+			if(!ur.ok) throw new Error('upload http '+ur.status);
+			var uj = await ur.json();
+			var ut = (performance.now()-us)/1000;
+			var uMbps = uj && uj.mbps ? Number(uj.mbps) : (ulBytes*8)/(ut*1e6);
+			$('dUp').textContent = fmtMbps(uMbps);
+
+			$('directStatus').textContent = 'Complete';
+			$('runDirect').disabled = false;
+		}
+
+		async function runAgent(){
+			$('runAgent').disabled = true;
+			$('agentStatus').textContent = 'Running server↔agent test...';
+			var form = new URLSearchParams();
+			form.set('csrf', csrf);
+			form.set('count', '60');
+			form.set('payload_bytes', '1024');
+			form.set('timeout_ms', '1500');
+			var r = await fetch('/api/nettest/agent', {method:'POST', body: form});
+			if(!r.ok){
+				var txt = await r.text();
+				throw new Error(txt || ('http '+r.status));
+			}
+			var j = await r.json();
+			$('aLatency').textContent = fmtMs(j.avgLatencyMs)+' / '+fmtMs(j.minLatencyMs)+' / '+fmtMs(j.maxLatencyMs);
+			$('aJitter').textContent = fmtMs(j.jitterMs);
+			$('aLoss').textContent = fmtPct(j.lossPercent)+' ('+j.lostPackets+'/'+j.sentPackets+')';
+			$('aDown').textContent = fmtMbps(j.downloadMbps);
+			$('aUp').textContent = fmtMbps(j.uploadMbps);
+			$('agentStatus').textContent = 'Complete ('+j.durationMs+' ms)';
+			$('runAgent').disabled = false;
+		}
+
+		$('runDirect').addEventListener('click', function(){
+			runDirect().catch(function(err){
+				$('directStatus').textContent = 'Failed: '+(err && err.message ? err.message : 'unknown');
+				$('runDirect').disabled = false;
+			});
+		});
+		$('runAgent').addEventListener('click', function(){
+			runAgent().catch(function(err){
+				$('agentStatus').textContent = 'Failed: '+(err && err.message ? err.message : 'unknown');
+				$('runAgent').disabled = false;
+			});
+		});
+	})();
 	</script>
 </body>
 </html>`

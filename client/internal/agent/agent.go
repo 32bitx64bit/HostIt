@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -372,6 +373,20 @@ ready:
 			if !cfg.DisableUDPEncryption {
 				udpSec.UpdateFromLine(cfg.Token, rest)
 			}
+		case "NETTEST_PING":
+			f := strings.Fields(rest)
+			if len(f) < 4 {
+				continue
+			}
+			id := strings.TrimSpace(f[0])
+			seq := strings.TrimSpace(f[1])
+			sendNS := strings.TrimSpace(f[2])
+			payload := strings.TrimSpace(f[3])
+			if _, err := base64.RawStdEncoding.DecodeString(payload); err != nil {
+				continue
+			}
+			recvNS := time.Now().UnixNano()
+			_ = rw.WriteLinef("NETTEST_PONG %s %s %s %d %s", id, seq, sendNS, recvNS, payload)
 		default:
 		}
 	}

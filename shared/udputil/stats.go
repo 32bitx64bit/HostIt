@@ -120,7 +120,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	snap.ReorderedPackets = s.reorderedPackets.Load()
 	snap.LatePackets = s.latePackets.Load()
 	snap.ECNCEMarks = s.ecnCEMarks.Load()
-	snap.ECNCEMarks = s.ecnECTMarks.Load()
+	snap.ECNECTMarks = s.ecnECTMarks.Load()
 	snap.ECNNotECTMarks = s.ecnNotECTMarks.Load()
 	snap.Retransmissions = s.retransmissions.Load()
 	snap.BytesRetransmitted = s.bytesRetransmitted.Load()

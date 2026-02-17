@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -176,6 +177,40 @@ func (q *udpWriteQueue) TryEnqueue(data []byte, bufPtr *[]byte) bool {
 	}
 }
 
+// EnqueueWithTimeout attempts to enqueue and waits up to timeout when full.
+// Returns false if still full after waiting.
+func (q *udpWriteQueue) EnqueueWithTimeout(data []byte, bufPtr *[]byte, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return q.TryEnqueue(data, bufPtr)
+	}
+	pkt := outPacketWithResult{
+		data:    data,
+		bufPtr:  bufPtr,
+		enqueue: time.Now(),
+	}
+	select {
+	case q.queue <- pkt:
+		q.depth.Add(1)
+		return true
+	default:
+	}
+
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case q.queue <- pkt:
+		q.depth.Add(1)
+		return true
+	case <-t.C:
+		q.drops.Add(1)
+		q.stats.RecordLoss(1)
+		if bufPtr != nil {
+			udputil.PutOutputBuffer(bufPtr)
+		}
+		return false
+	}
+}
+
 // Dequeue returns the next packet to send.
 func (q *udpWriteQueue) Dequeue(ctx context.Context) (outPacketWithResult, bool) {
 	select {
@@ -286,6 +321,18 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		}
 		log.Infof(logging.CatUDP, "UDP connection established to %s", dataAddr)
 		log.Infof(logging.CatUDP, "UDP profile: fast (low-latency, drop-on-overload)")
+		directRelay := true
+		if v := os.Getenv("HOSTIT_UDP_DIRECT_RELAY"); strings.TrimSpace(v) != "" {
+			lv := strings.ToLower(strings.TrimSpace(v))
+			if lv == "0" || lv == "false" || lv == "no" || lv == "off" {
+				directRelay = false
+			}
+		}
+		if directRelay {
+			log.Info(logging.CatUDP, "UDP relay mode: direct (immediate receive->send, minimal queueing)")
+		} else {
+			log.Info(logging.CatUDP, "UDP relay mode: queued (async writers + burst absorption)")
+		}
 
 		uc, ok := c.(*net.UDPConn)
 		if !ok {
@@ -311,21 +358,59 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				queueCapacity = q
 			}
 		}
-		maxQueueLatencyMs := envIntBound("HOSTIT_UDP_MAX_QUEUE_LATENCY_MS", 30, 5, 500)
-		highWaterPct := envIntBound("HOSTIT_UDP_HIGH_WATER_PCT", 75, 50, 98)
+		maxQueueLatencyMs := envIntBound("HOSTIT_UDP_MAX_QUEUE_LATENCY_MS", 0, 0, 5000)
+		highWaterPct := envIntBound("HOSTIT_UDP_HIGH_WATER_PCT", 90, 50, 98)
 		baseBudget := time.Duration(maxQueueLatencyMs) * time.Millisecond
 		tightBudget := baseBudget / 2
-		if tightBudget < 5*time.Millisecond {
+		if baseBudget > 0 && tightBudget < 5*time.Millisecond {
 			tightBudget = 5 * time.Millisecond
 		}
 		writeQueue := newUDPWriteQueue(queueCapacity, stats)
+		enqueueWait := time.Duration(envIntBound("HOSTIT_UDP_ENQUEUE_WAIT_US", 20000, 0, 50000)) * time.Microsecond
+		maxPayload := envIntBound("HOSTIT_UDP_MAX_PAYLOAD", 1400, 0, 65507)
+		seqToServer := &udputil.SequenceCounter{}
+		if maxPayload > 0 {
+			log.Infof(logging.CatUDP, "UDP max payload cap enabled (agent->server): %d bytes", maxPayload)
+		} else {
+			log.Warn(logging.CatUDP, "UDP max payload cap disabled (agent->server); large packets may fragment and drop")
+		}
+
+		// Precompute UDP route local targets and resolved addresses to avoid per-packet
+		// localTargetFromPublicAddr parsing and DNS/address resolution on the hot path.
+		type udpRouteTarget struct {
+			localTarget string
+			raddr       *net.UDPAddr
+		}
+		udpTargets := map[string]udpRouteTarget{}
+		for name, rt := range routesByName {
+			if !routeHasUDP(rt.Proto) {
+				continue
+			}
+			localTarget, ok := localTargetFromPublicAddr(rt.PublicAddr)
+			if !ok {
+				log.Warnf(logging.CatUDP, "UDP route target parse failed route=%s public=%q", name, rt.PublicAddr)
+				continue
+			}
+			raddr, err := net.ResolveUDPAddr("udp", localTarget)
+			if err != nil {
+				log.Warnf(logging.CatUDP, "UDP route target resolve failed route=%s target=%s: %v", name, localTarget, err)
+				continue
+			}
+			udpTargets[name] = udpRouteTarget{localTarget: localTarget, raddr: raddr}
+		}
 
 		// Register so the server learns our UDP address.
 		ks := sec.Get()
 		if ks.Enabled() {
-			_, _ = uc.Write(udputil.EncodeRegEnc2(ks, token))
+			if _, err := uc.Write(udputil.EncodeRegEnc2(ks, token)); err != nil {
+				stats.RecordLoss(1)
+				log.Warnf(logging.CatUDP, "UDP register write failed (enc): %v", err)
+			}
 		} else {
-			_, _ = uc.Write(udputil.EncodeReg(token))
+			if _, err := uc.Write(udputil.EncodeReg(token)); err != nil {
+				stats.RecordLoss(1)
+				log.Warnf(logging.CatUDP, "UDP register write failed: %v", err)
+			}
 		}
 
 		// Keepalive: some NATs expire UDP mappings quickly (often ~10-30s) when idle
@@ -344,9 +429,15 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				case <-t.C:
 					ks := sec.Get()
 					if ks.Enabled() {
-						_, _ = uc.Write(udputil.EncodeRegEnc2(ks, token))
+						if _, err := uc.Write(udputil.EncodeRegEnc2(ks, token)); err != nil {
+							stats.RecordLoss(1)
+							log.Warnf(logging.CatUDP, "UDP keepalive write failed (enc): %v", err)
+						}
 					} else {
-						_, _ = uc.Write(udputil.EncodeReg(token))
+						if _, err := uc.Write(udputil.EncodeReg(token)); err != nil {
+							stats.RecordLoss(1)
+							log.Warnf(logging.CatUDP, "UDP keepalive write failed: %v", err)
+						}
 					}
 				}
 			}
@@ -359,72 +450,79 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		sessionsMu := sync.RWMutex{}
 		sessions := map[string]map[string]*udpSession{} // route -> client -> session
 
-		// Multiple writer goroutines reduce single-writer bottleneck under heavy load.
-		writerWorkers := runtimeNumCPU()
-		if writerWorkers < 2 {
-			writerWorkers = 2
-		}
-		if writerWorkers > 16 {
-			writerWorkers = 16
-		}
-		if nStr := os.Getenv("HOSTIT_UDP_WRITE_WORKERS"); nStr != "" {
-			if n, err := strconv.Atoi(nStr); err == nil && n >= 1 && n <= 32 {
-				writerWorkers = n
-			}
-		}
 		var writerWg sync.WaitGroup
-		writerWg.Add(writerWorkers)
-		for i := 0; i < writerWorkers; i++ {
-			go func() {
-				defer writerWg.Done()
-				for {
-					pkt, ok := writeQueue.Dequeue(connCtx)
-					if !ok {
-						return
-					}
-					if !pkt.enqueue.IsZero() {
-						budget := adaptiveBudget(baseBudget, tightBudget, writeQueue.Depth(), writeQueue.Capacity(), highWaterPct)
-						if time.Since(pkt.enqueue) > budget {
-							stats.RecordLoss(1)
-							if pkt.bufPtr != nil {
-								udputil.PutOutputBuffer(pkt.bufPtr)
+		if !directRelay {
+			// Multiple writer goroutines reduce single-writer bottleneck under heavy load.
+			writerWorkers := runtimeNumCPU()
+			if writerWorkers < 2 {
+				writerWorkers = 2
+			}
+			if writerWorkers > 64 {
+				writerWorkers = 64
+			}
+			if nStr := os.Getenv("HOSTIT_UDP_WRITE_WORKERS"); nStr != "" {
+				if n, err := strconv.Atoi(nStr); err == nil && n >= 1 && n <= 128 {
+					writerWorkers = n
+				}
+			}
+			writerWg.Add(writerWorkers)
+			for i := 0; i < writerWorkers; i++ {
+				go func() {
+					defer writerWg.Done()
+					for {
+						pkt, ok := writeQueue.Dequeue(connCtx)
+						if !ok {
+							return
+						}
+						if !pkt.enqueue.IsZero() {
+							budget := adaptiveBudget(baseBudget, tightBudget, writeQueue.Depth(), writeQueue.Capacity(), highWaterPct)
+							if budget > 0 && time.Since(pkt.enqueue) > budget {
+								stats.RecordLoss(1)
+								if pkt.bufPtr != nil {
+									udputil.PutOutputBuffer(pkt.bufPtr)
+								}
+								continue
 							}
-							continue
+						}
+						if _, err := uc.Write(pkt.data); err != nil {
+							if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
+								_, err = uc.Write(pkt.data)
+							}
+							if err != nil {
+								stats.RecordLoss(1)
+							}
+						} else {
+							stats.RecordSend(len(pkt.data))
+						}
+						if pkt.bufPtr != nil {
+							udputil.PutOutputBuffer(pkt.bufPtr)
 						}
 					}
-					if _, err := uc.Write(pkt.data); err != nil {
-						stats.RecordLoss(1)
-					} else {
-						stats.RecordSend(len(pkt.data))
-					}
-					if pkt.bufPtr != nil {
-						udputil.PutOutputBuffer(pkt.bufPtr)
+				}()
+			}
+
+			// Queue depth monitor - logs warnings when queue is getting full
+			go func() {
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-connCtx.Done():
+						return
+					case <-ticker.C:
+						depth := writeQueue.Depth()
+						capacity := writeQueue.Capacity()
+						pct := float64(depth) / float64(capacity) * 100
+						if pct > 80 {
+							log.Warnf(logging.CatUDP, "UDP write queue high: %d/%d (%.1f%%), avg latency=%v",
+								depth, capacity, pct, writeQueue.AvgLatency())
+						}
 					}
 				}
 			}()
 		}
 
-		// Queue depth monitor - logs warnings when queue is getting full
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-connCtx.Done():
-					return
-				case <-ticker.C:
-					depth := writeQueue.Depth()
-					capacity := writeQueue.Capacity()
-					pct := float64(depth) / float64(capacity) * 100
-					if pct > 80 {
-						log.Warnf(logging.CatUDP, "UDP write queue high: %d/%d (%.1f%%), avg latency=%v",
-							depth, capacity, pct, writeQueue.AvgLatency())
-					}
-				}
-			}
-		}()
-
-		getOrCreate := func(routeName, clientAddr, localTarget string) (*udpSession, bool) {
+		getOrCreate := func(routeName, clientAddr string, target udpRouteTarget) (*udpSession, bool) {
 			// RLock fast-path: most packets go to existing sessions.
 			sessionsMu.RLock()
 			if m := sessions[routeName]; m != nil {
@@ -443,22 +541,16 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				sessions[routeName] = m
 			}
 			if s := m[clientAddr]; s != nil {
+				// Another goroutine created the session first.
 				sessionsMu.Unlock()
 				return s, true
 			}
 
-			raddr, err := net.ResolveUDPAddr("udp", localTarget)
-			if err != nil {
-				sessionsMu.Unlock()
-				log.Warnf(logging.CatUDP, "UDP resolve failed route=%s client=%s target=%s: %v", routeName, clientAddr, localTarget, err)
-				stats.RecordLoss(1)
-				return nil, false
-			}
 			lc := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-			lconn, err := net.DialUDP("udp", lc, raddr)
+			lconn, err := net.DialUDP("udp", lc, target.raddr)
 			if err != nil {
 				sessionsMu.Unlock()
-				log.Warnf(logging.CatUDP, "UDP local dial failed route=%s target=%s: %v", routeName, localTarget, err)
+				log.Warnf(logging.CatUDP, "UDP local dial failed route=%s target=%s: %v", routeName, target.localTarget, err)
 				stats.RecordLoss(1)
 				return nil, false
 			}
@@ -467,7 +559,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			s := &udpSession{conn: lconn, route: routeName, client: clientAddr}
 			m[clientAddr] = s
 			sessionsMu.Unlock()
-			log.Debugf(logging.CatUDP, "new UDP session route=%s client=%s target=%s", routeName, clientAddr, localTarget)
+			log.Debugf(logging.CatUDP, "new UDP session route=%s client=%s target=%s", routeName, clientAddr, target.localTarget)
 
 			go func() {
 				localBufPtr := udpBufPool.Get().(*[]byte)
@@ -478,19 +570,17 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				cachedKS := sec.Get()
 				pktCount := 0
 
-				// Use a timer-based idle timeout instead of SetReadDeadline per
-				// packet. This eliminates 2 syscalls (time.Now + setsockopt) on
-				// every read in the hot path. The timer resets after each packet.
-				idleTimer := time.NewTimer(idle)
-				defer idleTimer.Stop()
-
 				// Track last activity for race-free shutdown
 				lastActivity := time.Now()
 				const shutdownGracePeriod = 100 * time.Millisecond
 
 				for {
+					_ = lconn.SetReadDeadline(time.Now().Add(idle))
 					n, err := lconn.Read(localBuf)
 					if err != nil {
+						if ne, ok := err.(net.Error); ok && ne.Timeout() {
+							break
+						}
 						break
 					}
 
@@ -504,15 +594,6 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 
 					lastActivity = time.Now()
 
-					// Reset idle timer with proper drain to avoid race
-					if !idleTimer.Stop() {
-						select {
-						case <-idleTimer.C:
-						default:
-						}
-					}
-					idleTimer.Reset(idle)
-
 					// Refresh KeySet every ~1000 packets to pick up rotations without per-packet RLock.
 					pktCount++
 					if pktCount >= 1000 {
@@ -523,14 +604,35 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 					// Use pooled encoding for zero-allocation encryption
 					var encoded []byte
 					var bufPtr *[]byte
+					if maxPayload > 0 && n > maxPayload {
+						stats.RecordLoss(1)
+						continue
+					}
+					seq := seqToServer.Next()
 					if cachedKS.Enabled() {
-						encoded, bufPtr = udputil.EncodeDataEnc2Pooled(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n])
+						encoded, bufPtr = udputil.EncodeDataEnc2PooledWithSeq(cachedKS, cachedKS.CurID, seq, routeName, clientAddr, localBuf[:n])
 					} else {
-						encoded, bufPtr = udputil.EncodeDataPooled(routeName, clientAddr, localBuf[:n])
+						encoded = udputil.EncodeDataWithSeq(seq, routeName, clientAddr, localBuf[:n])
 					}
 
-					if !writeQueue.TryEnqueue(encoded, bufPtr) {
-						stats.RecordLoss(1)
+					if directRelay {
+						if _, err := uc.Write(encoded); err != nil {
+							if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
+								_, err = uc.Write(encoded)
+							}
+							if err != nil {
+								stats.RecordLoss(1)
+							}
+						} else {
+							stats.RecordSend(len(encoded))
+						}
+						if bufPtr != nil {
+							udputil.PutOutputBuffer(bufPtr)
+						}
+					} else {
+						if !writeQueue.EnqueueWithTimeout(encoded, bufPtr, enqueueWait) {
+							stats.RecordLoss(1)
+						}
 					}
 				}
 
@@ -622,10 +724,23 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 						continue
 					}
 
-					// Fast path: never block readers; drop if workers are saturated.
+					job := inJob{data: buf, len: n, bufPtr: bufPtr, pool: localBufPool, enq: time.Now()}
+					enqueued := false
 					select {
-					case inJobs <- inJob{data: buf, len: n, bufPtr: bufPtr, pool: localBufPool, enq: time.Now()}:
+					case inJobs <- job:
+						enqueued = true
 					default:
+						if enqueueWait > 0 {
+							t := time.NewTimer(enqueueWait)
+							select {
+							case inJobs <- job:
+								enqueued = true
+							case <-t.C:
+							}
+							t.Stop()
+						}
+					}
+					if !enqueued {
 						stats.RecordLoss(1)
 						localBufPool.Put(bufPtr)
 					}
@@ -644,7 +759,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				for job := range inJobs {
 					if !job.enq.IsZero() {
 						budget := adaptiveBudget(baseBudget, tightBudget, len(inJobs), cap(inJobs), highWaterPct)
-						if time.Since(job.enq) > budget {
+						if budget > 0 && time.Since(job.enq) > budget {
 							stats.RecordLoss(1)
 							if job.bufPtr != nil && job.pool != nil {
 								job.pool.Put(job.bufPtr)
@@ -665,7 +780,11 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 						ok         bool
 					)
 					if cachedKS.Enabled() {
-						routeName, clientAddr, payload, _, ok = udputil.DecodeDataEnc2(cachedKS, pkt)
+						if len(pkt) > 0 && pkt[0] == udputil.MsgDataEnc2Seq {
+							_, routeName, clientAddr, payload, _, ok = udputil.DecodeDataEnc2WithSeq(cachedKS, pkt)
+						} else {
+							routeName, clientAddr, payload, _, ok = udputil.DecodeDataEnc2(cachedKS, pkt)
+						}
 						if !ok {
 							stats.RecordLoss(1)
 							if job.bufPtr != nil && job.pool != nil {
@@ -674,7 +793,11 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 							continue
 						}
 					} else {
-						routeName, clientAddr, payload, ok = udputil.DecodeData(pkt)
+						if len(pkt) > 0 && pkt[0] == udputil.MsgDataSeq {
+							_, routeName, clientAddr, payload, ok = udputil.DecodeDataWithSeq(pkt)
+						} else {
+							routeName, clientAddr, payload, ok = udputil.DecodeData(pkt)
+						}
 						if !ok {
 							stats.RecordLoss(1)
 							if job.bufPtr != nil && job.pool != nil {
@@ -683,8 +806,8 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 							continue
 						}
 					}
-					rt, ok := routesByName[routeName]
-					if !ok || !routeHasUDP(rt.Proto) {
+					target, ok := udpTargets[routeName]
+					if !ok {
 						stats.RecordLoss(1)
 						log.Debugf(logging.CatUDP, "UDP packet dropped: unknown route=%s", routeName)
 						if job.bufPtr != nil && job.pool != nil {
@@ -692,15 +815,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 						}
 						continue
 					}
-					localTarget, ok := localTargetFromPublicAddr(rt.PublicAddr)
-					if !ok {
-						stats.RecordLoss(1)
-						if job.bufPtr != nil && job.pool != nil {
-							job.pool.Put(job.bufPtr)
-						}
-						continue
-					}
-					s, ok := getOrCreate(routeName, clientAddr, localTarget)
+					s, ok := getOrCreate(routeName, clientAddr, target)
 					if !ok || s == nil {
 						stats.RecordLoss(1)
 						if job.bufPtr != nil && job.pool != nil {
@@ -731,8 +846,10 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		close(inJobs)
 		inWg.Wait()
 
-		close(writeQueue.queue)
-		writerWg.Wait()
+		if !directRelay {
+			close(writeQueue.queue)
+			writerWg.Wait()
+		}
 
 		close(kaDone)
 		log.Info(logging.CatUDP, "UDP connection closed, reconnecting...")
