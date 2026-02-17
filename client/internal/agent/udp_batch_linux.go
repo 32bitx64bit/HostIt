@@ -35,6 +35,18 @@ type sockaddrInet6 struct {
 	Scope_id uint32
 }
 
+// sendmmsgBatch sends multiple packets in a single syscall on Linux.
+// This is a convenience wrapper for connected sockets (no per-packet addresses needed).
+// Returns the number of packets successfully sent and any error.
+func sendmmsgBatch(conn *net.UDPConn, packets [][]byte) (int, error) {
+	if len(packets) == 0 {
+		return 0, nil
+	}
+	// For connected sockets, use nil addresses
+	addrs := make([]*net.UDPAddr, len(packets))
+	return sendmmsg(conn, packets, addrs)
+}
+
 // sendmmsg sends multiple packets in a single syscall on Linux.
 // This reduces syscall overhead for high-throughput UDP scenarios.
 // Returns the number of packets successfully sent and any error.
@@ -55,20 +67,26 @@ func sendmmsg(conn *net.UDPConn, packets [][]byte, addrs []*net.UDPAddr) (int, e
 	var sendErr error
 
 	err = raw.Control(func(fd uintptr) {
-		// Prepare mmsghdr structures
 		msgs := make([]mmsghdr, len(packets))
 		iovecs := make([]unix.Iovec, len(packets))
-		var sa4s []sockaddrInet4
-		var sa6s []sockaddrInet6
+		// Pre-allocate sockaddr slices with full capacity to prevent
+		// reallocation during append. Without this, append may create a
+		// new backing array, making all previous unsafe.Pointer refs in
+		// msgs[j].Hdr.Name dangling — the kernel would send to garbage
+		// addresses silently.
+		sa4s := make([]sockaddrInet4, 0, len(packets))
+		sa6s := make([]sockaddrInet6, 0, len(packets))
 
 		for i, pkt := range packets {
-			// Set up iovec
+			// Guard against zero-length packets — &pkt[0] panics on empty slice
+			if len(pkt) == 0 {
+				continue
+			}
 			iovecs[i] = unix.Iovec{
 				Base: &pkt[0],
 				Len:  uint64(len(pkt)),
 			}
 
-			// Set up sockaddr
 			addr := addrs[i]
 			if addr == nil {
 				// No address - use connected socket
@@ -78,7 +96,6 @@ func sendmmsg(conn *net.UDPConn, packets [][]byte, addrs []*net.UDPAddr) (int, e
 			}
 
 			if len(addr.IP) == net.IPv4len || addr.IP.To4() != nil {
-				// IPv4
 				var sa4 sockaddrInet4
 				sa4.Family = unix.AF_INET
 				sa4.Port = binary.BigEndian.Uint16([]byte{byte(addr.Port >> 8), byte(addr.Port)})
@@ -87,7 +104,6 @@ func sendmmsg(conn *net.UDPConn, packets [][]byte, addrs []*net.UDPAddr) (int, e
 				msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&sa4s[len(sa4s)-1]))
 				msgs[i].Hdr.Namelen = uint32(unsafe.Sizeof(sa4))
 			} else {
-				// IPv6
 				var sa6 sockaddrInet6
 				sa6.Family = unix.AF_INET6
 				sa6.Port = binary.BigEndian.Uint16([]byte{byte(addr.Port >> 8), byte(addr.Port)})
@@ -110,11 +126,11 @@ func sendmmsg(conn *net.UDPConn, packets [][]byte, addrs []*net.UDPAddr) (int, e
 			0, 0,
 		)
 
+		sent = int(n)
 		if errno != 0 {
 			sendErr = errno
 			return
 		}
-		sent = int(n)
 	})
 
 	if err != nil {

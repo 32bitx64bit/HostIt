@@ -23,16 +23,16 @@ echo "  wmem_default: $(sysctl -n net.core.wmem_default) bytes"
 echo ""
 
 # Recommended values for high-bandwidth streaming (6+ ports)
-RMEM_MAX=16777216      # 16 MB
-WMEM_MAX=16777216      # 16 MB
-RMEM_DEFAULT=8388608   # 8 MB
-WMEM_DEFAULT=8388608   # 8 MB
+RMEM_MAX=67108864       # 64 MB
+WMEM_MAX=67108864       # 64 MB
+RMEM_DEFAULT=33554432   # 32 MB
+WMEM_DEFAULT=33554432   # 32 MB
 
 echo "Applying recommended settings for high-load scenarios..."
-echo "  rmem_max: $RMEM_MAX bytes (16 MB)"
-echo "  wmem_max: $WMEM_MAX bytes (16 MB)"
-echo "  rmem_default: $RMEM_DEFAULT bytes (8 MB)"
-echo "  wmem_default: $WMEM_DEFAULT bytes (8 MB)"
+echo "  rmem_max: $RMEM_MAX bytes (64 MB)"
+echo "  wmem_max: $WMEM_MAX bytes (64 MB)"
+echo "  rmem_default: $RMEM_DEFAULT bytes (32 MB)"
+echo "  wmem_default: $WMEM_DEFAULT bytes (32 MB)"
 echo ""
 
 # Apply settings
@@ -42,7 +42,7 @@ sysctl -w net.core.rmem_default=$RMEM_DEFAULT
 sysctl -w net.core.wmem_default=$WMEM_DEFAULT
 
 # Additional UDP memory settings
-sysctl -w net.ipv4.udp_mem="65536 131072 262144"
+sysctl -w net.ipv4.udp_mem="262144 524288 1048576"
 
 # Make persistent across reboots
 SYSCTL_FILE="/etc/sysctl.d/99-hostit-udp.conf"
@@ -63,7 +63,7 @@ net.core.rmem_default = $RMEM_DEFAULT
 net.core.wmem_default = $WMEM_DEFAULT
 
 # UDP memory limits (min, pressure, max) in pages
-net.ipv4.udp_mem = 65536 131072 262144
+net.ipv4.udp_mem = 262144 524288 1048576
 EOF
 
 echo "Settings applied and persisted to $SYSCTL_FILE"
@@ -87,7 +87,7 @@ echo ""
 echo "2. Restart the server and agent services"
 echo ""
 echo "3. Monitor logs for buffer size confirmation:"
-echo "   Look for: 'UDP buffers [server]: read=X write=Y (requested 8388608)'"
+echo "   Look for: 'UDP buffers [server]: read=X write=Y (requested 67108864)'"
 echo ""
 echo "4. Monitor queue drops:"
 echo "   Look for: 'UDP agent queue drops' or 'UDP public queue drops'"

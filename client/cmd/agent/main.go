@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"html/template"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -493,6 +494,47 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.WriteHeader(http.StatusAccepted)
 	})
+	mux.HandleFunc("/api/update/apply-local", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 512<<20)
+		if err := r.ParseMultipartForm(512 << 20); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		componentZipPath, hasComponent, err := writeUploadedZipTemp(r, "componentZip", "hostit-client-component-*.zip")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !hasComponent {
+			http.Error(w, "component zip is required", http.StatusBadRequest)
+			return
+		}
+		defer os.Remove(componentZipPath)
+
+		sharedZipPath, hasShared, err := writeUploadedZipTemp(r, "sharedZip", "hostit-client-shared-*.zip")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if hasShared {
+			defer os.Remove(sharedZipPath)
+		}
+
+		started, err := upd.ApplyLocal(r.Context(), componentZipPath, sharedZipPath)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !started {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
 
 	// Service controls
 	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
@@ -676,6 +718,33 @@ func detectModuleDir(configPath string) string {
 func fileExists(p string) bool {
 	st, err := os.Stat(p)
 	return err == nil && !st.IsDir()
+}
+
+func writeUploadedZipTemp(r *http.Request, fieldName string, pattern string) (string, bool, error) {
+	f, _, err := r.FormFile(fieldName)
+	if err != nil {
+		if err == http.ErrMissingFile {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	defer f.Close()
+
+	tmp, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", false, err
+	}
+	name := tmp.Name()
+	if _, err := io.Copy(tmp, f); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return "", false, err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", false, err
+	}
+	return name, true, nil
 }
 
 const agentHomeHTML = `<!doctype html>
@@ -1008,6 +1077,17 @@ const agentControlsHTML = `<!doctype html>
 						<button class="btn sm" id="checkNowBtn">Check now</button>
 						<button class="btn sm primary" id="applyBtn" disabled>Update</button>
 					</div>
+					<div style="margin-top:10px">
+						<div class="muted" style="font-size:12px;margin-bottom:6px">Local update (.zip)</div>
+						<div class="grid2" style="gap:8px">
+							<input type="file" id="localComponentZip" accept=".zip" />
+							<input type="file" id="localSharedZip" accept=".zip" />
+						</div>
+						<div class="muted" style="font-size:11px;margin-top:4px">Left: client.zip (required), right: shared.zip (optional).</div>
+						<div class="flex" style="margin-top:8px">
+							<button class="btn sm" id="applyLocalBtn">Apply local update</button>
+						</div>
+					</div>
 					<pre id="updateLog" style="display:none"></pre>
 				</div>
 			</div>
@@ -1057,6 +1137,19 @@ const agentControlsHTML = `<!doctype html>
 		document.getElementById('updateState').textContent='Updating…';
 		await refreshUpd();
 	}
+	async function applyLocalUpd(){
+		var comp=document.getElementById('localComponentZip');
+		var shared=document.getElementById('localSharedZip');
+		if(!comp||!comp.files||!comp.files.length){document.getElementById('updateState').textContent='Pick client.zip first';return;}
+		var fd=new FormData();
+		fd.append('componentZip', comp.files[0]);
+		if(shared&&shared.files&&shared.files.length){fd.append('sharedZip', shared.files[0]);}
+		document.getElementById('updateState').textContent='Uploading…';
+		var r=await fetch('/api/update/apply-local',{method:'POST',body:fd});
+		if(!r.ok){try{var t=await r.text();document.getElementById('updateState').textContent='Failed: '+t;}catch(e){document.getElementById('updateState').textContent='Failed';}return;}
+		document.getElementById('updateState').textContent='Updating…';
+		await refreshUpd();
+	}
 	function setSys(st){
 		if(!st)return;
 		document.getElementById('systemdState').textContent=st.available?(st.active||'unknown'):'unavailable';
@@ -1072,6 +1165,7 @@ const agentControlsHTML = `<!doctype html>
 	}
 	document.getElementById('checkNowBtn').onclick=checkNow;
 	document.getElementById('applyBtn').onclick=applyUpd;
+	document.getElementById('applyLocalBtn').onclick=applyLocalUpd;
 	document.getElementById('svcRestartBtn').onclick=function(){sysAction('/api/systemd/restart','Restarting…');};
 	document.getElementById('svcStopBtn').onclick=function(){sysAction('/api/systemd/stop','Stopping…');};
 	document.getElementById('procRestart').onclick=async function(){

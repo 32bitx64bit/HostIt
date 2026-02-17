@@ -6,6 +6,23 @@ import (
 	"net"
 )
 
+// sendmmsgBatch sends multiple packets, falling back to individual sends on non-Linux.
+// Returns the number of packets successfully sent and any error.
+func sendmmsgBatch(conn *net.UDPConn, packets [][]byte) (int, error) {
+	if len(packets) == 0 {
+		return 0, nil
+	}
+	sent := 0
+	for _, pkt := range packets {
+		_, err := conn.Write(pkt)
+		if err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
+}
+
 // sendmmsg is a stub for non-Linux platforms that falls back to individual sends.
 // Returns the number of packets successfully sent and any error.
 func sendmmsg(conn *net.UDPConn, packets [][]byte, addrs []*net.UDPAddr) (int, error) {

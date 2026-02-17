@@ -437,6 +437,39 @@ func EncodeData(route string, client string, payload []byte) []byte {
 	return b
 }
 
+// EncodeDataPooled encodes a data packet (plaintext) using the output pool.
+// Returns the encoded packet and a buffer pointer that MUST be returned via
+// PutOutputBuffer after the packet is sent.
+func EncodeDataPooled(route string, client string, payload []byte) ([]byte, *[]byte) {
+	rb := route
+	if len(rb) > 255 {
+		rb = rb[:255]
+	}
+	cb := client
+	if len(cb) > 65535 {
+		cb = cb[:65535]
+	}
+	total := 1 + 1 + len(rb) + 2 + len(cb) + len(payload)
+	outBufPtr := outPool.Get().(*[]byte)
+	outBuf := *outBufPtr
+	if cap(outBuf) < total {
+		outBuf = make([]byte, total)
+	}
+	outBuf = outBuf[:total]
+	outBuf[0] = MsgData
+	outBuf[1] = byte(len(rb))
+	o := 2
+	copy(outBuf[o:], rb)
+	o += len(rb)
+	binary.BigEndian.PutUint16(outBuf[o:o+2], uint16(len(cb)))
+	o += 2
+	copy(outBuf[o:], cb)
+	o += len(cb)
+	copy(outBuf[o:], payload)
+	*outBufPtr = outBuf
+	return outBuf, outBufPtr
+}
+
 // DecodeData decodes a data packet.
 func DecodeData(b []byte) (route string, client string, payload []byte, ok bool) {
 	if len(b) < 1+1+2 || b[0] != MsgData {

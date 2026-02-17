@@ -95,6 +95,84 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 	return nil
 }
 
+// ApplyZipFileUpdate applies an update from a local zip file path.
+func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, logw io.Writer) error {
+	if strings.TrimSpace(zipPath) == "" {
+		return errors.New("missing zip path")
+	}
+	if strings.TrimSpace(opts.ModuleDir) == "" {
+		return errors.New("missing module dir")
+	}
+	moduleDir, err := filepath.Abs(opts.ModuleDir)
+	if err != nil {
+		return err
+	}
+	zipPath, err = filepath.Abs(strings.TrimSpace(zipPath))
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(zipPath); err != nil {
+		return err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "hostit-update-local-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	_, _ = fmt.Fprintf(logw, "Using local zip: %s\n", zipPath)
+
+	extractDir := filepath.Join(tmpDir, "unzipped")
+	if err := unzip(zipPath, extractDir); err != nil {
+		return err
+	}
+
+	srcRoot, err := pickSourceRoot(extractDir, opts.ExpectedFolder)
+	if err != nil {
+		return err
+	}
+
+	sharedDest := strings.TrimSpace(opts.SharedDestDir)
+	if sharedDest != "" {
+		if p, err := filepath.Abs(sharedDest); err == nil {
+			sharedDest = p
+		}
+		sharedSrc, err := pickSharedRoot(extractDir)
+		if err != nil {
+			_, _ = fmt.Fprintf(logw, "Shared source not found in zip (continuing): %v\n", err)
+		} else {
+			_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDest)
+			if err := syncDir(sharedSrc, sharedDest, nil, logw); err != nil {
+				return err
+			}
+		}
+	}
+
+	_, _ = fmt.Fprintf(logw, "Extracted source: %s\n", srcRoot)
+	_, _ = fmt.Fprintf(logw, "Applying into: %s\n", moduleDir)
+
+	preserve := make([]string, 0, 1+len(opts.PreservePaths))
+	if strings.TrimSpace(opts.PreservePath) != "" {
+		preserve = append(preserve, opts.PreservePath)
+	}
+	for _, p := range opts.PreservePaths {
+		if strings.TrimSpace(p) != "" {
+			preserve = append(preserve, p)
+		}
+	}
+
+	if err := syncDir(srcRoot, moduleDir, preserve, logw); err != nil {
+		return err
+	}
+
+	if err := runBuild(ctx, moduleDir, logw); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // ApplySharedZipUpdate downloads a zip asset that contains the shared module (shared/go.mod)
 // and syncs it into sharedDestDir. It does not run build scripts.
 func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir string, logw io.Writer) error {
@@ -122,6 +200,52 @@ func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir st
 	if err := downloadToFile(ctx, assetURL, zipPath, logw); err != nil {
 		return err
 	}
+
+	extractDir := filepath.Join(tmpDir, "unzipped")
+	if err := unzip(zipPath, extractDir); err != nil {
+		return err
+	}
+
+	sharedSrc, err := pickSharedRoot(extractDir)
+	if err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(logw, "Extracted shared: %s\n", sharedSrc)
+	_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDestDir)
+	return syncDir(sharedSrc, sharedDestDir, nil, logw)
+}
+
+// ApplySharedZipFileUpdate applies shared module files from a local zip path.
+func ApplySharedZipFileUpdate(zipPath string, sharedDestDir string, logw io.Writer) error {
+	if strings.TrimSpace(zipPath) == "" {
+		return errors.New("missing zip path")
+	}
+	if strings.TrimSpace(sharedDestDir) == "" {
+		return errors.New("missing shared dest dir")
+	}
+	sharedDestDir, err := filepath.Abs(sharedDestDir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(sharedDestDir, 0o755); err != nil {
+		return err
+	}
+	zipPath, err = filepath.Abs(strings.TrimSpace(zipPath))
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(zipPath); err != nil {
+		return err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "hostit-update-local-shared-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	_, _ = fmt.Fprintf(logw, "Using local shared zip: %s\n", zipPath)
 
 	extractDir := filepath.Join(tmpDir, "unzipped")
 	if err := unzip(zipPath, extractDir); err != nil {

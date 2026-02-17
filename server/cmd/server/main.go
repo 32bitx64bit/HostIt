@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -615,6 +616,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"bytesTotal":     snap.BytesTotal,
 				"series":         snap.Series,
 				"routes":         outRoutes,
+				"systemEvents":   snap.Routes["_system"].Events,
 				"err": func() string {
 					if err == nil {
 						return ""
@@ -757,6 +759,52 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			started, err := upd.Apply(r.Context())
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !started {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+		})))
+		mux.HandleFunc("/api/update/apply-local", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 512<<20)
+			if err := r.ParseMultipartForm(512 << 20); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+
+			componentZipPath, hasComponent, err := writeUploadedZipTemp(r, "componentZip", "hostit-server-component-*.zip")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !hasComponent {
+				http.Error(w, "component zip is required", http.StatusBadRequest)
+				return
+			}
+			defer os.Remove(componentZipPath)
+
+			sharedZipPath, hasShared, err := writeUploadedZipTemp(r, "sharedZip", "hostit-server-shared-*.zip")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if hasShared {
+				defer os.Remove(sharedZipPath)
+			}
+
+			started, err := upd.ApplyLocal(r.Context(), componentZipPath, sharedZipPath)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -1294,6 +1342,33 @@ func fileExists(p string) bool {
 	return err == nil && !st.IsDir()
 }
 
+func writeUploadedZipTemp(r *http.Request, fieldName string, pattern string) (string, bool, error) {
+	f, _, err := r.FormFile(fieldName)
+	if err != nil {
+		if err == http.ErrMissingFile {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	defer f.Close()
+
+	tmp, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", false, err
+	}
+	name := tmp.Name()
+	if _, err := io.Copy(tmp, f); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return "", false, err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", false, err
+	}
+	return name, true, nil
+}
+
 func effectiveServerRoutes(cfg tunnel.ServerConfig) []tunnel.RouteConfig {
 	return cfg.Routes
 }
@@ -1556,6 +1631,20 @@ const serverStatsHTML = `<!doctype html>
       </div>
     </div>
 
+		<div class="secHead">
+			<h2>Transport Logs</h2>
+		</div>
+		<div class="grid2">
+			<div class="card">
+				<div class="small" style="margin-bottom:6px"><b>UDP (Global)</b></div>
+				<div id="udpGlobalLog" class="routeConsole">No UDP events yet.</div>
+			</div>
+			<div class="card">
+				<div class="small" style="margin-bottom:6px"><b>TCP (Global)</b></div>
+				<div id="tcpGlobalLog" class="routeConsole">No TCP events yet.</div>
+			</div>
+		</div>
+
     <div class="secHead">
       <h2>Routes</h2>
       <div class="liveIndicator"><span class="dot"></span><span id="liveText">Updating…</span></div>
@@ -1576,6 +1665,11 @@ const serverStatsHTML = `<!doctype html>
           <span class="routeActive"><span data-route-active>0</span> active</span>
         </summary>
         <div style="margin-top: 10px">
+					<div class="small" style="margin-bottom:4px"><b>Packet Loss</b></div>
+					<div data-route-loss-console class="routeConsole">No packet loss events yet.</div>
+				</div>
+				<div style="margin-top: 10px">
+					<div class="small" style="margin-bottom:4px"><b>Route Events</b></div>
           <div data-route-console class="routeConsole">No events yet.</div>
         </div>
       </details>
@@ -1784,6 +1878,48 @@ const serverStatsHTML = `<!doctype html>
       }
     }
 
+		function isUDPLossKind(kind){
+			kind = String(kind||'').toLowerCase();
+			return kind.indexOf('loss_udp') >= 0;
+		}
+		function isUDPKind(kind){
+			kind = String(kind||'').toLowerCase();
+			return kind.indexOf('udp') >= 0 || kind.indexOf('loss_udp') >= 0;
+		}
+		function isTCPKind(kind){
+			kind = String(kind||'').toLowerCase();
+			if(isUDPKind(kind)) return false;
+			return kind.indexOf('connect')>=0 || kind.indexOf('disconnect')>=0 || kind.indexOf('pair')>=0 || kind.indexOf('reject')>=0 || kind.indexOf('timeout')>=0 || kind.indexOf('error')>=0;
+		}
+		function renderEventList(el, events, emptyText){
+			if(!el) return;
+			events = events||[];
+			if(!events.length){ el.textContent = emptyText; return; }
+			el.innerHTML = '';
+			var start = Math.max(0, events.length-40);
+			for(var i=start;i<events.length;i++){
+				var e = events[i]||{};
+				var ts = e.t ? new Date(e.t*1000).toLocaleTimeString() : '';
+				var parts = [ts, e.kind||''];
+				if(e.route) parts.push('route='+e.route);
+				if(e.ip) parts.push('ip='+e.ip);
+				if(e.id) parts.push('id='+e.id.substring(0,8));
+				if(e.detail) parts.push(e.detail);
+				var row = document.createElement('div');
+				row.className = evClass(e.kind);
+				row.textContent = parts.join('  ');
+				el.appendChild(row);
+			}
+		}
+		function renderRouteLossConsole(el, route){
+			var ev = (route && route.events) ? route.events : [];
+			var loss = [];
+			for(var i=0;i<ev.length;i++){
+				if(isUDPLossKind(ev[i] && ev[i].kind)) loss.push(ev[i]);
+			}
+			renderEventList(el, loss, 'No packet loss events yet.');
+		}
+
     function computeLastBucket(s){ return s&&s.length ? Number(s[s.length-1].bytes||0) : 0; }
 
     function fmtInterval(sec){
@@ -1825,14 +1961,30 @@ const serverStatsHTML = `<!doctype html>
           drawAreaChart('connChart','connTooltip',j.series,connScaleSec,'conns',fmtNum,'rgba(163,113,247,1)');
         }
         var routes = j.routes||[];
+				var systemEvents = j.systemEvents||[];
+				var globalUDP = [];
+				var globalTCP = [];
+				for(var si=0;si<systemEvents.length;si++){
+					var sev = systemEvents[si]||{};
+					if(isUDPKind(sev.kind)) globalUDP.push(sev);
+					else if(isTCPKind(sev.kind)) globalTCP.push(sev);
+				}
         for(var i=0;i<routes.length;i++){
           var rt = routes[i]||{};
+					var evs = rt.events||[];
+					for(var ei=0;ei<evs.length;ei++){
+						var ev = evs[ei]||{};
+						if(isUDPKind(ev.kind)) globalUDP.push(ev);
+						else if(isTCPKind(ev.kind)) globalTCP.push(ev);
+					}
           var det = document.querySelector('details[data-route="'+(rt.name||'')+'"]');
           if(!det) continue;
           var a = det.querySelector('[data-route-active]');
           if(a) a.textContent = String(rt.active==null?0:rt.active);
           var c = det.querySelector('[data-route-console]');
           renderRouteConsole(c, rt);
+					var lc = det.querySelector('[data-route-loss-console]');
+					renderRouteLossConsole(lc, rt);
           // Update enabled/disabled state
           var toggle = det.querySelector('[data-route-toggle]');
           if(toggle){
@@ -1846,6 +1998,10 @@ const serverStatsHTML = `<!doctype html>
             }
           }
         }
+				globalUDP.sort(function(a,b){return Number(a.t||0)-Number(b.t||0);});
+				globalTCP.sort(function(a,b){return Number(a.t||0)-Number(b.t||0);});
+				renderEventList($('udpGlobalLog'), globalUDP, 'No UDP events yet.');
+				renderEventList($('tcpGlobalLog'), globalTCP, 'No TCP events yet.');
       } catch(e){
         if($('liveText')) $('liveText').textContent = 'Offline';
       }
@@ -2287,6 +2443,17 @@ const serverControlsHTML = `<!doctype html>
 						<button class="btn sm" id="checkNowBtn">Check now</button>
 						<button class="btn sm primary" id="applyBtn" disabled>Update</button>
 					</div>
+					<div style="margin-top:10px">
+						<div class="muted" style="font-size:12px;margin-bottom:6px">Local update (.zip)</div>
+						<div class="grid2" style="gap:8px">
+							<input type="file" id="localComponentZip" accept=".zip" />
+							<input type="file" id="localSharedZip" accept=".zip" />
+						</div>
+						<div class="muted" style="font-size:11px;margin-top:4px">Left: server.zip (required), right: shared.zip (optional).</div>
+						<div class="flex" style="margin-top:8px">
+							<button class="btn sm" id="applyLocalBtn">Apply local update</button>
+						</div>
+					</div>
 					<pre id="updateLog" style="display:none"></pre>
 				</div>
 			</div>
@@ -2338,6 +2505,20 @@ const serverControlsHTML = `<!doctype html>
 		document.getElementById('updateState').textContent='Updating…';
 		await refreshUpd();
 	}
+	async function applyLocalUpd(){
+		var comp=document.getElementById('localComponentZip');
+		var shared=document.getElementById('localSharedZip');
+		if(!comp||!comp.files||!comp.files.length){document.getElementById('updateState').textContent='Pick server.zip first';return;}
+		var fd=new FormData();
+		fd.append('csrf',csrf);
+		fd.append('componentZip', comp.files[0]);
+		if(shared&&shared.files&&shared.files.length){fd.append('sharedZip', shared.files[0]);}
+		document.getElementById('updateState').textContent='Uploading…';
+		var r=await fetch('/api/update/apply-local',{method:'POST',body:fd,credentials:'include'});
+		if(!r.ok){try{var t=await r.text();document.getElementById('updateState').textContent='Failed: '+t;}catch(e){document.getElementById('updateState').textContent='Failed';}return;}
+		document.getElementById('updateState').textContent='Updating…';
+		await refreshUpd();
+	}
 	function setSys(st){
 		if(!st)return;
 		document.getElementById('systemdState').textContent=st.available?(st.active||'unknown'):'unavailable';
@@ -2353,6 +2534,7 @@ const serverControlsHTML = `<!doctype html>
 	}
 	document.getElementById('checkNowBtn').onclick=checkNow;
 	document.getElementById('applyBtn').onclick=applyUpd;
+	document.getElementById('applyLocalBtn').onclick=applyLocalUpd;
 	document.getElementById('svcRestartBtn').onclick=function(){sysAction('/api/systemd/restart','Restarting…');};
 	document.getElementById('svcStopBtn').onclick=function(){sysAction('/api/systemd/stop','Stopping…');};
 	document.getElementById('procRestart').onclick=async function(){

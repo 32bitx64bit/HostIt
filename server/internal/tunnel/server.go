@@ -36,6 +36,13 @@ var udpBufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
+// payloadPool pools buffers for forwarding UDP payloads from agent to public clients.
+// Eliminates per-packet make([]byte, len(payload)) allocation in the hot path.
+var payloadPool = sync.Pool{New: func() any {
+	b := make([]byte, 2048) // Most streaming packets fit in 1500 bytes
+	return &b
+}}
+
 // logUDPBuf logs socket buffer sizes and warns if the kernel capped them.
 func logUDPBuf(label string, actualRead, actualWrite, wanted int) {
 	log.Infof(logging.CatUDP, "UDP buffers [%s]: read=%d write=%d (requested %d)", label, actualRead, actualWrite, wanted)
@@ -213,8 +220,9 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 
-	// Use larger buffer sizes for high-throughput scenarios
-	wantBuf := 16 * 1024 * 1024 // 16 MB — increased for high-load streaming
+	// Use larger buffer sizes for high-throughput scenarios.
+	// 64MB gives more burst absorption for high-FPS game streaming.
+	wantBuf := 64 * 1024 * 1024
 	if s.cfg.UDPBufferSize != nil && *s.cfg.UDPBufferSize > 0 {
 		wantBuf = *s.cfg.UDPBufferSize
 	}
@@ -282,6 +290,31 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	st := s.st
+	log.Info(logging.CatUDP, "UDP profile: fast (low-latency, drop-on-overload)")
+	udpWriteWorkers := runtime.NumCPU()
+	if udpWriteWorkers < 2 {
+		udpWriteWorkers = 2
+	}
+	if udpWriteWorkers > 16 {
+		udpWriteWorkers = 16
+	}
+	if nStr := os.Getenv("HOSTIT_UDP_WRITE_WORKERS"); nStr != "" {
+		if n, err := strconv.Atoi(nStr); err == nil && n >= 1 && n <= 32 {
+			udpWriteWorkers = n
+		}
+	}
+	udpWriteQueueSize := 131072
+	if s.cfg.UDPQueueSize != nil && *s.cfg.UDPQueueSize > 0 {
+		udpWriteQueueSize = *s.cfg.UDPQueueSize
+	}
+	maxQueueLatencyMs := envIntBound("HOSTIT_UDP_MAX_QUEUE_LATENCY_MS", 30, 5, 500)
+	highWaterPct := envIntBound("HOSTIT_UDP_HIGH_WATER_PCT", 75, 50, 98)
+	st.udpQueueBaseBudget = time.Duration(maxQueueLatencyMs) * time.Millisecond
+	st.udpQueueTightBudget = st.udpQueueBaseBudget / 2
+	if st.udpQueueTightBudget < 5*time.Millisecond {
+		st.udpQueueTightBudget = 5 * time.Millisecond
+	}
+	st.udpQueueHighWater = highWaterPct
 	st.udpData = udpDataConn
 	for _, x := range publicUDP {
 		st.publicUDP[x.name] = x.pc
@@ -290,15 +323,19 @@ func (s *Server) Run(ctx context.Context) error {
 	// Start async UDP writers for each public route (server→public client path)
 	// This prevents blocking on slow clients and absorbs traffic bursts
 	for _, x := range publicUDP {
-		writeQueue := newUDPWriteQueueWithBackpressure(65536) // Match the read queue size
+		writeQueue := newUDPWriteQueueWithBackpressure(udpWriteQueueSize)
 		st.udpPublicWriters[x.name] = writeQueue
 
-		// Single writer goroutine per route - ensures FIFO ordering of packets.
-		// Multiple writers from the same queue can cause reordering due to
-		// scheduler timing (goroutine B could write before goroutine A even
-		// though A dequeued first). A single writer preserves order while
-		// the queue provides backpressure absorption for bursty traffic.
-		go st.udpPublicWriter(ctx, x.pc, writeQueue, x.name)
+		for i := 0; i < udpWriteWorkers; i++ {
+			go st.udpPublicWriter(ctx, x.pc, writeQueue, x.name)
+		}
+	}
+
+	// Start async UDP writer for server→agent path (prevents blocking workers on slow agent)
+	// This is critical for high-FPS streaming - blocking writes cause worker starvation
+	st.udpAgentWriteQueue = newUDPWriteQueueWithBackpressure(udpWriteQueueSize)
+	for i := 0; i < udpWriteWorkers; i++ {
+		go st.udpAgentWriter(ctx, udpDataConn)
 	}
 
 	// Start pending connection cleaner
@@ -436,8 +473,16 @@ type serverState struct {
 	udpPublicWriters    map[string]*udpWriteQueueWithBackpressure // route -> write queue
 	udpPublicWriteDrops atomic.Int64
 
+	// Async write queue for server→agent path (prevents blocking workers on slow agent connections)
+	udpAgentWriteQueue *udpWriteQueueWithBackpressure
+	udpAgentWriteDrops atomic.Int64
+
 	// UDP statistics
 	udpStats *udputil.SessionStats
+
+	udpQueueBaseBudget  time.Duration
+	udpQueueTightBudget time.Duration
+	udpQueueHighWater   int
 
 	// UDP drop counters (atomic, for diagnostics)
 	udpAgentDrops  atomic.Int64
@@ -500,53 +545,20 @@ func (q *udpWriteQueueWithBackpressure) TryEnqueue(data []byte, addr net.Addr, b
 	default:
 		q.drops.Add(1)
 		q.enterCongestionMode()
-		if bufPtr != nil {
-			udpBufPool.Put(bufPtr)
-		}
+		// NOTE: Do NOT return bufPtr to a pool here — the caller owns the
+		// buffer and must choose the correct pool (payloadPool, outPool, etc.).
+		// Returning to the wrong pool causes buffer-size corruption.
 		return false
-	}
-}
-
-// EnqueueWithTimeout enqueues with a timeout for backpressure.
-func (q *udpWriteQueueWithBackpressure) EnqueueWithTimeout(ctx context.Context, data []byte, addr net.Addr, bufPtr *[]byte, timeout time.Duration) error {
-	job := udpWriteJob{
-		data:    data,
-		addr:    addr,
-		bufPtr:  bufPtr,
-		enqueue: time.Now(),
-	}
-
-	var timer *time.Timer
-	var timerChan <-chan time.Time
-	if timeout > 0 {
-		timer = time.NewTimer(timeout)
-		defer timer.Stop()
-		timerChan = timer.C
-	}
-
-	select {
-	case q.queue <- job:
-		q.depth.Add(1)
-		return nil
-	case <-ctx.Done():
-		if bufPtr != nil {
-			udpBufPool.Put(bufPtr)
-		}
-		return ctx.Err()
-	case <-timerChan:
-		if bufPtr != nil {
-			udpBufPool.Put(bufPtr)
-		}
-		q.drops.Add(1)
-		q.enterCongestionMode()
-		return context.DeadlineExceeded
 	}
 }
 
 // Dequeue returns the next job to process.
 func (q *udpWriteQueueWithBackpressure) Dequeue(ctx context.Context) (udpWriteJob, bool) {
 	select {
-	case job := <-q.queue:
+	case job, ok := <-q.queue:
+		if !ok {
+			return udpWriteJob{}, false
+		}
 		q.depth.Add(-1)
 		// Track latency
 		if !job.enqueue.IsZero() {
@@ -606,6 +618,35 @@ type udpJob struct {
 	addr   net.Addr
 	bufPtr *[]byte    // Pool buffer to return after processing (nil if data was copied)
 	pool   *sync.Pool // Pool to return buffer to (must match the pool it came from)
+	enq    time.Time
+}
+
+func envIntBound(name string, def, min, max int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	if n < min {
+		return min
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+func adaptiveBudget(base, tight time.Duration, depth, capacity, highWaterPct int) time.Duration {
+	if capacity <= 0 {
+		return base
+	}
+	if depth*100 >= capacity*highWaterPct {
+		return tight
+	}
+	return base
 }
 
 type pendingConn struct {
@@ -1548,8 +1589,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 	}
 
 	// Large buffer to absorb bursts without dropping packets.
-	// Increased from 16384 to 65536 for high-load scenarios like streaming.
-	jobBufSize := 65536
+	jobBufSize := 131072
 	if st.cfg.UDPQueueSize != nil && *st.cfg.UDPQueueSize > 0 {
 		jobBufSize = *st.cfg.UDPQueueSize
 	}
@@ -1567,6 +1607,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 		defer tick.Stop()
 		var prevDrops int64
 		var prevWriteDrops int64
+		var prevAgentWriteDrops int64
 		for {
 			select {
 			case <-ctx.Done():
@@ -1583,6 +1624,12 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 					log.Warnf(logging.CatUDP, "UDP public write queue drops: %d total (%d new)", wd, wd-prevWriteDrops)
 				}
 				prevWriteDrops = wd
+
+				awd := st.udpAgentWriteDrops.Load()
+				if awd > prevAgentWriteDrops {
+					log.Warnf(logging.CatUDP, "UDP agent write queue drops: %d total (%d new)", awd, awd-prevAgentWriteDrops)
+				}
+				prevAgentWriteDrops = awd
 			}
 		}
 	}()
@@ -1640,12 +1687,12 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 					return
 				}
 
-				// Pass pool buffer directly to worker - worker returns it after processing
+				// Fast path: never block readers; drop if workers are saturated.
 				select {
-				case jobs <- udpJob{data: buf, len: n, addr: addr, bufPtr: bufPtr, pool: localPool}:
+				case jobs <- udpJob{data: buf, len: n, addr: addr, bufPtr: bufPtr, pool: localPool, enq: time.Now()}:
 				default:
-					// Drop packet if workers overwhelmed, return buffer to pool
 					st.udpAgentDrops.Add(1)
+					st.dashErrorRateLimited(dashSystemRoute, "loss_udp_agent_reader_overload", hostFromAddr(addr), "", "agent UDP reader dropped packet (worker queue full)", 1*time.Second)
 					localPool.Put(bufPtr)
 				}
 			}
@@ -1699,6 +1746,15 @@ func (st *serverState) udpAgentWorker(ctx context.Context, jobs <-chan udpJob) {
 		case job, ok := <-jobs:
 			if !ok {
 				return
+			}
+			budget := adaptiveBudget(st.udpQueueBaseBudget, st.udpQueueTightBudget, len(jobs), cap(jobs), st.udpQueueHighWater)
+			if !job.enq.IsZero() && time.Since(job.enq) > budget {
+				st.udpAgentDrops.Add(1)
+				st.dashErrorRateLimited(dashSystemRoute, "loss_udp_agent_worker_stale", hostFromAddr(job.addr), "", "agent UDP worker dropped stale packet", 1*time.Second)
+				if job.bufPtr != nil && job.pool != nil {
+					job.pool.Put(job.bufPtr)
+				}
+				continue
 			}
 			pkt := job.data
 			if job.len > 0 && job.len < len(pkt) {
@@ -1793,12 +1849,19 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			st.dashErrorRateLimited(route, "error_udp_bad_client", hostFromAddr(addr), client, err.Error(), 1*time.Second)
 			return
 		}
-		// Copy payload since the original buffer will be returned to pool
-		payloadCopy := make([]byte, len(payload))
-		copy(payloadCopy, payload)
-		if !writeQueue.TryEnqueue(payloadCopy, ua, nil) {
-			// Queue full - drop packet rather than blocking
+		// Copy payload into pooled buffer to avoid per-packet allocation
+		bufPtr := payloadPool.Get().(*[]byte)
+		buf := *bufPtr
+		if cap(buf) < len(payload) {
+			buf = make([]byte, len(payload))
+			*bufPtr = buf
+		}
+		buf = buf[:len(payload)]
+		copy(buf, payload)
+		if !writeQueue.TryEnqueue(buf, ua, bufPtr) {
+			payloadPool.Put(bufPtr)
 			st.udpPublicWriteDrops.Add(1)
+			st.dashErrorRateLimited(route, "loss_udp_route_public_write_queue", hostFromAddr(addr), "", "route public write queue full", 1*time.Second)
 			traceUDPf("udp: DATA write queue full route=%s to=%v", route, ua)
 		}
 	case udputil.MsgDataEnc2:
@@ -1827,12 +1890,19 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			st.dashErrorRateLimited(route, "error_udp_bad_client", hostFromAddr(addr), client, err.Error(), 1*time.Second)
 			return
 		}
-		// Copy payload since the original buffer will be returned to pool
-		payloadCopy := make([]byte, len(payload))
-		copy(payloadCopy, payload)
-		if !writeQueue.TryEnqueue(payloadCopy, ua, nil) {
-			// Queue full - drop packet rather than blocking
+		// Copy payload into pooled buffer to avoid per-packet allocation
+		bufPtr := payloadPool.Get().(*[]byte)
+		buf := *bufPtr
+		if cap(buf) < len(payload) {
+			buf = make([]byte, len(payload))
+			*bufPtr = buf
+		}
+		buf = buf[:len(payload)]
+		copy(buf, payload)
+		if !writeQueue.TryEnqueue(buf, ua, bufPtr) {
+			payloadPool.Put(bufPtr)
 			st.udpPublicWriteDrops.Add(1)
+			st.dashErrorRateLimited(route, "loss_udp_route_public_write_queue", hostFromAddr(addr), "", "route public write queue full (enc)", 1*time.Second)
 			traceUDPf("udp: DATAEnc2 write queue full route=%s to=%v", route, ua)
 		}
 	}
@@ -1856,8 +1926,7 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 	}
 
 	// Large buffer to absorb bursts without dropping packets.
-	// Increased from 16384 to 65536 for high-load scenarios like streaming.
-	jobBufSize := 65536
+	jobBufSize := 131072
 	if st.cfg.UDPQueueSize != nil && *st.cfg.UDPQueueSize > 0 {
 		jobBufSize = *st.cfg.UDPQueueSize
 	}
@@ -1946,12 +2015,12 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 					return
 				}
 
-				// Pass pool buffer directly to worker - worker returns it after processing
+				// Fast path: never block readers; drop if workers are saturated.
 				select {
-				case jobs <- udpJob{data: buf, len: n, addr: clientAddr, bufPtr: bufPtr, pool: localPool}:
+				case jobs <- udpJob{data: buf, len: n, addr: clientAddr, bufPtr: bufPtr, pool: localPool, enq: time.Now()}:
 				default:
-					// Drop if workers overwhelmed, return buffer to pool
 					st.udpPublicDrops.Add(1)
+					st.dashErrorRateLimited(routeName, "loss_udp_public_reader_overload", hostFromAddr(clientAddr), "", "public UDP reader dropped packet (worker queue full)", 1*time.Second)
 					localPool.Put(bufPtr)
 				}
 			}
@@ -1975,6 +2044,15 @@ func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, 
 			if !ok {
 				return
 			}
+			budget := adaptiveBudget(st.udpQueueBaseBudget, st.udpQueueTightBudget, len(jobs), cap(jobs), st.udpQueueHighWater)
+			if !job.enq.IsZero() && time.Since(job.enq) > budget {
+				st.udpPublicDrops.Add(1)
+				st.dashErrorRateLimited(routeName, "loss_udp_public_worker_stale", hostFromAddr(job.addr), "", "public UDP worker dropped stale packet", 1*time.Second)
+				if job.bufPtr != nil && job.pool != nil {
+					job.pool.Put(job.bufPtr)
+				}
+				continue
+			}
 			pkt := job.data
 			if job.len > 0 && job.len < len(pkt) {
 				pkt = pkt[:job.len]
@@ -1988,18 +2066,36 @@ func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, 
 	}
 }
 
-// udpPublicWriter handles async writes to public clients (server→public path)
-// This prevents blocking on slow clients and absorbs traffic bursts
+// sendIndividual is a fallback for non-Linux platforms or when sendmmsg is unavailable.
+func sendIndividual(pc net.PacketConn, packets [][]byte, addrs []net.Addr) (int, error) {
+	sent := 0
+	for i, pkt := range packets {
+		_, err := pc.WriteTo(pkt, addrs[i])
+		if err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
+}
+
+// udpPublicWriter handles async writes to public clients (server→public path).
+// Uses Go's native WriteTo which properly handles EAGAIN via the netpoller.
+// This prevents blocking on slow clients and absorbs traffic bursts via the queue.
 func (st *serverState) udpPublicWriter(ctx context.Context, pc net.PacketConn, queue *udpWriteQueueWithBackpressure, routeName string) {
 	for {
 		job, ok := queue.Dequeue(ctx)
 		if !ok {
 			return
 		}
-
-		// Apply congestion backoff if needed
-		if backoff := queue.congestionBackoff.Load(); backoff > 0 {
-			time.Sleep(time.Duration(backoff))
+		budget := adaptiveBudget(st.udpQueueBaseBudget, st.udpQueueTightBudget, int(queue.depth.Load()), queue.capacity, st.udpQueueHighWater)
+		if !job.enqueue.IsZero() && time.Since(job.enqueue) > budget {
+			st.udpPublicWriteDrops.Add(1)
+			st.dashErrorRateLimited(routeName, "loss_udp_public_stale_queue", hostFromAddr(job.addr), "", "public UDP writer dropped stale packet", 1*time.Second)
+			if job.bufPtr != nil {
+				payloadPool.Put(job.bufPtr)
+			}
+			continue
 		}
 
 		_, err := pc.WriteTo(job.data, job.addr)
@@ -2008,14 +2104,49 @@ func (st *serverState) udpPublicWriter(ctx context.Context, pc net.PacketConn, q
 		} else {
 			queue.totalBytes.Add(uint64(len(job.data)))
 			queue.totalWrites.Add(1)
-			queue.maybeExitCongestionMode()
 			if st.dash != nil {
 				st.dash.addBytes(time.Now(), int64(len(job.data)))
 			}
 		}
-		// Return buffer to pool if it came from one
+		// Return buffer to payloadPool
 		if job.bufPtr != nil {
-			udpBufPool.Put(job.bufPtr)
+			payloadPool.Put(job.bufPtr)
+		}
+	}
+}
+
+// udpAgentWriter handles async writes to the agent (server→agent path).
+// Uses Go's native WriteTo which properly handles EAGAIN via the netpoller.
+// The async queue absorbs bursts and prevents worker starvation.
+func (st *serverState) udpAgentWriter(ctx context.Context, pc net.PacketConn) {
+	for {
+		job, ok := st.udpAgentWriteQueue.Dequeue(ctx)
+		if !ok {
+			return
+		}
+		budget := adaptiveBudget(st.udpQueueBaseBudget, st.udpQueueTightBudget, int(st.udpAgentWriteQueue.depth.Load()), st.udpAgentWriteQueue.capacity, st.udpQueueHighWater)
+		if !job.enqueue.IsZero() && time.Since(job.enqueue) > budget {
+			st.udpAgentWriteDrops.Add(1)
+			st.dashErrorRateLimited(dashSystemRoute, "loss_udp_agent_stale_queue", hostFromAddr(job.addr), "", "agent UDP writer dropped stale packet", 1*time.Second)
+			if job.bufPtr != nil {
+				udputil.PutOutputBuffer(job.bufPtr)
+			}
+			continue
+		}
+
+		_, err := pc.WriteTo(job.data, job.addr)
+		if err != nil {
+			traceUDPf("udp: agent write failed to=%v err=%v", job.addr, err)
+		} else {
+			st.udpAgentWriteQueue.totalBytes.Add(uint64(len(job.data)))
+			st.udpAgentWriteQueue.totalWrites.Add(1)
+			if st.dash != nil {
+				st.dash.addBytes(time.Now(), int64(len(job.data)))
+			}
+		}
+		// Return buffer to outPool
+		if job.bufPtr != nil {
+			udputil.PutOutputBuffer(job.bufPtr)
 		}
 	}
 }
@@ -2036,7 +2167,7 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 	var bufPtr *[]byte // For pooled encoding
 	clientAddrStr := clientAddr.String()
 	if st.encryptionNone || !st.udpKeys.Enabled() {
-		msg = udputil.EncodeData(routeName, clientAddrStr, pkt)
+		msg, bufPtr = udputil.EncodeDataPooled(routeName, clientAddrStr, pkt)
 	} else {
 		kid := st.getAgentUDPKeyID()
 		if kid == 0 {
@@ -2046,17 +2177,13 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 		msg, bufPtr = udputil.EncodeDataEnc2Pooled(st.udpKeys, kid, routeName, clientAddrStr, pkt)
 	}
 
-	_, err := st.udpData.WriteTo(msg, agent)
-
-	// Return buffer to pool if pooled encoding was used
-	if bufPtr != nil {
-		udputil.PutOutputBuffer(bufPtr)
-	}
-
-	if err != nil {
-		st.dashErrorRateLimited(routeName, "error_udp_write_agent", hostFromAddr(agent), "", err.Error(), 1*time.Second)
-		log.Warnf(logging.CatUDP, "UDP write to agent failed route=%s: %v", routeName, err)
-		return
+	if !st.udpAgentWriteQueue.TryEnqueue(msg, agent, bufPtr) {
+		st.udpAgentWriteDrops.Add(1)
+		st.dashErrorRateLimited(routeName, "loss_udp_agent_write_queue", hostFromAddr(agent), "", "agent write queue full", 1*time.Second)
+		traceUDPf("udp: agent write queue full route=%s", routeName)
+		if bufPtr != nil {
+			udputil.PutOutputBuffer(bufPtr)
+		}
 	}
 
 	// Stats + dashboard tracking — kept off the critical write path.

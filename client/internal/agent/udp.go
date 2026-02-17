@@ -48,12 +48,9 @@ func newUDPWriter(conn *net.UDPConn, stats *udputil.Stats, queueCapacity int) *u
 }
 
 // WritePooled writes an already-encoded packet. If bufPtr is non-nil, it returns the buffer to the pool after writing.
+// NOTE: Removed congestion backoff sleep - it causes more harm than good by introducing
+// latency that leads to queue overflow. Better to drop quickly than to block the writer.
 func (w *udpWriter) WritePooled(data []byte, bufPtr *[]byte) error {
-	// Apply congestion backoff if in congestion mode
-	if backoff := w.congestionBackoff.Load(); backoff > 0 {
-		time.Sleep(time.Duration(backoff))
-	}
-
 	_, err := w.conn.Write(data)
 	if bufPtr != nil {
 		udputil.PutOutputBuffer(bufPtr)
@@ -61,31 +58,24 @@ func (w *udpWriter) WritePooled(data []byte, bufPtr *[]byte) error {
 	if err != nil {
 		w.drops.Add(1)
 		w.stats.RecordLoss(1)
-		w.enterCongestionMode()
 		return err
 	}
 	w.writes.Add(1)
 	w.stats.RecordSend(len(data))
-	w.maybeExitCongestionMode()
 	return nil
 }
 
 // Write writes a pre-encoded packet (no pooling).
+// NOTE: Removed congestion backoff sleep - it causes more harm than good.
 func (w *udpWriter) Write(data []byte) error {
-	if backoff := w.congestionBackoff.Load(); backoff > 0 {
-		time.Sleep(time.Duration(backoff))
-	}
-
 	_, err := w.conn.Write(data)
 	if err != nil {
 		w.drops.Add(1)
 		w.stats.RecordLoss(1)
-		w.enterCongestionMode()
 		return err
 	}
 	w.writes.Add(1)
 	w.stats.RecordSend(len(data))
-	w.maybeExitCongestionMode()
 	return nil
 }
 
@@ -186,47 +176,13 @@ func (q *udpWriteQueue) TryEnqueue(data []byte, bufPtr *[]byte) bool {
 	}
 }
 
-// EnqueueWithBackpressure enqueues a packet with backpressure.
-// Blocks until the packet is queued or the context is cancelled.
-// Returns an error if the context is cancelled or timeout exceeded.
-func (q *udpWriteQueue) EnqueueWithBackpressure(ctx context.Context, data []byte, bufPtr *[]byte, timeout time.Duration) error {
-	pkt := outPacketWithResult{
-		data:    data,
-		bufPtr:  bufPtr,
-		enqueue: time.Now(),
-	}
-
-	// Use a timer for timeout
-	var timer *time.Timer
-	var timerChan <-chan time.Time
-	if timeout > 0 {
-		timer = time.NewTimer(timeout)
-		defer timer.Stop()
-		timerChan = timer.C
-	}
-
-	select {
-	case q.queue <- pkt:
-		q.depth.Add(1)
-		return nil
-	case <-ctx.Done():
-		if bufPtr != nil {
-			udputil.PutOutputBuffer(bufPtr)
-		}
-		return ctx.Err()
-	case <-timerChan:
-		if bufPtr != nil {
-			udputil.PutOutputBuffer(bufPtr)
-		}
-		q.stats.RecordLoss(1)
-		return context.DeadlineExceeded
-	}
-}
-
 // Dequeue returns the next packet to send.
 func (q *udpWriteQueue) Dequeue(ctx context.Context) (outPacketWithResult, bool) {
 	select {
-	case pkt := <-q.queue:
+	case pkt, ok := <-q.queue:
+		if !ok {
+			return outPacketWithResult{}, false
+		}
 		q.depth.Add(-1)
 		// Track latency
 		latency := time.Since(pkt.enqueue).Nanoseconds()
@@ -254,6 +210,34 @@ func (q *udpWriteQueue) Capacity() int { return q.capacity }
 // AvgLatency returns average queue latency.
 func (q *udpWriteQueue) AvgLatency() time.Duration {
 	return time.Duration(q.avgLatency.Load())
+}
+
+func envIntBound(name string, def, min, max int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	if n < min {
+		return min
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+func adaptiveBudget(base, tight time.Duration, depth, capacity, highWaterPct int) time.Duration {
+	if capacity <= 0 {
+		return base
+	}
+	if depth*100 >= capacity*highWaterPct {
+		return tight
+	}
+	return base
 }
 
 func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurityState, routesByName map[string]RemoteRoute) {
@@ -301,6 +285,7 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			continue
 		}
 		log.Infof(logging.CatUDP, "UDP connection established to %s", dataAddr)
+		log.Infof(logging.CatUDP, "UDP profile: fast (low-latency, drop-on-overload)")
 
 		uc, ok := c.(*net.UDPConn)
 		if !ok {
@@ -308,23 +293,32 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			return
 		}
 		// Set large UDP buffers with kernel verification.
-		// Increased from 8MB to 16MB for high-load streaming scenarios.
-		const wantBuf = 16 * 1024 * 1024
+		// 64MB improves burst absorption for high-FPS streaming workloads.
+		const wantBuf = 64 * 1024 * 1024
 		actualR, actualW := trySetUDPBuffers(uc, wantBuf)
 		log.Infof(logging.CatUDP, "UDP buffers [server]: read=%d write=%d (requested %d)", actualR, actualW, wantBuf)
-		if actualR > 0 && actualR < wantBuf/2 {
+		if actualR > 0 && actualR < wantBuf {
 			log.Warnf(logging.CatUDP, "UDP read buffer is only %d bytes (wanted %d). Run: sysctl -w net.core.rmem_max=%d", actualR, wantBuf, wantBuf)
 		}
-		if actualW > 0 && actualW < wantBuf/2 {
+		if actualW > 0 && actualW < wantBuf {
 			log.Warnf(logging.CatUDP, "UDP write buffer is only %d bytes (wanted %d). Run: sysctl -w net.core.wmem_max=%d", actualW, wantBuf, wantBuf)
 		}
 
 		// Create write queue with backpressure support
-		const queueCapacity = 65536
+		queueCapacity := 131072
+		if qStr := os.Getenv("HOSTIT_UDP_QUEUE"); qStr != "" {
+			if q, err := strconv.Atoi(qStr); err == nil && q >= 4096 && q <= 1048576 {
+				queueCapacity = q
+			}
+		}
+		maxQueueLatencyMs := envIntBound("HOSTIT_UDP_MAX_QUEUE_LATENCY_MS", 30, 5, 500)
+		highWaterPct := envIntBound("HOSTIT_UDP_HIGH_WATER_PCT", 75, 50, 98)
+		baseBudget := time.Duration(maxQueueLatencyMs) * time.Millisecond
+		tightBudget := baseBudget / 2
+		if tightBudget < 5*time.Millisecond {
+			tightBudget = 5 * time.Millisecond
+		}
 		writeQueue := newUDPWriteQueue(queueCapacity, stats)
-
-		// Create writer for outgoing packets
-		writer := newUDPWriter(uc, stats, queueCapacity)
 
 		// Register so the server learns our UDP address.
 		ks := sec.Get()
@@ -365,23 +359,50 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 		sessionsMu := sync.RWMutex{}
 		sessions := map[string]map[string]*udpSession{} // route -> client -> session
 
-		// Single writer goroutine - ensures FIFO ordering of packets.
-		// Multiple writers from the same queue can cause reordering due to
-		// scheduler timing (goroutine B could write before goroutine A even
-		// though A dequeued first). A single writer preserves order while
-		// the queue provides backpressure absorption for bursty traffic.
-		var writerWg sync.WaitGroup
-		writerWg.Add(1)
-		go func() {
-			defer writerWg.Done()
-			for {
-				pkt, ok := writeQueue.Dequeue(connCtx)
-				if !ok {
-					return
-				}
-				writer.WritePooled(pkt.data, pkt.bufPtr)
+		// Multiple writer goroutines reduce single-writer bottleneck under heavy load.
+		writerWorkers := runtimeNumCPU()
+		if writerWorkers < 2 {
+			writerWorkers = 2
+		}
+		if writerWorkers > 16 {
+			writerWorkers = 16
+		}
+		if nStr := os.Getenv("HOSTIT_UDP_WRITE_WORKERS"); nStr != "" {
+			if n, err := strconv.Atoi(nStr); err == nil && n >= 1 && n <= 32 {
+				writerWorkers = n
 			}
-		}()
+		}
+		var writerWg sync.WaitGroup
+		writerWg.Add(writerWorkers)
+		for i := 0; i < writerWorkers; i++ {
+			go func() {
+				defer writerWg.Done()
+				for {
+					pkt, ok := writeQueue.Dequeue(connCtx)
+					if !ok {
+						return
+					}
+					if !pkt.enqueue.IsZero() {
+						budget := adaptiveBudget(baseBudget, tightBudget, writeQueue.Depth(), writeQueue.Capacity(), highWaterPct)
+						if time.Since(pkt.enqueue) > budget {
+							stats.RecordLoss(1)
+							if pkt.bufPtr != nil {
+								udputil.PutOutputBuffer(pkt.bufPtr)
+							}
+							continue
+						}
+					}
+					if _, err := uc.Write(pkt.data); err != nil {
+						stats.RecordLoss(1)
+					} else {
+						stats.RecordSend(len(pkt.data))
+					}
+					if pkt.bufPtr != nil {
+						udputil.PutOutputBuffer(pkt.bufPtr)
+					}
+				}
+			}()
+		}
 
 		// Queue depth monitor - logs warnings when queue is getting full
 		go func() {
@@ -505,15 +526,10 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 					if cachedKS.Enabled() {
 						encoded, bufPtr = udputil.EncodeDataEnc2Pooled(cachedKS, cachedKS.CurID, routeName, clientAddr, localBuf[:n])
 					} else {
-						encoded = udputil.EncodeData(routeName, clientAddr, localBuf[:n])
-						bufPtr = nil
+						encoded, bufPtr = udputil.EncodeDataPooled(routeName, clientAddr, localBuf[:n])
 					}
 
-					// Enqueue with backpressure - use short timeout to avoid blocking
-					// the local reader for too long
-					err = writeQueue.EnqueueWithBackpressure(connCtx, encoded, bufPtr, 10*time.Millisecond)
-					if err != nil {
-						// Packet dropped due to backpressure
+					if !writeQueue.TryEnqueue(encoded, bufPtr) {
 						stats.RecordLoss(1)
 					}
 				}
@@ -561,8 +577,9 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 			len    int
 			bufPtr *[]byte
 			pool   *sync.Pool // Pool to return buffer to (must match the pool it came from)
+			enq    time.Time
 		}
-		inJobs := make(chan inJob, 65536) // Increased from 16384 to 65536
+		inJobs := make(chan inJob, queueCapacity)
 
 		// Start multiple reader goroutines for the main socket
 		// This is the key fix: multiple readers prevent the single-reader bottleneck
@@ -605,12 +622,10 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 						continue
 					}
 
-					// Dispatch to worker - pass buffer ownership
+					// Fast path: never block readers; drop if workers are saturated.
 					select {
-					case inJobs <- inJob{data: buf, len: n, bufPtr: bufPtr, pool: localBufPool}:
-						// Dispatched successfully
+					case inJobs <- inJob{data: buf, len: n, bufPtr: bufPtr, pool: localBufPool, enq: time.Now()}:
 					default:
-						// Workers overwhelmed - drop packet
 						stats.RecordLoss(1)
 						localBufPool.Put(bufPtr)
 					}
@@ -627,6 +642,16 @@ func runUDP(ctx context.Context, dataAddr string, token string, sec *udpSecurity
 				cachedKS := sec.Get()
 				pkts := 0
 				for job := range inJobs {
+					if !job.enq.IsZero() {
+						budget := adaptiveBudget(baseBudget, tightBudget, len(inJobs), cap(inJobs), highWaterPct)
+						if time.Since(job.enq) > budget {
+							stats.RecordLoss(1)
+							if job.bufPtr != nil && job.pool != nil {
+								job.pool.Put(job.bufPtr)
+							}
+							continue
+						}
+					}
 					pkt := job.data[:job.len]
 					pkts++
 					if pkts >= 1000 {
