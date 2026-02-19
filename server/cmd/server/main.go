@@ -1453,33 +1453,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/config", http.StatusSeeOther)
 		})))
 
-		// QUIC protocol toggle (protected)
-		mux.HandleFunc("/api/quic", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-			if err := r.ParseForm(); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if !checkCSRF(r) {
-				http.Error(w, "csrf", http.StatusBadRequest)
-				return
-			}
-			enable := strings.TrimSpace(r.Form.Get("enabled")) != ""
-			cfg, _, _ := runner.Get()
-			cfg.QUICEnabled = enable
-			if err := configio.Save(configPath, cfg); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			runner.Restart(cfg)
-			setMsg(fmt.Sprintf("QUIC %s — restarted", map[bool]string{true: "enabled", false: "disabled"}[enable]))
-			http.Redirect(w, r, "/controls", http.StatusSeeOther)
-		})))
-
 		// Route enable/disable toggle (protected) - runtime, no restart required
 		mux.HandleFunc("/api/routes/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -2815,12 +2788,6 @@ const serverControlsHTML = `<!doctype html>
 
 				<div class="secHead"><h2>Protocol Options</h2></div>
 				<div class="card">
-					<div class="row"><b>QUIC Protocol:</b> <span id="quicStatus">{{if .Cfg.QUICEnabled}}Enabled{{else}}Disabled{{end}}</span></div>
-					<div class="muted" style="margin-bottom:8px;font-size:12px">QUIC provides better reliability and congestion control for UDP transport. Experimental feature.</div>
-					<div class="flex">
-						<button class="btn sm primary" id="quicToggleBtn">{{if .Cfg.QUICEnabled}}Disable QUIC{{else}}Enable QUIC{{end}}</button>
-					</div>
-					<hr style="border:0;border-top:1px solid var(--border);margin:12px 0" />
 					<div class="row"><b>UDP Max Payload:</b> <code>{{.UDPMaxPayload}} bytes</code></div>
 					<div class="muted" style="margin-bottom:8px;font-size:12px">Default internet-safe value is 1400. Lower reduces fragmentation risk. Set 0 to disable cap.</div>
 					<form method="post" action="/api/udp/payload" style="margin:0">
@@ -2966,13 +2933,6 @@ const serverControlsHTML = `<!doctype html>
 	};
 	document.getElementById('procExit').onclick=async function(){
 		await fetch('/api/process/exit',{method:'POST',body:body(),credentials:'include'});
-		setTimeout(function(){location.reload();},1000);
-	};
-	document.getElementById('quicToggleBtn').onclick=async function(){
-		var btn=this;
-		var cur=btn.textContent.indexOf('Enable')>=0;
-		var p=new URLSearchParams();p.set('csrf',csrf);p.set('enabled',cur?'1':'');
-		await fetch('/api/quic',{method:'POST',body:p,credentials:'include'});
 		setTimeout(function(){location.reload();},1000);
 	};
 	refreshUpd();refreshSys();
