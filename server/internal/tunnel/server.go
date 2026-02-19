@@ -36,12 +36,9 @@ var udpBufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
-// payloadPool pools buffers for forwarding UDP payloads from agent to public clients.
-// Eliminates per-packet make([]byte, len(payload)) allocation in the hot path.
-var payloadPool = sync.Pool{New: func() any {
-	b := make([]byte, 2048) // Most streaming packets fit in 1500 bytes
-	return &b
-}}
+// elasticPayloadPool is an elastic buffer pool that handles variable-sized UDP payloads
+// efficiently without wasting memory or causing frequent allocations.
+var elasticPayloadPool = udputil.NewElasticBufferPool()
 
 // logUDPBuf logs socket buffer sizes and warns if the kernel capped them.
 func logUDPBuf(label string, actualRead, actualWrite, wanted int) {
@@ -138,14 +135,10 @@ func NewServer(cfg ServerConfig) *Server {
 	return &Server{cfg: cfg, st: st}
 }
 
-func buildUDPKeySet(cfg ServerConfig) udputil.KeySet {
-	mode := udputil.NormalizeMode(cfg.UDPEncryptionMode)
-	if cfg.DisableUDPEncryption {
-		mode = udputil.ModeNone
-	}
-	if mode == udputil.ModeNone {
-		ks, _ := udputil.NewKeySet(mode, "", 0, nil, 0, nil)
-		return ks
+func buildUDPKeySet(cfg ServerConfig) *udputil.KeySet {
+	mode := strings.TrimSpace(cfg.UDPEncryptionMode)
+	if cfg.DisableUDPEncryption || mode == "" || strings.EqualFold(mode, "none") {
+		return &udputil.KeySet{}
 	}
 	curSalt, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(cfg.UDPKeySaltB64))
 	if err != nil {
@@ -157,7 +150,7 @@ func buildUDPKeySet(cfg ServerConfig) udputil.KeySet {
 	}
 	ks, err := udputil.NewKeySet(mode, strings.TrimSpace(cfg.Token), cfg.UDPKeyID, curSalt, cfg.UDPPrevKeyID, prevSalt)
 	if err != nil {
-		ks, _ = udputil.NewKeySet(udputil.ModeNone, "", 0, nil, 0, nil)
+		return &udputil.KeySet{}
 	}
 	return ks
 }
@@ -348,19 +341,19 @@ func (s *Server) Run(ctx context.Context) error {
 
 	st := s.st
 	log.Info(logging.CatUDP, "UDP profile: fast (low-latency, drop-on-overload)")
-	udpWriteWorkers := runtime.NumCPU()
-	if udpWriteWorkers < 2 {
-		udpWriteWorkers = 2
+	udpWriteWorkers := runtime.NumCPU() * 2 // Increased from NumCPU()
+	if udpWriteWorkers < 4 {
+		udpWriteWorkers = 4 // Increased from 2
 	}
-	if udpWriteWorkers > 16 {
-		udpWriteWorkers = 16
+	if udpWriteWorkers > 64 {
+		udpWriteWorkers = 64 // Increased from 16
 	}
 	if nStr := os.Getenv("HOSTIT_UDP_WRITE_WORKERS"); nStr != "" {
-		if n, err := strconv.Atoi(nStr); err == nil && n >= 1 && n <= 32 {
+		if n, err := strconv.Atoi(nStr); err == nil && n >= 1 && n <= 128 {
 			udpWriteWorkers = n
 		}
 	}
-	udpWriteQueueSize := 131072
+	udpWriteQueueSize := 262144 // Increased from 131072
 	if s.cfg.UDPQueueSize != nil && *s.cfg.UDPQueueSize > 0 {
 		udpWriteQueueSize = *s.cfg.UDPQueueSize
 	}
@@ -373,7 +366,10 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	st.udpQueueHighWater = highWaterPct
 	st.udpEnqueueWait = time.Duration(envIntBound("HOSTIT_UDP_ENQUEUE_WAIT_US", 5000, 0, 50000)) * time.Microsecond
-	maxPayloadDefault := 1400
+	// Default to 0 (no cap) - let the application decide packet size.
+	// The previous default of 1400 was causing packet loss for applications
+	// using larger UDP packets (game servers, VoIP, etc.)
+	maxPayloadDefault := 0
 	if s.cfg.UDPMaxPayload != nil {
 		maxPayloadDefault = *s.cfg.UDPMaxPayload
 	}
@@ -517,7 +513,7 @@ func listenMaybeTLS(cfg ServerConfig, addr string) (net.Listener, error) {
 
 type serverState struct {
 	cfg     ServerConfig
-	udpKeys udputil.KeySet
+	udpKeys *udputil.KeySet
 	dash    *dashState
 
 	errMu   sync.Mutex
@@ -562,7 +558,7 @@ type serverState struct {
 	udpAgentWriteDrops atomic.Int64
 
 	// UDP statistics
-	udpStats      *udputil.SessionStats
+	udpStats      *udputil.SessionStatsMap
 	udpPacketsIn  atomic.Uint64
 	udpPacketsOut atomic.Uint64
 	udpBytesIn    atomic.Uint64
@@ -608,10 +604,11 @@ type resolvedAddr struct {
 
 // udpWriteJob represents a packet to write to a public client
 type udpWriteJob struct {
-	data    []byte
-	addr    net.Addr
-	bufPtr  *[]byte   // Pool buffer to return after writing (nil if data was copied)
-	enqueue time.Time // When the job was enqueued (for latency tracking)
+	data       []byte
+	addr       net.Addr
+	bufPtr     *[]byte                // Pool buffer to return after writing (nil if data was copied)
+	elasticBuf *udputil.ElasticBuffer // Elastic buffer to return after writing (takes precedence over bufPtr)
+	enqueue    time.Time              // When the job was enqueued (for latency tracking)
 }
 
 // udpWriteQueueWithBackpressure is a write queue with backpressure support.
@@ -1758,7 +1755,7 @@ func (st *serverState) acceptAgentUDP(ctx context.Context) error {
 	}
 
 	// Large buffer to absorb bursts without dropping packets.
-	jobBufSize := 131072
+	jobBufSize := 262144 // Increased from 131072
 	if st.cfg.UDPQueueSize != nil && *st.cfg.UDPQueueSize > 0 {
 		jobBufSize = *st.cfg.UDPQueueSize
 	}
@@ -2038,14 +2035,18 @@ func (st *serverState) udpAgentWorker(ctx context.Context, jobs <-chan udpJob) {
 			if !ok {
 				return
 			}
-			budget := adaptiveBudget(st.udpQueueBaseBudget, st.udpQueueTightBudget, len(jobs), cap(jobs), st.udpQueueHighWater)
-			if budget > 0 && !job.enq.IsZero() && time.Since(job.enq) > budget {
-				st.udpAgentDrops.Add(1)
-				st.dashErrorRateLimited(dashSystemRoute, "loss_udp_agent_worker_stale", hostFromAddr(job.addr), "", "agent UDP worker dropped stale packet", 1*time.Second)
-				if job.bufPtr != nil && job.pool != nil {
-					job.pool.Put(job.bufPtr)
+			// Only drop stale packets if budget is configured AND queue is under pressure
+			// This prevents dropping legitimate packets during normal operation
+			if st.udpQueueBaseBudget > 0 && len(jobs) > cap(jobs)/2 {
+				budget := adaptiveBudget(st.udpQueueBaseBudget, st.udpQueueTightBudget, len(jobs), cap(jobs), st.udpQueueHighWater)
+				if budget > 0 && !job.enq.IsZero() && time.Since(job.enq) > budget {
+					st.udpAgentDrops.Add(1)
+					st.dashErrorRateLimited(dashSystemRoute, "loss_udp_agent_worker_stale", hostFromAddr(job.addr), "", "agent UDP worker dropped stale packet", 1*time.Second)
+					if job.bufPtr != nil && job.pool != nil {
+						job.pool.Put(job.bufPtr)
+					}
+					continue
 				}
-				continue
 			}
 			pkt := job.data
 			if job.len > 0 && job.len < len(pkt) {
@@ -2065,13 +2066,23 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		return
 	}
 	enqueueWait := st.udpEnqueueWait
-	encNone := st.encryptionNone
-	switch pkt[0] {
-	case udputil.MsgReg:
-		if !encNone {
+
+	// Try to decrypt if encryption is enabled
+	var decrypted []byte
+	if st.udpKeys != nil && st.udpKeys.HasKey() {
+		var ok bool
+		decrypted, ok = st.udpKeys.Decrypt(pkt)
+		if !ok {
+			st.udpDecodeDrops.Add(1)
+			traceUDPf("udp: decrypt failed from=%v", addr)
 			return
 		}
-		tok, ok := udputil.DecodeReg(pkt)
+		pkt = decrypted
+	}
+
+	switch pkt[0] {
+	case udputil.TypeRegister:
+		tok, ok := udputil.DecodeRegister(pkt)
 		if !ok {
 			traceUDPf("udp: REG decode failed from=%v", addr)
 			st.dashErrorRateLimited(dashSystemRoute, "error_udp_reg_decode", hostFromAddr(addr), "", "", 1*time.Second)
@@ -2088,37 +2099,14 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 		}
 		oldAddr := st.getAgentUDPAddr()
 		st.setAgentUDPAddr(addr)
-		st.setAgentUDPKeyID(0)
 		if oldAddr == nil || !addrEqual(oldAddr, addr) {
-			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=plaintext", addr)
+			mode := "plaintext"
+			if st.udpKeys != nil && st.udpKeys.HasKey() {
+				mode = "encrypted"
+			}
+			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=%s", addr, mode)
 		}
-	case udputil.MsgRegEnc2:
-		if encNone {
-			return
-		}
-		expected := strings.TrimSpace(st.cfg.Token)
-		if expected == "" {
-			return
-		}
-		kid, ok := udputil.DecodeRegEnc2(st.udpKeys, expected, pkt)
-		if !ok {
-			traceUDPf("udp: REGEnc2 decode failed from=%v", addr)
-			st.dashErrorRateLimited(dashSystemRoute, "error_udp_regenc2_decode", hostFromAddr(addr), "", "", 1*time.Second)
-			return
-		}
-		if st.getAgentProto() == nil {
-			return
-		}
-		oldAddr := st.getAgentUDPAddr()
-		st.setAgentUDPAddr(addr)
-		st.setAgentUDPKeyID(kid)
-		if oldAddr == nil || !addrEqual(oldAddr, addr) {
-			log.Infof(logging.CatUDP, "agent UDP registered addr=%v mode=encrypted keyID=%d", addr, kid)
-		}
-	case udputil.MsgData:
-		if !encNone {
-			return
-		}
+	case udputil.TypeData:
 		route, client, payload, ok := udputil.DecodeData(pkt)
 		if !ok {
 			st.udpDecodeDrops.Add(1)
@@ -2133,60 +2121,6 @@ func (st *serverState) processAgentUDPPacket(pkt []byte, addr net.Addr) {
 			return
 		}
 		st.forwardAgentPayloadToPublic(route, client, payload, addr, enqueueWait, "DATA")
-	case udputil.MsgDataSeq:
-		if !encNone {
-			return
-		}
-		_, route, client, payload, ok := udputil.DecodeDataWithSeq(pkt)
-		if !ok {
-			st.udpDecodeDrops.Add(1)
-			traceUDPf("udp: DATASeq decode failed from=%v", addr)
-			st.dashErrorRateLimited(dashSystemRoute, "error_udp_dataseq_decode", hostFromAddr(addr), "", "", 1*time.Second)
-			return
-		}
-		st.udpPacketsIn.Add(1)
-		st.udpBytesIn.Add(uint64(len(payload)))
-		agent := st.getAgentUDPAddr()
-		if agent == nil || !addrEqual(agent, addr) {
-			return
-		}
-		st.forwardAgentPayloadToPublic(route, client, payload, addr, enqueueWait, "DATASeq")
-	case udputil.MsgDataEnc2:
-		if encNone {
-			return
-		}
-		route, client, payload, _, ok := udputil.DecodeDataEnc2(st.udpKeys, pkt)
-		if !ok {
-			st.udpDecodeDrops.Add(1)
-			traceUDPf("udp: DATAEnc2 decode failed from=%v", addr)
-			st.dashErrorRateLimited(dashSystemRoute, "error_udp_dataenc2_decode", hostFromAddr(addr), "", "", 1*time.Second)
-			return
-		}
-		st.udpPacketsIn.Add(1)
-		st.udpBytesIn.Add(uint64(len(payload)))
-		agent := st.getAgentUDPAddr()
-		if agent == nil || !addrEqual(agent, addr) {
-			return
-		}
-		st.forwardAgentPayloadToPublic(route, client, payload, addr, enqueueWait, "DATAEnc2")
-	case udputil.MsgDataEnc2Seq:
-		if encNone {
-			return
-		}
-		_, route, client, payload, _, ok := udputil.DecodeDataEnc2WithSeq(st.udpKeys, pkt)
-		if !ok {
-			st.udpDecodeDrops.Add(1)
-			traceUDPf("udp: DATAEnc2Seq decode failed from=%v", addr)
-			st.dashErrorRateLimited(dashSystemRoute, "error_udp_dataenc2seq_decode", hostFromAddr(addr), "", "", 1*time.Second)
-			return
-		}
-		st.udpPacketsIn.Add(1)
-		st.udpBytesIn.Add(uint64(len(payload)))
-		agent := st.getAgentUDPAddr()
-		if agent == nil || !addrEqual(agent, addr) {
-			return
-		}
-		st.forwardAgentPayloadToPublic(route, client, payload, addr, enqueueWait, "DATAEnc2Seq")
 	}
 }
 
@@ -2240,19 +2174,44 @@ func (st *serverState) forwardAgentPayloadToPublic(route, client string, payload
 		return
 	}
 
-	bufPtr := payloadPool.Get().(*[]byte)
-	buf := *bufPtr
-	if cap(buf) < len(payload) {
-		buf = make([]byte, len(payload))
-		*bufPtr = buf
+	// Use elastic buffer pool for efficient memory handling across variable packet sizes
+	eb := elasticPayloadPool.Get(len(payload))
+	copy(eb.Data(), payload)
+
+	// Create job with elastic buffer
+	job := udpWriteJob{
+		data:       eb.Data(),
+		addr:       ua,
+		elasticBuf: eb,
+		enqueue:    time.Now(),
 	}
-	buf = buf[:len(payload)]
-	copy(buf, payload)
-	if !writeQueue.EnqueueWithTimeout(buf, ua, bufPtr, enqueueWait) {
-		payloadPool.Put(bufPtr)
-		st.udpPublicWriteDrops.Add(1)
-		st.dashErrorRateLimited(route, "loss_udp_route_public_write_queue", hostFromAddr(srcAddr), "", "route public write queue full", 1*time.Second)
-		traceUDPf("udp: %s write queue full route=%s to=%v", label, route, ua)
+
+	select {
+	case writeQueue.queue <- job:
+		writeQueue.depth.Add(1)
+	default:
+		if enqueueWait > 0 {
+			t := time.NewTimer(enqueueWait)
+			select {
+			case writeQueue.queue <- job:
+				writeQueue.depth.Add(1)
+				t.Stop()
+			case <-t.C:
+				eb.Put()
+				st.udpPublicWriteDrops.Add(1)
+				writeQueue.drops.Add(1)
+				writeQueue.enterCongestionMode()
+				st.dashErrorRateLimited(route, "loss_udp_route_public_write_queue", hostFromAddr(srcAddr), "", "route public write queue full", 1*time.Second)
+				traceUDPf("udp: %s write queue full route=%s to=%v", label, route, ua)
+			}
+		} else {
+			eb.Put()
+			st.udpPublicWriteDrops.Add(1)
+			writeQueue.drops.Add(1)
+			writeQueue.enterCongestionMode()
+			st.dashErrorRateLimited(route, "loss_udp_route_public_write_queue", hostFromAddr(srcAddr), "", "route public write queue full", 1*time.Second)
+			traceUDPf("udp: %s write queue full route=%s to=%v", label, route, ua)
+		}
 	}
 }
 
@@ -2274,7 +2233,7 @@ func (st *serverState) acceptPublicUDP(ctx context.Context, pc net.PacketConn, r
 	}
 
 	// Large buffer to absorb bursts without dropping packets.
-	jobBufSize := 131072
+	jobBufSize := 262144 // Increased from 131072
 	if st.cfg.UDPQueueSize != nil && *st.cfg.UDPQueueSize > 0 {
 		jobBufSize = *st.cfg.UDPQueueSize
 	}
@@ -2406,14 +2365,18 @@ func (st *serverState) udpPublicWorker(ctx context.Context, jobs <-chan udpJob, 
 			if !ok {
 				return
 			}
-			budget := adaptiveBudget(st.udpQueueBaseBudget, st.udpQueueTightBudget, len(jobs), cap(jobs), st.udpQueueHighWater)
-			if budget > 0 && !job.enq.IsZero() && time.Since(job.enq) > budget {
-				st.udpPublicDrops.Add(1)
-				st.dashErrorRateLimited(routeName, "loss_udp_public_worker_stale", hostFromAddr(job.addr), "", "public UDP worker dropped stale packet", 1*time.Second)
-				if job.bufPtr != nil && job.pool != nil {
-					job.pool.Put(job.bufPtr)
+			// Only drop stale packets if budget is configured AND queue is under pressure
+			// This prevents dropping legitimate packets during normal operation
+			if st.udpQueueBaseBudget > 0 && len(jobs) > cap(jobs)/2 {
+				budget := adaptiveBudget(st.udpQueueBaseBudget, st.udpQueueTightBudget, len(jobs), cap(jobs), st.udpQueueHighWater)
+				if budget > 0 && !job.enq.IsZero() && time.Since(job.enq) > budget {
+					st.udpPublicDrops.Add(1)
+					st.dashErrorRateLimited(routeName, "loss_udp_public_worker_stale", hostFromAddr(job.addr), "", "public UDP worker dropped stale packet", 1*time.Second)
+					if job.bufPtr != nil && job.pool != nil {
+						job.pool.Put(job.bufPtr)
+					}
+					continue
 				}
-				continue
 			}
 			pkt := job.data
 			if job.len > 0 && job.len < len(pkt) {
@@ -2454,8 +2417,9 @@ func (st *serverState) udpPublicWriter(ctx context.Context, pc net.PacketConn, q
 		if budget > 0 && !job.enqueue.IsZero() && time.Since(job.enqueue) > budget {
 			st.udpPublicWriteDrops.Add(1)
 			st.dashErrorRateLimited(routeName, "loss_udp_public_stale_queue", hostFromAddr(job.addr), "", "public UDP writer dropped stale packet", 1*time.Second)
-			if job.bufPtr != nil {
-				payloadPool.Put(job.bufPtr)
+			// Return elastic buffer if present
+			if job.elasticBuf != nil {
+				job.elasticBuf.Put()
 			}
 			continue
 		}
@@ -2480,9 +2444,9 @@ func (st *serverState) udpPublicWriter(ctx context.Context, pc net.PacketConn, q
 				st.dash.addBytes(time.Now(), int64(len(job.data)))
 			}
 		}
-		// Return buffer to payloadPool
-		if job.bufPtr != nil {
-			payloadPool.Put(job.bufPtr)
+		// Return elastic buffer to pool
+		if job.elasticBuf != nil {
+			job.elasticBuf.Put()
 		}
 	}
 }
@@ -2501,7 +2465,7 @@ func (st *serverState) udpAgentWriter(ctx context.Context, pc net.PacketConn) {
 			st.udpAgentWriteDrops.Add(1)
 			st.dashErrorRateLimited(dashSystemRoute, "loss_udp_agent_stale_queue", hostFromAddr(job.addr), "", "agent UDP writer dropped stale packet", 1*time.Second)
 			if job.bufPtr != nil {
-				udputil.PutOutputBuffer(job.bufPtr)
+				udputil.PutBuffer(job.bufPtr)
 			}
 			continue
 		}
@@ -2526,15 +2490,14 @@ func (st *serverState) udpAgentWriter(ctx context.Context, pc net.PacketConn) {
 				st.dash.addBytes(time.Now(), int64(len(job.data)))
 			}
 		}
-		// Return buffer to outPool
+		// Return buffer to pool
 		if job.bufPtr != nil {
-			udputil.PutOutputBuffer(job.bufPtr)
+			udputil.PutBuffer(job.bufPtr)
 		}
 	}
 }
 
 func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, routeName string) {
-	enqueueWait := st.udpEnqueueWait
 	// Check if route is enabled
 	if !st.routeEnabled(routeName) {
 		st.udpRouteDisabledDrops.Add(1)
@@ -2558,27 +2521,18 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 		return
 	}
 
-	var msg []byte
-	var bufPtr *[]byte // For pooled encoding
+	// Encode the packet
 	clientAddrStr := clientAddr.String()
-	seq := st.udpSeqToAgent.Add(1)
-	if st.encryptionNone || !st.udpKeys.Enabled() {
-		msg = udputil.EncodeDataWithSeq(seq, routeName, clientAddrStr, pkt)
-	} else {
-		kid := st.getAgentUDPKeyID()
-		if kid == 0 {
-			kid = st.cfg.UDPKeyID
-		}
-		// Use pooled encoding for zero-allocation encryption
-		msg, bufPtr = udputil.EncodeDataEnc2PooledWithSeq(st.udpKeys, kid, seq, routeName, clientAddrStr, pkt)
+	msg := udputil.EncodeData(routeName, clientAddrStr, pkt)
+
+	// Encrypt if enabled
+	if st.udpKeys != nil && st.udpKeys.HasKey() {
+		msg = st.udpKeys.Encrypt(msg)
 	}
 
 	if st.udpDirectRelay {
 		if st.udpData == nil {
 			st.udpNoAgentDrops.Add(1)
-			if bufPtr != nil {
-				udputil.PutOutputBuffer(bufPtr)
-			}
 			return
 		}
 		_, err := st.udpData.WriteTo(msg, agent)
@@ -2599,24 +2553,17 @@ func (st *serverState) processPublicUDPPacket(pkt []byte, clientAddr net.Addr, r
 				st.dash.addBytes(time.Now(), int64(len(msg)))
 			}
 		}
-		if bufPtr != nil {
-			udputil.PutOutputBuffer(bufPtr)
-		}
-	} else if st.udpAgentWriteQueue == nil || !st.udpAgentWriteQueue.EnqueueWithTimeout(msg, agent, bufPtr, enqueueWait) {
-		st.udpAgentWriteDrops.Add(1)
-		st.dashErrorRateLimited(routeName, "loss_udp_agent_write_queue", hostFromAddr(agent), "", "agent write queue full", 1*time.Second)
-		traceUDPf("udp: agent write queue full route=%s", routeName)
-		if bufPtr != nil {
-			udputil.PutOutputBuffer(bufPtr)
+	} else {
+		// Non-direct relay: enqueue to write queue
+		enqueueWait := st.udpEnqueueWait
+		if st.udpAgentWriteQueue == nil || !st.udpAgentWriteQueue.EnqueueWithTimeout(msg, agent, nil, enqueueWait) {
+			st.udpAgentWriteDrops.Add(1)
+			st.dashErrorRateLimited(routeName, "loss_udp_agent_write_queue", hostFromAddr(agent), "", "agent write queue full", 1*time.Second)
+			traceUDPf("udp: agent write queue full route=%s", routeName)
 		}
 	}
 
 	// Stats + dashboard tracking — kept off the critical write path.
-	// Only call time.Now() once, and only when dashboard is active.
-	if st.dash != nil {
-		now := time.Now()
-		st.dash.addBytes(now, int64(len(pkt)))
-	}
 	if st.udpStats != nil {
 		// Track session stats with single lock acquisition.
 		clientIP := hostFromAddr(clientAddr)

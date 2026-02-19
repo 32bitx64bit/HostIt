@@ -143,27 +143,7 @@ type ServerConfig struct {
 	// If empty, defaults are used alongside the main config file.
 	WebTLSCertFile string
 	WebTLSKeyFile  string
-	// DisableUDPEncryption disables application-layer encryption for the agent<->server
-	// UDP data channel (used for UDP forwarding). By default it is enabled.
-	//
-	// Deprecated: prefer UDPEncryptionMode.
-	DisableUDPEncryption bool
-	// UDPEncryptionMode controls application-layer encryption for the agent<->server
-	// UDP data channel. Supported values: "none", "aes128", "aes256".
-	// Default: "aes256".
-	UDPEncryptionMode string
-	// UDPKeyID is the current UDP encryption key version identifier.
-	UDPKeyID uint32
-	// UDPKeySaltB64 is the current key salt (base64, raw). The key is derived from
-	// Token + salt.
-	UDPKeySaltB64 string
-	// UDPPrevKeyID/UDPPrevKeySaltB64 are kept to allow a short grace period during
-	// key rotation.
-	UDPPrevKeyID      uint32
-	UDPPrevKeySaltB64 string
-	// UDPKeyCreatedUnix is when the current UDP key was generated (unix seconds).
-	UDPKeyCreatedUnix int64
-	PairTimeout       time.Duration
+	PairTimeout    time.Duration
 	// MaxPendingConns limits the total number of pending connections waiting for agent
 	// attachment. This is a DoS protection measure. Default: 10000. Set to 0 to disable.
 	MaxPendingConns *int `json:",omitempty"`
@@ -177,42 +157,45 @@ type ServerConfig struct {
 	DashboardInterval time.Duration `json:",omitempty"`
 	Routes            []RouteConfig
 
-	// UDP performance tuning options (optional, defaults applied if not set)
-	// UDPReaderCount is the number of parallel reader goroutines per UDP socket.
-	// Default: GOMAXPROCS/2, min 2, max 16.
-	UDPReaderCount *int `json:",omitempty"`
-	// UDPWorkerCount is the number of worker goroutines for packet processing.
-	// Default: GOMAXPROCS*2, min 8, max 128.
-	UDPWorkerCount *int `json:",omitempty"`
-	// UDPQueueSize is the packet queue size between readers and workers.
-	// Default: 16384.
-	UDPQueueSize *int `json:",omitempty"`
-	// UDPMaxPayload caps forwarded UDP payload size in bytes.
-	// Default: 1400. Set to 0 to disable payload capping.
-	UDPMaxPayload *int `json:",omitempty"`
-	// UDPBufferSize is the kernel socket buffer size in bytes.
-	// Default: 8MB (8388608).
-	UDPBufferSize *int `json:",omitempty"`
-	// UDPSessionBufferSize is the per-session buffer size for local UDP connections.
-	// Default: 4MB (4194304).
-	UDPSessionBufferSize *int `json:",omitempty"`
-	// UDPBufferPoolSize is the size of each buffer in the pool in bytes.
-	// Default: 64KB (65536).
-	UDPBufferPoolSize *int `json:",omitempty"`
-	// QUICEnabled enables QUIC protocol for UDP transport.
-	// QUIC provides better reliability and congestion control.
-	// Default is false (disabled).
-	QUICEnabled bool `json:",omitempty"`
-
 	// AgentHeartbeatInterval is the interval between heartbeat pings to the agent.
 	// Default: 5s. Minimum: 1s. Maximum: 30s.
 	AgentHeartbeatInterval time.Duration `json:",omitempty"`
 	// AgentHeartbeatTimeout is the time after which an unresponsive agent is disconnected.
 	// Default: 10s. Must be greater than AgentHeartbeatInterval.
 	AgentHeartbeatTimeout time.Duration `json:",omitempty"`
-	// UDPSessionIdleTimeout is the idle timeout for UDP sessions.
-	// Default: 5 minutes. Minimum: 1 minute. Maximum: 30 minutes.
-	UDPSessionIdleTimeout time.Duration `json:",omitempty"`
+
+	// UDP configuration options
+	// UDPBufferSize sets the socket buffer size for UDP connections.
+	// Default: 64MB. Increase for high-throughput scenarios.
+	UDPBufferSize *int `json:",omitempty"`
+	// UDPQueueSize sets the queue size for UDP packet processing.
+	// Default: 262144.
+	UDPQueueSize *int `json:",omitempty"`
+	// UDPMaxPayload sets the maximum UDP payload size. 0 = no limit.
+	UDPMaxPayload *int `json:",omitempty"`
+	// UDPWorkerCount sets the number of UDP worker goroutines.
+	// Default: NumCPU * 4.
+	UDPWorkerCount *int `json:",omitempty"`
+	// UDPReaderCount sets the number of UDP reader goroutines.
+	// Default: NumCPU.
+	UDPReaderCount *int `json:",omitempty"`
+	// UDPEncryptionMode sets the encryption mode for UDP packets.
+	// Options: "none", "aes-gcm". Default: "aes-gcm".
+	UDPEncryptionMode string `json:",omitempty"`
+	// DisableUDPEncryption disables UDP encryption.
+	DisableUDPEncryption bool `json:",omitempty"`
+	// UDPKeyID is the current UDP encryption key ID.
+	UDPKeyID uint32 `json:",omitempty"`
+	// UDPKeySaltB64 is the base64-encoded salt for the current UDP key.
+	UDPKeySaltB64 string `json:",omitempty"`
+	// UDPKeyCreatedUnix is the Unix timestamp when the current UDP key was created.
+	UDPKeyCreatedUnix int64 `json:",omitempty"`
+	// UDPPrevKeyID is the previous UDP encryption key ID (for key rotation).
+	UDPPrevKeyID uint32 `json:",omitempty"`
+	// UDPPrevKeySaltB64 is the base64-encoded salt for the previous UDP key.
+	UDPPrevKeySaltB64 string `json:",omitempty"`
+	// QUICEnabled enables QUIC protocol support for UDP traffic.
+	QUICEnabled bool `json:",omitempty"`
 }
 
 // Validate validates the server configuration.
@@ -254,12 +237,6 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
-	// UDP encryption mode validation
-	mode := strings.ToLower(strings.TrimSpace(c.UDPEncryptionMode))
-	if mode != "" && mode != "none" && mode != "aes128" && mode != "aes256" {
-		errs = append(errs, fmt.Sprintf("invalid udp_encryption_mode %q (must be none, aes128, or aes256)", c.UDPEncryptionMode))
-	}
-
 	// PairTimeout validation
 	if c.PairTimeout < 0 {
 		errs = append(errs, "pair_timeout must be >= 0")
@@ -283,28 +260,6 @@ func (c *ServerConfig) Validate() error {
 		errs = append(errs, "dashboard_interval must be at most 10m")
 	}
 
-	// UDP tuning validation
-	if c.UDPReaderCount != nil && *c.UDPReaderCount < 1 {
-		errs = append(errs, "udp_reader_count must be >= 1")
-	}
-	if c.UDPWorkerCount != nil && *c.UDPWorkerCount < 1 {
-		errs = append(errs, "udp_worker_count must be >= 1")
-	}
-	if c.UDPQueueSize != nil && *c.UDPQueueSize < 1024 {
-		errs = append(errs, "udp_queue_size must be >= 1024")
-	}
-	if c.UDPMaxPayload != nil {
-		if *c.UDPMaxPayload < 0 {
-			errs = append(errs, "udp_max_payload must be >= 0")
-		}
-		if *c.UDPMaxPayload > 65507 {
-			errs = append(errs, "udp_max_payload must be <= 65507")
-		}
-	}
-	if c.UDPBufferSize != nil && *c.UDPBufferSize < 65536 {
-		errs = append(errs, "udp_buffer_size must be >= 65536")
-	}
-
 	// Agent heartbeat validation
 	if c.AgentHeartbeatInterval > 0 && c.AgentHeartbeatInterval < 1*time.Second {
 		errs = append(errs, "agent_heartbeat_interval must be at least 1s")
@@ -320,14 +275,6 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.AgentHeartbeatInterval > 0 && c.AgentHeartbeatTimeout > 0 && c.AgentHeartbeatTimeout <= c.AgentHeartbeatInterval {
 		errs = append(errs, "agent_heartbeat_timeout must be greater than agent_heartbeat_interval")
-	}
-
-	// UDP session idle timeout validation
-	if c.UDPSessionIdleTimeout > 0 && c.UDPSessionIdleTimeout < 1*time.Minute {
-		errs = append(errs, "udp_session_idle_timeout must be at least 1m")
-	}
-	if c.UDPSessionIdleTimeout > 30*time.Minute {
-		errs = append(errs, "udp_session_idle_timeout must be at most 30m")
 	}
 
 	// Route validation

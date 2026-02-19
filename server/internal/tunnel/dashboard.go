@@ -36,7 +36,18 @@ type DashboardRoute struct {
 	Events        []DashboardEvent `json:"events"`
 }
 
-// UDPStats represents UDP traffic statistics for the dashboard.
+type DashboardSnapshot struct {
+	NowUnix        int64                     `json:"nowUnix"`
+	BucketSec      int                       `json:"bucketSec"`
+	AgentConnected bool                      `json:"agentConnected"`
+	ActiveClients  int64                     `json:"activeClients"`
+	BytesTotal     int64                     `json:"bytesTotal"`
+	Series         []DashboardPoint          `json:"series"`
+	Routes         map[string]DashboardRoute `json:"routes"`
+	UDP            *UDPStats                 `json:"udp,omitempty"`
+}
+
+// UDPStats contains UDP statistics for the dashboard
 type UDPStats struct {
 	PacketsIn            int64   `json:"packetsIn"`
 	PacketsOut           int64   `json:"packetsOut"`
@@ -60,17 +71,6 @@ type UDPStats struct {
 	PublicQueueCapacity  int64   `json:"publicQueueCapacity"`
 	AgentQueueDepth      int64   `json:"agentQueueDepth"`
 	AgentQueueCapacity   int64   `json:"agentQueueCapacity"`
-}
-
-type DashboardSnapshot struct {
-	NowUnix        int64                     `json:"nowUnix"`
-	BucketSec      int                       `json:"bucketSec"`
-	AgentConnected bool                      `json:"agentConnected"`
-	ActiveClients  int64                     `json:"activeClients"`
-	BytesTotal     int64                     `json:"bytesTotal"`
-	Series         []DashboardPoint          `json:"series"`
-	Routes         map[string]DashboardRoute `json:"routes"`
-	UDP            *UDPStats                 `json:"udp,omitempty"`
 }
 
 type bucket struct {

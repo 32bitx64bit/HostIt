@@ -306,6 +306,16 @@ func (r *serverRunner) RunAgentNettest(ctx context.Context, req tunnel.AgentNett
 	return srv.RunAgentNettest(ctx, req)
 }
 
+func (r *serverRunner) RunThroughputTest(ctx context.Context, duration time.Duration, packetSize int) (tunnel.ThroughputTestResult, error) {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return tunnel.ThroughputTestResult{}, fmt.Errorf("server not running")
+	}
+	return srv.RunThroughputTest(ctx, duration, packetSize)
+}
+
 // SetRouteEnabled toggles a route's enabled state at runtime.
 // Returns false if the route doesn't exist.
 func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
@@ -776,6 +786,44 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = json.NewEncoder(w).Encode(result)
 		})))
 
+		// Throughput test endpoint - high-speed streaming test
+		mux.HandleFunc("/api/nettest/throughput", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			durationSec := 3
+			if raw := strings.TrimSpace(r.Form.Get("duration_sec")); raw != "" {
+				if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 10 {
+					durationSec = n
+				}
+			}
+			packetSize := 1400
+			if raw := strings.TrimSpace(r.Form.Get("packet_size")); raw != "" {
+				if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 65507 {
+					packetSize = n
+				}
+			}
+			ctx2, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			defer cancel()
+			result, err := runner.RunThroughputTest(ctx2, time.Duration(durationSec)*time.Second, packetSize)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(result)
+		})))
+
 		// Manual update check (protected)
 		mux.HandleFunc("/api/update/check-now", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -1084,16 +1132,36 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			if cfg.UDPMaxPayload != nil {
 				udpMaxPayload = *cfg.UDPMaxPayload
 			}
+			udpBufferSize := 0
+			if cfg.UDPBufferSize != nil {
+				udpBufferSize = *cfg.UDPBufferSize
+			}
+			udpQueueSize := 65536
+			if cfg.UDPQueueSize != nil {
+				udpQueueSize = *cfg.UDPQueueSize
+			}
+			udpWorkerCount := 0
+			if cfg.UDPWorkerCount != nil {
+				udpWorkerCount = *cfg.UDPWorkerCount
+			}
+			udpReaderCount := 0
+			if cfg.UDPReaderCount != nil {
+				udpReaderCount = *cfg.UDPReaderCount
+			}
 			data := map[string]any{
-				"Cfg":           cfg,
-				"Status":        st,
-				"ConfigPath":    configPath,
-				"Msg":           getMsg(),
-				"Err":           err,
-				"CSRF":          csrf,
-				"Version":       version.Current,
-				"DashInterval":  dashInterval.String(),
-				"UDPMaxPayload": udpMaxPayload,
+				"Cfg":            cfg,
+				"Status":         st,
+				"ConfigPath":     configPath,
+				"Msg":            getMsg(),
+				"Err":            err,
+				"CSRF":           csrf,
+				"Version":        version.Current,
+				"DashInterval":   dashInterval.String(),
+				"UDPMaxPayload":  udpMaxPayload,
+				"UDPBufferSize":  udpBufferSize,
+				"UDPQueueSize":   udpQueueSize,
+				"UDPWorkerCount": udpWorkerCount,
+				"UDPReaderCount": udpReaderCount,
 			}
 			_ = tplControls.Execute(w, data)
 		})))
@@ -1135,6 +1203,99 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			runner.Restart(cfg)
 			setMsg(fmt.Sprintf("UDP max payload set to %d bytes — restarted", n))
+			http.Redirect(w, r, "/controls", http.StatusSeeOther)
+		})))
+
+		// UDP performance settings update (protected)
+		mux.HandleFunc("/api/udp/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+
+			cfg, _, _ := runner.Get()
+			msgs := make([]string, 0, 4)
+
+			// Buffer size (in MB)
+			if raw := strings.TrimSpace(r.Form.Get("udp_buffer_size")); raw != "" {
+				n, err := strconv.Atoi(raw)
+				if err != nil {
+					http.Error(w, "invalid udp_buffer_size", http.StatusBadRequest)
+					return
+				}
+				if n < 0 || n > 1024 {
+					http.Error(w, "udp_buffer_size must be between 0 and 1024 MB", http.StatusBadRequest)
+					return
+				}
+				cfg.UDPBufferSize = &n
+				msgs = append(msgs, fmt.Sprintf("buffer=%dMB", n))
+			}
+
+			// Queue size
+			if raw := strings.TrimSpace(r.Form.Get("udp_queue_size")); raw != "" {
+				n, err := strconv.Atoi(raw)
+				if err != nil {
+					http.Error(w, "invalid udp_queue_size", http.StatusBadRequest)
+					return
+				}
+				if n < 1024 || n > 1048576 {
+					http.Error(w, "udp_queue_size must be between 1024 and 1048576", http.StatusBadRequest)
+					return
+				}
+				cfg.UDPQueueSize = &n
+				msgs = append(msgs, fmt.Sprintf("queue=%d", n))
+			}
+
+			// Worker count
+			if raw := strings.TrimSpace(r.Form.Get("udp_worker_count")); raw != "" {
+				n, err := strconv.Atoi(raw)
+				if err != nil {
+					http.Error(w, "invalid udp_worker_count", http.StatusBadRequest)
+					return
+				}
+				if n < 1 || n > 256 {
+					http.Error(w, "udp_worker_count must be between 1 and 256", http.StatusBadRequest)
+					return
+				}
+				cfg.UDPWorkerCount = &n
+				msgs = append(msgs, fmt.Sprintf("workers=%d", n))
+			}
+
+			// Reader count
+			if raw := strings.TrimSpace(r.Form.Get("udp_reader_count")); raw != "" {
+				n, err := strconv.Atoi(raw)
+				if err != nil {
+					http.Error(w, "invalid udp_reader_count", http.StatusBadRequest)
+					return
+				}
+				if n < 1 || n > 64 {
+					http.Error(w, "udp_reader_count must be between 1 and 64", http.StatusBadRequest)
+					return
+				}
+				cfg.UDPReaderCount = &n
+				msgs = append(msgs, fmt.Sprintf("readers=%d", n))
+			}
+
+			if len(msgs) == 0 {
+				http.Error(w, "no UDP settings provided", http.StatusBadRequest)
+				return
+			}
+
+			if err := configio.Save(configPath, cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			runner.Restart(cfg)
+			setMsg(fmt.Sprintf("UDP settings updated (%s) — restarted", strings.Join(msgs, ", ")))
 			http.Redirect(w, r, "/controls", http.StatusSeeOther)
 		})))
 
@@ -2669,6 +2830,31 @@ const serverControlsHTML = `<!doctype html>
 							<button type="submit" class="btn sm primary">Apply &amp; Restart</button>
 						</div>
 					</form>
+					<hr style="border:0;border-top:1px solid var(--border);margin:12px 0" />
+					<div class="row"><b>UDP Performance:</b></div>
+					<div class="muted" style="margin-bottom:8px;font-size:12px">Tune buffer sizes and worker counts for high-throughput scenarios. Leave at 0 for defaults.</div>
+					<form method="post" action="/api/udp/config" style="margin:0">
+						<input type="hidden" name="csrf" value="{{.CSRF}}" />
+						<div class="grid2" style="gap:8px;margin-bottom:8px">
+							<div>
+								<label style="font-size:11px;color:var(--textMuted)">Buffer Size (MB)</label>
+								<input type="number" name="udp_buffer_size" min="0" max="1024" value="{{.UDPBufferSize}}" placeholder="0 = auto" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px" />
+							</div>
+							<div>
+								<label style="font-size:11px;color:var(--textMuted)">Queue Size</label>
+								<input type="number" name="udp_queue_size" min="1024" max="1048576" value="{{.UDPQueueSize}}" placeholder="65536" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px" />
+							</div>
+							<div>
+								<label style="font-size:11px;color:var(--textMuted)">Worker Count</label>
+								<input type="number" name="udp_worker_count" min="1" max="256" value="{{.UDPWorkerCount}}" placeholder="0 = auto" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px" />
+							</div>
+							<div>
+								<label style="font-size:11px;color:var(--textMuted)">Reader Count</label>
+								<input type="number" name="udp_reader_count" min="1" max="64" value="{{.UDPReaderCount}}" placeholder="0 = auto" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px" />
+							</div>
+						</div>
+						<button type="submit" class="btn sm primary">Apply UDP Settings &amp; Restart</button>
+					</form>
 				</div>
 
 				<div class="secHead"><h2>Updates</h2></div>
@@ -2868,6 +3054,30 @@ const serverNetworkTestHTML = `<!doctype html>
 					<div class="k">Upload speed</div><div class="v" id="aUp">—</div>
 				</div>
 			</div>
+
+			<div class="card">
+				<h3 style="margin:0 0 8px">UDP Throughput Test</h3>
+				<div class="muted" style="margin-bottom:12px">High-speed streaming test over UDP tunnel. Measures real tunnel capacity.</div>
+				<div class="grid2" style="margin-bottom:12px;gap:8px">
+					<div>
+						<label style="font-size:11px;color:var(--textMuted)">Duration (sec)</label>
+						<input type="number" id="throughputDuration" value="3" min="1" max="10" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text)" />
+					</div>
+					<div>
+						<label style="font-size:11px;color:var(--textMuted)">Packet size</label>
+						<input type="number" id="throughputPktSize" value="1400" min="64" max="65507" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text)" />
+					</div>
+				</div>
+				<button id="runThroughput" class="btn primary">Run Throughput Test</button>
+				<div id="throughputStatus" class="muted" style="margin-top:8px">Idle</div>
+				<div class="kv" style="margin-top:12px">
+					<div class="k">Upload (server→agent)</div><div class="v" id="tUp">—</div>
+					<div class="k">Download (agent→server)</div><div class="v" id="tDown">—</div>
+					<div class="k">Upload packets</div><div class="v" id="tUpPkts">—</div>
+					<div class="k">Download packets</div><div class="v" id="tDownPkts">—</div>
+					<div class="k">Packet loss</div><div class="v" id="tLoss">—</div>
+				</div>
+			</div>
 		</div>
 	</div>
 
@@ -2971,6 +3181,37 @@ const serverNetworkTestHTML = `<!doctype html>
 			runAgent().catch(function(err){
 				$('agentStatus').textContent = 'Failed: '+(err && err.message ? err.message : 'unknown');
 				$('runAgent').disabled = false;
+			});
+		});
+
+		async function runThroughput(){
+			$('runThroughput').disabled = true;
+			$('throughputStatus').textContent = 'Running UDP throughput test...';
+			var duration = parseInt($('throughputDuration').value||'3',10);
+			var pktSize = parseInt($('throughputPktSize').value||'1400',10);
+			var form = new URLSearchParams();
+			form.set('csrf', csrf);
+			form.set('duration_sec', String(duration));
+			form.set('packet_size', String(pktSize));
+			var r = await fetch('/api/nettest/throughput', {method:'POST', body: form});
+			if(!r.ok){
+				var txt = await r.text();
+				throw new Error(txt || ('http '+r.status));
+			}
+			var j = await r.json();
+			$('tUp').textContent = fmtMbps(j.uploadMbps);
+			$('tDown').textContent = fmtMbps(j.downloadMbps);
+			$('tUpPkts').textContent = (j.uploadPackets||0).toLocaleString() + ' pkts';
+			$('tDownPkts').textContent = (j.downloadPackets||0).toLocaleString() + ' pkts';
+			$('tLoss').textContent = fmtPct(j.lossPercent||0);
+			$('throughputStatus').textContent = 'Complete (upload: '+(j.uploadDurationMs||0)+'ms, download: '+(j.downloadDurationMs||0)+'ms)';
+			$('runThroughput').disabled = false;
+		}
+
+		$('runThroughput').addEventListener('click', function(){
+			runThroughput().catch(function(err){
+				$('throughputStatus').textContent = 'Failed: '+(err && err.message ? err.message : 'unknown');
+				$('runThroughput').disabled = false;
 			});
 		});
 	})();

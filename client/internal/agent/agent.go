@@ -238,10 +238,17 @@ func runOnce(ctx context.Context, cfg Config, hooks *Hooks) error {
 		}
 	}
 	debugf("agent: server OK; dataTLS=%s dataInsecure=%s", dataAddrTLS, dataAddrInsecure)
+
+	// UDP encryption parameters (received from server)
+	var udpEncMode string
+	var udpKeyID uint32
+	var udpSaltB64 string
+	var udpPrevKeyID uint32
+	var udpPrevSaltB64 string
+
 	// Read server-pushed routes before marking connected.
 	routesByName := map[string]RemoteRoute{}
 	routesList := make([]RemoteRoute, 0, 8)
-	udpSec := newUDPSecurityState()
 	for {
 		_ = controlConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		ln, err := rw.ReadLine()
@@ -255,6 +262,21 @@ func runOnce(ctx context.Context, cfg Config, hooks *Hooks) error {
 		switch c {
 		case "READY":
 			goto ready
+		case "UDPSEC":
+			// Parse UDP security parameters: mode keyID salt prevKeyID prevSalt
+			f := strings.Fields(rest)
+			if len(f) >= 5 {
+				udpEncMode = strings.TrimSpace(f[0])
+				if v, err := strconv.ParseUint(strings.TrimSpace(f[1]), 10, 32); err == nil {
+					udpKeyID = uint32(v)
+				}
+				udpSaltB64 = strings.TrimSpace(f[2])
+				if v, err := strconv.ParseUint(strings.TrimSpace(f[3]), 10, 32); err == nil {
+					udpPrevKeyID = uint32(v)
+				}
+				udpPrevSaltB64 = strings.TrimSpace(f[4])
+				debugf("agent: UDPSEC mode=%s keyID=%d prevKeyID=%d", udpEncMode, udpKeyID, udpPrevKeyID)
+			}
 		case "ROUTE":
 			f := strings.Fields(rest)
 			if len(f) < 3 {
@@ -294,10 +316,6 @@ func runOnce(ctx context.Context, cfg Config, hooks *Hooks) error {
 			debugf("agent: route name=%s proto=%s public=%s nodelay=%v tls=%v preconnect=%d", rt.Name, rt.Proto, rt.PublicAddr, rt.TCPNoDelay, rt.TunnelTLS, rt.Preconnect)
 		case "PING":
 			_ = rw.WriteLinef("PONG %s", rest)
-		case "UDPSEC":
-			if !cfg.DisableUDPEncryption {
-				udpSec.UpdateFromLine(cfg.Token, rest)
-			}
 		default:
 			// Ignore anything else during handshake.
 		}
@@ -311,25 +329,26 @@ ready:
 	if hooks != nil && hooks.OnConnected != nil {
 		hooks.OnConnected()
 	}
-	udpCtx, udpCancel := context.WithCancel(onceCtx)
-	defer udpCancel()
-	if cfg.DisableUDPEncryption {
-		udpSec.ForceNone()
-	}
-	hasUDP := false
+	pools := startDataPools(onceCtx, cfg, routesByName, dataAddrTLS, dataAddrInsecure)
+
+	// Start UDP client if there are UDP routes
+	var udpClient *UDPClient
 	for _, rt := range routesByName {
 		if routeHasUDP(rt.Proto) {
-			hasUDP = true
+			udpClient = NewUDPClient(cfg, dataAddrTLS, routesByName)
+			if err := udpClient.SetKeys(udpEncMode, udpKeyID, udpSaltB64, udpPrevKeyID, udpPrevSaltB64); err != nil {
+				log.Warnf(logging.CatUDP, "failed to set UDP encryption keys: %v", err)
+			}
+			if err := udpClient.Start(onceCtx); err != nil {
+				log.Warnf(logging.CatUDP, "failed to start UDP client: %v", err)
+				udpClient = nil
+			}
 			break
 		}
 	}
-	if hasUDP {
-		log.Debugf(logging.CatUDP, "starting UDP handler (encryption=%v)", !cfg.DisableUDPEncryption)
-		go runUDP(udpCtx, dataAddrTLS, cfg.Token, udpSec, routesByName)
-	} else {
-		log.Debug(logging.CatUDP, "skipping UDP handler (no UDP routes)")
+	if udpClient != nil {
+		defer udpClient.Stop()
 	}
-	pools := startDataPools(onceCtx, cfg, routesByName, dataAddrTLS, dataAddrInsecure)
 
 	for {
 		select {
@@ -368,11 +387,6 @@ ready:
 			go handleOne(ctx, cfg, dataAddrTLS, dataAddrInsecure, pools, routesByName, id, routeName)
 		case "PING":
 			_ = rw.WriteLinef("PONG %s", rest)
-		case "UDPSEC":
-			log.Debug(logging.CatUDP, "received UDPSEC update")
-			if !cfg.DisableUDPEncryption {
-				udpSec.UpdateFromLine(cfg.Token, rest)
-			}
 		case "NETTEST_PING":
 			f := strings.Fields(rest)
 			if len(f) < 4 {

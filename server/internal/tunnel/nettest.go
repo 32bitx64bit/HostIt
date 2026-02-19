@@ -31,6 +31,20 @@ type AgentNettestResult struct {
 	DownloadMbps   float64 `json:"downloadMbps"`
 }
 
+// ThroughputTestResult represents results from a high-throughput streaming test
+type ThroughputTestResult struct {
+	AgentConnected   bool    `json:"agentConnected"`
+	UploadMbps       float64 `json:"uploadMbps"`
+	DownloadMbps     float64 `json:"downloadMbps"`
+	UploadBytes      int64   `json:"uploadBytes"`
+	DownloadBytes    int64   `json:"downloadBytes"`
+	UploadDuration   int64   `json:"uploadDurationMs"`
+	DownloadDuration int64   `json:"downloadDurationMs"`
+	UploadPackets    int64   `json:"uploadPackets"`
+	DownloadPackets  int64   `json:"downloadPackets"`
+	LossPercent      float64 `json:"lossPercent"`
+}
+
 type nettestPong struct {
 	id      string
 	seq     int
@@ -41,6 +55,11 @@ type nettestPong struct {
 
 func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (AgentNettestResult, error) {
 	return s.st.runAgentNettest(ctx, req)
+}
+
+// RunThroughputTest runs a high-throughput streaming test to measure actual tunnel capacity
+func (s *Server) RunThroughputTest(ctx context.Context, duration time.Duration, packetSize int) (ThroughputTestResult, error) {
+	return s.st.runThroughputTest(ctx, duration, packetSize)
 }
 
 func (st *serverState) runAgentNettest(ctx context.Context, req AgentNettestRequest) (AgentNettestResult, error) {
@@ -176,6 +195,153 @@ func (st *serverState) runAgentNettest(ctx context.Context, req AgentNettestRequ
 	return result, nil
 }
 
+// runThroughputTest performs a high-throughput streaming test
+// This sends packets at a controlled rate to measure tunnel capacity
+// without overwhelming the control channel
+func (st *serverState) runThroughputTest(ctx context.Context, duration time.Duration, packetSize int) (ThroughputTestResult, error) {
+	st.nettestRunMu.Lock()
+	defer st.nettestRunMu.Unlock()
+
+	// Defaults
+	if duration <= 0 {
+		duration = 3 * time.Second
+	}
+	if duration > 10*time.Second {
+		duration = 10 * time.Second
+	}
+	if packetSize <= 0 {
+		packetSize = 1400 // Typical MTU-safe UDP payload
+	}
+	if packetSize > 65507 {
+		packetSize = 65507
+	}
+
+	st.mu.Lock()
+	conn := st.agentConn
+	st.mu.Unlock()
+	if conn == nil {
+		return ThroughputTestResult{AgentConnected: false}, fmt.Errorf("agent not connected")
+	}
+
+	result := ThroughputTestResult{AgentConnected: true}
+	id := newID()
+
+	// Create a fixed payload to avoid per-packet random generation overhead
+	payload := make([]byte, min(packetSize-100, 4096)) // Leave room for headers
+	rand.Read(payload)
+	payloadB64 := base64.RawStdEncoding.EncodeToString(payload)
+
+	// Use a single shared channel for ALL responses for this test
+	sharedCh := make(chan nettestPong, 100000)
+
+	// Counters for sent packets
+	var sentPackets int64
+	var sentBytes int64
+
+	// Control channel is not designed for high-throughput.
+	// Send at a reasonable rate to avoid overwhelming the agent.
+	// Max ~500 packets/second to keep the control channel responsive
+	maxPacketsPerSecond := int64(500)
+	minInterval := time.Second / time.Duration(maxPacketsPerSecond)
+
+	// Upload phase - send at controlled rate
+	uploadStart := time.Now()
+	uploadDeadline := uploadStart.Add(duration)
+	lastSend := time.Now()
+
+	// Send packets
+	for time.Now().Before(uploadDeadline) {
+		if ctx.Err() != nil {
+			break
+		}
+
+		// Rate limit
+		elapsed := time.Since(lastSend)
+		if elapsed < minInterval {
+			time.Sleep(minInterval - elapsed)
+		}
+		lastSend = time.Now()
+
+		sentPackets++
+		sendNS := time.Now().UnixNano()
+
+		// Register this packet with the shared channel
+		key := nettestKey(id, int(sentPackets))
+		st.nettestMu.Lock()
+		st.nettestPending[key] = sharedCh
+		st.nettestMu.Unlock()
+
+		if err := st.agentWriteLinef(conn, "NETTEST_PING %s %d %d %s", id, sentPackets, sendNS, payloadB64); err != nil {
+			st.nettestMu.Lock()
+			delete(st.nettestPending, key)
+			st.nettestMu.Unlock()
+			break
+		}
+
+		sentBytes += int64(len(payloadB64))
+
+		// Drain any responses that have arrived
+		for {
+			select {
+			case <-sharedCh:
+				result.DownloadPackets++
+				result.DownloadBytes += int64(len(payloadB64))
+			default:
+				goto continueSending
+			}
+		}
+	continueSending:
+	}
+
+	uploadDuration := time.Since(uploadStart)
+	result.UploadDuration = uploadDuration.Milliseconds()
+	result.UploadPackets = sentPackets
+	result.UploadBytes = sentBytes
+
+	// Wait for remaining responses
+	waitDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		select {
+		case <-sharedCh:
+			result.DownloadPackets++
+			result.DownloadBytes += int64(len(payloadB64))
+		case <-time.After(200 * time.Millisecond):
+			// No more responses coming
+			if result.DownloadPackets >= sentPackets {
+				goto done
+			}
+		}
+	}
+
+done:
+	// Clean up any remaining pending entries for this test
+	st.nettestMu.Lock()
+	for seq := int64(1); seq <= sentPackets; seq++ {
+		delete(st.nettestPending, nettestKey(id, int(seq)))
+	}
+	st.nettestMu.Unlock()
+
+	result.DownloadDuration = uploadDuration.Milliseconds()
+
+	// Calculate throughput
+	uploadSeconds := uploadDuration.Seconds()
+	if uploadSeconds <= 0 {
+		uploadSeconds = 0.001
+	}
+	result.UploadMbps = float64(result.UploadBytes*8) / uploadSeconds / 1e6
+	result.DownloadMbps = float64(result.DownloadBytes*8) / uploadSeconds / 1e6
+
+	// Calculate loss
+	if result.UploadPackets > 0 {
+		result.LossPercent = (1.0 - float64(result.DownloadPackets)/float64(result.UploadPackets)) * 100.0
+		if result.LossPercent < 0 {
+			result.LossPercent = 0
+		}
+	}
+
+	return result, nil
+}
+
 func nettestKey(id string, seq int) string {
 	return id + ":" + strconv.Itoa(seq)
 }
@@ -222,4 +388,11 @@ func (st *serverState) clearNettestPending() {
 		delete(st.nettestPending, k)
 	}
 	st.nettestMu.Unlock()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

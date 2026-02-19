@@ -36,9 +36,6 @@ type Config struct {
 	// TLSPinSHA256 optionally pins the server certificate by SHA256(der) hex.
 	// This is recommended with self-signed certs to prevent MITM.
 	TLSPinSHA256 string
-	// DisableUDPEncryption disables application-layer encryption for the agent<->server
-	// UDP data channel (used for UDP forwarding). By default it is enabled.
-	DisableUDPEncryption bool
 }
 
 // Validate validates the client configuration.
