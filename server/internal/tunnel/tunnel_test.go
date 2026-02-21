@@ -6,11 +6,10 @@ import (
 	"io"
 	"net"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	"hostit/server/internal/lineproto"
+	"hostit/shared/protocol"
 )
 
 func TestEndToEndTCP(t *testing.T) {
@@ -226,10 +225,16 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, tok
 	}()
 	defer controlConn.Close()
 
-	rw := lineproto.New(controlConn, controlConn)
-	_ = rw.WriteLinef("HELLO %s", token)
-	_, err := rw.ReadLine() // OK ...
-	if err != nil {
+	// Simple auth
+	controlConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	controlConn.Write([]byte(token))
+	controlConn.SetWriteDeadline(time.Time{})
+
+	// Read HELLO
+	controlConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	helloPkt, err := protocol.ReadPacket(controlConn)
+	controlConn.SetReadDeadline(time.Time{})
+	if err != nil || helloPkt.Type != protocol.TypeHello {
 		return
 	}
 
@@ -239,65 +244,49 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, tok
 			return
 		default:
 		}
-		line, err := rw.ReadLine()
+		controlConn.SetReadDeadline(time.Now().Add(45 * time.Second))
+		pkt, err := protocol.ReadPacket(controlConn)
 		if err != nil {
 			return
 		}
-		cmd, rest := lineproto.Split2(line)
-		if cmd != "NEW" || rest == "" {
-			continue
+		if pkt.Type == protocol.TypeConnect {
+			routeName := pkt.Route
+			clientID := pkt.Client
+			go func() {
+				dataConn, err := net.Dial("tcp", dataAddr)
+				if err != nil {
+					return
+				}
+				defer dataConn.Close()
+
+				// Authenticate and send route/client info in one write
+				routeBytes := []byte(routeName)
+				clientBytes := []byte(clientID)
+
+				buf := make([]byte, 0, len(token)+1+len(routeBytes)+1+len(clientBytes))
+				buf = append(buf, []byte(token)...)
+				buf = append(buf, byte(len(routeBytes)))
+				buf = append(buf, routeBytes...)
+				buf = append(buf, byte(len(clientBytes)))
+				buf = append(buf, clientBytes...)
+
+				dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if _, err := dataConn.Write(buf); err != nil {
+					return
+				}
+				dataConn.SetWriteDeadline(time.Time{})
+
+				localConn, err := net.Dial("tcp", localAddr)
+				if err != nil {
+					return
+				}
+				defer localConn.Close()
+
+				go func() {
+					io.Copy(localConn, dataConn)
+				}()
+				io.Copy(dataConn, localConn)
+			}()
 		}
-		fields := strings.Fields(rest)
-		if len(fields) == 0 {
-			continue
-		}
-		id := fields[0]
-		go func() {
-			dataConn, err := net.Dial("tcp", dataAddr)
-			if err != nil {
-				return
-			}
-			defer dataConn.Close()
-			drw := lineproto.New(dataConn, dataConn)
-			_ = drw.WriteLinef("CONN %s", id)
-
-			// Read PAIRED acknowledgment byte-by-byte to avoid buffering
-			// application data that follows.
-			if err := readPairedAckRaw(dataConn, 3*time.Second); err != nil {
-				return
-			}
-
-			localConn, err := net.Dial("tcp", localAddr)
-			if err != nil {
-				return
-			}
-			defer localConn.Close()
-
-			bidirPipe(localConn, dataConn)
-		}()
 	}
-}
-
-// readPairedAckRaw reads the "PAIRED\n" acknowledgment one byte at a time
-// so it doesn't over-buffer application data from the socket.
-func readPairedAckRaw(c net.Conn, timeout time.Duration) error {
-	_ = c.SetReadDeadline(time.Now().Add(timeout))
-	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
-	var buf [32]byte
-	i := 0
-	for i < len(buf) {
-		_, err := c.Read(buf[i : i+1])
-		if err != nil {
-			return err
-		}
-		if buf[i] == '\n' {
-			line := strings.TrimSpace(string(buf[:i]))
-			if line == "PAIRED" {
-				return nil
-			}
-			return fmt.Errorf("unexpected ack: %q", line)
-		}
-		i++
-	}
-	return fmt.Errorf("ack too long")
 }

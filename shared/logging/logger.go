@@ -85,16 +85,16 @@ const (
 
 // Entry represents a single log entry.
 type Entry struct {
-	Time      time.Time         `json:"time"`
-	Level     Level             `json:"level"`
-	LevelStr  string            `json:"level_str"`
-	Category  Category          `json:"category"`
-	Component string            `json:"component"` // "server" or "agent"
-	Message   string            `json:"message"`
-	Fields    map[string]any    `json:"fields,omitempty"`
-	Error     error             `json:"-"`
-	ErrorStr  string            `json:"error,omitempty"`
-	Caller    string            `json:"caller,omitempty"`
+	Time      time.Time      `json:"time"`
+	Level     Level          `json:"level"`
+	LevelStr  string         `json:"level_str"`
+	Category  Category       `json:"category"`
+	Component string         `json:"component"` // "server" or "agent"
+	Message   string         `json:"message"`
+	Fields    map[string]any `json:"fields,omitempty"`
+	Error     error          `json:"-"`
+	ErrorStr  string         `json:"error,omitempty"`
+	Caller    string         `json:"caller,omitempty"`
 }
 
 // Hook is called for each log entry. Hooks can be used to send logs to dashboards,
@@ -111,7 +111,7 @@ type Logger struct {
 	fields     map[string]any
 	jsonFormat bool
 	showCaller bool
-	
+
 	// Rate limiting for high-volume logs
 	rateLimiter *rateLimiter
 }
@@ -209,7 +209,7 @@ func (l *Logger) AddHook(hook Hook) {
 func (l *Logger) WithFields(fields map[string]any) *Logger {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	
+
 	newFields := make(map[string]any, len(l.fields)+len(fields))
 	for k, v := range l.fields {
 		newFields[k] = v
@@ -217,7 +217,7 @@ func (l *Logger) WithFields(fields map[string]any) *Logger {
 	for k, v := range fields {
 		newFields[k] = v
 	}
-	
+
 	return &Logger{
 		output:      l.output,
 		component:   l.component,
@@ -310,7 +310,7 @@ func (l *Logger) write(entry Entry) {
 	} else {
 		output = l.formatText(entry)
 	}
-	
+
 	l.mu.Lock()
 	_, _ = io.WriteString(l.output, output)
 	l.mu.Unlock()
@@ -318,25 +318,25 @@ func (l *Logger) write(entry Entry) {
 
 func (l *Logger) formatText(entry Entry) string {
 	var b strings.Builder
-	
+
 	// Timestamp
 	b.WriteString(entry.Time.Format("2006/01/02 15:04:05"))
 	b.WriteString(" ")
-	
+
 	// Level with padding
 	b.WriteString(fmt.Sprintf("%-5s", entry.LevelStr))
 	b.WriteString(" ")
-	
+
 	// Category
 	if entry.Category != "" {
 		b.WriteString("[")
 		b.WriteString(string(entry.Category))
 		b.WriteString("] ")
 	}
-	
+
 	// Message
 	b.WriteString(entry.Message)
-	
+
 	// Fields
 	if len(entry.Fields) > 0 {
 		for k, v := range entry.Fields {
@@ -346,20 +346,20 @@ func (l *Logger) formatText(entry Entry) string {
 			b.WriteString(fmt.Sprintf(" %s=%v", k, v))
 		}
 	}
-	
+
 	// Error
 	if entry.ErrorStr != "" {
 		b.WriteString(" error=\"")
 		b.WriteString(entry.ErrorStr)
 		b.WriteString("\"")
 	}
-	
+
 	// Caller
 	if entry.Caller != "" {
 		b.WriteString(" caller=")
 		b.WriteString(entry.Caller)
 	}
-	
+
 	b.WriteString("\n")
 	return b.String()
 }

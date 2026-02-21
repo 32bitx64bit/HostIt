@@ -13,15 +13,7 @@ type RemoteRoute struct {
 	Name       string
 	Proto      string // "tcp", "udp", or "both"
 	PublicAddr string // server listen addr (host:port)
-	// TCPNoDelay enables TCP_NODELAY (low latency) for this route.
-	// If true, the agent will disable Nagle on the data TCP connection and the local backend TCP connection.
-	TCPNoDelay bool
-	// TunnelTLS controls whether the agent should use the TLS-encrypted data channel for this route.
-	// Default is true.
-	TunnelTLS bool
-	// Preconnect controls how many ready data connections the agent maintains for this route.
-	// Default is 0 unless the server provides a value.
-	Preconnect int
+	Encrypted  bool   // whether this route uses application-layer encryption
 }
 
 type Config struct {
@@ -36,6 +28,11 @@ type Config struct {
 	// TLSPinSHA256 optionally pins the server certificate by SHA256(der) hex.
 	// This is recommended with self-signed certs to prevent MITM.
 	TLSPinSHA256 string
+	// EncryptionAlgorithm specifies the global encryption standard for routes that have encryption enabled.
+	// Supported values: "aes-128", "aes-256", "none". Default is "aes-128".
+	EncryptionAlgorithm string
+	// Routes is populated by the server's HELLO message.
+	Routes map[string]RemoteRoute `json:"-"`
 }
 
 // Validate validates the client configuration.

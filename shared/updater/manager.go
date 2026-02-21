@@ -17,13 +17,11 @@ import (
 )
 
 type Manager struct {
-	Repo      string
-	Component Component
-	AssetName string
-	ModuleDir string
-	Store     *Store
-	// Preserve is kept for backwards compatibility; prefer PreservePaths.
-	Preserve      string
+	Repo          string
+	Component     Component
+	AssetName     string
+	ModuleDir     string
+	Store         *Store
 	PreservePaths []string
 	Now           func() time.Time
 	Restart       func() error
@@ -264,10 +262,7 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 		expectedFolder = "client"
 	}
 
-	preserve := make([]string, 0, 1+len(m.PreservePaths))
-	if strings.TrimSpace(m.Preserve) != "" {
-		preserve = append(preserve, m.Preserve)
-	}
+	preserve := make([]string, 0, len(m.PreservePaths))
 	for _, p := range m.PreservePaths {
 		if strings.TrimSpace(p) != "" {
 			preserve = append(preserve, p)
@@ -278,7 +273,6 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 		AssetURL:       assetURL,
 		ModuleDir:      m.ModuleDir,
 		ExpectedFolder: expectedFolder,
-		PreservePath:   m.Preserve,
 		PreservePaths:  preserve,
 		SharedDestDir:  siblingSharedDir(m.ModuleDir),
 	}, logw)
@@ -346,10 +340,7 @@ func (m *Manager) runApplyLocal(componentZipPath string, sharedZipPath string) {
 		expectedFolder = "client"
 	}
 
-	preserve := make([]string, 0, 1+len(m.PreservePaths))
-	if strings.TrimSpace(m.Preserve) != "" {
-		preserve = append(preserve, m.Preserve)
-	}
+	preserve := make([]string, 0, len(m.PreservePaths))
 	for _, p := range m.PreservePaths {
 		if strings.TrimSpace(p) != "" {
 			preserve = append(preserve, p)
@@ -359,7 +350,6 @@ func (m *Manager) runApplyLocal(componentZipPath string, sharedZipPath string) {
 	err := ApplyZipFileUpdate(ctx, componentZipPath, ApplyOptions{
 		ModuleDir:      m.ModuleDir,
 		ExpectedFolder: expectedFolder,
-		PreservePath:   m.Preserve,
 		PreservePaths:  preserve,
 		SharedDestDir:  siblingSharedDir(m.ModuleDir),
 	}, logw)

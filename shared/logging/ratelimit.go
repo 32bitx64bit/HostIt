@@ -26,18 +26,18 @@ func (r *rateLimiter) allow(key string) bool {
 	if r == nil || r.interval <= 0 {
 		return true
 	}
-	
+
 	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	
+
 	if last, ok := r.last[key]; ok {
 		if now.Sub(last) < r.interval {
 			return false
 		}
 	}
 	r.last[key] = now
-	
+
 	// Cleanup old entries periodically
 	if len(r.last) > 1000 {
 		cutoff := now.Add(-r.interval * 10)
@@ -47,7 +47,7 @@ func (r *rateLimiter) allow(key string) bool {
 			}
 		}
 	}
-	
+
 	return true
 }
 

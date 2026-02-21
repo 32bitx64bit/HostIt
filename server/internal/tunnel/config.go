@@ -28,28 +28,25 @@ type RouteConfig struct {
 	// If nil, the default is enabled (true).
 	// Disabled routes are not exposed and the client will not forward traffic.
 	Enabled *bool
-	// TCPNoDelay controls TCP_NODELAY for this route's TCP connections.
-	// If nil, the default is enabled (true).
-	TCPNoDelay *bool
-	// TunnelTLS controls whether the agent<->server data channel should be TLS-encrypted
-	// for this route.
-	//
-	// Note: this is only applicable if the server is configured with an insecure data
-	// listener as well (DataAddrInsecure). If nil, the default is enabled (true).
-	TunnelTLS *bool
-	// Preconnect controls how many pre-handshaked data TCP connections the agent should
-	// keep ready to reduce per-connection pairing latency.
-	// If nil, the default is 4 for TCP-capable routes.
-	// If 0, the agent dials on-demand.
-	Preconnect *int
+	// Encrypted controls whether the tunnel traffic for this route is encrypted.
+	// If nil, the default is false.
+	Encrypted *bool
 }
 
 // IsEnabled returns true if the route is enabled (default is true).
-func (r *RouteConfig) IsEnabled() bool {
+func (r RouteConfig) IsEnabled() bool {
 	if r.Enabled == nil {
 		return true
 	}
 	return *r.Enabled
+}
+
+// IsEncrypted returns true if the route is encrypted (default is false).
+func (r RouteConfig) IsEncrypted() bool {
+	if r.Encrypted == nil {
+		return false
+	}
+	return *r.Encrypted
 }
 
 // validateRouteName validates that a route name contains only safe characters.
@@ -108,11 +105,6 @@ func (r *RouteConfig) Validate() error {
 		}
 	}
 
-	// Preconnect must be non-negative
-	if r.Preconnect != nil && *r.Preconnect < 0 {
-		errs = append(errs, fmt.Sprintf("route %q: preconnect must be >= 0", r.Name))
-	}
-
 	if len(errs) > 0 {
 		return &ConfigValidationError{Errors: errs}
 	}
@@ -122,10 +114,6 @@ func (r *RouteConfig) Validate() error {
 type ServerConfig struct {
 	ControlAddr string
 	DataAddr    string
-	// DataAddrInsecure optionally enables a second (non-TLS) TCP listener for the agent
-	// data channel. This is only used when TLS is enabled globally and some routes have
-	// TunnelTLS=false.
-	DataAddrInsecure string
 	// PublicAddr is kept for backwards compatibility. If Routes is empty, a default
 	// TCP route named "default" is created from PublicAddr.
 	PublicAddr string
@@ -144,58 +132,14 @@ type ServerConfig struct {
 	WebTLSCertFile string
 	WebTLSKeyFile  string
 	PairTimeout    time.Duration
-	// MaxPendingConns limits the total number of pending connections waiting for agent
-	// attachment. This is a DoS protection measure. Default: 10000. Set to 0 to disable.
-	MaxPendingConns *int `json:",omitempty"`
-	// MaxPendingPerIP limits pending connections per source IP address.
-	// This prevents a single client from exhausting the pending connection pool.
-	// Default: 100. Set to 0 to disable.
-	MaxPendingPerIP *int `json:",omitempty"`
 	// DashboardInterval controls the bucket width for the time-series dashboard.
 	// Smaller values give higher resolution at the cost of more memory.
 	// Default: 30s. Minimum: 5s. Maximum: 10m.
 	DashboardInterval time.Duration `json:",omitempty"`
+	// EncryptionAlgorithm specifies the global encryption standard for routes that have encryption enabled.
+	// Supported values: "aes-128", "aes-256", "none". Default is "aes-128".
+	EncryptionAlgorithm string `json:",omitempty"`
 	Routes            []RouteConfig
-
-	// AgentHeartbeatInterval is the interval between heartbeat pings to the agent.
-	// Default: 5s. Minimum: 1s. Maximum: 30s.
-	AgentHeartbeatInterval time.Duration `json:",omitempty"`
-	// AgentHeartbeatTimeout is the time after which an unresponsive agent is disconnected.
-	// Default: 10s. Must be greater than AgentHeartbeatInterval.
-	AgentHeartbeatTimeout time.Duration `json:",omitempty"`
-
-	// UDP configuration options
-	// UDPBufferSize sets the socket buffer size for UDP connections.
-	// Default: 64MB. Increase for high-throughput scenarios.
-	UDPBufferSize *int `json:",omitempty"`
-	// UDPQueueSize sets the queue size for UDP packet processing.
-	// Default: 262144.
-	UDPQueueSize *int `json:",omitempty"`
-	// UDPMaxPayload sets the maximum UDP payload size. 0 = no limit.
-	UDPMaxPayload *int `json:",omitempty"`
-	// UDPWorkerCount sets the number of UDP worker goroutines.
-	// Default: NumCPU * 4.
-	UDPWorkerCount *int `json:",omitempty"`
-	// UDPReaderCount sets the number of UDP reader goroutines.
-	// Default: NumCPU.
-	UDPReaderCount *int `json:",omitempty"`
-	// UDPEncryptionMode sets the encryption mode for UDP packets.
-	// Options: "none", "aes-gcm". Default: "aes-gcm".
-	UDPEncryptionMode string `json:",omitempty"`
-	// DisableUDPEncryption disables UDP encryption.
-	DisableUDPEncryption bool `json:",omitempty"`
-	// UDPKeyID is the current UDP encryption key ID.
-	UDPKeyID uint32 `json:",omitempty"`
-	// UDPKeySaltB64 is the base64-encoded salt for the current UDP key.
-	UDPKeySaltB64 string `json:",omitempty"`
-	// UDPKeyCreatedUnix is the Unix timestamp when the current UDP key was created.
-	UDPKeyCreatedUnix int64 `json:",omitempty"`
-	// UDPPrevKeyID is the previous UDP encryption key ID (for key rotation).
-	UDPPrevKeyID uint32 `json:",omitempty"`
-	// UDPPrevKeySaltB64 is the base64-encoded salt for the previous UDP key.
-	UDPPrevKeySaltB64 string `json:",omitempty"`
-	// QUICEnabled enables QUIC protocol support for UDP traffic.
-	QUICEnabled bool `json:",omitempty"`
 }
 
 // Validate validates the server configuration.
@@ -242,39 +186,12 @@ func (c *ServerConfig) Validate() error {
 		errs = append(errs, "pair_timeout must be >= 0")
 	}
 
-	// MaxPendingConns validation
-	if c.MaxPendingConns != nil && *c.MaxPendingConns < 0 {
-		errs = append(errs, "max_pending_conns must be >= 0")
-	}
-
-	// MaxPendingPerIP validation
-	if c.MaxPendingPerIP != nil && *c.MaxPendingPerIP < 0 {
-		errs = append(errs, "max_pending_per_ip must be >= 0")
-	}
-
 	// DashboardInterval validation
 	if c.DashboardInterval > 0 && c.DashboardInterval < 5*time.Second {
 		errs = append(errs, "dashboard_interval must be at least 5s")
 	}
 	if c.DashboardInterval > 10*time.Minute {
 		errs = append(errs, "dashboard_interval must be at most 10m")
-	}
-
-	// Agent heartbeat validation
-	if c.AgentHeartbeatInterval > 0 && c.AgentHeartbeatInterval < 1*time.Second {
-		errs = append(errs, "agent_heartbeat_interval must be at least 1s")
-	}
-	if c.AgentHeartbeatInterval > 30*time.Second {
-		errs = append(errs, "agent_heartbeat_interval must be at most 30s")
-	}
-	if c.AgentHeartbeatTimeout > 0 && c.AgentHeartbeatTimeout < 2*time.Second {
-		errs = append(errs, "agent_heartbeat_timeout must be at least 2s")
-	}
-	if c.AgentHeartbeatTimeout > 60*time.Second {
-		errs = append(errs, "agent_heartbeat_timeout must be at most 60s")
-	}
-	if c.AgentHeartbeatInterval > 0 && c.AgentHeartbeatTimeout > 0 && c.AgentHeartbeatTimeout <= c.AgentHeartbeatInterval {
-		errs = append(errs, "agent_heartbeat_timeout must be greater than agent_heartbeat_interval")
 	}
 
 	// Route validation

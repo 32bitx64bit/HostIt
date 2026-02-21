@@ -45,7 +45,6 @@ func main() {
 	var disableTLS bool
 	var tlsCert string
 	var tlsKey string
-	var disableUDPEnc bool
 
 	flag.StringVar(&controlAddr, "control", ":7000", "control listen address")
 	flag.StringVar(&dataAddr, "data", ":7001", "data listen address")
@@ -53,7 +52,6 @@ func main() {
 	flag.BoolVar(&disableTLS, "disable-tls", false, "disable TLS for agent<->server control/data TCP")
 	flag.StringVar(&tlsCert, "tls-cert", "", "TLS certificate PEM path (default: alongside config)")
 	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key PEM path (default: alongside config)")
-	flag.BoolVar(&disableUDPEnc, "disable-udp-encryption", false, "disable application-layer encryption for agent<->server UDP data (deprecated; use server config: UDP Encryption = none)")
 	flag.DurationVar(&pairTimeout, "pair-timeout", 10*time.Second, "max wait for agent to attach")
 	flag.StringVar(&webAddr, "web", "127.0.0.1:7002", "web dashboard listen address (empty to disable)")
 	flag.StringVar(&configPath, "config", "server.json", "path to server config JSON")
@@ -70,16 +68,15 @@ func main() {
 	defer cancel()
 
 	cfg := tunnel.ServerConfig{
-		ControlAddr:          controlAddr,
-		DataAddr:             dataAddr,
-		Token:                token,
-		DisableTLS:           disableTLS,
-		TLSCertFile:          tlsCert,
-		TLSKeyFile:           tlsKey,
-		DisableUDPEncryption: disableUDPEnc,
-		PairTimeout:          pairTimeout,
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Token:       token,
+		DisableTLS:  disableTLS,
+		TLSCertFile: tlsCert,
+		TLSKeyFile:  tlsKey,
+		PairTimeout: pairTimeout,
 	}
-	_, _ = configio.Load(configPath, &cfg)
+	loaded, _ := configio.Load(configPath, &cfg)
 
 	// Apply flag overrides after loading.
 	if disableTLS {
@@ -91,9 +88,13 @@ func main() {
 	if strings.TrimSpace(tlsKey) != "" {
 		cfg.TLSKeyFile = tlsKey
 	}
-	if disableUDPEnc {
-		cfg.DisableUDPEncryption = true
-		cfg.UDPEncryptionMode = "none"
+
+	if cfg.EncryptionAlgorithm == "" {
+		if !loaded {
+			cfg.EncryptionAlgorithm = "aes-128"
+		} else {
+			cfg.EncryptionAlgorithm = "none"
+		}
 	}
 
 	if strings.TrimSpace(cfg.Token) == "" {
@@ -102,11 +103,6 @@ func main() {
 		slog.Info(logging.CatSystem, "generated new server token (was empty)")
 	}
 
-	// Normalize/ensure UDP encryption settings + key material.
-	if changed := tunnel.EnsureUDPKeys(&cfg, time.Now()); changed {
-		_ = configio.Save(configPath, cfg)
-		slog.Info(logging.CatEncryption, "UDP encryption keys updated", serverlog.F("key_id", cfg.UDPKeyID))
-	}
 	if !cfg.DisableTLS {
 		cfgDir := filepath.Dir(configPath)
 		if strings.TrimSpace(cfg.TLSCertFile) == "" {
@@ -159,37 +155,6 @@ func main() {
 		"data_addr", cfg.DataAddr,
 		"tls_enabled", !cfg.DisableTLS,
 	))
-
-	// Auto-rotate UDP keys every 60 days (checked periodically).
-	go func() {
-		t := time.NewTicker(12 * time.Hour)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-			}
-			cfg, _, _ := runner.Get()
-			if strings.EqualFold(strings.TrimSpace(cfg.UDPEncryptionMode), "none") {
-				continue
-			}
-			beforeID := cfg.UDPKeyID
-			beforeCreated := cfg.UDPKeyCreatedUnix
-			if !tunnel.EnsureUDPKeys(&cfg, time.Now()) {
-				continue
-			}
-			if cfg.UDPKeyID == beforeID && cfg.UDPKeyCreatedUnix == beforeCreated {
-				continue
-			}
-			if err := configio.Save(configPath, cfg); err != nil {
-				slog.Error(logging.CatEncryption, "UDP key rotation save failed", serverlog.F("error", err))
-				continue
-			}
-			runner.Restart(cfg)
-			slog.Info(logging.CatEncryption, "UDP keys rotated", serverlog.F("new_key_id", cfg.UDPKeyID))
-		}
-	}()
 
 	if webAddr != "" {
 		go func() {
@@ -306,25 +271,31 @@ func (r *serverRunner) RunAgentNettest(ctx context.Context, req tunnel.AgentNett
 	return srv.RunAgentNettest(ctx, req)
 }
 
-func (r *serverRunner) RunThroughputTest(ctx context.Context, duration time.Duration, packetSize int) (tunnel.ThroughputTestResult, error) {
-	r.mu.Lock()
-	srv := r.srv
-	r.mu.Unlock()
-	if srv == nil {
-		return tunnel.ThroughputTestResult{}, fmt.Errorf("server not running")
-	}
-	return srv.RunThroughputTest(ctx, duration, packetSize)
-}
-
 // SetRouteEnabled toggles a route's enabled state at runtime.
 // Returns false if the route doesn't exist.
 func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.srv == nil {
+
+	// Update the runner's config so it persists across restarts
+	found := false
+	for i, rt := range r.cfg.Routes {
+		if rt.Name == routeName {
+			val := enabled
+			r.cfg.Routes[i].Enabled = &val
+			found = true
+			break
+		}
+	}
+
+	if !found {
 		return false
 	}
-	return r.srv.SetRouteEnabled(routeName, enabled)
+
+	if r.srv != nil {
+		r.srv.SetRouteEnabled(routeName, enabled)
+	}
+	return true
 }
 
 // GetRouteEnabled returns the current enabled state of a route.
@@ -786,44 +757,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = json.NewEncoder(w).Encode(result)
 		})))
 
-		// Throughput test endpoint - high-speed streaming test
-		mux.HandleFunc("/api/nettest/throughput", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-			if err := r.ParseForm(); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if !checkCSRF(r) {
-				http.Error(w, "csrf", http.StatusBadRequest)
-				return
-			}
-			durationSec := 3
-			if raw := strings.TrimSpace(r.Form.Get("duration_sec")); raw != "" {
-				if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 10 {
-					durationSec = n
-				}
-			}
-			packetSize := 1400
-			if raw := strings.TrimSpace(r.Form.Get("packet_size")); raw != "" {
-				if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 65507 {
-					packetSize = n
-				}
-			}
-			ctx2, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-			defer cancel()
-			result, err := runner.RunThroughputTest(ctx2, time.Duration(durationSec)*time.Second, packetSize)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(result)
-		})))
-
 		// Manual update check (protected)
 		mux.HandleFunc("/api/update/check-now", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -1064,33 +997,14 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			cfg, st, err := runner.Get()
 			routes := cfg.Routes
 			type routeView struct {
-				Name       string
-				Proto      string
-				PublicAddr string
-				TCPNoDelay bool
-				TunnelTLS  bool
-				Preconnect int
+				Name        string
+				Proto       string
+				PublicAddr  string
+				IsEncrypted bool
 			}
 			routeViews := make([]routeView, 0, len(routes))
 			for _, rt := range routes {
-				noDelay := true
-				if rt.TCPNoDelay != nil {
-					noDelay = *rt.TCPNoDelay
-				}
-				tlsOn := true
-				if rt.TunnelTLS != nil {
-					tlsOn = *rt.TunnelTLS
-				}
-				pc := 0
-				if rt.Preconnect != nil {
-					pc = *rt.Preconnect
-				} else {
-					p := strings.ToLower(strings.TrimSpace(rt.Proto))
-					if p == "tcp" || p == "both" {
-						pc = 4
-					}
-				}
-				routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, TCPNoDelay: noDelay, TunnelTLS: tlsOn, Preconnect: pc})
+				routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, IsEncrypted: rt.IsEncrypted()})
 			}
 			data := map[string]any{
 				"Cfg":        cfg,
@@ -1106,12 +1020,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"WebTLSCert": webCertFile,
 				"WebTLSKey":  webKeyFile,
 				"WebTLSFP":   webFingerprint,
-				"UDPKeyCreated": func() string {
-					if cfg.UDPKeyCreatedUnix == 0 {
-						return ""
-					}
-					return time.Unix(cfg.UDPKeyCreatedUnix, 0).Format(time.RFC3339)
-				}(),
 			}
 			_ = tplConfig.Execute(w, data)
 		})))
@@ -1128,175 +1036,27 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			if dashInterval <= 0 {
 				dashInterval = 30 * time.Second
 			}
-			udpMaxPayload := 1400
-			if cfg.UDPMaxPayload != nil {
-				udpMaxPayload = *cfg.UDPMaxPayload
-			}
-			udpBufferSize := 0
-			if cfg.UDPBufferSize != nil {
-				udpBufferSize = *cfg.UDPBufferSize
-			}
-			udpQueueSize := 65536
-			if cfg.UDPQueueSize != nil {
-				udpQueueSize = *cfg.UDPQueueSize
-			}
-			udpWorkerCount := 0
-			if cfg.UDPWorkerCount != nil {
-				udpWorkerCount = *cfg.UDPWorkerCount
-			}
-			udpReaderCount := 0
-			if cfg.UDPReaderCount != nil {
-				udpReaderCount = *cfg.UDPReaderCount
-			}
 			data := map[string]any{
-				"Cfg":            cfg,
-				"Status":         st,
-				"ConfigPath":     configPath,
-				"Msg":            getMsg(),
-				"Err":            err,
-				"CSRF":           csrf,
-				"Version":        version.Current,
-				"DashInterval":   dashInterval.String(),
-				"UDPMaxPayload":  udpMaxPayload,
-				"UDPBufferSize":  udpBufferSize,
-				"UDPQueueSize":   udpQueueSize,
-				"UDPWorkerCount": udpWorkerCount,
-				"UDPReaderCount": udpReaderCount,
+				"Cfg":          cfg,
+				"Status":       st,
+				"ConfigPath":   configPath,
+				"Msg":          getMsg(),
+				"Err":          err,
+				"CSRF":         csrf,
+				"Version":      version.Current,
+				"DashInterval": dashInterval.String(),
 			}
 			_ = tplControls.Execute(w, data)
 		})))
 
 		// UDP max payload cap update (protected)
 		mux.HandleFunc("/api/udp/payload", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-			if err := r.ParseForm(); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if !checkCSRF(r) {
-				http.Error(w, "csrf", http.StatusBadRequest)
-				return
-			}
-			raw := strings.TrimSpace(r.Form.Get("udp_max_payload"))
-			if raw == "" {
-				http.Error(w, "udp_max_payload required", http.StatusBadRequest)
-				return
-			}
-			n, err := strconv.Atoi(raw)
-			if err != nil {
-				http.Error(w, "invalid udp_max_payload", http.StatusBadRequest)
-				return
-			}
-			if n < 0 || n > 65507 {
-				http.Error(w, "udp_max_payload must be between 0 and 65507", http.StatusBadRequest)
-				return
-			}
-			cfg, _, _ := runner.Get()
-			cfg.UDPMaxPayload = &n
-			if err := configio.Save(configPath, cfg); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			runner.Restart(cfg)
-			setMsg(fmt.Sprintf("UDP max payload set to %d bytes — restarted", n))
-			http.Redirect(w, r, "/controls", http.StatusSeeOther)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		})))
 
 		// UDP performance settings update (protected)
 		mux.HandleFunc("/api/udp/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-			if err := r.ParseForm(); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if !checkCSRF(r) {
-				http.Error(w, "csrf", http.StatusBadRequest)
-				return
-			}
-
-			cfg, _, _ := runner.Get()
-			msgs := make([]string, 0, 4)
-
-			// Buffer size (in MB)
-			if raw := strings.TrimSpace(r.Form.Get("udp_buffer_size")); raw != "" {
-				n, err := strconv.Atoi(raw)
-				if err != nil {
-					http.Error(w, "invalid udp_buffer_size", http.StatusBadRequest)
-					return
-				}
-				if n < 0 || n > 1024 {
-					http.Error(w, "udp_buffer_size must be between 0 and 1024 MB", http.StatusBadRequest)
-					return
-				}
-				cfg.UDPBufferSize = &n
-				msgs = append(msgs, fmt.Sprintf("buffer=%dMB", n))
-			}
-
-			// Queue size
-			if raw := strings.TrimSpace(r.Form.Get("udp_queue_size")); raw != "" {
-				n, err := strconv.Atoi(raw)
-				if err != nil {
-					http.Error(w, "invalid udp_queue_size", http.StatusBadRequest)
-					return
-				}
-				if n < 1024 || n > 1048576 {
-					http.Error(w, "udp_queue_size must be between 1024 and 1048576", http.StatusBadRequest)
-					return
-				}
-				cfg.UDPQueueSize = &n
-				msgs = append(msgs, fmt.Sprintf("queue=%d", n))
-			}
-
-			// Worker count
-			if raw := strings.TrimSpace(r.Form.Get("udp_worker_count")); raw != "" {
-				n, err := strconv.Atoi(raw)
-				if err != nil {
-					http.Error(w, "invalid udp_worker_count", http.StatusBadRequest)
-					return
-				}
-				if n < 1 || n > 256 {
-					http.Error(w, "udp_worker_count must be between 1 and 256", http.StatusBadRequest)
-					return
-				}
-				cfg.UDPWorkerCount = &n
-				msgs = append(msgs, fmt.Sprintf("workers=%d", n))
-			}
-
-			// Reader count
-			if raw := strings.TrimSpace(r.Form.Get("udp_reader_count")); raw != "" {
-				n, err := strconv.Atoi(raw)
-				if err != nil {
-					http.Error(w, "invalid udp_reader_count", http.StatusBadRequest)
-					return
-				}
-				if n < 1 || n > 64 {
-					http.Error(w, "udp_reader_count must be between 1 and 64", http.StatusBadRequest)
-					return
-				}
-				cfg.UDPReaderCount = &n
-				msgs = append(msgs, fmt.Sprintf("readers=%d", n))
-			}
-
-			if len(msgs) == 0 {
-				http.Error(w, "no UDP settings provided", http.StatusBadRequest)
-				return
-			}
-
-			if err := configio.Save(configPath, cfg); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			runner.Restart(cfg)
-			setMsg(fmt.Sprintf("UDP settings updated (%s) — restarted", strings.Join(msgs, ", ")))
-			http.Redirect(w, r, "/controls", http.StatusSeeOther)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		})))
 
 		mux.HandleFunc("/config/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1337,36 +1097,19 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			old, _, _ := runner.Get()
 			cfg := old
-			oldEnc := strings.TrimSpace(cfg.UDPEncryptionMode)
 			webWas := cfg.WebHTTPS
 			cfg.ControlAddr = r.Form.Get("control")
 			cfg.DataAddr = r.Form.Get("data")
-			cfg.DataAddrInsecure = r.Form.Get("data_insecure")
 			cfg.Token = strings.TrimSpace(r.Form.Get("token"))
 			cfg.PairTimeout = pt
 			cfg.WebHTTPS = strings.TrimSpace(r.Form.Get("web_https")) != ""
+			cfg.EncryptionAlgorithm = r.Form.Get("encryption_algorithm")
 			if cfg.Token == "" {
 				cfg.Token = genToken()
 				addMsg("Token was empty; generated a new token")
 			}
 			cfg.Routes = parseServerRoutesForm(r)
 
-			// UDP encryption config
-			cfg.UDPEncryptionMode = strings.TrimSpace(r.Form.Get("udp_enc"))
-			if strings.EqualFold(cfg.UDPEncryptionMode, "none") {
-				cfg.DisableUDPEncryption = true
-			} else {
-				cfg.DisableUDPEncryption = false
-			}
-			if strings.TrimSpace(r.Form.Get("udp_regen")) != "" {
-				tunnel.RotateUDPKeys(&cfg, time.Now())
-				addMsg("Regenerated UDP keys")
-			} else if strings.TrimSpace(oldEnc) != strings.TrimSpace(cfg.UDPEncryptionMode) {
-				// Mode changed: regenerate keys to force a clean cutover.
-				tunnel.RotateUDPKeys(&cfg, time.Now())
-				addMsg("UDP encryption changed; regenerated UDP keys")
-			}
-			_ = tunnel.EnsureUDPKeys(&cfg, time.Now())
 			if strings.TrimSpace(r.Form.Get("tls_regen")) != "" {
 				if cfg.DisableTLS {
 					addMsg("TLS is disabled; skipped TLS cert/key regeneration")
@@ -1433,7 +1176,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			runner.Restart(cfg)
 			addMsg("Saved + restarted")
-			setMsg(strings.Join(msgs, " · "))
 
 			webNow := cfg.WebHTTPS
 			needsWebRestart := webWas != webNow || strings.TrimSpace(r.Form.Get("web_tls_regen")) != ""
@@ -1478,6 +1220,13 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "route not found", http.StatusNotFound)
 				return
 			}
+
+			// Save the updated config to disk
+			cfg, _, _ := runner.Get()
+			if err := configio.Save(configPath, cfg); err != nil {
+				serverlog.Log.Error(logging.CatSystem, "failed to save config after route toggle", serverlog.F("error", err))
+			}
+
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"route":   routeName,
@@ -1717,33 +1466,21 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		name := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_name"))
 		proto := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_proto"))
 		pub := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_public"))
-		nodelayRaw := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_nodelay"))
-		nodelay := nodelayRaw != "" && nodelayRaw != "0" && !strings.EqualFold(nodelayRaw, "false")
-		tlsRaw := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_tls"))
-		tlsOn := tlsRaw != "" && tlsRaw != "0" && !strings.EqualFold(tlsRaw, "false")
-		pcRaw := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_preconnect"))
-		pc := 0
-		if pcRaw != "" {
-			if n, err := strconv.Atoi(pcRaw); err == nil {
-				if n < 0 {
-					n = 0
-				}
-				if n > 64 {
-					n = 64
-				}
-				pc = n
-			}
-		}
 		if name == "" && proto == "" && pub == "" {
 			continue
 		}
 		if name == "" {
-			name = "default"
+			name = fmt.Sprintf("route-%d", i)
 		}
 		if proto == "" {
 			proto = "tcp"
 		}
-		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, TCPNoDelay: &nodelay, TunnelTLS: &tlsOn, Preconnect: &pc})
+		encrypted := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_encrypted")) == "1"
+		var encPtr *bool
+		if encrypted {
+			encPtr = &encrypted
+		}
+		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, Encrypted: encPtr})
 	}
 	return routes
 }
@@ -2543,11 +2280,6 @@ const serverConfigHTML = `<!doctype html>
 					<input name="data" value="{{.Cfg.DataAddr}}" />
 				</div>
 				<div>
-					<label>Insecure data listen</label>
-					<div class="help">Optional plaintext TCP data listener for routes with TLS disabled</div>
-					<input name="data_insecure" value="{{.Cfg.DataAddrInsecure}}" placeholder="Leave empty to disable" />
-				</div>
-				<div>
 					<label>Pair timeout</label>
 					<div class="help">Max wait for agent to attach (e.g. <code>10s</code>)</div>
 					<input name="pair_timeout" value="{{.Cfg.PairTimeout}}" />
@@ -2586,19 +2318,13 @@ const serverConfigHTML = `<!doctype html>
 					<button type="submit" class="btn sm" name="web_tls_regen" value="1">Regen dashboard cert</button>
 				</div>
 				<div>
-					<label>UDP Encryption</label>
-					<div class="help">Message-layer encryption for UDP relay</div>
-					<select name="udp_enc">
-						<option value="none" {{if eq .Cfg.UDPEncryptionMode "none"}}selected{{end}}>No encryption</option>
-						<option value="aes128" {{if eq .Cfg.UDPEncryptionMode "aes128"}}selected{{end}}>AES-128-GCM</option>
-						<option value="aes256" {{if or (eq .Cfg.UDPEncryptionMode "aes256") (eq .Cfg.UDPEncryptionMode "")}}selected{{end}}>AES-256-GCM</option>
+					<label>Encryption Algorithm</label>
+					<div class="help">Global encryption standard for tunnel traffic</div>
+					<select name="encryption_algorithm">
+						<option value="none" {{if eq .Cfg.EncryptionAlgorithm "none"}}selected{{end}}>None</option>
+						<option value="aes-128" {{if eq .Cfg.EncryptionAlgorithm "aes-128"}}selected{{end}}>AES-128</option>
+						<option value="aes-256" {{if eq .Cfg.EncryptionAlgorithm "aes-256"}}selected{{end}}>AES-256</option>
 					</select>
-					<div class="help" style="margin-top:6px">Key ID: <code>{{.Cfg.UDPKeyID}}</code>{{if .UDPKeyCreated}} · <code>{{.UDPKeyCreated}}</code>{{end}}</div>
-				</div>
-				<div>
-					<label>UDP Key Actions</label>
-					<div class="help">Force new UDP encryption key</div>
-					<button type="submit" class="btn" name="udp_regen" value="1">Regen UDP keys + restart</button>
 				</div>
 			</div>
 
@@ -2617,7 +2343,7 @@ const serverConfigHTML = `<!doctype html>
 						<input type="hidden" name="route_{{$i}}_delete" value="0" data-route-delete />
 						<div class="grid2" style="margin-top:10px">
 							<div>
-								<label>Name</label>
+								<label>Name (optional)</label>
 								<input name="route_{{$i}}_name" value="{{$r.Name}}" />
 							</div>
 							<div>
@@ -2629,23 +2355,14 @@ const serverConfigHTML = `<!doctype html>
 								</select>
 							</div>
 							<div>
-								<label>Public address</label>
+								<label>Port (e.g. :25565)</label>
 								<input name="route_{{$i}}_public" value="{{$r.PublicAddr}}" placeholder=":25565" />
 							</div>
 							<div>
-								<label>Preconnect</label>
-								<input type="number" min="0" max="64" name="route_{{$i}}_preconnect" value="{{$r.Preconnect}}" />
-							</div>
-							<div>
-								<label style="font-weight:400;display:flex;gap:8px;align-items:center">
-									<input type="checkbox" name="route_{{$i}}_nodelay" value="1" {{if $r.TCPNoDelay}}checked{{end}} />
-									<span>TCP_NODELAY (low latency)</span>
-								</label>
-							</div>
-							<div>
-								<label style="font-weight:400;display:flex;gap:8px;align-items:center">
-									<input type="checkbox" name="route_{{$i}}_tls" value="1" {{if $r.TunnelTLS}}checked{{end}} />
-									<span>Data channel TLS</span>
+								<label>Encryption</label>
+								<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
+									<input type="checkbox" name="route_{{$i}}_encrypted" value="1" {{if $r.IsEncrypted}}checked{{end}} />
+									<span>Enable encryption for this route</span>
 								</label>
 							</div>
 						</div>
@@ -2668,12 +2385,16 @@ const serverConfigHTML = `<!doctype html>
 			</div>
 			<input type="hidden" name="route_IDX_delete" value="0" data-route-delete />
 			<div class="grid2" style="margin-top:10px">
-				<div><label>Name</label><input name="route_IDX_name" value="" /></div>
+				<div><label>Name (optional)</label><input name="route_IDX_name" value="" /></div>
 				<div><label>Protocol</label><select name="route_IDX_proto"><option value="tcp" selected>tcp</option><option value="udp">udp</option><option value="both">both</option></select></div>
-				<div><label>Public address</label><input name="route_IDX_public" value="" placeholder=":25565" /></div>
-				<div><label>Preconnect</label><input type="number" min="0" max="64" name="route_IDX_preconnect" value="4" /></div>
-				<div><label style="font-weight:400;display:flex;gap:8px;align-items:center"><input type="checkbox" name="route_IDX_nodelay" value="1" checked /><span>TCP_NODELAY</span></label></div>
-				<div><label style="font-weight:400;display:flex;gap:8px;align-items:center"><input type="checkbox" name="route_IDX_tls" value="1" checked /><span>Data channel TLS</span></label></div>
+				<div><label>Port (e.g. :25565)</label><input name="route_IDX_public" value="" placeholder=":25565" /></div>
+				<div>
+					<label>Encryption</label>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
+						<input type="checkbox" name="route_IDX_encrypted" value="1" />
+						<span>Enable encryption for this route</span>
+					</label>
+				</div>
 			</div>
 		</div>
 	</template>
@@ -2783,44 +2504,6 @@ const serverControlsHTML = `<!doctype html>
 							</select>
 							<button type="submit" class="btn sm primary">Apply &amp; Restart</button>
 						</div>
-					</form>
-				</div>
-
-				<div class="secHead"><h2>Protocol Options</h2></div>
-				<div class="card">
-					<div class="row"><b>UDP Max Payload:</b> <code>{{.UDPMaxPayload}} bytes</code></div>
-					<div class="muted" style="margin-bottom:8px;font-size:12px">Default internet-safe value is 1400. Lower reduces fragmentation risk. Set 0 to disable cap.</div>
-					<form method="post" action="/api/udp/payload" style="margin:0">
-						<input type="hidden" name="csrf" value="{{.CSRF}}" />
-						<div class="flex">
-							<input type="number" name="udp_max_payload" min="0" max="65507" value="{{.UDPMaxPayload}}" class="btn sm" style="appearance:auto;padding:5px 8px;width:140px" />
-							<button type="submit" class="btn sm primary">Apply &amp; Restart</button>
-						</div>
-					</form>
-					<hr style="border:0;border-top:1px solid var(--border);margin:12px 0" />
-					<div class="row"><b>UDP Performance:</b></div>
-					<div class="muted" style="margin-bottom:8px;font-size:12px">Tune buffer sizes and worker counts for high-throughput scenarios. Leave at 0 for defaults.</div>
-					<form method="post" action="/api/udp/config" style="margin:0">
-						<input type="hidden" name="csrf" value="{{.CSRF}}" />
-						<div class="grid2" style="gap:8px;margin-bottom:8px">
-							<div>
-								<label style="font-size:11px;color:var(--textMuted)">Buffer Size (MB)</label>
-								<input type="number" name="udp_buffer_size" min="0" max="1024" value="{{.UDPBufferSize}}" placeholder="0 = auto" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px" />
-							</div>
-							<div>
-								<label style="font-size:11px;color:var(--textMuted)">Queue Size</label>
-								<input type="number" name="udp_queue_size" min="1024" max="1048576" value="{{.UDPQueueSize}}" placeholder="65536" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px" />
-							</div>
-							<div>
-								<label style="font-size:11px;color:var(--textMuted)">Worker Count</label>
-								<input type="number" name="udp_worker_count" min="1" max="256" value="{{.UDPWorkerCount}}" placeholder="0 = auto" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px" />
-							</div>
-							<div>
-								<label style="font-size:11px;color:var(--textMuted)">Reader Count</label>
-								<input type="number" name="udp_reader_count" min="1" max="64" value="{{.UDPReaderCount}}" placeholder="0 = auto" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px" />
-							</div>
-						</div>
-						<button type="submit" class="btn sm primary">Apply UDP Settings &amp; Restart</button>
 					</form>
 				</div>
 
@@ -3014,30 +2697,6 @@ const serverNetworkTestHTML = `<!doctype html>
 					<div class="k">Upload speed</div><div class="v" id="aUp">—</div>
 				</div>
 			</div>
-
-			<div class="card">
-				<h3 style="margin:0 0 8px">UDP Throughput Test</h3>
-				<div class="muted" style="margin-bottom:12px">High-speed streaming test over UDP tunnel. Measures real tunnel capacity.</div>
-				<div class="grid2" style="margin-bottom:12px;gap:8px">
-					<div>
-						<label style="font-size:11px;color:var(--textMuted)">Duration (sec)</label>
-						<input type="number" id="throughputDuration" value="3" min="1" max="10" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text)" />
-					</div>
-					<div>
-						<label style="font-size:11px;color:var(--textMuted)">Packet size</label>
-						<input type="number" id="throughputPktSize" value="1400" min="64" max="65507" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text)" />
-					</div>
-				</div>
-				<button id="runThroughput" class="btn primary">Run Throughput Test</button>
-				<div id="throughputStatus" class="muted" style="margin-top:8px">Idle</div>
-				<div class="kv" style="margin-top:12px">
-					<div class="k">Upload (server→agent)</div><div class="v" id="tUp">—</div>
-					<div class="k">Download (agent→server)</div><div class="v" id="tDown">—</div>
-					<div class="k">Upload packets</div><div class="v" id="tUpPkts">—</div>
-					<div class="k">Download packets</div><div class="v" id="tDownPkts">—</div>
-					<div class="k">Packet loss</div><div class="v" id="tLoss">—</div>
-				</div>
-			</div>
 		</div>
 	</div>
 
@@ -3141,37 +2800,6 @@ const serverNetworkTestHTML = `<!doctype html>
 			runAgent().catch(function(err){
 				$('agentStatus').textContent = 'Failed: '+(err && err.message ? err.message : 'unknown');
 				$('runAgent').disabled = false;
-			});
-		});
-
-		async function runThroughput(){
-			$('runThroughput').disabled = true;
-			$('throughputStatus').textContent = 'Running UDP throughput test...';
-			var duration = parseInt($('throughputDuration').value||'3',10);
-			var pktSize = parseInt($('throughputPktSize').value||'1400',10);
-			var form = new URLSearchParams();
-			form.set('csrf', csrf);
-			form.set('duration_sec', String(duration));
-			form.set('packet_size', String(pktSize));
-			var r = await fetch('/api/nettest/throughput', {method:'POST', body: form});
-			if(!r.ok){
-				var txt = await r.text();
-				throw new Error(txt || ('http '+r.status));
-			}
-			var j = await r.json();
-			$('tUp').textContent = fmtMbps(j.uploadMbps);
-			$('tDown').textContent = fmtMbps(j.downloadMbps);
-			$('tUpPkts').textContent = (j.uploadPackets||0).toLocaleString() + ' pkts';
-			$('tDownPkts').textContent = (j.downloadPackets||0).toLocaleString() + ' pkts';
-			$('tLoss').textContent = fmtPct(j.lossPercent||0);
-			$('throughputStatus').textContent = 'Complete (upload: '+(j.uploadDurationMs||0)+'ms, download: '+(j.downloadDurationMs||0)+'ms)';
-			$('runThroughput').disabled = false;
-		}
-
-		$('runThroughput').addEventListener('click', function(){
-			runThroughput().catch(function(err){
-				$('throughputStatus').textContent = 'Failed: '+(err && err.message ? err.message : 'unknown');
-				$('runThroughput').disabled = false;
 			});
 		});
 	})();

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,7 +18,6 @@ type ApplyOptions struct {
 	AssetURL       string
 	ModuleDir      string
 	ExpectedFolder string   // "server" or "client"; empty means module root
-	PreservePath   string   // legacy single absolute path to preserve (e.g. config file)
 	PreservePaths  []string // additional absolute paths to preserve (files or directories)
 	SharedDestDir  string   // optional absolute path to shared module destination
 }
@@ -34,9 +34,14 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 		return err
 	}
 
-	tmpDir, err := os.MkdirTemp("", "hostit-update-*")
+	// Create temp dir inside moduleDir to allow fast os.Rename across same filesystem
+	tmpDir, err := os.MkdirTemp(moduleDir, ".hostit-update-*")
 	if err != nil {
-		return err
+		// Fallback to system temp dir
+		tmpDir, err = os.MkdirTemp("", "hostit-update-*")
+		if err != nil {
+			return err
+		}
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -65,7 +70,7 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 			_, _ = fmt.Fprintf(logw, "Shared source not found in zip (continuing): %v\n", err)
 		} else {
 			_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDest)
-			if err := syncDir(sharedSrc, sharedDest, nil, logw); err != nil {
+			if err := syncDir(sharedSrc, sharedDest, nil, nil, logw); err != nil {
 				return err
 			}
 		}
@@ -74,17 +79,19 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 	_, _ = fmt.Fprintf(logw, "Extracted source: %s\n", srcRoot)
 	_, _ = fmt.Fprintf(logw, "Applying into: %s\n", moduleDir)
 
-	preserve := make([]string, 0, 1+len(opts.PreservePaths))
-	if strings.TrimSpace(opts.PreservePath) != "" {
-		preserve = append(preserve, opts.PreservePath)
-	}
+	preserve := make([]string, 0, len(opts.PreservePaths))
 	for _, p := range opts.PreservePaths {
 		if strings.TrimSpace(p) != "" {
 			preserve = append(preserve, p)
 		}
 	}
 
-	if err := syncDir(srcRoot, moduleDir, preserve, logw); err != nil {
+	var extraSkip []string
+	if srcRoot == extractDir && sharedDest != "" {
+		extraSkip = append(extraSkip, "shared")
+	}
+
+	if err := syncDir(srcRoot, moduleDir, preserve, extraSkip, logw); err != nil {
 		return err
 	}
 
@@ -115,9 +122,13 @@ func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, 
 		return err
 	}
 
-	tmpDir, err := os.MkdirTemp("", "hostit-update-local-*")
+	// Create temp dir inside moduleDir to allow fast os.Rename across same filesystem
+	tmpDir, err := os.MkdirTemp(moduleDir, ".hostit-update-local-*")
 	if err != nil {
-		return err
+		tmpDir, err = os.MkdirTemp("", "hostit-update-local-*")
+		if err != nil {
+			return err
+		}
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -143,7 +154,7 @@ func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, 
 			_, _ = fmt.Fprintf(logw, "Shared source not found in zip (continuing): %v\n", err)
 		} else {
 			_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDest)
-			if err := syncDir(sharedSrc, sharedDest, nil, logw); err != nil {
+			if err := syncDir(sharedSrc, sharedDest, nil, nil, logw); err != nil {
 				return err
 			}
 		}
@@ -152,17 +163,19 @@ func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, 
 	_, _ = fmt.Fprintf(logw, "Extracted source: %s\n", srcRoot)
 	_, _ = fmt.Fprintf(logw, "Applying into: %s\n", moduleDir)
 
-	preserve := make([]string, 0, 1+len(opts.PreservePaths))
-	if strings.TrimSpace(opts.PreservePath) != "" {
-		preserve = append(preserve, opts.PreservePath)
-	}
+	preserve := make([]string, 0, len(opts.PreservePaths))
 	for _, p := range opts.PreservePaths {
 		if strings.TrimSpace(p) != "" {
 			preserve = append(preserve, p)
 		}
 	}
 
-	if err := syncDir(srcRoot, moduleDir, preserve, logw); err != nil {
+	var extraSkip []string
+	if srcRoot == extractDir && sharedDest != "" {
+		extraSkip = append(extraSkip, "shared")
+	}
+
+	if err := syncDir(srcRoot, moduleDir, preserve, extraSkip, logw); err != nil {
 		return err
 	}
 
@@ -190,9 +203,13 @@ func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir st
 		return err
 	}
 
-	tmpDir, err := os.MkdirTemp("", "hostit-update-shared-*")
+	// Create temp dir inside sharedDestDir to allow fast os.Rename across same filesystem
+	tmpDir, err := os.MkdirTemp(sharedDestDir, ".hostit-update-shared-*")
 	if err != nil {
-		return err
+		tmpDir, err = os.MkdirTemp("", "hostit-update-shared-*")
+		if err != nil {
+			return err
+		}
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -213,7 +230,7 @@ func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir st
 
 	_, _ = fmt.Fprintf(logw, "Extracted shared: %s\n", sharedSrc)
 	_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDestDir)
-	return syncDir(sharedSrc, sharedDestDir, nil, logw)
+	return syncDir(sharedSrc, sharedDestDir, nil, nil, logw)
 }
 
 // ApplySharedZipFileUpdate applies shared module files from a local zip path.
@@ -239,9 +256,13 @@ func ApplySharedZipFileUpdate(zipPath string, sharedDestDir string, logw io.Writ
 		return err
 	}
 
-	tmpDir, err := os.MkdirTemp("", "hostit-update-local-shared-*")
+	// Create temp dir inside sharedDestDir to allow fast os.Rename across same filesystem
+	tmpDir, err := os.MkdirTemp(sharedDestDir, ".hostit-update-local-shared-*")
 	if err != nil {
-		return err
+		tmpDir, err = os.MkdirTemp("", "hostit-update-local-shared-*")
+		if err != nil {
+			return err
+		}
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -259,7 +280,7 @@ func ApplySharedZipFileUpdate(zipPath string, sharedDestDir string, logw io.Writ
 
 	_, _ = fmt.Fprintf(logw, "Extracted shared: %s\n", sharedSrc)
 	_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDestDir)
-	return syncDir(sharedSrc, sharedDestDir, nil, logw)
+	return syncDir(sharedSrc, sharedDestDir, nil, nil, logw)
 }
 
 func pickSharedRoot(extractDir string) (string, error) {
@@ -347,7 +368,13 @@ func unzip(zipPath string, dstDir string) error {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return err
 	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(r.File))
+	sem := make(chan struct{}, 10) // limit concurrency
+
 	for _, f := range r.File {
+		f := f
 		name := f.Name
 		if strings.Contains(name, "..") {
 			// basic zip-slip defense
@@ -366,20 +393,36 @@ func unzip(zipPath string, dstDir string) error {
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			return err
 		}
-		rc, err := f.Open()
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			rc, err := f.Open()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer rc.Close()
+			out, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer out.Close()
+			if _, err := io.Copy(out, rc); err != nil {
+				errCh <- err
+				return
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
 		if err != nil {
 			return err
-		}
-		out, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
-		if err != nil {
-			rc.Close()
-			return err
-		}
-		_, copyErr := io.Copy(out, rc)
-		rc.Close()
-		out.Close()
-		if copyErr != nil {
-			return copyErr
 		}
 	}
 	return nil
@@ -393,7 +436,22 @@ func pickSourceRoot(extractDir string, expectedFolder string) (string, error) {
 				return cand, nil
 			}
 		}
+
+		// If expectedFolder is provided but not found at the root, check if the zip
+		// was extracted with a single top-level wrapper folder (common in GitHub releases).
+		ents, err := os.ReadDir(extractDir)
+		if err == nil && len(ents) == 1 && ents[0].IsDir() {
+			wrapperCand := filepath.Join(extractDir, ents[0].Name(), expectedFolder)
+			if fi, err := os.Stat(wrapperCand); err == nil && fi.IsDir() {
+				if _, err := os.Stat(filepath.Join(wrapperCand, "build.sh")); err == nil {
+					return wrapperCand, nil
+				}
+			}
+		}
+
+		return "", fmt.Errorf("could not locate expected folder %q with build.sh in extracted zip", expectedFolder)
 	}
+
 	// if build.sh exists at root, use root
 	if _, err := os.Stat(filepath.Join(extractDir, "build.sh")); err == nil {
 		return extractDir, nil
@@ -415,7 +473,7 @@ func pickSourceRoot(extractDir string, expectedFolder string) (string, error) {
 	return "", errors.New("could not locate build.sh in extracted zip")
 }
 
-func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.Writer) error {
+func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkipPrefixes []string, logw io.Writer) error {
 	preserveFiles := make(map[string]struct{})
 	preserveDirs := make([]string, 0)
 	for _, p := range preserveAbsList {
@@ -435,6 +493,7 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 	}
 
 	skipPrefixes := []string{".git", "bin"}
+	skipPrefixes = append(skipPrefixes, extraSkipPrefixes...)
 
 	// First pass: collect all relative paths from source
 	srcRelPaths := make(map[string]struct{})
@@ -459,6 +518,12 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 					}
 					return nil
 				}
+			}
+			if strings.HasPrefix(parts[0], ".hostit-update-") {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
 		}
 		srcRelPaths[rel] = struct{}{}
@@ -501,6 +566,12 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 					return nil
 				}
 			}
+			if strings.HasPrefix(parts[0], ".hostit-update-") {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 		}
 
 		abs := filepath.Clean(path)
@@ -536,7 +607,11 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 	}
 
 	// Third pass: copy files from source to destination
-	return filepath.WalkDir(srcRoot, func(path string, d os.DirEntry, err error) error {
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1000)
+	sem := make(chan struct{}, 10) // limit concurrency
+
+	err = filepath.WalkDir(srcRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -557,6 +632,12 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 					}
 					return nil
 				}
+			}
+			if strings.HasPrefix(parts[0], ".hostit-update-") {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
 		}
 
@@ -602,32 +683,60 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, logw io.W
 				return err
 			}
 		}
-		in, err := os.Open(path)
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(path, dstPath string, mode os.FileMode) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			// Try fast rename first
+			_ = os.Remove(dstPath) // Remove existing file to avoid issues on Windows
+			if err := os.Rename(path, dstPath); err == nil {
+				return
+			}
+
+			// Fallback to copy
+			in, err := os.Open(path)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer in.Close()
+			out, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+			if err != nil {
+				if os.IsPermission(err) {
+					_ = ensureWritablePath(dstPath, dstAbs)
+					_ = ensureWritablePath(filepath.Dir(dstPath), dstAbs)
+					out, err = os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+				}
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+			defer out.Close()
+			if _, err := io.Copy(out, in); err != nil {
+				errCh <- err
+				return
+			}
+		}(path, dstPath, si.Mode())
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
 		if err != nil {
 			return err
 		}
-		defer in.Close()
-		out, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, si.Mode())
-		if err != nil {
-			if os.IsPermission(err) {
-				_ = ensureWritablePath(dstPath, dstAbs)
-				_ = ensureWritablePath(filepath.Dir(dstPath), dstAbs)
-				out, err = os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, si.Mode())
-			}
-			if err != nil {
-				return err
-			}
-		}
-		_, copyErr := io.Copy(out, in)
-		closeErr := out.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func removeAllWritable(path string, dstRoot string) error {

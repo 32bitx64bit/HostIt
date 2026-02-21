@@ -10,12 +10,12 @@ import (
 )
 
 type persistedState struct {
-	LastCheckUnix    int64  `json:"lastCheckUnix"`
-	AvailableVersion string `json:"availableVersion"`
-	AvailableURL     string `json:"availableURL"`
-	SkipVersion      string `json:"skipVersion"`
-	RemindUntilUnix  int64  `json:"remindUntilUnix"`
-	Job             JobStatus `json:"job"`
+	LastCheckUnix    int64     `json:"lastCheckUnix"`
+	AvailableVersion string    `json:"availableVersion"`
+	AvailableURL     string    `json:"availableURL"`
+	SkipVersion      string    `json:"skipVersion"`
+	RemindUntilUnix  int64     `json:"remindUntilUnix"`
+	Job              JobStatus `json:"job"`
 }
 
 type Store struct {

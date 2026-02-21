@@ -147,9 +147,9 @@ func TestServerMultiConn_PendingCleanupAndAgentRestart(t *testing.T) {
 
 	// After a burst, pending should be empty.
 	time.Sleep(100 * time.Millisecond)
-	srv.st.pendingMu.Lock()
-	pendingLen := len(srv.st.pending)
-	srv.st.pendingMu.Unlock()
+	srv.mu.Lock()
+	pendingLen := len(srv.pendingTCP)
+	srv.mu.Unlock()
 	if pendingLen != 0 {
 		t.Fatalf("expected pending=0 after burst, got %d", pendingLen)
 	}
@@ -180,9 +180,9 @@ func TestServerMultiConn_PendingCleanupAndAgentRestart(t *testing.T) {
 	burst("b", 50)
 
 	time.Sleep(100 * time.Millisecond)
-	srv.st.pendingMu.Lock()
-	pendingLen = len(srv.st.pending)
-	srv.st.pendingMu.Unlock()
+	srv.mu.Lock()
+	pendingLen = len(srv.pendingTCP)
+	srv.mu.Unlock()
 	if pendingLen != 0 {
 		t.Fatalf("expected pending=0 after restart burst, got %d", pendingLen)
 	}
