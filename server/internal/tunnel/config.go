@@ -139,7 +139,7 @@ type ServerConfig struct {
 	// EncryptionAlgorithm specifies the global encryption standard for routes that have encryption enabled.
 	// Supported values: "aes-128", "aes-256", "none". Default is "aes-128".
 	EncryptionAlgorithm string `json:",omitempty"`
-	Routes            []RouteConfig
+	Routes              []RouteConfig
 }
 
 // Validate validates the server configuration.

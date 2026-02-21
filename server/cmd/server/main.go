@@ -1475,7 +1475,7 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		if proto == "" {
 			proto = "tcp"
 		}
-		encrypted := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_encrypted")) == "1"
+		encrypted := strings.TrimSpace(r.Form.Get("route_"+strconv.Itoa(i)+"_encrypted")) == "1"
 		var encPtr *bool
 		if encrypted {
 			encPtr = &encrypted

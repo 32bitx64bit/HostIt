@@ -239,7 +239,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 			payload := make([]byte, bwPayloadBytes)
 			binary.BigEndian.PutUint64(payload, uint64(1000+i)) // offset seq to avoid collision
 			pkt := &protocol.Packet{Type: protocol.TypePing, Payload: payload}
-			
+
 			if err := protocol.WritePacket(agent, pkt); err != nil {
 				break
 			}
@@ -593,7 +593,7 @@ func (s *Server) acceptData(ln net.Listener) {
 		conn.SetReadDeadline(time.Time{})
 
 		routeName := string(routeBytes)
-		
+
 		// Check if route is encrypted
 		s.mu.RLock()
 		var isEncrypted bool
