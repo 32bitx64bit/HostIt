@@ -119,11 +119,11 @@ func (a *Agent) connectAndRun() error {
 	defer conn.Close()
 
 	// Authenticate
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write([]byte(a.cfg.Token)); err != nil {
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := crypto.AuthenticateClient(conn, a.cfg.Token); err != nil {
 		return fmt.Errorf("control auth failed: %w", err)
 	}
-	conn.SetWriteDeadline(time.Time{})
+	conn.SetDeadline(time.Time{})
 
 	// Connect to UDP data server
 	serverAddr, err := net.ResolveUDPAddr("udp", a.cfg.DataAddr())
@@ -340,12 +340,19 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					return
 				}
 
-				// Authenticate and send route/client info in one write
+				// Authenticate
+				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
+				if err := crypto.AuthenticateClient(dataConn, a.cfg.Token); err != nil {
+					logging.Global().Errorf(logging.CatTCP, "data auth failed: %v", err)
+					dataConn.Close()
+					return
+				}
+
+				// Send route/client info
 				routeBytes := []byte(routeName)
 				clientBytes := []byte(clientID)
 
-				buf := make([]byte, 0, len(a.cfg.Token)+1+len(routeBytes)+1+len(clientBytes))
-				buf = append(buf, []byte(a.cfg.Token)...)
+				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes))
 				buf = append(buf, byte(len(routeBytes)))
 				buf = append(buf, routeBytes...)
 				buf = append(buf, byte(len(clientBytes)))

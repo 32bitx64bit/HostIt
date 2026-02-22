@@ -456,14 +456,14 @@ func (s *Server) acceptControl(ln net.Listener) {
 			continue
 		}
 
-		// Simple auth
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		buf := make([]byte, len(s.cfg.Token))
-		if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != s.cfg.Token {
+		// Mutual auth
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "control auth failed: %v", err)
 			conn.Close()
 			continue
 		}
-		conn.SetReadDeadline(time.Time{})
+		conn.SetDeadline(time.Time{})
 
 		s.mu.Lock()
 		if s.agentTCP != nil {
@@ -597,13 +597,14 @@ func (s *Server) acceptData(ln net.Listener) {
 			continue
 		}
 
-		// Simple auth
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		buf := make([]byte, len(s.cfg.Token))
-		if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != s.cfg.Token {
+		// Mutual auth
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "data auth failed: %v", err)
 			conn.Close()
 			continue
 		}
+		conn.SetDeadline(time.Time{})
 
 		// Read route name
 		var routeLen byte
