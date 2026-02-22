@@ -56,14 +56,6 @@ func main() {
 	cfg := agent.Config{}
 	loaded, _ := configio.Load(configPath, &cfg)
 
-	if cfg.EncryptionAlgorithm == "" {
-		if !loaded {
-			cfg.EncryptionAlgorithm = "aes-128"
-		} else {
-			cfg.EncryptionAlgorithm = "none"
-		}
-	}
-
 	// Log configuration status
 	if loaded {
 		log.Printf("Loaded configuration from: %s", configPath)
@@ -635,7 +627,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		cfg := old
 		cfg.Server = strings.TrimSpace(r.Form.Get("server"))
 		cfg.Token = strings.TrimSpace(r.Form.Get("token"))
-		cfg.EncryptionAlgorithm = r.Form.Get("encryption_algorithm")
 		if cfg.Server == "" {
 			http.Error(w, "server is required", http.StatusBadRequest)
 			return
@@ -869,15 +860,6 @@ const agentHomeHTML = `<!doctype html>
 					<label>Token</label>
 					<div class="help">Required. Must match the server token.</div>
 					<input name="token" value="{{.Cfg.Token}}" />
-				</div>
-				<div>
-					<label>Encryption Algorithm</label>
-					<div class="help">Global encryption standard for tunnel traffic</div>
-					<select name="encryption_algorithm" style="width:100%;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:var(--font);font-size:14px;transition:border-color .15s">
-						<option value="none" {{if eq .Cfg.EncryptionAlgorithm "none"}}selected{{end}}>None</option>
-						<option value="aes-128" {{if eq .Cfg.EncryptionAlgorithm "aes-128"}}selected{{end}}>AES-128</option>
-						<option value="aes-256" {{if eq .Cfg.EncryptionAlgorithm "aes-256"}}selected{{end}}>AES-256</option>
-					</select>
 				</div>
 			</div>
 			<div style="margin-top:10px" class="muted" style="font-size:12px">Routes come from the server. The agent forwards to <code>127.0.0.1:&lt;publicPort&gt;</code>.</div>

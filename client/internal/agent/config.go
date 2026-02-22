@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"crypto/cipher"
 	"fmt"
 	"net"
 	"strconv"
@@ -14,6 +15,9 @@ type RemoteRoute struct {
 	Proto      string // "tcp", "udp", or "both"
 	PublicAddr string // server listen addr (host:port)
 	Encrypted  bool   // whether this route uses application-layer encryption
+	Algorithm  string // encryption algorithm to use
+	DerivedKey []byte `json:"-"` // cached derived key
+	UDPCipher  cipher.AEAD `json:"-"` // cached UDP cipher
 }
 
 type Config struct {
@@ -28,9 +32,6 @@ type Config struct {
 	// TLSPinSHA256 optionally pins the server certificate by SHA256(der) hex.
 	// This is recommended with self-signed certs to prevent MITM.
 	TLSPinSHA256 string
-	// EncryptionAlgorithm specifies the global encryption standard for routes that have encryption enabled.
-	// Supported values: "aes-128", "aes-256", "none". Default is "aes-128".
-	EncryptionAlgorithm string
 	// Routes is populated by the server's HELLO message.
 	Routes map[string]RemoteRoute `json:"-"`
 }

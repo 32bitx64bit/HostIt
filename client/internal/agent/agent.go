@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -256,6 +257,23 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 				logging.Global().Errorf(logging.CatTCP, "failed to parse HELLO routes: %v", err)
 				continue
 			}
+			for k, r := range routes {
+				if r.Encrypted {
+					key, err := crypto.DeriveKey(a.cfg.Token, r.Algorithm)
+					if err != nil {
+						logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", r.Name, err)
+					} else {
+						r.DerivedKey = key
+						udpCipher, err := crypto.NewUDPCipher(key)
+						if err != nil {
+							logging.Global().Errorf(logging.CatTCP, "failed to create udp cipher for route %s: %v", r.Name, err)
+						} else {
+							r.UDPCipher = udpCipher
+						}
+						routes[k] = r
+					}
+				}
+			}
 			a.mu.Lock()
 			a.cfg.Routes = routes
 			a.mu.Unlock()
@@ -327,14 +345,13 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 				}
 
 				if rt.Encrypted {
-					key, err := crypto.DeriveKey(a.cfg.Token, a.cfg.EncryptionAlgorithm)
-					if err != nil {
-						logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", routeName, err)
+					if rt.DerivedKey == nil {
+						logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: key is nil", routeName)
 						dataConn.Close()
 						localConn.Close()
 						return
 					}
-					dataConn, err = crypto.WrapTCP(dataConn, key)
+					dataConn, err = crypto.WrapTCP(dataConn, rt.DerivedKey)
 					if err != nil {
 						logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
 						dataConn.Close()
@@ -429,11 +446,11 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 
 			payload := pkt.Payload
 			if rt.Encrypted {
-				key, err := crypto.DeriveKey(a.cfg.Token, a.cfg.EncryptionAlgorithm)
-				if err != nil {
+				udpCipher := rt.UDPCipher
+				if udpCipher == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(payload, key)
+				decrypted, err := crypto.DecryptUDP(udpCipher, payload)
 				if err != nil {
 					continue
 				}
@@ -476,7 +493,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 				sessionsMu.Unlock()
 
 				// Start reader for this session
-				go func(sessionKey string, clientID string, routeName string, c *net.UDPConn, isEncrypted bool) {
+				go func(sessionKey string, clientID string, routeName string, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
 					defer func() {
 						c.Close()
 						sessionsMu.Lock()
@@ -501,11 +518,10 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 
 						payload := respBuf[:rn]
 						if isEncrypted {
-							key, err := crypto.DeriveKey(a.cfg.Token, a.cfg.EncryptionAlgorithm)
-							if err != nil {
+							if udpCipher == nil {
 								continue
 							}
-							encrypted, err := crypto.EncryptUDP(payload, key)
+							encrypted, err := crypto.EncryptUDP(udpCipher, payload)
 							if err != nil {
 								continue
 							}
@@ -526,7 +542,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 
 						a.udpDataConn.WriteToUDP(data, a.serverUDP)
 					}
-				}(sessionKey, pkt.Client, pkt.Route, localConn, rt.Encrypted)
+				}(sessionKey, pkt.Client, pkt.Route, localConn, rt.Encrypted, rt.UDPCipher)
 			}
 
 			sess.conn.Write(payload)

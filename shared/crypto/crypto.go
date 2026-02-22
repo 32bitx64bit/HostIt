@@ -10,6 +10,9 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
+
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // Supported algorithms
@@ -20,13 +23,15 @@ const (
 )
 
 // DeriveKey derives a key of the appropriate length for the given algorithm from a shared token.
+// It uses PBKDF2 with HMAC-SHA256 to derive a strong key from the token.
 func DeriveKey(token string, alg string) ([]byte, error) {
-	hash := sha256.Sum256([]byte(token))
 	switch strings.ToLower(alg) {
 	case AlgAES128:
-		return hash[:16], nil
+		// Use PBKDF2 to derive a 16-byte key (AES-128)
+		return pbkdf2.Key([]byte(token), []byte("hostit-salt"), 4096, 16, sha256.New), nil
 	case AlgAES256:
-		return hash[:32], nil
+		// Use PBKDF2 to derive a 32-byte key (AES-256)
+		return pbkdf2.Key([]byte(token), []byte("hostit-salt"), 4096, 32, sha256.New), nil
 	case AlgNone, "":
 		return nil, nil
 	default:
@@ -34,18 +39,22 @@ func DeriveKey(token string, alg string) ([]byte, error) {
 	}
 }
 
-// EncryptUDP encrypts a UDP payload using AES-GCM.
-func EncryptUDP(key []byte, plaintext []byte) ([]byte, error) {
+// NewUDPCipher creates a new cipher.AEAD for UDP encryption.
+func NewUDPCipher(key []byte) (cipher.AEAD, error) {
 	if len(key) == 0 {
-		return plaintext, nil
+		return nil, nil
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
+	return cipher.NewGCM(block)
+}
+
+// EncryptUDP encrypts a UDP payload using AES-GCM.
+func EncryptUDP(aesgcm cipher.AEAD, plaintext []byte) ([]byte, error) {
+	if aesgcm == nil {
+		return plaintext, nil
 	}
 	nonce := make([]byte, aesgcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
@@ -55,17 +64,9 @@ func EncryptUDP(key []byte, plaintext []byte) ([]byte, error) {
 }
 
 // DecryptUDP decrypts a UDP payload using AES-GCM.
-func DecryptUDP(key []byte, ciphertext []byte) ([]byte, error) {
-	if len(key) == 0 {
+func DecryptUDP(aesgcm cipher.AEAD, ciphertext []byte) ([]byte, error) {
+	if aesgcm == nil {
 		return ciphertext, nil
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
 	}
 	nonceSize := aesgcm.NonceSize()
 	if len(ciphertext) < nonceSize {
@@ -76,7 +77,7 @@ func DecryptUDP(key []byte, ciphertext []byte) ([]byte, error) {
 }
 
 // WrapTCP wraps a net.Conn with AES-CTR encryption/decryption.
-// It writes a random IV to the connection on creation, and reads the peer's IV.
+// It exchanges IVs concurrently to avoid deadlock when both sides call WrapTCP simultaneously.
 func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
 	if len(key) == 0 {
 		return conn, nil
@@ -86,19 +87,36 @@ func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
 		return nil, err
 	}
 
-	// Generate and send our IV
+	// Generate our IV
 	writeIV := make([]byte, block.BlockSize())
 	if _, err := io.ReadFull(rand.Reader, writeIV); err != nil {
 		return nil, err
 	}
-	if _, err := conn.Write(writeIV); err != nil {
-		return nil, err
-	}
 
-	// Read peer's IV
-	readIV := make([]byte, block.BlockSize())
-	if _, err := io.ReadFull(conn, readIV); err != nil {
-		return nil, err
+	// Exchange IVs concurrently to avoid deadlock
+	// Both sides must be able to write and read simultaneously
+	var readIV []byte
+	var readErr, writeErr error
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		iv := make([]byte, block.BlockSize())
+		_, readErr = io.ReadFull(conn, iv)
+		readIV = iv
+	}()
+	go func() {
+		defer wg.Done()
+		_, writeErr = conn.Write(writeIV)
+	}()
+	wg.Wait()
+
+	if readErr != nil {
+		return nil, fmt.Errorf("IV read failed: %w", readErr)
+	}
+	if writeErr != nil {
+		return nil, fmt.Errorf("IV write failed: %w", writeErr)
 	}
 
 	streamWriter := cipher.NewCTR(block, writeIV)

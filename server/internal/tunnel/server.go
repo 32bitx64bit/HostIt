@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -19,6 +20,9 @@ import (
 // Server represents the tunnel server.
 type Server struct {
 	cfg ServerConfig
+
+	derivedKey []byte
+	udpCipher  cipher.AEAD
 
 	mu          sync.RWMutex
 	agentTCP    net.Conn
@@ -39,6 +43,14 @@ type Server struct {
 	wg     sync.WaitGroup
 
 	dash *dashState
+}
+
+type helloRoute struct {
+	Name       string
+	Proto      string
+	PublicAddr string
+	Encrypted  bool
+	Algorithm  string
 }
 
 type ServerStatus struct {
@@ -91,9 +103,15 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 
 			// If agent is connected, send updated routes
 			if s.agentTCP != nil {
-				routesMap := make(map[string]RouteConfig)
+				routesMap := make(map[string]helloRoute)
 				for _, r := range s.cfg.Routes {
-					routesMap[r.Name] = r
+					routesMap[r.Name] = helloRoute{
+						Name:       r.Name,
+						Proto:      r.Proto,
+						PublicAddr: r.PublicAddr,
+						Encrypted:  r.IsEncrypted(),
+						Algorithm:  s.cfg.EncryptionAlgorithm,
+					}
 				}
 				routesJSON, _ := json.Marshal(routesMap)
 				helloPkt := &protocol.Packet{
@@ -298,8 +316,12 @@ func (s *Server) Run(ctx context.Context) error {
 
 // NewServer creates a new tunnel server.
 func NewServer(cfg ServerConfig) *Server {
+	key, _ := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
+	udpCipher, _ := crypto.NewUDPCipher(key)
 	return &Server{
 		cfg:        cfg,
+		derivedKey: key,
+		udpCipher:  udpCipher,
 		publicTCP:  make(map[string]net.Listener),
 		publicUDP:  make(map[string]*net.UDPConn),
 		pendingTCP: make(map[string]chan net.Conn),
@@ -448,14 +470,26 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.agentTCP.Close()
 		}
 		s.agentTCP = conn
+		s.agentUDP = nil // Clear UDP state for new connection
+		// Clear any stale pending TCP connections from previous agent
+		for clientID, ch := range s.pendingTCP {
+			close(ch)
+			delete(s.pendingTCP, clientID)
+		}
 		s.mu.Unlock()
 
 		logging.Global().Infof(logging.CatTCP, "Agent connected to control")
 
 		// Send HELLO with routes
-		routesMap := make(map[string]RouteConfig)
+		routesMap := make(map[string]helloRoute)
 		for _, rt := range s.cfg.Routes {
-			routesMap[rt.Name] = rt
+			routesMap[rt.Name] = helloRoute{
+				Name:       rt.Name,
+				Proto:      rt.Proto,
+				PublicAddr: rt.PublicAddr,
+				Encrypted:  rt.IsEncrypted(),
+				Algorithm:  s.cfg.EncryptionAlgorithm,
+			}
 		}
 		routesJSON, _ := json.Marshal(routesMap)
 		helloPkt := &protocol.Packet{
@@ -536,6 +570,12 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.mu.Lock()
 			if s.agentTCP == c {
 				s.agentTCP = nil
+				s.agentUDP = nil // Clear UDP state on disconnect
+				// Clear any pending TCP connections that were waiting for this agent
+				for clientID, ch := range s.pendingTCP {
+					close(ch)
+					delete(s.pendingTCP, clientID)
+				}
 				logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
 			}
 			s.mu.Unlock()
@@ -606,13 +646,12 @@ func (s *Server) acceptData(ln net.Listener) {
 		s.mu.RUnlock()
 
 		if isEncrypted {
-			key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
-			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", routeName, err)
+			if s.derivedKey == nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: key is nil", routeName)
 				conn.Close()
 				continue
 			}
-			conn, err = crypto.WrapTCP(conn, key)
+			conn, err = crypto.WrapTCP(conn, s.derivedKey)
 			if err != nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
 				conn.Close()
@@ -694,6 +733,10 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			defer c.Close()
 			select {
 			case agentConn := <-ch:
+				if agentConn == nil {
+					// Channel was closed (agent disconnected)
+					return
+				}
 				defer agentConn.Close()
 				s.dash.addConn(time.Now())
 				s.dash.incActive(routeName)
@@ -769,9 +812,11 @@ func (s *Server) acceptAgentUDP() {
 			s.mu.RLock()
 			pubConn, ok := s.publicUDP[pkt.Route]
 			var isEncrypted bool
+			var udpCipher cipher.AEAD
 			for _, rt := range s.cfg.Routes {
 				if rt.Name == pkt.Route {
 					isEncrypted = rt.IsEncrypted()
+					udpCipher = s.udpCipher
 					break
 				}
 			}
@@ -783,11 +828,10 @@ func (s *Server) acceptAgentUDP() {
 
 			payload := pkt.Payload
 			if isEncrypted {
-				key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
-				if err != nil {
+				if udpCipher == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(payload, key)
+				decrypted, err := crypto.DecryptUDP(udpCipher, payload)
 				if err != nil {
 					continue
 				}
@@ -829,10 +873,12 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		agentAddr := s.agentUDP
 		enabled := false
 		isEncrypted := false
+		var udpCipher cipher.AEAD
 		for _, rt := range s.cfg.Routes {
 			if rt.Name == routeName {
 				enabled = rt.IsEnabled()
 				isEncrypted = rt.IsEncrypted()
+				udpCipher = s.udpCipher
 				break
 			}
 		}
@@ -844,11 +890,10 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 
 		payload := buf[:n]
 		if isEncrypted {
-			key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
-			if err != nil {
+			if udpCipher == nil {
 				continue
 			}
-			encrypted, err := crypto.EncryptUDP(payload, key)
+			encrypted, err := crypto.EncryptUDP(udpCipher, payload)
 			if err != nil {
 				continue
 			}
