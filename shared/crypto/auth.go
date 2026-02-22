@@ -79,7 +79,7 @@ func AuthenticateServer(conn net.Conn, token string) error {
 	macData = append(macData, serverNonce...)
 	macData = append(macData, clientNonce...)
 	serverMac := computeHMAC(token, macData)
-	
+
 	respBuf := make([]byte, 64)
 	copy(respBuf[:32], serverNonce)
 	copy(respBuf[32:], serverMac)
