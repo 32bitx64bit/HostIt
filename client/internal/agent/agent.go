@@ -47,14 +47,12 @@ type Agent struct {
 	wg     sync.WaitGroup
 }
 
-// NewAgent creates a new tunnel agent.
 func NewAgent(cfg Config) *Agent {
 	return &Agent{
 		cfg: cfg,
 	}
 }
 
-// Start starts the tunnel agent.
 func (a *Agent) Run(ctx context.Context) error {
 	a.ctx, a.cancel = context.WithCancel(ctx)
 
@@ -77,13 +75,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-a.ctx.Done():
 			return nil
 		case <-time.After(2 * time.Second):
-			// Reconnect delay
 		}
 	}
 }
 
 func (a *Agent) connectAndRun() error {
-	// Connect to control server
 	var conn net.Conn
 	var err error
 	if a.cfg.DisableTLS {
@@ -118,14 +114,12 @@ func (a *Agent) connectAndRun() error {
 	a.controlConn = conn
 	defer conn.Close()
 
-	// Authenticate
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := crypto.AuthenticateClient(conn, a.cfg.Token); err != nil {
 		return fmt.Errorf("control auth failed: %w", err)
 	}
 	conn.SetDeadline(time.Time{})
 
-	// Connect to UDP data server
 	serverAddr, err := net.ResolveUDPAddr("udp", a.cfg.DataAddr())
 	if err != nil {
 		return fmt.Errorf("resolve udp data addr failed: %w", err)
@@ -145,7 +139,6 @@ func (a *Agent) connectAndRun() error {
 	a.udpDataConn.SetWriteBuffer(8 * 1024 * 1024)
 	defer a.udpDataConn.Close()
 
-	// Send initial registration
 	pkt := &protocol.Packet{
 		Type: protocol.TypeRegister,
 	}
@@ -158,11 +151,10 @@ func (a *Agent) connectAndRun() error {
 		a.hooks.OnConnected()
 	}
 
-	// Create a sub-context for this connection
 	connCtx, connCancel := context.WithCancel(a.ctx)
 	defer connCancel()
 
-	// Start UDP keep-alive (frequent to punch NAT and recover from packet loss)
+	// UDP keep-alive (NAT punch)
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
@@ -176,7 +168,6 @@ func (a *Agent) connectAndRun() error {
 		}
 	}()
 
-	// Start TCP keep-alive
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
@@ -219,7 +210,6 @@ func (a *Agent) connectAndRun() error {
 		}
 	}()
 
-	// Wait for either context cancellation or a critical goroutine to exit
 	wg.Wait()
 	close(errCh)
 
@@ -231,7 +221,6 @@ func (a *Agent) connectAndRun() error {
 	return nil
 }
 
-// Stop stops the tunnel agent.
 func (a *Agent) Stop() {
 	a.cancel()
 	if a.controlConn != nil {
@@ -275,7 +264,6 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 		}
 
 		if pkt.Type == protocol.TypeHello {
-			// Parse routes
 			var routes map[string]RemoteRoute
 			if err := json.Unmarshal(pkt.Payload, &routes); err != nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to parse HELLO routes: %v", err)
@@ -327,7 +315,6 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 			}
 
 			go func(routeName, clientID string, rt RemoteRoute) {
-				// Open data connection
 				var dataConn net.Conn
 				var err error
 				if a.cfg.DisableTLS {
@@ -340,7 +327,6 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					return
 				}
 
-				// Authenticate
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
 				if err := crypto.AuthenticateClient(dataConn, a.cfg.Token); err != nil {
 					logging.Global().Errorf(logging.CatTCP, "data auth failed: %v", err)
@@ -348,7 +334,6 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					return
 				}
 
-				// Send route/client info
 				routeBytes := []byte(routeName)
 				clientBytes := []byte(clientID)
 
@@ -365,7 +350,6 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 				}
 				dataConn.SetWriteDeadline(time.Time{})
 
-				// Connect to local service
 				_, port, _ := net.SplitHostPort(rt.PublicAddr)
 				localAddr := "127.0.0.1:" + port
 				localConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
@@ -420,7 +404,6 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 		sessions   = make(map[string]*agentUDPSession)
 	)
 
-	// Cleanup idle sessions
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()

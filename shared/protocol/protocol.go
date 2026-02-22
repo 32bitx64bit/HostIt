@@ -6,7 +6,6 @@ import (
 	"io"
 )
 
-// Packet types
 const (
 	TypeRegister byte = 1
 	TypeData     byte = 2
@@ -16,16 +15,13 @@ const (
 	TypeConnect  byte = 6
 )
 
-// Protocol errors
 var (
 	ErrInvalidPacket = errors.New("invalid packet")
 	ErrPayloadTooBig = errors.New("payload too big")
 )
 
-// MaxPayloadSize is the maximum size of a packet payload
 const MaxPayloadSize = 64 * 1024 // 64KB
 
-// Packet represents a single protocol message
 type Packet struct {
 	Type    byte
 	Route   string
@@ -33,7 +29,6 @@ type Packet struct {
 	Payload []byte
 }
 
-// WritePacket writes a packet to an io.Writer (for TCP)
 func WritePacket(w io.Writer, p *Packet) error {
 	routeBytes := []byte(p.Route)
 	clientBytes := []byte(p.Client)
@@ -45,7 +40,6 @@ func WritePacket(w io.Writer, p *Packet) error {
 	totalLen := 5 + len(routeBytes) + len(clientBytes) + len(p.Payload)
 	buf := make([]byte, totalLen)
 
-	// Header: [Type(1)] [RouteLen(1)] [ClientLen(1)] [PayloadLen(2)]
 	buf[0] = p.Type
 	buf[1] = byte(len(routeBytes))
 	buf[2] = byte(len(clientBytes))
@@ -68,7 +62,6 @@ func WritePacket(w io.Writer, p *Packet) error {
 	return err
 }
 
-// ReadPacket reads a packet from an io.Reader (for TCP)
 func ReadPacket(r io.Reader) (*Packet, error) {
 	header := make([]byte, 5)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -109,7 +102,6 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 	return p, nil
 }
 
-// MarshalUDP encodes a packet for UDP transmission
 func MarshalUDP(p *Packet, dst []byte) ([]byte, error) {
 	routeBytes := []byte(p.Route)
 	clientBytes := []byte(p.Client)
@@ -144,7 +136,6 @@ func MarshalUDP(p *Packet, dst []byte) ([]byte, error) {
 	return dst, nil
 }
 
-// UnmarshalUDP decodes a packet from a UDP datagram
 func UnmarshalUDP(data []byte) (*Packet, error) {
 	if len(data) < 3 {
 		return nil, ErrInvalidPacket

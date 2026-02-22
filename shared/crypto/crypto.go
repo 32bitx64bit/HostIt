@@ -23,15 +23,12 @@ const (
 	AlgNone   = "none"
 )
 
-// DeriveKey derives a key of the appropriate length for the given algorithm from a shared token.
-// It uses PBKDF2 with HMAC-SHA256 to derive a strong key from the token.
+// DeriveKey derives a key from a shared token using PBKDF2.
 func DeriveKey(token string, alg string) ([]byte, error) {
 	switch strings.ToLower(alg) {
 	case AlgAES128:
-		// Use PBKDF2 to derive a 16-byte key (AES-128)
 		return pbkdf2.Key([]byte(token), []byte("hostit-salt"), 4096, 16, sha256.New), nil
 	case AlgAES256:
-		// Use PBKDF2 to derive a 32-byte key (AES-256)
 		return pbkdf2.Key([]byte(token), []byte("hostit-salt"), 4096, 32, sha256.New), nil
 	case AlgNone, "":
 		return nil, nil
@@ -78,10 +75,7 @@ func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 		dst = dst[:nonceSize]
 	}
 
-	// Use a fast atomic counter for the nonce instead of reading from crypto/rand
-	// This is safe as long as the key is rotated before the counter wraps around (2^64 packets)
-	// and the counter is unique per key. For a simple tunnel, this is usually sufficient.
-	// To be strictly correct across restarts, we mix in some random bytes at startup.
+	// Use a fast atomic counter for the nonce
 	val := atomic.AddUint64(&udpNonceCounter, 1)
 	for i := 0; i < 8 && i < nonceSize; i++ {
 		dst[i] = byte(val >> (i * 8))
@@ -115,7 +109,6 @@ func DecryptUDP(aesgcm cipher.AEAD, dst, ciphertext []byte) ([]byte, error) {
 }
 
 // WrapTCP wraps a net.Conn with AES-CTR encryption/decryption.
-// It exchanges IVs concurrently to avoid deadlock when both sides call WrapTCP simultaneously.
 func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
 	if len(key) == 0 {
 		return conn, nil
@@ -131,7 +124,7 @@ func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
 		return nil, err
 	}
 
-	// Write our IV immediately to avoid waiting for a full RTT during connection setup.
+	// Write our IV immediately
 	if _, err := conn.Write(writeIV); err != nil {
 		return nil, fmt.Errorf("IV write failed: %w", err)
 	}
@@ -182,8 +175,7 @@ var writeBufPool = sync.Pool{
 }
 
 func (c *cryptoConn) Write(b []byte) (n int, err error) {
-	// We must not modify the input buffer, so we need a temporary buffer
-	// For small writes, we can use a stack-allocated buffer to avoid allocations
+	// Use a temporary buffer to avoid modifying input
 	if len(b) <= 4096 {
 		var buf [4096]byte
 		c.writer.XORKeyStream(buf[:len(b)], b)

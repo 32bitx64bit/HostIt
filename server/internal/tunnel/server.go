@@ -17,7 +17,6 @@ import (
 	"hostit/shared/protocol"
 )
 
-// Server represents the tunnel server.
 type Server struct {
 	cfg ServerConfig
 
@@ -101,7 +100,6 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 			val := enabled
 			s.cfg.Routes[i].Enabled = &val
 
-			// If agent is connected, send updated routes
 			if s.agentTCP != nil {
 				routesMap := make(map[string]helloRoute)
 				for _, r := range s.cfg.Routes {
@@ -150,7 +148,6 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		s.mu.Unlock()
 		return AgentNettestResult{}, fmt.Errorf("test already in progress")
 	}
-	// Increase channel size to avoid dropping packets during burst
 	pongCh := make(chan []byte, 1000)
 	s.pongCh = pongCh
 	s.mu.Unlock()
@@ -163,7 +160,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 
 	var res AgentNettestResult
 
-	// Phase 1: Latency test (20 pings, 8 bytes, sequential)
+	// Phase 1: Latency test
 	latencyCount := 20
 	var (
 		minRTT    time.Duration
@@ -235,7 +232,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		}
 	}
 
-	// Phase 2: Bandwidth test (concurrent burst)
+	// Phase 2: Bandwidth test
 	bwCount := 100
 	bwPayloadBytes := 64000 // 64KB
 	var bwSent int32
@@ -246,7 +243,6 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 	bwStart := time.Now()
 	sendDone := make(chan struct{})
 
-	// Send all packets concurrently
 	go func() {
 		defer close(sendDone)
 		agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -267,7 +263,6 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		agent.SetWriteDeadline(time.Time{})
 	}()
 
-	// Wait for replies
 	timeout := time.After(5 * time.Second)
 bwWaitLoop:
 	for bwRecv < bwCount {
@@ -287,7 +282,7 @@ bwWaitLoop:
 		}
 	}
 
-	<-sendDone // Ensure sender goroutine is finished before returning
+	<-sendDone
 	bwDuration := time.Since(bwStart)
 
 	res.SentPackets = latencyCount + int(bwSent)
@@ -314,7 +309,6 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-// NewServer creates a new tunnel server.
 func NewServer(cfg ServerConfig) *Server {
 	key, _ := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
 	udpCipher, _ := crypto.NewUDPCipher(key)
@@ -329,11 +323,9 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 }
 
-// Start starts the tunnel server.
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	// Start control listener
 	var controlLn net.Listener
 	var dataLn net.Listener
 	var err error
@@ -367,12 +359,10 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go s.acceptControl(controlLn)
 
-	// Start data listener (TCP)
 	s.dataLn = dataLn
 	s.wg.Add(1)
 	go s.acceptData(dataLn)
 
-	// Start data listener (UDP)
 	udpAddr, err := net.ResolveUDPAddr("udp", s.cfg.DataAddr)
 	if err != nil {
 		return fmt.Errorf("resolve udp data addr failed: %w", err)
@@ -386,7 +376,6 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go s.acceptAgentUDP()
 
-	// Start public listeners
 	for _, rt := range s.cfg.Routes {
 		if rt.Proto == "tcp" || rt.Proto == "both" {
 			ln, err := net.Listen("tcp", rt.PublicAddr)
@@ -421,7 +410,6 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops the tunnel server.
 func (s *Server) Stop() {
 	s.cancel()
 	if s.controlLn != nil {
@@ -470,8 +458,8 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.agentTCP.Close()
 		}
 		s.agentTCP = conn
-		s.agentUDP = nil // Clear UDP state for new connection
-		// Clear any stale pending TCP connections from previous agent
+		s.agentUDP = nil
+		// Clear stale pending TCP connections
 		for clientID, ch := range s.pendingTCP {
 			close(ch)
 			delete(s.pendingTCP, clientID)
@@ -480,7 +468,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 
 		logging.Global().Infof(logging.CatTCP, "Agent connected to control")
 
-		// Send HELLO with routes
 		routesMap := make(map[string]helloRoute)
 		for _, rt := range s.cfg.Routes {
 			routesMap[rt.Name] = helloRoute{
@@ -515,7 +502,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 			defer s.wg.Done()
 			defer c.Close()
 
-			// Start a goroutine to send PINGs
 			pingCtx, pingCancel := context.WithCancel(s.ctx)
 			defer pingCancel()
 			go func() {
@@ -538,7 +524,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 				}
 			}()
 
-			// Read loop to detect disconnect
 			for {
 				c.SetReadDeadline(time.Now().Add(45 * time.Second))
 				pkt, err := protocol.ReadPacket(c)
@@ -570,8 +555,8 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.mu.Lock()
 			if s.agentTCP == c {
 				s.agentTCP = nil
-				s.agentUDP = nil // Clear UDP state on disconnect
-				// Clear any pending TCP connections that were waiting for this agent
+				s.agentUDP = nil
+				// Clear pending TCP connections
 				for clientID, ch := range s.pendingTCP {
 					close(ch)
 					delete(s.pendingTCP, clientID)
@@ -597,7 +582,6 @@ func (s *Server) acceptData(ln net.Listener) {
 			continue
 		}
 
-		// Mutual auth
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "data auth failed: %v", err)
@@ -606,7 +590,6 @@ func (s *Server) acceptData(ln net.Listener) {
 		}
 		conn.SetDeadline(time.Time{})
 
-		// Read route name
 		var routeLen byte
 		if err := binary.Read(conn, binary.BigEndian, &routeLen); err != nil {
 			conn.Close()
@@ -619,7 +602,6 @@ func (s *Server) acceptData(ln net.Listener) {
 		}
 		_ = string(routeBytes) // routeName not needed here
 
-		// Read client ID
 		var clientLen byte
 		if err := binary.Read(conn, binary.BigEndian, &clientLen); err != nil {
 			conn.Close()
@@ -635,7 +617,6 @@ func (s *Server) acceptData(ln net.Listener) {
 
 		routeName := string(routeBytes)
 
-		// Check if route is encrypted
 		s.mu.RLock()
 		var isEncrypted bool
 		for _, rt := range s.cfg.Routes {
@@ -692,7 +673,6 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		clientID := fmt.Sprintf("%s-%d", conn.RemoteAddr().String(), time.Now().UnixNano())
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
 
-		// Notify agent to open a data connection
 		s.mu.RLock()
 		agent := s.agentTCP
 		enabled := false
@@ -714,7 +694,6 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		s.pendingTCP[clientID] = ch
 		s.mu.Unlock()
 
-		// Send connect request to agent
 		reqPkt := &protocol.Packet{
 			Type:   protocol.TypeConnect,
 			Route:  routeName,
@@ -735,7 +714,6 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			select {
 			case agentConn := <-ch:
 				if agentConn == nil {
-					// Channel was closed (agent disconnected)
 					return
 				}
 				defer agentConn.Close()
@@ -794,11 +772,11 @@ func (s *Server) acceptAgentUDP() {
 			continue
 		}
 
-		// Always update agent address to handle NAT port changes instantly
+		// Update agent address to handle NAT port changes
 		s.mu.Lock()
 		if s.agentUDP == nil || s.agentUDP.String() != addr.String() {
 			s.agentUDP = addr
-			// Only log if it's a register packet to avoid spamming logs on every data packet if NAT changes
+			// Only log on register to avoid spam
 			if pkt.Type == protocol.TypeRegister {
 				logging.Global().Infof(logging.CatUDP, "Agent UDP address updated to %s", addr.String())
 			}
