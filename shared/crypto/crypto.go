@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -51,29 +52,66 @@ func NewUDPCipher(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
+var udpNonceCounter uint64
+
+func init() {
+	// Initialize the nonce counter with a random value to avoid nonce reuse across restarts
+	var b [8]byte
+	if _, err := io.ReadFull(rand.Reader, b[:]); err == nil {
+		udpNonceCounter = uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
+			uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+	}
+}
+
 // EncryptUDP encrypts a UDP payload using AES-GCM.
-func EncryptUDP(aesgcm cipher.AEAD, plaintext []byte) ([]byte, error) {
+func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 	if aesgcm == nil {
-		return plaintext, nil
+		return append(dst, plaintext...), nil
 	}
-	nonce := make([]byte, aesgcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
+	nonceSize := aesgcm.NonceSize()
+
+	// Ensure dst has enough capacity for nonce + ciphertext + tag
+	outLen := nonceSize + len(plaintext) + aesgcm.Overhead()
+	if cap(dst) < outLen {
+		dst = make([]byte, nonceSize, outLen)
+	} else {
+		dst = dst[:nonceSize]
 	}
-	return aesgcm.Seal(nonce, nonce, plaintext, nil), nil
+
+	// Use a fast atomic counter for the nonce instead of reading from crypto/rand
+	// This is safe as long as the key is rotated before the counter wraps around (2^64 packets)
+	// and the counter is unique per key. For a simple tunnel, this is usually sufficient.
+	// To be strictly correct across restarts, we mix in some random bytes at startup.
+	val := atomic.AddUint64(&udpNonceCounter, 1)
+	for i := 0; i < 8 && i < nonceSize; i++ {
+		dst[i] = byte(val >> (i * 8))
+	}
+	return aesgcm.Seal(dst, dst[:nonceSize], plaintext, nil), nil
 }
 
 // DecryptUDP decrypts a UDP payload using AES-GCM.
-func DecryptUDP(aesgcm cipher.AEAD, ciphertext []byte) ([]byte, error) {
+func DecryptUDP(aesgcm cipher.AEAD, dst, ciphertext []byte) ([]byte, error) {
 	if aesgcm == nil {
-		return ciphertext, nil
+		return append(dst, ciphertext...), nil
 	}
 	nonceSize := aesgcm.NonceSize()
 	if len(ciphertext) < nonceSize {
 		return nil, errors.New("ciphertext too short")
 	}
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return aesgcm.Open(nil, nonce, ciphertext, nil)
+
+	// Ensure dst has enough capacity for plaintext
+	outLen := len(ciphertext) - aesgcm.Overhead()
+	if outLen < 0 {
+		outLen = 0
+	}
+	if cap(dst) < outLen {
+		dst = make([]byte, 0, outLen)
+	} else {
+		dst = dst[:0]
+	}
+
+	return aesgcm.Open(dst, nonce, ciphertext, nil)
 }
 
 // WrapTCP wraps a net.Conn with AES-CTR encryption/decryption.
@@ -93,52 +131,77 @@ func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
 		return nil, err
 	}
 
-	// Exchange IVs concurrently to avoid deadlock
-	// Both sides must be able to write and read simultaneously
-	var readIV []byte
-	var readErr, writeErr error
-	var wg sync.WaitGroup
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		iv := make([]byte, block.BlockSize())
-		_, readErr = io.ReadFull(conn, iv)
-		readIV = iv
-	}()
-	go func() {
-		defer wg.Done()
-		_, writeErr = conn.Write(writeIV)
-	}()
-	wg.Wait()
-
-	if readErr != nil {
-		return nil, fmt.Errorf("IV read failed: %w", readErr)
-	}
-	if writeErr != nil {
-		return nil, fmt.Errorf("IV write failed: %w", writeErr)
+	// Write our IV immediately to avoid waiting for a full RTT during connection setup.
+	if _, err := conn.Write(writeIV); err != nil {
+		return nil, fmt.Errorf("IV write failed: %w", err)
 	}
 
 	streamWriter := cipher.NewCTR(block, writeIV)
-	streamReader := cipher.NewCTR(block, readIV)
 
 	return &cryptoConn{
 		Conn:   conn,
-		reader: &cipher.StreamReader{S: streamReader, R: conn},
-		writer: &cipher.StreamWriter{S: streamWriter, W: conn},
+		block:  block,
+		writer: streamWriter,
 	}, nil
 }
 
 type cryptoConn struct {
 	net.Conn
-	reader io.Reader
-	writer io.Writer
+	block    cipher.Block
+	reader   cipher.Stream
+	writer   cipher.Stream
+	readOnce sync.Once
+	readErr  error
 }
 
 func (c *cryptoConn) Read(b []byte) (n int, err error) {
-	return c.reader.Read(b)
+	c.readOnce.Do(func() {
+		iv := make([]byte, c.block.BlockSize())
+		if _, err := io.ReadFull(c.Conn, iv); err != nil {
+			c.readErr = fmt.Errorf("IV read failed: %w", err)
+			return
+		}
+		c.reader = cipher.NewCTR(c.block, iv)
+	})
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
+
+	n, err = c.Conn.Read(b)
+	if n > 0 {
+		c.reader.XORKeyStream(b[:n], b[:n])
+	}
+	return n, err
+}
+
+var writeBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
 }
 
 func (c *cryptoConn) Write(b []byte) (n int, err error) {
-	return c.writer.Write(b)
+	// We must not modify the input buffer, so we need a temporary buffer
+	// For small writes, we can use a stack-allocated buffer to avoid allocations
+	if len(b) <= 4096 {
+		var buf [4096]byte
+		c.writer.XORKeyStream(buf[:len(b)], b)
+		return c.Conn.Write(buf[:len(b)])
+	}
+
+	// For larger writes, try to use the pool
+	if len(b) <= 32*1024 {
+		bufPtr := writeBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		c.writer.XORKeyStream(buf[:len(b)], b)
+		n, err = c.Conn.Write(buf[:len(b)])
+		writeBufPool.Put(bufPtr)
+		return n, err
+	}
+
+	// For extremely large writes, allocate a new buffer
+	buf := make([]byte, len(b))
+	c.writer.XORKeyStream(buf, b)
+	return c.Conn.Write(buf)
 }

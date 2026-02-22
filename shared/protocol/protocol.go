@@ -110,7 +110,7 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 }
 
 // MarshalUDP encodes a packet for UDP transmission
-func MarshalUDP(p *Packet) ([]byte, error) {
+func MarshalUDP(p *Packet, dst []byte) ([]byte, error) {
 	routeBytes := []byte(p.Route)
 	clientBytes := []byte(p.Client)
 
@@ -119,24 +119,29 @@ func MarshalUDP(p *Packet) ([]byte, error) {
 	}
 
 	totalLen := 1 + 1 + len(routeBytes) + 1 + len(clientBytes) + len(p.Payload)
-	buf := make([]byte, totalLen)
+
+	if cap(dst) < totalLen {
+		dst = make([]byte, totalLen)
+	} else {
+		dst = dst[:totalLen]
+	}
 
 	i := 0
-	buf[i] = p.Type
+	dst[i] = p.Type
 	i++
 
-	buf[i] = byte(len(routeBytes))
+	dst[i] = byte(len(routeBytes))
 	i++
-	copy(buf[i:], routeBytes)
+	copy(dst[i:], routeBytes)
 	i += len(routeBytes)
 
-	buf[i] = byte(len(clientBytes))
+	dst[i] = byte(len(clientBytes))
 	i++
-	copy(buf[i:], clientBytes)
+	copy(dst[i:], clientBytes)
 	i += len(clientBytes)
 
-	copy(buf[i:], p.Payload)
-	return buf, nil
+	copy(dst[i:], p.Payload)
+	return dst, nil
 }
 
 // UnmarshalUDP decodes a packet from a UDP datagram

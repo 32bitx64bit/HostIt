@@ -12,11 +12,11 @@ import (
 // The agent derives local targets from PublicAddr (defaults to 127.0.0.1:<port>).
 type RemoteRoute struct {
 	Name       string
-	Proto      string // "tcp", "udp", or "both"
-	PublicAddr string // server listen addr (host:port)
-	Encrypted  bool   // whether this route uses application-layer encryption
-	Algorithm  string // encryption algorithm to use
-	DerivedKey []byte `json:"-"` // cached derived key
+	Proto      string      // "tcp", "udp", or "both"
+	PublicAddr string      // server listen addr (host:port)
+	Encrypted  bool        // whether this route uses application-layer encryption
+	Algorithm  string      // encryption algorithm to use
+	DerivedKey []byte      `json:"-"` // cached derived key
 	UDPCipher  cipher.AEAD `json:"-"` // cached UDP cipher
 }
 

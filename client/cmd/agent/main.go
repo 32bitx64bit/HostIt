@@ -627,12 +627,17 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		cfg := old
 		cfg.Server = strings.TrimSpace(r.Form.Get("server"))
 		cfg.Token = strings.TrimSpace(r.Form.Get("token"))
+		cfg.TLSPinSHA256 = strings.TrimSpace(r.Form.Get("tls_pin_sha256"))
 		if cfg.Server == "" {
 			http.Error(w, "server is required", http.StatusBadRequest)
 			return
 		}
 		if cfg.Token == "" {
 			http.Error(w, "token is required", http.StatusBadRequest)
+			return
+		}
+		if err := cfg.Validate(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		if err := configio.Save(configPath, cfg); err != nil {
@@ -860,6 +865,11 @@ const agentHomeHTML = `<!doctype html>
 					<label>Token</label>
 					<div class="help">Required. Must match the server token.</div>
 					<input name="token" value="{{.Cfg.Token}}" />
+				</div>
+				<div>
+					<label>TLS Pin (SHA256)</label>
+					<div class="help">Optional. Hex fingerprint of the server's certificate to prevent MITM.</div>
+					<input name="tls_pin_sha256" value="{{.Cfg.TLSPinSHA256}}" placeholder="e.g. a1b2c3d4..." />
 				</div>
 			</div>
 			<div style="margin-top:10px" class="muted" style="font-size:12px">Routes come from the server. The agent forwards to <code>127.0.0.1:&lt;publicPort&gt;</code>.</div>

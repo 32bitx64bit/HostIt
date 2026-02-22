@@ -831,7 +831,7 @@ func (s *Server) acceptAgentUDP() {
 				if udpCipher == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(udpCipher, payload)
+				decrypted, err := crypto.DecryptUDP(udpCipher, nil, payload)
 				if err != nil {
 					continue
 				}
@@ -893,7 +893,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			if udpCipher == nil {
 				continue
 			}
-			encrypted, err := crypto.EncryptUDP(udpCipher, payload)
+			encrypted, err := crypto.EncryptUDP(udpCipher, nil, payload)
 			if err != nil {
 				continue
 			}
@@ -907,7 +907,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			Payload: payload,
 		}
 
-		data, err := protocol.MarshalUDP(pkt)
+		data, err := protocol.MarshalUDP(pkt, nil)
 		if err != nil {
 			continue
 		}

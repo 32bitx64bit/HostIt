@@ -3,11 +3,15 @@ package agent
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,7 +89,27 @@ func (a *Agent) connectAndRun() error {
 	if a.cfg.DisableTLS {
 		conn, err = net.Dial("tcp", a.cfg.ControlAddr())
 	} else {
-		tlsConfig := &tls.Config{InsecureSkipVerify: true} // TODO: implement pinning
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: true,
+		}
+
+		if a.cfg.TLSPinSHA256 != "" {
+			tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+				if len(rawCerts) == 0 {
+					return fmt.Errorf("no certificates provided by server")
+				}
+
+				// Hash the first certificate (the server's leaf cert)
+				hash := sha256.Sum256(rawCerts[0])
+				hashHex := hex.EncodeToString(hash[:])
+
+				if !strings.EqualFold(hashHex, a.cfg.TLSPinSHA256) {
+					return fmt.Errorf("certificate pinning failed: expected %s, got %s", a.cfg.TLSPinSHA256, hashHex)
+				}
+				return nil
+			}
+		}
+
 		conn, err = tls.Dial("tcp", a.cfg.ControlAddr(), tlsConfig)
 	}
 	if err != nil {
@@ -125,7 +149,7 @@ func (a *Agent) connectAndRun() error {
 	pkt := &protocol.Packet{
 		Type: protocol.TypeRegister,
 	}
-	data, _ := protocol.MarshalUDP(pkt)
+	data, _ := protocol.MarshalUDP(pkt, nil)
 	a.udpDataConn.WriteToUDP(data, a.serverUDP)
 
 	logging.Global().Infof(logging.CatSystem, "Agent started on control=%s data=%s", a.cfg.ControlAddr(), a.cfg.DataAddr())
@@ -450,7 +474,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 				if udpCipher == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(udpCipher, payload)
+				decrypted, err := crypto.DecryptUDP(udpCipher, nil, payload)
 				if err != nil {
 					continue
 				}
@@ -521,7 +545,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 							if udpCipher == nil {
 								continue
 							}
-							encrypted, err := crypto.EncryptUDP(udpCipher, payload)
+							encrypted, err := crypto.EncryptUDP(udpCipher, nil, payload)
 							if err != nil {
 								continue
 							}
@@ -535,7 +559,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 							Payload: payload,
 						}
 
-						data, err := protocol.MarshalUDP(respPkt)
+						data, err := protocol.MarshalUDP(respPkt, nil)
 						if err != nil {
 							continue
 						}
