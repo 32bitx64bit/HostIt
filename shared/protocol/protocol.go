@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"unsafe"
 )
 
 const (
@@ -30,29 +31,26 @@ type Packet struct {
 }
 
 func WritePacket(w io.Writer, p *Packet) error {
-	routeBytes := []byte(p.Route)
-	clientBytes := []byte(p.Client)
-
 	if len(p.Payload) > MaxPayloadSize {
 		return ErrPayloadTooBig
 	}
 
-	totalLen := 5 + len(routeBytes) + len(clientBytes) + len(p.Payload)
+	totalLen := 5 + len(p.Route) + len(p.Client) + len(p.Payload)
 	buf := make([]byte, totalLen)
 
 	buf[0] = p.Type
-	buf[1] = byte(len(routeBytes))
-	buf[2] = byte(len(clientBytes))
+	buf[1] = byte(len(p.Route))
+	buf[2] = byte(len(p.Client))
 	binary.BigEndian.PutUint16(buf[3:5], uint16(len(p.Payload)))
 
 	offset := 5
-	if len(routeBytes) > 0 {
-		copy(buf[offset:], routeBytes)
-		offset += len(routeBytes)
+	if len(p.Route) > 0 {
+		copy(buf[offset:], p.Route)
+		offset += len(p.Route)
 	}
-	if len(clientBytes) > 0 {
-		copy(buf[offset:], clientBytes)
-		offset += len(clientBytes)
+	if len(p.Client) > 0 {
+		copy(buf[offset:], p.Client)
+		offset += len(p.Client)
 	}
 	if len(p.Payload) > 0 {
 		copy(buf[offset:], p.Payload)
@@ -103,14 +101,11 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 }
 
 func MarshalUDP(p *Packet, dst []byte) ([]byte, error) {
-	routeBytes := []byte(p.Route)
-	clientBytes := []byte(p.Client)
-
 	if len(p.Payload) > MaxPayloadSize {
 		return nil, ErrPayloadTooBig
 	}
 
-	totalLen := 1 + 1 + len(routeBytes) + 1 + len(clientBytes) + len(p.Payload)
+	totalLen := 1 + 1 + len(p.Route) + 1 + len(p.Client) + len(p.Payload)
 
 	if cap(dst) < totalLen {
 		dst = make([]byte, totalLen)
@@ -122,48 +117,55 @@ func MarshalUDP(p *Packet, dst []byte) ([]byte, error) {
 	dst[i] = p.Type
 	i++
 
-	dst[i] = byte(len(routeBytes))
+	dst[i] = byte(len(p.Route))
 	i++
-	copy(dst[i:], routeBytes)
-	i += len(routeBytes)
+	copy(dst[i:], p.Route)
+	i += len(p.Route)
 
-	dst[i] = byte(len(clientBytes))
+	dst[i] = byte(len(p.Client))
 	i++
-	copy(dst[i:], clientBytes)
-	i += len(clientBytes)
+	copy(dst[i:], p.Client)
+	i += len(p.Client)
 
 	copy(dst[i:], p.Payload)
 	return dst, nil
 }
 
 func UnmarshalUDP(data []byte) (*Packet, error) {
+	p := &Packet{}
+	err := UnmarshalUDPTo(data, p)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func UnmarshalUDPTo(data []byte, p *Packet) error {
 	if len(data) < 3 {
-		return nil, ErrInvalidPacket
+		return ErrInvalidPacket
 	}
 
-	p := &Packet{
-		Type: data[0],
-	}
+	p.Type = data[0]
 
 	i := 1
 	routeLen := int(data[i])
 	i++
 
 	if len(data) < i+routeLen+1 {
-		return nil, ErrInvalidPacket
+		return ErrInvalidPacket
 	}
-	p.Route = string(data[i : i+routeLen])
+	p.Route = unsafe.String(unsafe.SliceData(data[i:i+routeLen]), routeLen)
 	i += routeLen
 
 	clientLen := int(data[i])
 	i++
 
 	if len(data) < i+clientLen {
-		return nil, ErrInvalidPacket
+		return ErrInvalidPacket
 	}
-	p.Client = string(data[i : i+clientLen])
+	p.Client = unsafe.String(unsafe.SliceData(data[i:i+clientLen]), clientLen)
 	i += clientLen
 
 	p.Payload = data[i:]
-	return p, nil
+	return nil
 }

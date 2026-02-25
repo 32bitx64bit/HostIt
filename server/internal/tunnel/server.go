@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"hostit/shared/crypto"
@@ -25,7 +27,7 @@ type Server struct {
 
 	mu          sync.RWMutex
 	agentTCP    net.Conn
-	agentUDP    *net.UDPAddr
+	agentUDP    netip.AddrPort
 	udpDataConn *net.UDPConn
 	controlLn   net.Listener
 	dataLn      net.Listener
@@ -42,6 +44,10 @@ type Server struct {
 	wg     sync.WaitGroup
 
 	dash *dashState
+	
+	// We use an atomic.Value to store the route cache so it can be updated safely
+	// and read without locks in the hot path.
+	routeCache atomic.Value
 }
 
 type helloRoute struct {
@@ -92,14 +98,36 @@ func (s *Server) Dashboard(now time.Time) DashboardSnapshot {
 	return s.dash.snapshot(now, connected)
 }
 
+type routeConfig struct {
+	enabled     bool
+	isEncrypted bool
+}
+
+func (s *Server) updateRouteCache() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
+	newCache := make(map[string]routeConfig)
+	for _, rt := range s.cfg.Routes {
+		newCache[rt.Name] = routeConfig{
+			enabled:     rt.IsEnabled(),
+			isEncrypted: rt.IsEncrypted(),
+		}
+	}
+	s.routeCache.Store(newCache)
+}
+
 func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i, rt := range s.cfg.Routes {
 		if rt.Name == name {
 			val := enabled
 			s.cfg.Routes[i].Enabled = &val
+			s.mu.Unlock()
+			
+			s.updateRouteCache()
 
+			s.mu.Lock()
 			if s.agentTCP != nil {
 				routesMap := make(map[string]helloRoute)
 				for _, r := range s.cfg.Routes {
@@ -120,9 +148,11 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 				protocol.WritePacket(s.agentTCP, helloPkt)
 				s.agentTCP.SetWriteDeadline(time.Time{})
 			}
+			s.mu.Unlock()
 			return true
 		}
 	}
+	s.mu.Unlock()
 	return false
 }
 
@@ -312,7 +342,7 @@ func (s *Server) Run(ctx context.Context) error {
 func NewServer(cfg ServerConfig) *Server {
 	key, _ := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
 	udpCipher, _ := crypto.NewUDPCipher(key)
-	return &Server{
+	s := &Server{
 		cfg:        cfg,
 		derivedKey: key,
 		udpCipher:  udpCipher,
@@ -321,6 +351,8 @@ func NewServer(cfg ServerConfig) *Server {
 		pendingTCP: make(map[string]chan net.Conn),
 		dash:       newDashState(),
 	}
+	s.updateRouteCache()
+	return s
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -458,7 +490,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.agentTCP.Close()
 		}
 		s.agentTCP = conn
-		s.agentUDP = nil
+		s.agentUDP = netip.AddrPort{}
 		// Clear stale pending TCP connections
 		for clientID, ch := range s.pendingTCP {
 			close(ch)
@@ -555,7 +587,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.mu.Lock()
 			if s.agentTCP == c {
 				s.agentTCP = nil
-				s.agentUDP = nil
+				s.agentUDP = netip.AddrPort{}
 				// Clear pending TCP connections
 				for clientID, ch := range s.pendingTCP {
 					close(ch)
@@ -752,6 +784,12 @@ func (s *Server) acceptAgentUDP() {
 	defer s.udpDataConn.Close()
 
 	buf := make([]byte, 65536)
+	decryptBuf := make([]byte, 65536)
+	var pkt protocol.Packet
+	
+	addrCacheMu := sync.RWMutex{}
+	addrCache := make(map[string]*net.UDPAddr)
+
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -759,7 +797,7 @@ func (s *Server) acceptAgentUDP() {
 		default:
 		}
 
-		n, addr, err := s.udpDataConn.ReadFromUDP(buf)
+		n, addr, err := s.udpDataConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return
@@ -767,14 +805,14 @@ func (s *Server) acceptAgentUDP() {
 			continue
 		}
 
-		pkt, err := protocol.UnmarshalUDP(buf[:n])
+		err = protocol.UnmarshalUDPTo(buf[:n], &pkt)
 		if err != nil {
 			continue
 		}
 
 		// Update agent address to handle NAT port changes
 		s.mu.Lock()
-		if s.agentUDP == nil || s.agentUDP.String() != addr.String() {
+		if !s.agentUDP.IsValid() || s.agentUDP != addr {
 			s.agentUDP = addr
 			// Only log on register to avoid spam
 			if pkt.Type == protocol.TypeRegister {
@@ -790,36 +828,48 @@ func (s *Server) acceptAgentUDP() {
 		if pkt.Type == protocol.TypeData {
 			s.mu.RLock()
 			pubConn, ok := s.publicUDP[pkt.Route]
-			var isEncrypted bool
-			var udpCipher cipher.AEAD
-			for _, rt := range s.cfg.Routes {
-				if rt.Name == pkt.Route {
-					isEncrypted = rt.IsEncrypted()
-					udpCipher = s.udpCipher
-					break
-				}
-			}
+			udpCipher := s.udpCipher
 			s.mu.RUnlock()
 
 			if !ok {
 				continue
 			}
 
+			cache := s.routeCache.Load().(map[string]routeConfig)
+			rc, ok := cache[pkt.Route]
+			if !ok {
+				continue
+			}
+
 			payload := pkt.Payload
-			if isEncrypted {
+			if rc.isEncrypted {
 				if udpCipher == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(udpCipher, nil, payload)
+				decrypted, err := crypto.DecryptUDP(udpCipher, decryptBuf, payload)
 				if err != nil {
 					continue
 				}
 				payload = decrypted
 			}
 
-			clientAddr, err := net.ResolveUDPAddr("udp", pkt.Client)
-			if err != nil {
-				continue
+			addrCacheMu.RLock()
+			clientAddr, ok := addrCache[pkt.Client]
+			addrCacheMu.RUnlock()
+
+			if !ok {
+				var err error
+				clientAddr, err = net.ResolveUDPAddr("udp", pkt.Client)
+				if err != nil {
+					continue
+				}
+				addrCacheMu.Lock()
+				if len(addrCache) > 10000 {
+					addrCache = make(map[string]*net.UDPAddr)
+				}
+				// Copy string because it points to buf
+				addrCache[string([]byte(pkt.Client))] = clientAddr
+				addrCacheMu.Unlock()
 			}
 
 			s.dash.addBytes(time.Now(), int64(len(payload)))
@@ -833,6 +883,12 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 	defer conn.Close()
 
 	buf := make([]byte, 65536)
+	marshalBuf := make([]byte, 65536)
+	encryptBuf := make([]byte, 65536)
+	
+	addrStrCache := make(map[netip.AddrPort]string)
+	var pkt protocol.Packet
+
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -840,7 +896,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		default:
 		}
 
-		n, addr, err := conn.ReadFromUDP(buf)
+		n, addr, err := conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return
@@ -848,50 +904,50 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			continue
 		}
 
+		clientStr, ok := addrStrCache[addr]
+		if !ok {
+			clientStr = addr.String()
+			// Prevent cache from growing indefinitely
+			if len(addrStrCache) > 10000 {
+				addrStrCache = make(map[netip.AddrPort]string)
+			}
+			addrStrCache[addr] = clientStr
+		}
+
 		s.mu.RLock()
 		agentAddr := s.agentUDP
-		enabled := false
-		isEncrypted := false
-		var udpCipher cipher.AEAD
-		for _, rt := range s.cfg.Routes {
-			if rt.Name == routeName {
-				enabled = rt.IsEnabled()
-				isEncrypted = rt.IsEncrypted()
-				udpCipher = s.udpCipher
-				break
-			}
-		}
+		udpCipher := s.udpCipher
 		s.mu.RUnlock()
 
-		if agentAddr == nil || !enabled {
+		cache := s.routeCache.Load().(map[string]routeConfig)
+		rc, ok := cache[routeName]
+		if !ok || !agentAddr.IsValid() || !rc.enabled {
 			continue
 		}
 
 		payload := buf[:n]
-		if isEncrypted {
+		if rc.isEncrypted {
 			if udpCipher == nil {
 				continue
 			}
-			encrypted, err := crypto.EncryptUDP(udpCipher, nil, payload)
+			encrypted, err := crypto.EncryptUDP(udpCipher, encryptBuf, payload)
 			if err != nil {
 				continue
 			}
 			payload = encrypted
 		}
 
-		pkt := &protocol.Packet{
-			Type:    protocol.TypeData,
-			Route:   routeName,
-			Client:  addr.String(),
-			Payload: payload,
-		}
+		pkt.Type = protocol.TypeData
+		pkt.Route = routeName
+		pkt.Client = clientStr
+		pkt.Payload = payload
 
-		data, err := protocol.MarshalUDP(pkt, nil)
+		data, err := protocol.MarshalUDP(&pkt, marshalBuf)
 		if err != nil {
 			continue
 		}
 
 		s.dash.addBytes(time.Now(), int64(len(pkt.Payload)))
-		s.udpDataConn.WriteToUDP(data, agentAddr)
+		s.udpDataConn.WriteToUDPAddrPort(data, agentAddr)
 	}
 }

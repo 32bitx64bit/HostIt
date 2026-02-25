@@ -63,6 +63,7 @@ func init() {
 // EncryptUDP encrypts a UDP payload using AES-GCM.
 func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 	if aesgcm == nil {
+		dst = dst[:0]
 		return append(dst, plaintext...), nil
 	}
 	nonceSize := aesgcm.NonceSize()
@@ -86,6 +87,7 @@ func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 // DecryptUDP decrypts a UDP payload using AES-GCM.
 func DecryptUDP(aesgcm cipher.AEAD, dst, ciphertext []byte) ([]byte, error) {
 	if aesgcm == nil {
+		dst = dst[:0]
 		return append(dst, ciphertext...), nil
 	}
 	nonceSize := aesgcm.NonceSize()

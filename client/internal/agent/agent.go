@@ -398,10 +398,17 @@ type agentUDPSession struct {
 
 func (a *Agent) handleUDPData(ctx context.Context) error {
 	buf := make([]byte, 65536)
+	decryptBuf := make([]byte, 65536)
+	var pkt protocol.Packet
+
+	type sessionKey struct {
+		route  string
+		client string
+	}
 
 	var (
 		sessionsMu sync.Mutex
-		sessions   = make(map[string]*agentUDPSession)
+		sessions   = make(map[sessionKey]*agentUDPSession)
 	)
 
 	go func() {
@@ -429,6 +436,25 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 		}
 	}()
 
+	// Cache route configurations to avoid iterating over a.cfg.Routes on every packet
+	type routeConfig struct {
+		isEncrypted bool
+		udpCipher   cipher.AEAD
+		publicAddr  string
+	}
+	var routeCache sync.Map
+
+	// Initialize cache
+	a.mu.RLock()
+	for _, rt := range a.cfg.Routes {
+		routeCache.Store(rt.Name, routeConfig{
+			isEncrypted: rt.Encrypted,
+			udpCipher:   rt.UDPCipher,
+			publicAddr:  rt.PublicAddr,
+		})
+	}
+	a.mu.RUnlock()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -436,7 +462,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 		default:
 		}
 
-		n, _, err := a.udpDataConn.ReadFromUDP(buf)
+		n, _, err := a.udpDataConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -444,44 +470,59 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 			return fmt.Errorf("udp data read error: %w", err)
 		}
 
-		pkt, err := protocol.UnmarshalUDP(buf[:n])
+		err = protocol.UnmarshalUDPTo(buf[:n], &pkt)
 		if err != nil {
 			continue
 		}
 
 		if pkt.Type == protocol.TypeData {
-			a.mu.RLock()
-			rt, ok := a.cfg.Routes[pkt.Route]
-			a.mu.RUnlock()
-
+			rcVal, ok := routeCache.Load(pkt.Route)
+			var rc routeConfig
 			if !ok {
-				continue
+				a.mu.RLock()
+				rt, ok := a.cfg.Routes[pkt.Route]
+				a.mu.RUnlock()
+				if !ok {
+					continue
+				}
+				rc = routeConfig{
+					isEncrypted: rt.Encrypted,
+					udpCipher:   rt.UDPCipher,
+					publicAddr:  rt.PublicAddr,
+				}
+				routeCache.Store(pkt.Route, rc)
+			} else {
+				rc = rcVal.(routeConfig)
 			}
 
 			payload := pkt.Payload
-			if rt.Encrypted {
-				udpCipher := rt.UDPCipher
+			if rc.isEncrypted {
+				udpCipher := rc.udpCipher
 				if udpCipher == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(udpCipher, nil, payload)
+				decrypted, err := crypto.DecryptUDP(udpCipher, decryptBuf, payload)
 				if err != nil {
 					continue
 				}
 				payload = decrypted
 			}
 
-			sessionKey := pkt.Route + "-" + pkt.Client
+			key := sessionKey{route: pkt.Route, client: pkt.Client}
 
 			sessionsMu.Lock()
-			sess, exists := sessions[sessionKey]
+			sess, exists := sessions[key]
 			if exists {
 				sess.lastSeen = time.Now()
 			}
 			sessionsMu.Unlock()
 
 			if !exists {
-				_, port, _ := net.SplitHostPort(rt.PublicAddr)
+				// Copy strings because they point to buf
+				key.route = string([]byte(pkt.Route))
+				key.client = string([]byte(pkt.Client))
+
+				_, port, _ := net.SplitHostPort(rc.publicAddr)
 				localAddrStr := "127.0.0.1:" + port
 				localAddr, err := net.ResolveUDPAddr("udp", localAddrStr)
 				if err != nil {
@@ -503,19 +544,22 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 				}
 
 				sessionsMu.Lock()
-				sessions[sessionKey] = sess
+				sessions[key] = sess
 				sessionsMu.Unlock()
 
 				// Start reader for this session
-				go func(sessionKey string, clientID string, routeName string, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
+				go func(key sessionKey, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
 					defer func() {
 						c.Close()
 						sessionsMu.Lock()
-						delete(sessions, sessionKey)
+						delete(sessions, key)
 						sessionsMu.Unlock()
 					}()
 
 					respBuf := make([]byte, 65536)
+					marshalBuf := make([]byte, 65536)
+					encryptBuf := make([]byte, 65536)
+					var respPkt protocol.Packet
 					for {
 						c.SetReadDeadline(time.Now().Add(2 * time.Minute))
 						rn, err := c.Read(respBuf)
@@ -524,7 +568,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 						}
 
 						sessionsMu.Lock()
-						s, ok := sessions[sessionKey]
+						s, ok := sessions[key]
 						if ok {
 							s.lastSeen = time.Now()
 						}
@@ -535,28 +579,26 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 							if udpCipher == nil {
 								continue
 							}
-							encrypted, err := crypto.EncryptUDP(udpCipher, nil, payload)
+							encrypted, err := crypto.EncryptUDP(udpCipher, encryptBuf, payload)
 							if err != nil {
 								continue
 							}
 							payload = encrypted
 						}
 
-						respPkt := &protocol.Packet{
-							Type:    protocol.TypeData,
-							Route:   routeName,
-							Client:  clientID,
-							Payload: payload,
-						}
+						respPkt.Type = protocol.TypeData
+						respPkt.Route = key.route
+						respPkt.Client = key.client
+						respPkt.Payload = payload
 
-						data, err := protocol.MarshalUDP(respPkt, nil)
+						data, err := protocol.MarshalUDP(&respPkt, marshalBuf)
 						if err != nil {
 							continue
 						}
 
 						a.udpDataConn.WriteToUDP(data, a.serverUDP)
 					}
-				}(sessionKey, pkt.Client, pkt.Route, localConn, rt.Encrypted, rt.UDPCipher)
+				}(key, localConn, rc.isEncrypted, rc.udpCipher)
 			}
 
 			sess.conn.Write(payload)

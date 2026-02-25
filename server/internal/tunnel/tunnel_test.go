@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"hostit/shared/crypto"
 	"hostit/shared/protocol"
 )
 
@@ -225,10 +226,12 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, tok
 	}()
 	defer controlConn.Close()
 
-	// Simple auth
-	controlConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	controlConn.Write([]byte(token))
-	controlConn.SetWriteDeadline(time.Time{})
+	// Mutual auth
+	controlConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := crypto.AuthenticateClient(controlConn, token); err != nil {
+		return
+	}
+	controlConn.SetDeadline(time.Time{})
 
 	// Read HELLO
 	controlConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -259,12 +262,17 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, tok
 				}
 				defer dataConn.Close()
 
-				// Authenticate and send route/client info in one write
+				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
+				if err := crypto.AuthenticateClient(dataConn, token); err != nil {
+					return
+				}
+				dataConn.SetDeadline(time.Time{})
+
+				// Send route/client info
 				routeBytes := []byte(routeName)
 				clientBytes := []byte(clientID)
 
-				buf := make([]byte, 0, len(token)+1+len(routeBytes)+1+len(clientBytes))
-				buf = append(buf, []byte(token)...)
+				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes))
 				buf = append(buf, byte(len(routeBytes)))
 				buf = append(buf, routeBytes...)
 				buf = append(buf, byte(len(clientBytes)))
