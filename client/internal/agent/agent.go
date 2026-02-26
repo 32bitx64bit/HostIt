@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 	"sync"
@@ -317,13 +316,16 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 			go func(routeName, clientID string, rt RemoteRoute) {
 				var dataConn net.Conn
 				var err error
+				dialTimeout := 10 * time.Second
 				if a.cfg.DisableTLS {
-					dataConn, err = net.Dial("tcp", a.cfg.DataAddr())
+					dataConn, err = net.DialTimeout("tcp", a.cfg.DataAddr(), dialTimeout)
 				} else {
 					tlsConfig := &tls.Config{InsecureSkipVerify: true}
-					dataConn, err = tls.Dial("tcp", a.cfg.DataAddr(), tlsConfig)
+					dialer := &net.Dialer{Timeout: dialTimeout}
+					dataConn, err = tls.DialWithDialer(dialer, "tcp", a.cfg.DataAddr(), tlsConfig)
 				}
 				if err != nil {
+					logging.Global().Errorf(logging.CatTCP, "failed to dial data server %s: %v", a.cfg.DataAddr(), err)
 					return
 				}
 
@@ -348,7 +350,8 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					dataConn.Close()
 					return
 				}
-				dataConn.SetWriteDeadline(time.Time{})
+				// Clear all deadlines - connection will use idle timeout for cleanup
+				dataConn.SetDeadline(time.Time{})
 
 				_, port, _ := net.SplitHostPort(rt.PublicAddr)
 				localAddr := "127.0.0.1:" + port
@@ -375,14 +378,39 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					}
 				}
 
-				// Proxy data
+				// Proxy data with idle timeout to prevent connection leaks
+				const idleTimeout = 5 * time.Minute
+				proxyDone := make(chan struct{}, 2)
 				go func() {
-					io.Copy(localConn, dataConn)
-					localConn.Close()
-					dataConn.Close()
+					defer func() { proxyDone <- struct{}{} }()
+					buf := make([]byte, 32*1024)
+					for {
+						dataConn.SetReadDeadline(time.Now().Add(idleTimeout))
+						n, err := dataConn.Read(buf)
+						if err != nil {
+							return
+						}
+						if _, err := localConn.Write(buf[:n]); err != nil {
+							return
+						}
+					}
 				}()
 				go func() {
-					io.Copy(dataConn, localConn)
+					defer func() { proxyDone <- struct{}{} }()
+					buf := make([]byte, 32*1024)
+					for {
+						localConn.SetReadDeadline(time.Now().Add(idleTimeout))
+						n, err := localConn.Read(buf)
+						if err != nil {
+							return
+						}
+						if _, err := dataConn.Write(buf[:n]); err != nil {
+							return
+						}
+					}
+				}()
+				go func() {
+					<-proxyDone
 					localConn.Close()
 					dataConn.Close()
 				}()
