@@ -44,7 +44,7 @@ type Server struct {
 	wg     sync.WaitGroup
 
 	dash *dashState
-	
+
 	// We use an atomic.Value to store the route cache so it can be updated safely
 	// and read without locks in the hot path.
 	routeCache atomic.Value
@@ -106,7 +106,7 @@ type routeConfig struct {
 func (s *Server) updateRouteCache() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	newCache := make(map[string]routeConfig)
 	for _, rt := range s.cfg.Routes {
 		newCache[rt.Name] = routeConfig{
@@ -124,7 +124,7 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 			val := enabled
 			s.cfg.Routes[i].Enabled = &val
 			s.mu.Unlock()
-			
+
 			s.updateRouteCache()
 
 			s.mu.Lock()
@@ -146,7 +146,7 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 				}
 				s.agentTCP.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				protocol.WritePacket(s.agentTCP, helloPkt)
-				s.agentTCP.SetWriteDeadline(time.Time{})
+
 			}
 			s.mu.Unlock()
 			return true
@@ -212,7 +212,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		sendStart := time.Now()
 		agent.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		err := protocol.WritePacket(agent, pkt)
-		agent.SetWriteDeadline(time.Time{})
+
 		if err != nil {
 			continue
 		}
@@ -290,7 +290,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 			bwSent++
 			bytesSent += int64(bwPayloadBytes)
 		}
-		agent.SetWriteDeadline(time.Time{})
+
 	}()
 
 	timeout := time.After(5 * time.Second)
@@ -526,7 +526,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.mu.Unlock()
 			continue
 		}
-		conn.SetWriteDeadline(time.Time{})
 
 		// Keep connection open and detect disconnect
 		s.wg.Add(1)
@@ -550,7 +549,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 						if isAgent {
 							c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 							protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing})
-							c.SetWriteDeadline(time.Time{})
+
 						}
 					}
 				}
@@ -568,7 +567,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 						Type:    protocol.TypePong,
 						Payload: pkt.Payload,
 					})
-					c.SetWriteDeadline(time.Time{})
+
 					continue
 				}
 				if pkt.Type == protocol.TypePong {
@@ -620,7 +619,7 @@ func (s *Server) acceptData(ln net.Listener) {
 			conn.Close()
 			continue
 		}
-		conn.SetDeadline(time.Time{})
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 		var routeLen byte
 		if err := binary.Read(conn, binary.BigEndian, &routeLen); err != nil {
@@ -739,7 +738,6 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			s.mu.Unlock()
 			continue
 		}
-		agent.SetWriteDeadline(time.Time{})
 
 		go func(c net.Conn, clientID string) {
 			defer c.Close()
@@ -786,7 +784,7 @@ func (s *Server) acceptAgentUDP() {
 	buf := make([]byte, 65536)
 	decryptBuf := make([]byte, 65536)
 	var pkt protocol.Packet
-	
+
 	addrCacheMu := sync.RWMutex{}
 	addrCache := make(map[string]*net.UDPAddr)
 
@@ -885,7 +883,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 	buf := make([]byte, 65536)
 	marshalBuf := make([]byte, 65536)
 	encryptBuf := make([]byte, 65536)
-	
+
 	addrStrCache := make(map[netip.AddrPort]string)
 	var pkt protocol.Packet
 
