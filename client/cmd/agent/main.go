@@ -20,6 +20,7 @@ import (
 
 	"hostit/client/internal/agent"
 	"hostit/client/internal/configio"
+	"hostit/shared/module"
 	"hostit/shared/updater"
 	"hostit/shared/version"
 )
@@ -289,7 +290,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		absCfg = p
 	}
 	updStatePath := filepath.Join(filepath.Dir(absCfg), "update_state_client.json")
-	moduleDir := detectModuleDir(absCfg)
+	moduleDir := module.DetectModuleDir(absCfg)
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentClient, "client.zip", moduleDir, updStatePath)
 	upd.PreservePaths = []string{absCfg}
 	upd.Restart = func() error {
@@ -704,32 +705,6 @@ func localTargetFromPublicAddr(publicAddr string) string {
 		}
 	}
 	return "127.0.0.1"
-}
-
-func detectModuleDir(configPath string) string {
-	if wd, err := os.Getwd(); err == nil && wd != "" {
-		if fileExists(filepath.Join(wd, "build.sh")) {
-			return wd
-		}
-	}
-	if exe, err := os.Executable(); err == nil && exe != "" {
-		exeDir := filepath.Dir(exe)
-		if filepath.Base(exeDir) == "bin" {
-			parent := filepath.Dir(exeDir)
-			if fileExists(filepath.Join(parent, "build.sh")) {
-				return parent
-			}
-		}
-	}
-	if strings.TrimSpace(configPath) != "" {
-		return filepath.Dir(configPath)
-	}
-	return "."
-}
-
-func fileExists(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && !st.IsDir()
 }
 
 func writeUploadedZipTemp(r *http.Request, fieldName string, pattern string) (string, bool, error) {

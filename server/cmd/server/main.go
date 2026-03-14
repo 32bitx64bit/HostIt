@@ -28,6 +28,7 @@ import (
 	"hostit/server/internal/tlsutil"
 	"hostit/server/internal/tunnel"
 	"hostit/shared/logging"
+	"hostit/shared/module"
 	"hostit/shared/updater"
 	"hostit/shared/version"
 )
@@ -333,7 +334,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		absAuthDB = p
 	}
 	updStatePath := filepath.Join(filepath.Dir(absCfg), "update_state_server.json")
-	moduleDir := detectModuleDir(absCfg)
+	moduleDir := module.DetectModuleDir(absCfg)
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentServer, "server.zip", moduleDir, updStatePath)
 	upd.PreservePaths = []string{absCfg, absAuthDB}
 	upd.Restart = func() error {
@@ -1391,35 +1392,6 @@ func genToken() string {
 	return hex.EncodeToString(b[:])
 }
 
-func detectModuleDir(configPath string) string {
-	// Prefer current working directory if build.sh is present.
-	if wd, err := os.Getwd(); err == nil && wd != "" {
-		if fileExists(filepath.Join(wd, "build.sh")) {
-			return wd
-		}
-	}
-	// If we're running from ./bin/<binary>, prefer the parent dir.
-	if exe, err := os.Executable(); err == nil && exe != "" {
-		exeDir := filepath.Dir(exe)
-		if filepath.Base(exeDir) == "bin" {
-			parent := filepath.Dir(exeDir)
-			if fileExists(filepath.Join(parent, "build.sh")) {
-				return parent
-			}
-		}
-	}
-	// Fallback: alongside config.
-	if strings.TrimSpace(configPath) != "" {
-		return filepath.Dir(configPath)
-	}
-	return "."
-}
-
-func fileExists(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && !st.IsDir()
-}
-
 func writeUploadedZipTemp(r *http.Request, fieldName string, pattern string) (string, bool, error) {
 	f, _, err := r.FormFile(fieldName)
 	if err != nil {
@@ -1473,6 +1445,20 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		}
 		if name == "" {
 			name = fmt.Sprintf("route-%d", i)
+		}
+		// Validate and sanitize route name: must be alphanumeric with hyphens/underscores, max 64 chars
+		sanitized := make([]rune, 0, len(name))
+		for _, r := range name {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+				sanitized = append(sanitized, r)
+			} else {
+				sanitized = append(sanitized, '-')
+			}
+		}
+		if len(sanitized) > 64 {
+			name = string(sanitized[:64])
+		} else {
+			name = string(sanitized)
 		}
 		if proto == "" {
 			proto = "tcp"

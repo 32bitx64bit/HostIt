@@ -479,7 +479,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 		// Mutual auth
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "control auth failed: %v", err)
+			logging.Global().Errorf(logging.CatTCP, "control auth failed from %s: %v", conn.RemoteAddr(), err)
 			conn.Close()
 			continue
 		}
@@ -645,7 +645,7 @@ func (s *Server) acceptData(ln net.Listener) {
 
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "data auth failed: %v", err)
+			logging.Global().Errorf(logging.CatTCP, "data auth failed from %s: %v", conn.RemoteAddr(), err)
 			conn.Close()
 			continue
 		}
@@ -819,8 +819,7 @@ func (s *Server) acceptAgentUDP() {
 	decryptBuf := make([]byte, 65536)
 	var pkt protocol.Packet
 
-	addrCacheMu := sync.RWMutex{}
-	addrCache := make(map[string]*net.UDPAddr)
+	addrCache := sync.Map{}
 
 	for {
 		select {
@@ -885,23 +884,18 @@ func (s *Server) acceptAgentUDP() {
 				payload = decrypted
 			}
 
-			addrCacheMu.RLock()
-			clientAddr, ok := addrCache[pkt.Client]
-			addrCacheMu.RUnlock()
-
+			clientAddrVal, ok := addrCache.Load(pkt.Client)
 			if !ok {
-				var err error
-				clientAddr, err = net.ResolveUDPAddr("udp", pkt.Client)
+				clientAddr, err := net.ResolveUDPAddr("udp", pkt.Client)
 				if err != nil {
 					continue
 				}
-				addrCacheMu.Lock()
-				if len(addrCache) > 10000 {
-					addrCache = make(map[string]*net.UDPAddr)
-				}
-				// Copy string because it points to buf
-				addrCache[string([]byte(pkt.Client))] = clientAddr
-				addrCacheMu.Unlock()
+				clientAddrVal = clientAddr
+				addrCache.Store(pkt.Client, clientAddrVal)
+			}
+			clientAddr, ok := clientAddrVal.(*net.UDPAddr)
+			if !ok || clientAddr == nil {
+				continue
 			}
 
 			s.dash.addBytes(time.Now(), int64(len(payload)))

@@ -198,7 +198,7 @@ func IsUniqueConstraint(err error) bool {
 		return false
 	}
 	// modernc sqlite returns errors with text including "UNIQUE constraint failed"
-	return errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "UNIQUE constraint failed")
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 var ErrBadInput = fmt.Errorf("bad input")

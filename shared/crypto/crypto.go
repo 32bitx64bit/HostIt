@@ -171,7 +171,7 @@ func (c *cryptoConn) Read(b []byte) (n int, err error) {
 
 var writeBufPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 32*1024)
+		var b [32 * 1024]byte
 		return &b
 	},
 }
