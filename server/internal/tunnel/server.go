@@ -701,6 +701,10 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			continue
 		}
 
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(5 * time.Second)
+		}
 		clientID := fmt.Sprintf("%s-%d", conn.RemoteAddr().String(), time.Now().UnixNano())
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
 
