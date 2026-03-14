@@ -535,6 +535,11 @@ func (s *Server) acceptControl(ln net.Listener) {
 
 			pingCtx, pingCancel := context.WithCancel(s.ctx)
 			defer pingCancel()
+
+			// Track last pong time for health checks using atomic to avoid data race
+			var lastPong atomic.Value
+			lastPong.Store(time.Now().UnixNano())
+
 			go func() {
 				ticker := time.NewTicker(15 * time.Second)
 				defer ticker.Stop()
@@ -549,7 +554,31 @@ func (s *Server) acceptControl(ln net.Listener) {
 						if isAgent {
 							c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 							protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing})
+						}
+					}
+				}
+			}()
 
+			// Health check goroutine: detect if agent is unresponsive
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-pingCtx.Done():
+						return
+					case <-ticker.C:
+						s.mu.RLock()
+						isAgent := s.agentTCP == c
+						s.mu.RUnlock()
+						if isAgent {
+							lastPongTime := time.Unix(0, lastPong.Load().(int64))
+							if time.Since(lastPongTime) > 60*time.Second {
+								// Agent hasn't responded to pings for 60 seconds, close connection
+								logging.Global().Errorf(logging.CatTCP, "agent health check timeout, closing connection")
+								c.Close()
+								return
+							}
 						}
 					}
 				}
@@ -571,6 +600,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 					continue
 				}
 				if pkt.Type == protocol.TypePong {
+					lastPong.Store(time.Now().UnixNano())
 					s.mu.RLock()
 					ch := s.pongCh
 					s.mu.RUnlock()

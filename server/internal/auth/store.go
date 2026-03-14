@@ -16,7 +16,10 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func Open(path string) (*Store, error) {
@@ -31,15 +34,43 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(5)
 	db.SetMaxIdleConns(2)
 
-	s := &Store{db: db}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Store{db: db, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	if err := s.migrate(context.Background()); err != nil {
+		cancel()
 		_ = db.Close()
 		return nil, err
 	}
+	// Start background cleanup goroutine
+	go s.cleanupLoop()
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			// Final cleanup on shutdown
+			_ = s.deleteExpired(context.Background())
+			close(s.done)
+			return
+		case <-ticker.C:
+			_ = s.deleteExpired(context.Background())
+		}
+	}
+}
+
+func (s *Store) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.done != nil {
+		<-s.done
+	}
+	return s.db.Close()
+}
 
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{
@@ -111,7 +142,7 @@ func (s *Store) Authenticate(ctx context.Context, username string, password stri
 }
 
 func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Duration) (string, error) {
-	_ = s.deleteExpired(ctx)
+	// Expired sessions are cleaned up by background goroutine
 
 	sid, err := randHex(32)
 	if err != nil {
@@ -126,7 +157,7 @@ func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Durati
 }
 
 func (s *Store) GetSession(ctx context.Context, sid string) (int64, bool, error) {
-	_ = s.deleteExpired(ctx)
+	// Expired sessions are cleaned up by background goroutine
 
 	var userID int64
 	var expiresAt int64

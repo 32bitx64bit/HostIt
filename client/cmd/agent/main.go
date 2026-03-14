@@ -42,13 +42,20 @@ func main() {
 	var webAddr string
 	var configPath string
 	var autostart bool
+	var shutdownTimeoutFlag time.Duration
 
 	flag.StringVar(&serverHost, "server", "", "tunnel server host/IP (optionally include control port, e.g. host:7000)")
 	flag.StringVar(&token, "token", "", "shared token (required)")
 	flag.StringVar(&webAddr, "web", "127.0.0.1:7003", "agent web dashboard listen address (empty to disable)")
 	flag.StringVar(&configPath, "config", "agent.json", "path to agent config JSON")
 	flag.BoolVar(&autostart, "autostart", true, "start agent automatically")
+	flag.DurationVar(&shutdownTimeoutFlag, "shutdown-timeout", 0, "graceful shutdown timeout (e.g. 10s, 1m)")
 	flag.Parse()
+
+	// Apply command-line shutdown timeout override
+	if shutdownTimeoutFlag > 0 {
+		shutdownTimeout = shutdownTimeoutFlag
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

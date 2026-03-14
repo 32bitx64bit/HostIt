@@ -45,6 +45,7 @@ func main() {
 	var disableTLS bool
 	var tlsCert string
 	var tlsKey string
+	var webShutdownTimeout time.Duration
 
 	flag.StringVar(&controlAddr, "control", ":7000", "control listen address")
 	flag.StringVar(&dataAddr, "data", ":7001", "data listen address")
@@ -58,6 +59,7 @@ func main() {
 	flag.StringVar(&authDBPath, "auth-db", "auth.db", "sqlite auth db path")
 	flag.BoolVar(&cookieSecure, "cookie-secure", true, "set Secure on cookies (enabled by default since dashboard uses HTTPS)")
 	flag.DurationVar(&sessionTTL, "session-ttl", 7*24*time.Hour, "session lifetime")
+	flag.DurationVar(&webShutdownTimeout, "web-shutdown-timeout", 2*time.Second, "web server graceful shutdown timeout")
 	flag.Parse()
 
 	// Initialize centralized logging
@@ -170,7 +172,7 @@ func main() {
 				scheme = "https"
 			}
 			slog.Info(logging.CatDashboard, "web dashboard starting", serverlog.F("url", scheme+"://"+webAddr))
-			if err := serveServerDashboard(ctx, webAddr, configPath, authDBPath, runner, store, cookieSecure, sessionTTL); err != nil {
+			if err := serveServerDashboard(ctx, webAddr, configPath, authDBPath, runner, store, cookieSecure, sessionTTL, webShutdownTimeout); err != nil {
 				slog.Error(logging.CatDashboard, "web dashboard error", serverlog.F("error", err))
 			}
 		}()
@@ -314,7 +316,7 @@ const (
 	ctxUserID ctxKey = iota
 )
 
-func serveServerDashboard(ctx context.Context, addr string, configPath string, authDBPath string, runner *serverRunner, store *auth.Store, cookieSecure bool, sessionTTL time.Duration) error {
+func serveServerDashboard(ctx context.Context, addr string, configPath string, authDBPath string, runner *serverRunner, store *auth.Store, cookieSecure bool, sessionTTL time.Duration, shutdownTimeout time.Duration) error {
 	tplStats := template.Must(template.New("stats").Parse(serverStatsHTML))
 	tplConfig := template.Must(template.New("config").Parse(serverConfigHTML))
 	tplControls := template.Must(template.New("controls").Parse(serverControlsHTML))
@@ -1347,7 +1349,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 
 		select {
 		case <-ctx.Done():
-			ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx2, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 			_ = h.Shutdown(ctx2)
 			cancel()
 			err := <-errCh
@@ -1356,7 +1358,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			return err
 		case <-restartCh:
-			ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx2, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 			_ = h.Shutdown(ctx2)
 			cancel()
 			err := <-errCh
@@ -2940,7 +2942,39 @@ func newIPRateLimiter(limit int, window time.Duration) *ipRateLimiter {
 	if window <= 0 {
 		window = 30 * time.Second
 	}
-	return &ipRateLimiter{limit: limit, window: window, byIP: map[string][]time.Time{}}
+	l := &ipRateLimiter{limit: limit, window: window, byIP: map[string][]time.Time{}}
+	// Start background cleanup to prevent memory growth
+	go l.cleanupLoop()
+	return l
+}
+
+func (l *ipRateLimiter) cleanupLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			l.mu.Lock()
+			now := time.Now()
+			cut := now.Add(-l.window)
+			for ip, arr := range l.byIP {
+				j := 0
+				for ; j < len(arr); j++ {
+					if arr[j].After(cut) {
+						break
+					}
+				}
+				if j > 0 {
+					if j >= len(arr) {
+						delete(l.byIP, ip)
+					} else {
+						l.byIP[ip] = append([]time.Time(nil), arr[j:]...)
+					}
+				}
+			}
+			l.mu.Unlock()
+		}
+	}
 }
 
 func (l *ipRateLimiter) Allow(ip string) bool {
