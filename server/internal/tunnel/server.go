@@ -32,6 +32,12 @@ type Server struct {
 	controlLn   net.Listener
 	dataLn      net.Listener
 
+	// agentWriteMu serializes all writes to the agentTCP control connection.
+	// Multiple goroutines (acceptPublicTCP per route, ping ticker, SetRouteEnabled)
+	// all write to the same agentTCP connection. Without a mutex, concurrent
+	// SetWriteDeadline + WritePacket calls corrupt the protocol framing.
+	agentWriteMu sync.Mutex
+
 	publicTCP map[string]net.Listener
 	publicUDP map[string]*net.UDPConn
 
@@ -144,8 +150,10 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 					Type:    protocol.TypeHello,
 					Payload: routesJSON,
 				}
+				s.agentWriteMu.Lock()
 				s.agentTCP.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				protocol.WritePacket(s.agentTCP, helloPkt)
+				s.agentWriteMu.Unlock()
 
 			}
 			s.mu.Unlock()
@@ -210,8 +218,10 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		pkt := &protocol.Packet{Type: protocol.TypePing, Payload: payload}
 
 		sendStart := time.Now()
+		s.agentWriteMu.Lock()
 		agent.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		err := protocol.WritePacket(agent, pkt)
+		s.agentWriteMu.Unlock()
 
 		if err != nil {
 			continue
@@ -275,7 +285,9 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 
 	go func() {
 		defer close(sendDone)
+		s.agentWriteMu.Lock()
 		agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		s.agentWriteMu.Unlock()
 		for i := 0; i < bwCount; i++ {
 			if ctx.Err() != nil {
 				break
@@ -284,9 +296,12 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 			binary.BigEndian.PutUint64(payload, uint64(1000+i)) // offset seq to avoid collision
 			pkt := &protocol.Packet{Type: protocol.TypePing, Payload: payload}
 
+			s.agentWriteMu.Lock()
 			if err := protocol.WritePacket(agent, pkt); err != nil {
+				s.agentWriteMu.Unlock()
 				break
 			}
+			s.agentWriteMu.Unlock()
 			bwSent++
 			bytesSent += int64(bwPayloadBytes)
 		}
@@ -552,8 +567,10 @@ func (s *Server) acceptControl(ln net.Listener) {
 						isAgent := s.agentTCP == c
 						s.mu.RUnlock()
 						if isAgent {
+							s.agentWriteMu.Lock()
 							c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 							protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing})
+							s.agentWriteMu.Unlock()
 						}
 					}
 				}
@@ -591,11 +608,13 @@ func (s *Server) acceptControl(ln net.Listener) {
 					break
 				}
 				if pkt.Type == protocol.TypePing {
+					s.agentWriteMu.Lock()
 					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 					protocol.WritePacket(c, &protocol.Packet{
 						Type:    protocol.TypePong,
 						Payload: pkt.Payload,
 					})
+					s.agentWriteMu.Unlock()
 
 					continue
 				}
@@ -764,14 +783,17 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			Route:  routeName,
 			Client: clientID,
 		}
+		s.agentWriteMu.Lock()
 		agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if err := protocol.WritePacket(agent, reqPkt); err != nil {
+			s.agentWriteMu.Unlock()
 			conn.Close()
 			s.mu.Lock()
 			delete(s.pendingTCP, clientID)
 			s.mu.Unlock()
 			continue
 		}
+		s.agentWriteMu.Unlock()
 
 		go func(c net.Conn, clientID string) {
 			defer c.Close()
@@ -780,32 +802,63 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				if agentConn == nil {
 					return
 				}
-				defer agentConn.Close()
 				s.dash.addConn(time.Now())
 				s.dash.incActive(routeName)
 				defer s.dash.decActive(routeName)
 
-				var wg sync.WaitGroup
-				wg.Add(2)
-				go func() {
-					defer wg.Done()
-					n, _ := io.Copy(c, agentConn)
-					s.dash.addBytes(time.Now(), n)
+				// Use sync.Once to ensure connections are closed exactly once.
+				// When one copy direction finishes it closes both connections,
+				// which immediately unblocks the other direction's Read.
+				closeOnce := sync.Once{}
+				cleanup := func() {
 					c.Close()
 					agentConn.Close()
-				}()
-				go func() {
-					defer wg.Done()
-					n, _ := io.Copy(agentConn, c)
-					s.dash.addBytes(time.Now(), n)
-					c.Close()
-					agentConn.Close()
-				}()
-				wg.Wait()
+				}
+
+				// Idle timeout for each direction — refreshed on every successful
+				// read so that active connections are never killed.
+				const idleTimeout = 5 * time.Minute
+
+				// WaitGroup keeps this goroutine alive until both copy
+				// directions finish, preventing the deferred c.Close() from
+				// killing the connection prematurely.
+				var copyWg sync.WaitGroup
+				copyWg.Add(2)
+
+				// copyWithIdleTimeout copies data from src to dst, refreshing the
+				// read deadline on src after every successful read. When the read
+				// side finishes (EOF, error, or idle timeout) we close both
+				// connections via closeOnce so the other direction stops too.
+				copyWithIdleTimeout := func(dst, src net.Conn) {
+					defer copyWg.Done()
+					defer closeOnce.Do(cleanup)
+
+					buf := make([]byte, 32*1024)
+					for {
+						src.SetReadDeadline(time.Now().Add(idleTimeout))
+						n, err := src.Read(buf)
+						if n > 0 {
+							dst.SetWriteDeadline(time.Now().Add(30 * time.Second))
+							if _, werr := dst.Write(buf[:n]); werr != nil {
+								return
+							}
+							s.dash.addBytes(time.Now(), int64(n))
+						}
+						if err != nil {
+							return
+						}
+					}
+				}
+
+				go copyWithIdleTimeout(c, agentConn)
+				go copyWithIdleTimeout(agentConn, c)
+				copyWg.Wait()
+
 			case <-time.After(s.cfg.PairTimeout):
 				s.mu.Lock()
 				delete(s.pendingTCP, clientID)
 				s.mu.Unlock()
+				// Close the public connection on timeout (c is already closed by defer)
 			}
 		}(conn, clientID)
 	}

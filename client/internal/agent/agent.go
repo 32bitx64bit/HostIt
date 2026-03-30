@@ -41,6 +41,12 @@ type Agent struct {
 	udpDataConn *net.UDPConn
 	serverUDP   *net.UDPAddr
 
+	// controlWriteMu serializes all writes to the controlConn.
+	// Multiple goroutines (keepalive ticker, ping/pong handler in handleControl)
+	// all write to the same control connection. Without a mutex, concurrent
+	// SetWriteDeadline + WritePacket calls corrupt the protocol framing.
+	controlWriteMu sync.Mutex
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -175,9 +181,11 @@ func (a *Agent) connectAndRun() error {
 			case <-connCtx.Done():
 				return
 			case <-ticker.C:
+				a.controlWriteMu.Lock()
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypePing})
 				conn.SetWriteDeadline(time.Time{})
+				a.controlWriteMu.Unlock()
 			}
 		}
 	}()
@@ -249,12 +257,14 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 		}
 
 		if pkt.Type == protocol.TypePing {
+			a.controlWriteMu.Lock()
 			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			protocol.WritePacket(conn, &protocol.Packet{
 				Type:    protocol.TypePong,
 				Payload: pkt.Payload,
 			})
 			conn.SetWriteDeadline(time.Time{})
+			a.controlWriteMu.Unlock()
 			continue
 		}
 
@@ -378,11 +388,20 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					}
 				}
 
-				// Proxy data with idle timeout to prevent connection leaks
+				// Proxy data with idle timeout to prevent connection leaks.
+				// When one direction finishes (EOF, error, or idle timeout),
+				// closeOnce closes both connections so the other direction
+				// stops immediately instead of waiting for its own timeout.
 				const idleTimeout = 5 * time.Minute
-				proxyDone := make(chan struct{}, 2)
+
+				closeOnce := sync.Once{}
+				cleanup := func() {
+					localConn.Close()
+					dataConn.Close()
+				}
+
 				go func() {
-					defer func() { proxyDone <- struct{}{} }()
+					defer closeOnce.Do(cleanup)
 					buf := make([]byte, 32*1024)
 					for {
 						dataConn.SetReadDeadline(time.Now().Add(idleTimeout))
@@ -390,13 +409,14 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 						if err != nil {
 							return
 						}
+						localConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 						if _, err := localConn.Write(buf[:n]); err != nil {
 							return
 						}
 					}
 				}()
 				go func() {
-					defer func() { proxyDone <- struct{}{} }()
+					defer closeOnce.Do(cleanup)
 					buf := make([]byte, 32*1024)
 					for {
 						localConn.SetReadDeadline(time.Now().Add(idleTimeout))
@@ -404,15 +424,11 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 						if err != nil {
 							return
 						}
+						dataConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 						if _, err := dataConn.Write(buf[:n]); err != nil {
 							return
 						}
 					}
-				}()
-				go func() {
-					<-proxyDone
-					localConn.Close()
-					dataConn.Close()
 				}()
 			}(routeName, clientID, rt)
 		}
