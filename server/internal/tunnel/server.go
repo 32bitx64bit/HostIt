@@ -19,6 +19,14 @@ import (
 	"hostit/shared/protocol"
 )
 
+type agentSession struct {
+	conn        net.Conn
+	cancel      context.CancelFunc
+	remoteAddr  string
+	connectTime time.Time
+	writeMu     sync.Mutex
+}
+
 type Server struct {
 	cfg ServerConfig
 
@@ -28,15 +36,10 @@ type Server struct {
 	mu          sync.RWMutex
 	agentTCP    net.Conn
 	agentUDP    netip.AddrPort
+	agentUDPAt  time.Time
 	udpDataConn *net.UDPConn
 	controlLn   net.Listener
 	dataLn      net.Listener
-
-	// agentWriteMu serializes all writes to the agentTCP control connection.
-	// Multiple goroutines (acceptPublicTCP per route, ping ticker, SetRouteEnabled)
-	// all write to the same agentTCP connection. Without a mutex, concurrent
-	// SetWriteDeadline + WritePacket calls corrupt the protocol framing.
-	agentWriteMu sync.Mutex
 
 	publicTCP map[string]net.Listener
 	publicUDP map[string]*net.UDPConn
@@ -51,9 +54,10 @@ type Server struct {
 
 	dash *dashState
 
-	// We use an atomic.Value to store the route cache so it can be updated safely
-	// and read without locks in the hot path.
 	routeCache atomic.Value
+
+	sessionsMu sync.Mutex
+	sessions   map[string]*agentSession
 }
 
 type helloRoute struct {
@@ -150,13 +154,19 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 					Type:    protocol.TypeHello,
 					Payload: routesJSON,
 				}
-				s.agentWriteMu.Lock()
-				s.agentTCP.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				protocol.WritePacket(s.agentTCP, helloPkt)
-				s.agentWriteMu.Unlock()
-
+				remoteAddr := s.agentTCP.RemoteAddr().String()
+				s.mu.Unlock()
+				s.sessionsMu.Lock()
+				if session, ok := s.sessions[remoteAddr]; ok {
+					session.writeMu.Lock()
+					s.agentTCP.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					protocol.WritePacket(s.agentTCP, helloPkt)
+					session.writeMu.Unlock()
+				}
+				s.sessionsMu.Unlock()
+			} else {
+				s.mu.Unlock()
 			}
-			s.mu.Unlock()
 			return true
 		}
 	}
@@ -182,6 +192,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		s.mu.Unlock()
 		return AgentNettestResult{}, fmt.Errorf("agent not connected")
 	}
+	remoteAddr := agent.RemoteAddr().String()
 	if s.pongCh != nil {
 		s.mu.Unlock()
 		return AgentNettestResult{}, fmt.Errorf("test already in progress")
@@ -198,7 +209,6 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 
 	var res AgentNettestResult
 
-	// Phase 1: Latency test
 	latencyCount := 20
 	var (
 		minRTT    time.Duration
@@ -218,12 +228,19 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		pkt := &protocol.Packet{Type: protocol.TypePing, Payload: payload}
 
 		sendStart := time.Now()
-		s.agentWriteMu.Lock()
-		agent.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		err := protocol.WritePacket(agent, pkt)
-		s.agentWriteMu.Unlock()
+		s.sessionsMu.Lock()
+		if session, ok := s.sessions[remoteAddr]; ok {
+			session.writeMu.Lock()
+			agent.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			err := protocol.WritePacket(agent, pkt)
+			session.writeMu.Unlock()
+			s.sessionsMu.Unlock()
 
-		if err != nil {
+			if err != nil {
+				continue
+			}
+		} else {
+			s.sessionsMu.Unlock()
 			continue
 		}
 
@@ -285,27 +302,38 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 
 	go func() {
 		defer close(sendDone)
-		s.agentWriteMu.Lock()
-		agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		s.agentWriteMu.Unlock()
+		s.sessionsMu.Lock()
+		if session, ok := s.sessions[remoteAddr]; ok {
+			session.writeMu.Lock()
+			agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			session.writeMu.Unlock()
+		}
+		s.sessionsMu.Unlock()
 		for i := 0; i < bwCount; i++ {
 			if ctx.Err() != nil {
 				break
 			}
 			payload := make([]byte, bwPayloadBytes)
-			binary.BigEndian.PutUint64(payload, uint64(1000+i)) // offset seq to avoid collision
+			binary.BigEndian.PutUint64(payload, uint64(1000+i))
 			pkt := &protocol.Packet{Type: protocol.TypePing, Payload: payload}
 
-			s.agentWriteMu.Lock()
-			if err := protocol.WritePacket(agent, pkt); err != nil {
-				s.agentWriteMu.Unlock()
+			s.sessionsMu.Lock()
+			if session, ok := s.sessions[remoteAddr]; ok {
+				session.writeMu.Lock()
+				if err := protocol.WritePacket(agent, pkt); err != nil {
+					session.writeMu.Unlock()
+					s.sessionsMu.Unlock()
+					break
+				}
+				session.writeMu.Unlock()
+				s.sessionsMu.Unlock()
+				bwSent++
+				bytesSent += int64(bwPayloadBytes)
+			} else {
+				s.sessionsMu.Unlock()
 				break
 			}
-			s.agentWriteMu.Unlock()
-			bwSent++
-			bytesSent += int64(bwPayloadBytes)
 		}
-
 	}()
 
 	timeout := time.After(5 * time.Second)
@@ -365,6 +393,7 @@ func NewServer(cfg ServerConfig) *Server {
 		publicUDP:  make(map[string]*net.UDPConn),
 		pendingTCP: make(map[string]chan net.Conn),
 		dash:       newDashState(),
+		sessions:   make(map[string]*agentSession),
 	}
 	s.updateRouteCache()
 	return s
@@ -491,7 +520,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 			continue
 		}
 
-		// Mutual auth
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "control auth failed from %s: %v", conn.RemoteAddr(), err)
@@ -500,20 +528,41 @@ func (s *Server) acceptControl(ln net.Listener) {
 		}
 		conn.SetDeadline(time.Time{})
 
-		s.mu.Lock()
-		if s.agentTCP != nil {
-			s.agentTCP.Close()
+		remoteAddr := conn.RemoteAddr().String()
+
+		s.sessionsMu.Lock()
+		if oldSession, exists := s.sessions[remoteAddr]; exists {
+			logging.Global().Infof(logging.CatTCP, "Terminating previous session from %s", remoteAddr)
+			if oldSession.cancel != nil {
+				oldSession.cancel()
+			}
+			if oldSession.conn != nil {
+				oldSession.conn.Close()
+			}
+			delete(s.sessions, remoteAddr)
 		}
+
+		sessionCtx, sessionCancel := context.WithCancel(s.ctx)
+		session := &agentSession{
+			conn:        conn,
+			cancel:      sessionCancel,
+			remoteAddr:  remoteAddr,
+			connectTime: time.Now(),
+		}
+		s.sessions[remoteAddr] = session
+		s.sessionsMu.Unlock()
+
+		s.mu.Lock()
 		s.agentTCP = conn
 		s.agentUDP = netip.AddrPort{}
-		// Clear stale pending TCP connections
+		s.agentUDPAt = time.Time{}
 		for clientID, ch := range s.pendingTCP {
 			close(ch)
 			delete(s.pendingTCP, clientID)
 		}
 		s.mu.Unlock()
 
-		logging.Global().Infof(logging.CatTCP, "Agent connected to control")
+		logging.Global().Infof(logging.CatTCP, "Agent connected to control from %s", remoteAddr)
 
 		routesMap := make(map[string]helloRoute)
 		for _, rt := range s.cfg.Routes {
@@ -530,28 +579,39 @@ func (s *Server) acceptControl(ln net.Listener) {
 			Type:    protocol.TypeHello,
 			Payload: routesJSON,
 		}
+		session.writeMu.Lock()
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if err := protocol.WritePacket(conn, helloPkt); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
 			conn.Close()
+			session.writeMu.Unlock()
 			s.mu.Lock()
 			if s.agentTCP == conn {
 				s.agentTCP = nil
 			}
 			s.mu.Unlock()
+			s.sessionsMu.Lock()
+			delete(s.sessions, remoteAddr)
+			s.sessionsMu.Unlock()
 			continue
 		}
+		session.writeMu.Unlock()
 
-		// Keep connection open and detect disconnect
 		s.wg.Add(1)
-		go func(c net.Conn) {
+		go func(c net.Conn, session *agentSession, remoteAddr string) {
 			defer s.wg.Done()
-			defer c.Close()
+			defer func() {
+				c.Close()
+				s.sessionsMu.Lock()
+				if s.sessions[remoteAddr] == session {
+					delete(s.sessions, remoteAddr)
+				}
+				s.sessionsMu.Unlock()
+			}()
 
-			pingCtx, pingCancel := context.WithCancel(s.ctx)
+			pingCtx, pingCancel := context.WithCancel(sessionCtx)
 			defer pingCancel()
 
-			// Track last pong time for health checks using atomic to avoid data race
 			var lastPong atomic.Value
 			lastPong.Store(time.Now().UnixNano())
 
@@ -567,16 +627,15 @@ func (s *Server) acceptControl(ln net.Listener) {
 						isAgent := s.agentTCP == c
 						s.mu.RUnlock()
 						if isAgent {
-							s.agentWriteMu.Lock()
+							session.writeMu.Lock()
 							c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 							protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing})
-							s.agentWriteMu.Unlock()
+							session.writeMu.Unlock()
 						}
 					}
 				}
 			}()
 
-			// Health check goroutine: detect if agent is unresponsive
 			go func() {
 				ticker := time.NewTicker(30 * time.Second)
 				defer ticker.Stop()
@@ -591,7 +650,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 						if isAgent {
 							lastPongTime := time.Unix(0, lastPong.Load().(int64))
 							if time.Since(lastPongTime) > 60*time.Second {
-								// Agent hasn't responded to pings for 60 seconds, close connection
 								logging.Global().Errorf(logging.CatTCP, "agent health check timeout, closing connection")
 								c.Close()
 								return
@@ -602,20 +660,25 @@ func (s *Server) acceptControl(ln net.Listener) {
 			}()
 
 			for {
+				select {
+				case <-sessionCtx.Done():
+					return
+				default:
+				}
+
 				c.SetReadDeadline(time.Now().Add(45 * time.Second))
 				pkt, err := protocol.ReadPacket(c)
 				if err != nil {
 					break
 				}
 				if pkt.Type == protocol.TypePing {
-					s.agentWriteMu.Lock()
+					session.writeMu.Lock()
 					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 					protocol.WritePacket(c, &protocol.Packet{
 						Type:    protocol.TypePong,
 						Payload: pkt.Payload,
 					})
-					s.agentWriteMu.Unlock()
-
+					session.writeMu.Unlock()
 					continue
 				}
 				if pkt.Type == protocol.TypePong {
@@ -635,8 +698,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.mu.Lock()
 			if s.agentTCP == c {
 				s.agentTCP = nil
-				s.agentUDP = netip.AddrPort{}
-				// Clear pending TCP connections
 				for clientID, ch := range s.pendingTCP {
 					close(ch)
 					delete(s.pendingTCP, clientID)
@@ -644,7 +705,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 				logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
 			}
 			s.mu.Unlock()
-		}(conn)
+		}(conn, session, remoteAddr)
 	}
 }
 
@@ -773,6 +834,8 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			continue
 		}
 
+		remoteAddr := agent.RemoteAddr().String()
+
 		ch := make(chan net.Conn, 1)
 		s.mu.Lock()
 		s.pendingTCP[clientID] = ch
@@ -783,17 +846,29 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			Route:  routeName,
 			Client: clientID,
 		}
-		s.agentWriteMu.Lock()
-		agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		if err := protocol.WritePacket(agent, reqPkt); err != nil {
-			s.agentWriteMu.Unlock()
+		s.sessionsMu.Lock()
+		if session, ok := s.sessions[remoteAddr]; ok {
+			session.writeMu.Lock()
+			agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := protocol.WritePacket(agent, reqPkt); err != nil {
+				session.writeMu.Unlock()
+				s.sessionsMu.Unlock()
+				conn.Close()
+				s.mu.Lock()
+				delete(s.pendingTCP, clientID)
+				s.mu.Unlock()
+				continue
+			}
+			session.writeMu.Unlock()
+		} else {
+			s.sessionsMu.Unlock()
 			conn.Close()
 			s.mu.Lock()
 			delete(s.pendingTCP, clientID)
 			s.mu.Unlock()
 			continue
 		}
-		s.agentWriteMu.Unlock()
+		s.sessionsMu.Unlock()
 
 		go func(c net.Conn, clientID string) {
 			defer c.Close()
@@ -806,32 +881,19 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				s.dash.incActive(routeName)
 				defer s.dash.decActive(routeName)
 
-				// Use sync.Once to ensure connections are closed exactly once.
-				// When one copy direction finishes it closes both connections,
-				// which immediately unblocks the other direction's Read.
 				closeOnce := sync.Once{}
 				cleanup := func() {
 					c.Close()
 					agentConn.Close()
 				}
 
-				// Idle timeout for each direction — refreshed on every successful
-				// read so that active connections are never killed.
-				const idleTimeout = 5 * time.Minute
+				const idleTimeout = 30 * time.Second
 
-				// WaitGroup keeps this goroutine alive until both copy
-				// directions finish, preventing the deferred c.Close() from
-				// killing the connection prematurely.
 				var copyWg sync.WaitGroup
 				copyWg.Add(2)
 
-				// copyWithIdleTimeout copies data from src to dst, refreshing the
-				// read deadline on src after every successful read. When the read
-				// side finishes (EOF, error, or idle timeout) we close both
-				// connections via closeOnce so the other direction stops too.
 				copyWithIdleTimeout := func(dst, src net.Conn) {
 					defer copyWg.Done()
-					defer closeOnce.Do(cleanup)
 
 					buf := make([]byte, 32*1024)
 					for {
@@ -840,6 +902,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 						if n > 0 {
 							dst.SetWriteDeadline(time.Now().Add(30 * time.Second))
 							if _, werr := dst.Write(buf[:n]); werr != nil {
+								closeOnce.Do(cleanup)
 								return
 							}
 							s.dash.addBytes(time.Now(), int64(n))
@@ -853,12 +916,19 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				go copyWithIdleTimeout(c, agentConn)
 				go copyWithIdleTimeout(agentConn, c)
 				copyWg.Wait()
+				closeOnce.Do(cleanup)
 
 			case <-time.After(s.cfg.PairTimeout):
 				s.mu.Lock()
 				delete(s.pendingTCP, clientID)
 				s.mu.Unlock()
-				// Close the public connection on timeout (c is already closed by defer)
+				select {
+				case lateConn := <-ch:
+					if lateConn != nil {
+						lateConn.Close()
+					}
+				default:
+				}
 			}
 		}(conn, clientID)
 	}
@@ -894,14 +964,16 @@ func (s *Server) acceptAgentUDP() {
 			continue
 		}
 
-		// Update agent address to handle NAT port changes
 		s.mu.Lock()
-		if !s.agentUDP.IsValid() || s.agentUDP != addr {
-			s.agentUDP = addr
-			// Only log on register to avoid spam
-			if pkt.Type == protocol.TypeRegister {
-				logging.Global().Infof(logging.CatUDP, "Agent UDP address updated to %s", addr.String())
+		if pkt.Type == protocol.TypeRegister {
+			if !s.agentUDP.IsValid() || s.agentUDP != addr {
+				s.agentUDP = addr
+				logging.Global().Infof(logging.CatUDP, "Agent UDP address registered: %s", addr.String())
 			}
+			s.agentUDPAt = time.Now()
+		} else if !s.agentUDP.IsValid() || s.agentUDP != addr {
+			s.agentUDP = addr
+			s.agentUDPAt = time.Now()
 		}
 		s.mu.Unlock()
 
@@ -986,7 +1058,6 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		clientStr, ok := addrStrCache[addr]
 		if !ok {
 			clientStr = addr.String()
-			// Prevent cache from growing indefinitely
 			if len(addrStrCache) > 10000 {
 				addrStrCache = make(map[netip.AddrPort]string)
 			}
@@ -995,8 +1066,23 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 
 		s.mu.RLock()
 		agentAddr := s.agentUDP
+		agentUDPAt := s.agentUDPAt
 		udpCipher := s.udpCipher
 		s.mu.RUnlock()
+
+		if !agentAddr.IsValid() {
+			continue
+		}
+
+		if !agentUDPAt.IsZero() && time.Since(agentUDPAt) > 60*time.Second {
+			s.mu.Lock()
+			if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > 60*time.Second {
+				logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
+				s.agentUDP = netip.AddrPort{}
+			}
+			s.mu.Unlock()
+			continue
+		}
 
 		cache := s.routeCache.Load().(map[string]routeConfig)
 		rc, ok := cache[routeName]

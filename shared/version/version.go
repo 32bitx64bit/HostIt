@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-// Current is the currently running HostIt/Playit-prototype version.
-// Keep this in sync with your GitHub release tags.
 const Current = "2.1.1"
 
 type Version struct {
@@ -42,7 +40,6 @@ func (v Version) Compare(o Version) int {
 	return 0
 }
 
-// Parse parses versions like "1", "1.2", "1.2.3", with optional "v" prefix.
 func Parse(s string) (Version, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {

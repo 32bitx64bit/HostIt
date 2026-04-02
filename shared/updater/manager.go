@@ -163,7 +163,6 @@ func (m *Manager) Apply(ctx context.Context) (bool, error) {
 		return false, errors.New("already up to date")
 	}
 	assetURL := ""
-	// refresh release to get asset URLs
 	m.mu.Unlock()
 
 	ctx2, cancel := context.WithTimeout(ctx, 12*time.Second)
@@ -231,8 +230,6 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 		_, _ = fmt.Fprintf(logw, "Check error (continuing): %v\n", err)
 	}
 
-	// If the release includes a shared.zip asset, apply it into the sibling shared module
-	// before building the component.
 	sharedDest := siblingSharedDir(m.ModuleDir)
 	if strings.TrimSpace(sharedDest) != "" {
 		ctxShared, cancel := context.WithTimeout(ctx, 12*time.Second)
@@ -246,7 +243,6 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 				_, _ = fmt.Fprintf(logw, "Applying shared.zip update...\n")
 				if err := ApplySharedZipUpdate(ctx, sharedURL, sharedDest, logw); err != nil {
 					_, _ = fmt.Fprintf(logw, "Shared update failed: %v\n", err)
-					// Don't hard-fail: allow component update to proceed; build may still succeed.
 				}
 			} else {
 				_, _ = fmt.Fprintf(logw, "No shared.zip asset found on release (continuing).\n")
@@ -449,8 +445,6 @@ func (w *jobLogWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Enforce an upper bound on log size while still returning len(p)
-	// so callers don't treat this as a write failure.
 	if w.remaining > 0 {
 		toWrite := p
 		if len(toWrite) > w.remaining {
@@ -468,7 +462,6 @@ func (w *jobLogWriter) Write(p []byte) (int, error) {
 }
 
 func (w *jobLogWriter) persistLocked(now time.Time) {
-	// Avoid hammering disk; only persist while the job is running.
 	w.m.mu.Lock()
 	if w.m.st.Job.State == JobRunning {
 		w.m.st.Job.Log = w.buf.String()
@@ -497,8 +490,6 @@ func siblingSharedDir(moduleDir string) string {
 	if fi, err := os.Stat(shared); err == nil && fi.IsDir() {
 		return shared
 	}
-	// If it doesn't exist yet, still return the intended path so the updater
-	// can create it when the release zip includes shared/.
 	return shared
 }
 

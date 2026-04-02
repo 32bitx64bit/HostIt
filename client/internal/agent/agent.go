@@ -357,19 +357,24 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 
 				dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if _, err := dataConn.Write(buf); err != nil {
+					logging.Global().Errorf(logging.CatTCP, "failed to write route/client to data conn: %v", err)
 					dataConn.Close()
 					return
 				}
-				// Clear all deadlines - connection will use idle timeout for cleanup
 				dataConn.SetDeadline(time.Time{})
 
 				_, port, _ := net.SplitHostPort(rt.PublicAddr)
 				localAddr := "127.0.0.1:" + port
-				localConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
+				localConn, err := net.DialTimeout("tcp", localAddr, 10*time.Second)
 				if err != nil {
 					logging.Global().Errorf(logging.CatTCP, "failed to dial local tcp %s: %v", localAddr, err)
 					dataConn.Close()
 					return
+				}
+
+				if tcpConn, ok := localConn.(*net.TCPConn); ok {
+					tcpConn.SetKeepAlive(true)
+					tcpConn.SetKeepAlivePeriod(30 * time.Second)
 				}
 
 				if rt.Encrypted {
@@ -392,7 +397,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 				// When one direction finishes (EOF, error, or idle timeout),
 				// closeOnce closes both connections so the other direction
 				// stops immediately instead of waiting for its own timeout.
-				const idleTimeout = 5 * time.Minute
+				const idleTimeout = 30 * time.Second
 
 				closeOnce := sync.Once{}
 				cleanup := func() {
@@ -400,36 +405,47 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					dataConn.Close()
 				}
 
+				var copyWg sync.WaitGroup
+				copyWg.Add(2)
+
 				go func() {
-					defer closeOnce.Do(cleanup)
+					defer copyWg.Done()
 					buf := make([]byte, 32*1024)
 					for {
 						dataConn.SetReadDeadline(time.Now().Add(idleTimeout))
 						n, err := dataConn.Read(buf)
-						if err != nil {
-							return
+						if n > 0 {
+							localConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+							if _, werr := localConn.Write(buf[:n]); werr != nil {
+								closeOnce.Do(cleanup)
+								return
+							}
 						}
-						localConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-						if _, err := localConn.Write(buf[:n]); err != nil {
+						if err != nil {
 							return
 						}
 					}
 				}()
 				go func() {
-					defer closeOnce.Do(cleanup)
+					defer copyWg.Done()
 					buf := make([]byte, 32*1024)
 					for {
 						localConn.SetReadDeadline(time.Now().Add(idleTimeout))
 						n, err := localConn.Read(buf)
-						if err != nil {
-							return
+						if n > 0 {
+							dataConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+							if _, werr := dataConn.Write(buf[:n]); werr != nil {
+								closeOnce.Do(cleanup)
+								return
+							}
 						}
-						dataConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-						if _, err := dataConn.Write(buf[:n]); err != nil {
+						if err != nil {
 							return
 						}
 					}
 				}()
+				copyWg.Wait()
+				closeOnce.Do(cleanup)
 			}(routeName, clientID, rt)
 		}
 	}
@@ -511,7 +527,8 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return fmt.Errorf("udp data read error: %w", err)
+			logging.Global().Errorf(logging.CatUDP, "udp data read error: %v", err)
+			continue
 		}
 
 		err = protocol.UnmarshalUDPTo(buf[:n], &pkt)
@@ -562,7 +579,6 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 			sessionsMu.Unlock()
 
 			if !exists {
-				// Copy strings because they point to buf
 				key.route = string([]byte(pkt.Route))
 				key.client = string([]byte(pkt.Client))
 
@@ -591,7 +607,6 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 				sessions[key] = sess
 				sessionsMu.Unlock()
 
-				// Start reader for this session
 				go func(key sessionKey, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
 					defer func() {
 						c.Close()
@@ -605,9 +620,18 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 					encryptBuf := make([]byte, 65536)
 					var respPkt protocol.Packet
 					for {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+
 						c.SetReadDeadline(time.Now().Add(2 * time.Minute))
 						rn, err := c.Read(respBuf)
 						if err != nil {
+							if ctx.Err() != nil {
+								return
+							}
 							return
 						}
 
@@ -645,7 +669,11 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 				}(key, localConn, rc.isEncrypted, rc.udpCipher)
 			}
 
-			sess.conn.Write(payload)
+			sessionsMu.Lock()
+			if s, ok := sessions[key]; ok && s.conn != nil {
+				s.conn.Write(payload)
+			}
+			sessionsMu.Unlock()
 		}
 	}
 }

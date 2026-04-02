@@ -19,6 +19,7 @@ const (
 var (
 	ErrInvalidPacket = errors.New("invalid packet")
 	ErrPayloadTooBig = errors.New("payload too big")
+	ErrFieldTooLong  = errors.New("route or client field too long")
 )
 
 const MaxPayloadSize = 64 * 1024 // 64KB
@@ -33,6 +34,9 @@ type Packet struct {
 func WritePacket(w io.Writer, p *Packet) error {
 	if len(p.Payload) > MaxPayloadSize {
 		return ErrPayloadTooBig
+	}
+	if len(p.Route) > 255 || len(p.Client) > 255 {
+		return ErrFieldTooLong
 	}
 
 	totalLen := 5 + len(p.Route) + len(p.Client) + len(p.Payload)
@@ -56,8 +60,19 @@ func WritePacket(w io.Writer, p *Packet) error {
 		copy(buf[offset:], p.Payload)
 	}
 
-	_, err := w.Write(buf)
-	return err
+	for len(buf) > 0 {
+		n, err := w.Write(buf)
+		if n > 0 {
+			buf = buf[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func ReadPacket(r io.Reader) (*Packet, error) {
@@ -103,6 +118,9 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 func MarshalUDP(p *Packet, dst []byte) ([]byte, error) {
 	if len(p.Payload) > MaxPayloadSize {
 		return nil, ErrPayloadTooBig
+	}
+	if len(p.Route) > 255 || len(p.Client) > 255 {
+		return nil, ErrFieldTooLong
 	}
 
 	totalLen := 1 + 1 + len(p.Route) + 1 + len(p.Client) + len(p.Payload)

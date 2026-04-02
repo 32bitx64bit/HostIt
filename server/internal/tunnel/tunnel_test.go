@@ -203,7 +203,190 @@ func TestEndToEndTCPConcurrent(t *testing.T) {
 	}
 }
 
+func TestEndToEndTCPConcurrentMultiRoute(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startEcho := func(prefix string) (net.Listener, string) {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					buf := make([]byte, 1024)
+					for {
+						n, err := conn.Read(buf)
+						if n > 0 {
+							_, _ = conn.Write(append([]byte(prefix+":"), buf[:n]...))
+						}
+						if err != nil {
+							return
+						}
+					}
+				}(c)
+			}
+		}()
+		return ln, ln.Addr().String()
+	}
+
+	echoALn, echoAAddr := startEcho("a")
+	defer echoALn.Close()
+	echoBLn, echoBAddr := startEcho("b")
+	defer echoBLn.Close()
+
+	controlLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlAddr := controlLn.Addr().String()
+	_ = controlLn.Close()
+
+	dataLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataAddr := dataLn.Addr().String()
+	_ = dataLn.Close()
+
+	publicALn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicAAddr := publicALn.Addr().String()
+	_ = publicALn.Close()
+
+	publicBLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicBAddr := publicBLn.Addr().String()
+	_ = publicBLn.Close()
+
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes: []RouteConfig{
+			{Name: "route-a", Proto: "tcp", PublicAddr: publicAAddr},
+			{Name: "route-b", Proto: "tcp", PublicAddr: publicBAddr},
+		},
+		Token:      "testtoken",
+		PairTimeout: 2 * time.Second,
+		DisableTLS: true,
+	})
+	go func() { _ = srv.Run(ctx) }()
+
+	go fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{
+		"route-a": echoAAddr,
+		"route-b": echoBAddr,
+	}, "testtoken")
+
+	waitReady := func(addr string) {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if time.Now().After(deadline) {
+				t.Fatalf("listener %s never became ready", addr)
+			}
+			c, err := net.Dial("tcp", addr)
+			if err != nil {
+				time.Sleep(25 * time.Millisecond)
+				continue
+			}
+			_ = c.Close()
+			return
+		}
+	}
+
+	waitReady(publicAAddr)
+	waitReady(publicBAddr)
+
+	targets := []struct {
+		addr   string
+		prefix string
+	}{
+		{addr: publicAAddr, prefix: "a:"},
+		{addr: publicBAddr, prefix: "b:"},
+	}
+
+	const perRoute = 20
+	errCh := make(chan error, len(targets)*perRoute)
+	start := make(chan struct{})
+	for _, target := range targets {
+		target := target
+		for i := 0; i < perRoute; i++ {
+			i := i
+			go func() {
+				<-start
+				c, err := net.Dial("tcp", target.addr)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				msg := []byte("msg-" + strconv.Itoa(i))
+				if _, err := c.Write(msg); err != nil {
+					errCh <- err
+					return
+				}
+				buf := make([]byte, len(target.prefix)+len(msg))
+				if _, err := io.ReadFull(c, buf); err != nil {
+					errCh <- err
+					return
+				}
+				want := target.prefix + string(msg)
+				if string(buf) != want {
+					errCh <- fmt.Errorf("addr %s: expected %q got %q", target.addr, want, string(buf))
+					return
+				}
+				errCh <- nil
+			}()
+		}
+	}
+	close(start)
+
+	for i := 0; i < len(targets)*perRoute; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPendingTCPKeyIncludesRoute(t *testing.T) {
+	a := makePendingTCPKey("route-a", "client-1")
+	b := makePendingTCPKey("route-b", "client-1")
+	if a == b {
+		t.Fatalf("pending TCP keys must differ across routes: %#v %#v", a, b)
+	}
+}
+
+func TestNextClientIDIsCompact(t *testing.T) {
+	s := &Server{}
+	first := s.nextClientID()
+	second := s.nextClientID()
+	if first == "" || second == "" {
+		t.Fatalf("nextClientID returned empty values: %q %q", first, second)
+	}
+	if first == second {
+		t.Fatalf("nextClientID returned duplicate ids: %q", first)
+	}
+	if len(first) > 16 || len(second) > 16 {
+		t.Fatalf("nextClientID should stay compact, got %q (%d) and %q (%d)", first, len(first), second, len(second))
+	}
+}
+
 func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, token string) {
+	fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{"default": localAddr}, token)
+}
+
+func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAddrs map[string]string, token string) {
 	var controlConn net.Conn
 	for {
 		select {
@@ -256,6 +439,10 @@ func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, tok
 			routeName := pkt.Route
 			clientID := pkt.Client
 			go func() {
+				localAddr, ok := localAddrs[routeName]
+				if !ok {
+					return
+				}
 				dataConn, err := net.Dial("tcp", dataAddr)
 				if err != nil {
 					return

@@ -33,6 +33,9 @@ import (
 	"hostit/shared/version"
 )
 
+	if pt < 1*time.Second {
+		http.Error(w, "pair timeout must be at least 1 second", http.StatusBadRequest)
+		return
 func main() {
 	var controlAddr string
 	var dataAddr string
@@ -80,18 +83,28 @@ func main() {
 		PairTimeout: pairTimeout,
 	}
 	loaded, _ := configio.Load(configPath, &cfg)
+		cfgDir := filepath.Dir(configPath)
+		if strings.TrimSpace(cfg.WebTLSCertFile) == "" {
+			cfg.WebTLSCertFile = filepath.Join(cfgDir, "web.crt")
 
 	// Apply flag overrides after loading.
 	if disableTLS {
 		cfg.DisableTLS = true
 	}
 	if strings.TrimSpace(tlsCert) != "" {
+		mux.HandleFunc("/api/routes/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
 		cfg.TLSCertFile = tlsCert
 	}
 	if strings.TrimSpace(tlsKey) != "" {
 		cfg.TLSKeyFile = tlsKey
 	}
 
+		cfg, _, _ := runner.Get()
+		if err := configio.Save(configPath, cfg); err != nil {
+			serverlog.Log.Error(logging.CatSystem, "failed to save config after route toggle", serverlog.F("error", err))
 	if cfg.EncryptionAlgorithm == "" {
 		if !loaded {
 			cfg.EncryptionAlgorithm = "aes-128"
@@ -388,7 +401,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		mux := http.NewServeMux()
 		lim := newIPRateLimiter(10, 30*time.Second) // 10 attempts per 30s per IP
 
-		// Setup: only available if no users exist.
 		mux.HandleFunc("/setup", securityHeaders(cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			hasUsers, err := store.HasAnyUsers(r.Context())
 			if err != nil {
@@ -443,7 +455,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 						errMsg = "Password must be at least 10 characters."
 					}
 					if errConfirm {
-						// If both are true, this message is more actionable.
 						errMsg = "Passwords must match."
 					}
 					render(errMsg, username, errUser, errPass, errConfirm)
@@ -1003,11 +1014,12 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				Name        string
 				Proto       string
 				PublicAddr  string
+				LocalAddr   string
 				IsEncrypted bool
 			}
 			routeViews := make([]routeView, 0, len(routes))
 			for _, rt := range routes {
-				routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, IsEncrypted: rt.IsEncrypted()})
+				routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, LocalAddr: rt.LocalAddr, IsEncrypted: rt.IsEncrypted()})
 			}
 			data := map[string]any{
 				"Cfg":        cfg,
@@ -1440,7 +1452,8 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		name := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_name"))
 		proto := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_proto"))
 		pub := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_public"))
-		if name == "" && proto == "" && pub == "" {
+		local := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_local"))
+		if name == "" && proto == "" && pub == "" && local == "" {
 			continue
 		}
 		if name == "" {
@@ -1468,7 +1481,7 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		if encrypted {
 			encPtr = &encrypted
 		}
-		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, Encrypted: encPtr})
+		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, LocalAddr: local, Encrypted: encPtr})
 	}
 	return routes
 }
@@ -2347,6 +2360,10 @@ const serverConfigHTML = `<!doctype html>
 								<input name="route_{{$i}}_public" value="{{$r.PublicAddr}}" placeholder=":25565" />
 							</div>
 							<div>
+								<label>Local target (optional)</label>
+								<input name="route_{{$i}}_local" value="{{$r.LocalAddr}}" placeholder="127.0.0.1:3000" />
+							</div>
+							<div>
 								<label>Encryption</label>
 								<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
 									<input type="checkbox" name="route_{{$i}}_encrypted" value="1" {{if $r.IsEncrypted}}checked{{end}} />
@@ -2376,6 +2393,7 @@ const serverConfigHTML = `<!doctype html>
 				<div><label>Name (optional)</label><input name="route_IDX_name" value="" /></div>
 				<div><label>Protocol</label><select name="route_IDX_proto"><option value="tcp" selected>tcp</option><option value="udp">udp</option><option value="both">both</option></select></div>
 				<div><label>Port (e.g. :25565)</label><input name="route_IDX_public" value="" placeholder=":25565" /></div>
+				<div><label>Local target (optional)</label><input name="route_IDX_local" value="" placeholder="127.0.0.1:3000" /></div>
 				<div>
 					<label>Encryption</label>
 					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">

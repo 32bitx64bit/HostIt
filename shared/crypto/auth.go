@@ -10,19 +10,17 @@ import (
 	"net"
 )
 
-// AuthenticateClient performs a 1-RTT mutual authentication handshake.
 func AuthenticateClient(conn net.Conn, token string) error {
 	clientNonce := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, clientNonce); err != nil {
 		return fmt.Errorf("failed to generate client nonce: %w", err)
 	}
 
-	// Send nonce and MAC
 	clientMac := computeHMAC(token, clientNonce)
 	buf := make([]byte, 64)
 	copy(buf[:32], clientNonce)
 	copy(buf[32:], clientMac)
-	if _, err := conn.Write(buf); err != nil {
+	if _, err := writeAll(conn, buf); err != nil {
 		return fmt.Errorf("failed to write client auth: %w", err)
 	}
 
@@ -33,7 +31,6 @@ func AuthenticateClient(conn net.Conn, token string) error {
 	serverNonce := respBuf[:32]
 	serverMac := respBuf[32:]
 
-	// Verify server MAC (includes our nonce to prevent replay)
 	macData := make([]byte, 0, 64)
 	macData = append(macData, serverNonce...)
 	macData = append(macData, clientNonce...)
@@ -45,7 +42,6 @@ func AuthenticateClient(conn net.Conn, token string) error {
 	return nil
 }
 
-// AuthenticateServer performs the server side of the mutual authentication handshake.
 func AuthenticateServer(conn net.Conn, token string) error {
 	buf := make([]byte, 64)
 	if _, err := io.ReadFull(conn, buf); err != nil {
@@ -72,7 +68,7 @@ func AuthenticateServer(conn net.Conn, token string) error {
 	respBuf := make([]byte, 64)
 	copy(respBuf[:32], serverNonce)
 	copy(respBuf[32:], serverMac)
-	if _, err := conn.Write(respBuf); err != nil {
+	if _, err := writeAll(conn, respBuf); err != nil {
 		return fmt.Errorf("failed to write server response: %w", err)
 	}
 

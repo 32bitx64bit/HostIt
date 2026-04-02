@@ -17,9 +17,9 @@ import (
 type ApplyOptions struct {
 	AssetURL       string
 	ModuleDir      string
-	ExpectedFolder string   // "server" or "client"; empty means module root
-	PreservePaths  []string // additional absolute paths to preserve (files or directories)
-	SharedDestDir  string   // optional absolute path to shared module destination
+	ExpectedFolder string
+	PreservePaths  []string
+	SharedDestDir  string
 }
 
 func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) error {
@@ -34,10 +34,8 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 		return err
 	}
 
-	// Create temp dir inside moduleDir to allow fast os.Rename across same filesystem
 	tmpDir, err := os.MkdirTemp(moduleDir, ".hostit-update-*")
 	if err != nil {
-		// Fallback to system temp dir
 		tmpDir, err = os.MkdirTemp("", "hostit-update-*")
 		if err != nil {
 			return err
@@ -122,7 +120,6 @@ func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, 
 		return err
 	}
 
-	// Create temp dir inside moduleDir to allow fast os.Rename across same filesystem
 	tmpDir, err := os.MkdirTemp(moduleDir, ".hostit-update-local-*")
 	if err != nil {
 		tmpDir, err = os.MkdirTemp("", "hostit-update-local-*")
@@ -186,8 +183,6 @@ func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, 
 	return nil
 }
 
-// ApplySharedZipUpdate downloads a zip asset that contains the shared module (shared/go.mod)
-// and syncs it into sharedDestDir. It does not run build scripts.
 func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir string, logw io.Writer) error {
 	if strings.TrimSpace(assetURL) == "" {
 		return errors.New("missing asset URL")
@@ -203,7 +198,6 @@ func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir st
 		return err
 	}
 
-	// Create temp dir inside sharedDestDir to allow fast os.Rename across same filesystem
 	tmpDir, err := os.MkdirTemp(sharedDestDir, ".hostit-update-shared-*")
 	if err != nil {
 		tmpDir, err = os.MkdirTemp("", "hostit-update-shared-*")
@@ -233,7 +227,6 @@ func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir st
 	return syncDir(sharedSrc, sharedDestDir, nil, nil, logw)
 }
 
-// ApplySharedZipFileUpdate applies shared module files from a local zip path.
 func ApplySharedZipFileUpdate(zipPath string, sharedDestDir string, logw io.Writer) error {
 	if strings.TrimSpace(zipPath) == "" {
 		return errors.New("missing zip path")
@@ -256,7 +249,6 @@ func ApplySharedZipFileUpdate(zipPath string, sharedDestDir string, logw io.Writ
 		return err
 	}
 
-	// Create temp dir inside sharedDestDir to allow fast os.Rename across same filesystem
 	tmpDir, err := os.MkdirTemp(sharedDestDir, ".hostit-update-local-shared-*")
 	if err != nil {
 		tmpDir, err = os.MkdirTemp("", "hostit-update-local-shared-*")
@@ -284,7 +276,6 @@ func ApplySharedZipFileUpdate(zipPath string, sharedDestDir string, logw io.Writ
 }
 
 func pickSharedRoot(extractDir string) (string, error) {
-	// Common case: zip includes top-level shared/go.mod.
 	cand := filepath.Join(extractDir, "shared")
 	if fi, err := os.Stat(cand); err == nil && fi.IsDir() {
 		if _, err := os.Stat(filepath.Join(cand, "go.mod")); err == nil {
@@ -292,8 +283,6 @@ func pickSharedRoot(extractDir string) (string, error) {
 		}
 	}
 
-	// Fallback: search a few levels deep for a directory named 'shared' containing go.mod.
-	// (Release zips sometimes wrap content in an extra top folder.)
 	best := ""
 	_ = filepath.WalkDir(extractDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -377,7 +366,6 @@ func unzip(zipPath string, dstDir string) error {
 		f := f
 		name := f.Name
 		if strings.Contains(name, "..") {
-			// basic zip-slip defense
 			continue
 		}
 		p := filepath.Join(dstDir, filepath.FromSlash(name))
@@ -437,8 +425,6 @@ func pickSourceRoot(extractDir string, expectedFolder string) (string, error) {
 			}
 		}
 
-		// If expectedFolder is provided but not found at the root, check if the zip
-		// was extracted with a single top-level wrapper folder (common in GitHub releases).
 		ents, err := os.ReadDir(extractDir)
 		if err == nil && len(ents) == 1 && ents[0].IsDir() {
 			wrapperCand := filepath.Join(extractDir, ents[0].Name(), expectedFolder)
@@ -452,11 +438,9 @@ func pickSourceRoot(extractDir string, expectedFolder string) (string, error) {
 		return "", fmt.Errorf("could not locate expected folder %q with build.sh in extracted zip", expectedFolder)
 	}
 
-	// if build.sh exists at root, use root
 	if _, err := os.Stat(filepath.Join(extractDir, "build.sh")); err == nil {
 		return extractDir, nil
 	}
-	// fallback: try to find a single folder containing build.sh
 	ents, err := os.ReadDir(extractDir)
 	if err != nil {
 		return "", err
@@ -495,7 +479,6 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 	skipPrefixes := []string{".git", "bin"}
 	skipPrefixes = append(skipPrefixes, extraSkipPrefixes...)
 
-	// First pass: collect all relative paths from source
 	srcRelPaths := make(map[string]struct{})
 	err := filepath.WalkDir(srcRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -533,7 +516,6 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 		return err
 	}
 
-	// Second pass: delete files in dst that don't exist in src
 	dstAbs, err := filepath.Abs(dstRoot)
 	if err != nil {
 		return err
@@ -576,7 +558,6 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 
 		abs := filepath.Clean(path)
 
-		// Check if this path should be preserved
 		if _, ok := preserveFiles[abs]; ok {
 			return nil
 		}
@@ -586,7 +567,6 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 			}
 		}
 
-		// If not in source, mark for deletion
 		if _, exists := srcRelPaths[rel]; !exists {
 			toDelete = append(toDelete, path)
 		}
@@ -596,7 +576,6 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 		return err
 	}
 
-	// Delete files/directories not in source (delete in reverse order for dirs)
 	for i := len(toDelete) - 1; i >= 0; i-- {
 		path := toDelete[i]
 		if err := removeAllWritable(path, dstAbs); err != nil {
@@ -606,10 +585,9 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 		}
 	}
 
-	// Third pass: copy files from source to destination
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1000)
-	sem := make(chan struct{}, 10) // limit concurrency
+	sem := make(chan struct{}, 10)
 
 	err = filepath.WalkDir(srcRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -675,7 +653,6 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 			if os.IsPermission(err) {
 				_ = ensureWritablePath(filepath.Dir(dstPath), dstAbs)
 				if err2 := os.MkdirAll(filepath.Dir(dstPath), 0o755); err2 == nil {
-					// continue
 				} else {
 					return err
 				}
@@ -690,13 +667,11 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// Try fast rename first
-			_ = os.Remove(dstPath) // Remove existing file to avoid issues on Windows
+			_ = os.Remove(dstPath)
 			if err := os.Rename(path, dstPath); err == nil {
 				return
 			}
 
-			// Fallback to copy
 			in, err := os.Open(path)
 			if err != nil {
 				errCh <- err
@@ -842,8 +817,6 @@ func ensureGoBuildEnv(env []string, moduleDir string) []string {
 
 	home := strings.TrimSpace(get("HOME"))
 	if home == "" {
-		// systemd services often have HOME unset; Go 1.24+ needs a module cache.
-		// Use a writable fallback.
 		home = moduleDir
 	}
 	setIfMissing("HOME", home)

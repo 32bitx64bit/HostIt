@@ -5,7 +5,6 @@ import (
 	"time"
 )
 
-// DashboardEvent represents an event that should be displayed on the dashboard.
 type DashboardEvent struct {
 	TimeUnix  int64    `json:"time_unix"`
 	Kind      string   `json:"kind"`
@@ -19,20 +18,17 @@ type DashboardEvent struct {
 	Level     string   `json:"level"`
 }
 
-// DashboardHook is a hook that collects events for dashboard display.
 type DashboardHook struct {
 	mu       sync.RWMutex
 	events   []DashboardEvent
 	maxSize  int
 	minLevel Level
 
-	// Per-category rate limiting
 	rateMu   sync.Mutex
 	rateKeys map[string]time.Time
 	rateMin  time.Duration
 }
 
-// NewDashboardHook creates a new dashboard hook.
 func NewDashboardHook(maxSize int, minLevel Level) *DashboardHook {
 	if maxSize <= 0 {
 		maxSize = 500
@@ -42,11 +38,10 @@ func NewDashboardHook(maxSize int, minLevel Level) *DashboardHook {
 		maxSize:  maxSize,
 		minLevel: minLevel,
 		rateKeys: make(map[string]time.Time),
-		rateMin:  time.Second, // Rate limit dashboard events to 1 per second per key
+		rateMin:  time.Second,
 	}
 }
 
-// Hook returns a Hook function for use with Logger.AddHook.
 func (d *DashboardHook) Hook() Hook {
 	return func(entry Entry) {
 		if entry.Level < d.minLevel {
@@ -62,7 +57,6 @@ func (d *DashboardHook) Hook() Hook {
 			Level:     entry.LevelStr,
 		}
 
-		// Extract common fields
 		if route, ok := entry.Fields["route"].(string); ok {
 			event.Route = route
 		}
@@ -83,7 +77,6 @@ func (d *DashboardHook) Hook() Hook {
 			}
 		}
 
-		// Rate limit by category+kind
 		rateKey := string(event.Category) + "|" + event.Kind
 		if !d.allowRated(rateKey) {
 			return
@@ -94,12 +87,10 @@ func (d *DashboardHook) Hook() Hook {
 }
 
 func (d *DashboardHook) kindFromEntry(entry Entry) string {
-	// Try to extract kind from fields
 	if kind, ok := entry.Fields["kind"].(string); ok {
 		return kind
 	}
 
-	// Generate kind from level and category
 	prefix := ""
 	switch entry.Level {
 	case LevelError, LevelFatal:
@@ -132,18 +123,15 @@ func (d *DashboardHook) addEvent(event DashboardEvent) {
 
 	d.events = append(d.events, event)
 	if len(d.events) > d.maxSize {
-		// Remove oldest events
 		copy(d.events, d.events[len(d.events)-d.maxSize:])
 		d.events = d.events[:d.maxSize]
 	}
 }
 
-// AddEvent manually adds an event (bypasses rate limiting).
 func (d *DashboardHook) AddEvent(event DashboardEvent) {
 	d.addEvent(event)
 }
 
-// Events returns a copy of recent events.
 func (d *DashboardHook) Events() []DashboardEvent {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -153,7 +141,6 @@ func (d *DashboardHook) Events() []DashboardEvent {
 	return result
 }
 
-// EventsSince returns events since the given unix timestamp.
 func (d *DashboardHook) EventsSince(sinceUnix int64) []DashboardEvent {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -167,7 +154,6 @@ func (d *DashboardHook) EventsSince(sinceUnix int64) []DashboardEvent {
 	return result
 }
 
-// EventsByCategory returns events filtered by category.
 func (d *DashboardHook) EventsByCategory(cat Category) []DashboardEvent {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -181,19 +167,17 @@ func (d *DashboardHook) EventsByCategory(cat Category) []DashboardEvent {
 	return result
 }
 
-// Clear removes all events.
 func (d *DashboardHook) Clear() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.events = d.events[:0]
 }
 
-// Stats returns summary statistics for dashboard display.
 type DashboardStats struct {
 	TotalEvents   int            `json:"total_events"`
 	EventsByLevel map[string]int `json:"events_by_level"`
 	EventsByCat   map[string]int `json:"events_by_category"`
-	RecentErrors  int            `json:"recent_errors"` // Errors in last 5 minutes
+	RecentErrors  int            `json:"recent_errors"`
 }
 
 func (d *DashboardHook) Stats() DashboardStats {

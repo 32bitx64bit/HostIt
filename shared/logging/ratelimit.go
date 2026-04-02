@@ -5,7 +5,6 @@ import (
 	"time"
 )
 
-// rateLimiter prevents high-frequency duplicate log messages.
 type rateLimiter struct {
 	mu       sync.Mutex
 	interval time.Duration
@@ -38,7 +37,6 @@ func (r *rateLimiter) allow(key string) bool {
 	}
 	r.last[key] = now
 
-	// Cleanup old entries periodically
 	if len(r.last) > 1000 {
 		cutoff := now.Add(-r.interval * 10)
 		for k, t := range r.last {
@@ -51,22 +49,18 @@ func (r *rateLimiter) allow(key string) bool {
 	return true
 }
 
-// RateLimitedLog logs a message at most once per the configured interval.
-// The key is used to identify unique log sources.
 func (l *Logger) RateLimitedLog(level Level, cat Category, key string, msg string, fields map[string]any) {
 	if l.rateLimiter.allow(key) {
 		l.log(level, cat, msg, fields)
 	}
 }
 
-// RateLimitedWarn logs a warning at most once per the configured interval.
 func (l *Logger) RateLimitedWarn(cat Category, key string, msg string, fields ...map[string]any) {
 	if l.rateLimiter.allow(key) {
 		l.Warn(cat, msg, fields...)
 	}
 }
 
-// RateLimitedError logs an error at most once per the configured interval.
 func (l *Logger) RateLimitedError(cat Category, key string, msg string, fields ...map[string]any) {
 	if l.rateLimiter.allow(key) {
 		l.Error(cat, msg, fields...)

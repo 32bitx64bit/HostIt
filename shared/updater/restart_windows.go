@@ -5,8 +5,6 @@ import (
 	"os/exec"
 )
 
-// ExecReplace replaces the current process with a new instance of the binary.
-// On Windows, we spawn a new process and exit the current one.
 func ExecReplace(bin string, args []string) error {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdin = os.Stdin

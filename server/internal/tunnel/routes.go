@@ -121,6 +121,7 @@ func normalizeRoutes(cfg *ServerConfig) {
 			cfg.Routes[i].Proto = "tcp"
 		}
 		cfg.Routes[i].PublicAddr = strings.TrimSpace(cfg.Routes[i].PublicAddr)
+		cfg.Routes[i].LocalAddr = strings.TrimSpace(cfg.Routes[i].LocalAddr)
 	}
 }
 

@@ -8,49 +8,43 @@ import (
 	"strings"
 )
 
-// RemoteRoute is sent by the server after HELLO.
-// The agent derives local targets from PublicAddr (defaults to 127.0.0.1:<port>).
 type RemoteRoute struct {
 	Name       string
 	Proto      string      // "tcp", "udp", or "both"
 	PublicAddr string      // server listen addr (host:port)
-	Encrypted  bool        // whether this route uses application-layer encryption
-	Algorithm  string      // encryption algorithm to use
-	DerivedKey []byte      `json:"-"` // cached derived key
-	UDPCipher  cipher.AEAD `json:"-"` // cached UDP cipher
+	LocalAddr  string      // agent-side target addr (host:port)
+	Encrypted  bool
+	Algorithm  string
+	DerivedKey []byte      `json:"-"`
+	UDPCipher  cipher.AEAD `json:"-"`
+}
+
+func (r RemoteRoute) EffectiveLocalAddr() string {
+	if s := strings.TrimSpace(r.LocalAddr); s != "" {
+		return s
+	}
+	return localTargetFromPublicAddr(r.PublicAddr)
 }
 
 type Config struct {
-	// Server is the tunnel server host/IP. You can optionally specify a port
-	// (control port), e.g. "vps.example.com:7000".
 	Server string
-	// Token is mandatory and must match the server's token.
 	Token string
-	// DisableTLS disables TLS for agent<->server control/data TCP connections.
-	// By default TLS is enabled.
 	DisableTLS bool
-	// TLSPinSHA256 optionally pins the server certificate by SHA256(der) hex.
-	// This is recommended with self-signed certs to prevent MITM.
 	TLSPinSHA256 string
-	// Routes is populated by the server's HELLO message.
 	Routes map[string]RemoteRoute `json:"-"`
 }
 
-// Validate validates the client configuration.
 func (c Config) Validate() error {
 	var errs []string
 
-	// Server is required
 	if strings.TrimSpace(c.Server) == "" {
 		errs = append(errs, "server address is required")
 	}
 
-	// Token is required
 	if strings.TrimSpace(c.Token) == "" {
 		errs = append(errs, "token is required")
 	}
 
-	// TLSPinSHA256 validation (if provided, must be valid hex and correct length)
 	if pin := strings.TrimSpace(c.TLSPinSHA256); pin != "" {
 		if len(pin) != 64 {
 			errs = append(errs, fmt.Sprintf("tls_pin_sha256 must be 64 characters (got %d)", len(pin)))
@@ -98,6 +92,31 @@ func splitHostPortOrDefault(server string, defaultPort string) (host, port strin
 		}
 		return h, p
 	}
-	// If the user passed only a host/IP (no port).
 	return s, defaultPort
+}
+
+func localTargetFromPublicAddr(publicAddr string) string {
+	if strings.TrimSpace(publicAddr) == "" {
+		return "127.0.0.1"
+	}
+	if strings.HasPrefix(publicAddr, ":") {
+		port := strings.TrimPrefix(publicAddr, ":")
+		if port == "" {
+			return "127.0.0.1"
+		}
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+
+	_, port, err := net.SplitHostPort(publicAddr)
+	if err == nil {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+
+	if idx := strings.LastIndex(publicAddr, ":"); idx != -1 && idx+1 < len(publicAddr) {
+		port = publicAddr[idx+1:]
+		if port != "" {
+			return net.JoinHostPort("127.0.0.1", port)
+		}
+	}
+	return "127.0.0.1"
 }

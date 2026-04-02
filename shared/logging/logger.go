@@ -1,6 +1,3 @@
-// Package logging provides a centralized, structured logging system for HostIt.
-// It supports multiple output destinations including console, dashboard events,
-// and custom hooks for extensibility.
 package logging
 
 import (
@@ -15,7 +12,6 @@ import (
 	"time"
 )
 
-// Level represents the severity of a log message.
 type Level int
 
 const (
@@ -46,7 +42,6 @@ func (l Level) String() string {
 	}
 }
 
-// ParseLevel parses a string into a Level.
 func ParseLevel(s string) Level {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "TRACE":
@@ -66,7 +61,6 @@ func ParseLevel(s string) Level {
 	}
 }
 
-// Category represents a functional area of the system for filtering.
 type Category string
 
 const (
@@ -83,13 +77,12 @@ const (
 	CatEncryption Category = "encryption"
 )
 
-// Entry represents a single log entry.
 type Entry struct {
 	Time      time.Time      `json:"time"`
 	Level     Level          `json:"level"`
 	LevelStr  string         `json:"level_str"`
 	Category  Category       `json:"category"`
-	Component string         `json:"component"` // "server" or "agent"
+	Component string         `json:"component"`
 	Message   string         `json:"message"`
 	Fields    map[string]any `json:"fields,omitempty"`
 	Error     error          `json:"-"`
@@ -97,11 +90,8 @@ type Entry struct {
 	Caller    string         `json:"caller,omitempty"`
 }
 
-// Hook is called for each log entry. Hooks can be used to send logs to dashboards,
-// external services, etc.
 type Hook func(entry Entry)
 
-// Logger is the main logging interface.
 type Logger struct {
 	mu         sync.RWMutex
 	level      atomic.Int32
@@ -112,21 +102,18 @@ type Logger struct {
 	jsonFormat bool
 	showCaller bool
 
-	// Rate limiting for high-volume logs
 	rateLimiter *rateLimiter
 }
 
-// Config holds logger configuration.
 type Config struct {
 	Level      Level
 	Output     io.Writer
-	Component  string // "server" or "agent"
+	Component  string
 	JSONFormat bool
 	ShowCaller bool
-	RateLimit  time.Duration // Minimum interval between same-message logs
+	RateLimit  time.Duration
 }
 
-// DefaultConfig returns a sensible default configuration.
 func DefaultConfig(component string) Config {
 	return Config{
 		Level:      LevelInfo,
@@ -138,7 +125,6 @@ func DefaultConfig(component string) Config {
 	}
 }
 
-// New creates a new Logger with the given configuration.
 func New(cfg Config) *Logger {
 	if cfg.Output == nil {
 		cfg.Output = os.Stderr
@@ -156,13 +142,11 @@ func New(cfg Config) *Logger {
 	return l
 }
 
-// Global logger instance
 var (
 	globalLogger     *Logger
 	globalLoggerOnce sync.Once
 )
 
-// Global returns the global logger instance, initializing it if necessary.
 func Global() *Logger {
 	globalLoggerOnce.Do(func() {
 		globalLogger = New(DefaultConfig("app"))
@@ -170,24 +154,19 @@ func Global() *Logger {
 	return globalLogger
 }
 
-// SetGlobal sets the global logger instance.
 func SetGlobal(l *Logger) {
-	globalLoggerOnce.Do(func() {}) // Ensure once is triggered
+	globalLoggerOnce.Do(func() {})
 	globalLogger = l
 }
 
-// SetLevel sets the minimum log level.
 func (l *Logger) SetLevel(level Level) {
 	l.level.Store(int32(level))
 }
 
-// GetLevel returns the current minimum log level.
 func (l *Logger) GetLevel() Level {
 	return Level(l.level.Load())
 }
 
-// SetLevelFromEnv sets the level from environment variables.
-// Checks HOSTIT_LOG_LEVEL and PLAYIT_LOG_LEVEL.
 func (l *Logger) SetLevelFromEnv() {
 	v := strings.TrimSpace(os.Getenv("HOSTIT_LOG_LEVEL"))
 	if v == "" {
@@ -198,14 +177,12 @@ func (l *Logger) SetLevelFromEnv() {
 	}
 }
 
-// AddHook adds a hook that will be called for each log entry.
 func (l *Logger) AddHook(hook Hook) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.hooks = append(l.hooks, hook)
 }
 
-// WithFields returns a new logger with additional fields.
 func (l *Logger) WithFields(fields map[string]any) *Logger {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -229,17 +206,14 @@ func (l *Logger) WithFields(fields map[string]any) *Logger {
 	}
 }
 
-// WithField returns a new logger with an additional field.
 func (l *Logger) WithField(key string, value any) *Logger {
 	return l.WithFields(map[string]any{key: value})
 }
 
-// WithError returns a new logger with the error field set.
 func (l *Logger) WithError(err error) *Logger {
 	return l.WithField("error", err)
 }
 
-// WithCategory returns a new logger with the category field set.
 func (l *Logger) WithCategory(cat Category) *Logger {
 	return l.WithField("category", string(cat))
 }
@@ -258,13 +232,11 @@ func (l *Logger) log(level Level, cat Category, msg string, fields map[string]an
 		Message:   msg,
 	}
 
-	// Copy logger fields
 	l.mu.RLock()
 	loggerFields := l.fields
 	hooks := l.hooks
 	l.mu.RUnlock()
 
-	// Only allocate Fields map when there are actual fields to merge.
 	if len(loggerFields) > 0 || len(fields) > 0 {
 		entry.Fields = make(map[string]any, len(loggerFields)+len(fields))
 		for k, v := range loggerFields {
@@ -282,10 +254,8 @@ func (l *Logger) log(level Level, cat Category, msg string, fields map[string]an
 		}
 	}
 
-	// Add caller info if enabled
 	if l.showCaller {
 		if _, file, line, ok := runtime.Caller(3); ok {
-			// Shorten the file path
 			if idx := strings.LastIndex(file, "/"); idx >= 0 {
 				file = file[idx+1:]
 			}
@@ -293,10 +263,8 @@ func (l *Logger) log(level Level, cat Category, msg string, fields map[string]an
 		}
 	}
 
-	// Format and write
 	l.write(entry)
 
-	// Call hooks
 	for _, hook := range hooks {
 		hook(entry)
 	}
@@ -319,42 +287,35 @@ func (l *Logger) write(entry Entry) {
 func (l *Logger) formatText(entry Entry) string {
 	var b strings.Builder
 
-	// Timestamp
 	b.WriteString(entry.Time.Format("2006/01/02 15:04:05"))
 	b.WriteString(" ")
 
-	// Level with padding
 	b.WriteString(fmt.Sprintf("%-5s", entry.LevelStr))
 	b.WriteString(" ")
 
-	// Category
 	if entry.Category != "" {
 		b.WriteString("[")
 		b.WriteString(string(entry.Category))
 		b.WriteString("] ")
 	}
 
-	// Message
 	b.WriteString(entry.Message)
 
-	// Fields
 	if len(entry.Fields) > 0 {
 		for k, v := range entry.Fields {
 			if k == "category" {
-				continue // Already shown
+				continue
 			}
 			b.WriteString(fmt.Sprintf(" %s=%v", k, v))
 		}
 	}
 
-	// Error
 	if entry.ErrorStr != "" {
 		b.WriteString(" error=\"")
 		b.WriteString(entry.ErrorStr)
 		b.WriteString("\"")
 	}
 
-	// Caller
 	if entry.Caller != "" {
 		b.WriteString(" caller=")
 		b.WriteString(entry.Caller)

@@ -25,8 +25,6 @@ import (
 	"hostit/shared/version"
 )
 
-// ShutdownTimeout is the maximum time to wait for graceful shutdown.
-// Can be overridden via the HOSTIT_SHUTDOWN_TIMEOUT environment variable.
 var shutdownTimeout = 5 * time.Second
 
 func init() {
@@ -53,7 +51,6 @@ func main() {
 	flag.DurationVar(&shutdownTimeoutFlag, "shutdown-timeout", 0, "graceful shutdown timeout (e.g. 10s, 1m)")
 	flag.Parse()
 
-	// Apply command-line shutdown timeout override
 	if shutdownTimeoutFlag > 0 {
 		shutdownTimeout = shutdownTimeoutFlag
 	}
@@ -64,20 +61,17 @@ func main() {
 	cfg := agent.Config{}
 	loaded, _ := configio.Load(configPath, &cfg)
 
-	// Log configuration status
 	if loaded {
 		log.Printf("Loaded configuration from: %s", configPath)
 	} else {
 		log.Printf("No configuration file found at: %s (will create on save)", configPath)
 	}
 
-	// First-run convenience: if no config file exists, default to localhost.
 	if !loaded && strings.TrimSpace(cfg.Server) == "" {
 		cfg.Server = "127.0.0.1"
 		log.Printf("First run: using default server: %s", cfg.Server)
 	}
 
-	// Override with command-line arguments
 	if strings.TrimSpace(token) != "" {
 		cfg.Token = token
 		log.Printf("Using token from command-line argument")
@@ -87,7 +81,6 @@ func main() {
 		log.Printf("Using server from command-line argument: %s", serverHost)
 	}
 
-	// Validate configuration
 	if strings.TrimSpace(cfg.Server) == "" {
 		if webAddr == "" {
 			log.Fatalf("ERROR: agent server is required (set -server or agent.json Server)")
@@ -341,7 +334,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 				Name:        rt.Name,
 				Proto:       rt.Proto,
 				PublicAddr:  rt.PublicAddr,
-				LocalTarget: localTargetFromPublicAddr(rt.PublicAddr),
+				LocalTarget: rt.EffectiveLocalAddr(),
 			})
 		}
 		return out
@@ -377,7 +370,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		outRoutes := make([]routeView, 0, len(routes))
 		for _, rt := range routes {
-			outRoutes = append(outRoutes, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, LocalTarget: localTargetFromPublicAddr(rt.PublicAddr)})
+			outRoutes = append(outRoutes, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, LocalTarget: rt.EffectiveLocalAddr()})
 		}
 		resp := map[string]any{
 			"running":    running,
@@ -681,32 +674,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	return err
 }
 
-func localTargetFromPublicAddr(publicAddr string) string {
-	if strings.TrimSpace(publicAddr) == "" {
-		return "127.0.0.1"
-	}
-	if strings.HasPrefix(publicAddr, ":") {
-		port := strings.TrimPrefix(publicAddr, ":")
-		if port == "" {
-			return "127.0.0.1"
-		}
-		return net.JoinHostPort("127.0.0.1", port)
-	}
-
-	_, port, err := net.SplitHostPort(publicAddr)
-	if err == nil {
-		return net.JoinHostPort("127.0.0.1", port)
-	}
-
-	if idx := strings.LastIndex(publicAddr, ":"); idx != -1 && idx+1 < len(publicAddr) {
-		port = publicAddr[idx+1:]
-		if port != "" {
-			return net.JoinHostPort("127.0.0.1", port)
-		}
-	}
-	return "127.0.0.1"
-}
-
 func writeUploadedZipTemp(r *http.Request, fieldName string, pattern string) (string, bool, error) {
 	f, _, err := r.FormFile(fieldName)
 	if err != nil {
@@ -854,7 +821,7 @@ const agentHomeHTML = `<!doctype html>
 					<input name="tls_pin_sha256" value="{{.Cfg.TLSPinSHA256}}" placeholder="e.g. a1b2c3d4..." />
 				</div>
 			</div>
-			<div style="margin-top:10px" class="muted" style="font-size:12px">Routes come from the server. The agent forwards to <code>127.0.0.1:&lt;publicPort&gt;</code>.</div>
+			<div style="margin-top:10px" class="muted" style="font-size:12px">Routes come from the server. Each route forwards to its configured local target, or defaults to <code>127.0.0.1:&lt;publicPort&gt;</code>.</div>
 			<div class="flex" style="margin-top:12px">
 				<button type="submit" class="btn primary">Save &amp; restart</button>
 			</div>
