@@ -10,9 +10,9 @@ import (
 
 type RemoteRoute struct {
 	Name       string
-	Proto      string      // "tcp", "udp", or "both"
-	PublicAddr string      // server listen addr (host:port)
-	LocalAddr  string      // agent-side target addr (host:port)
+	Proto      string // "tcp", "udp", or "both"
+	PublicAddr string // server listen addr (host:port)
+	LocalAddr  string // agent-side target addr (host:port)
 	Encrypted  bool
 	Algorithm  string
 	DerivedKey []byte      `json:"-"`
@@ -27,11 +27,11 @@ func (r RemoteRoute) EffectiveLocalAddr() string {
 }
 
 type Config struct {
-	Server string
-	Token string
-	DisableTLS bool
+	Server       string
+	Token        string
+	DisableTLS   bool
 	TLSPinSHA256 string
-	Routes map[string]RemoteRoute `json:"-"`
+	Routes       map[string]RemoteRoute `json:"-"`
 }
 
 func (c Config) Validate() error {

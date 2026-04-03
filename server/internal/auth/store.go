@@ -27,10 +27,6 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Increased from 1 to allow better concurrency under load.
-	// SQLite handles locking internally, and modernc.org/sqlite is pure Go
-	// so connection overhead is lower. 5 connections allows parallel reads
-	// while still being conservative for a small auth database.
 	db.SetMaxOpenConns(5)
 	db.SetMaxIdleConns(2)
 
@@ -41,7 +37,6 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	// Start background cleanup goroutine
 	go s.cleanupLoop()
 	return s, nil
 }
@@ -52,7 +47,6 @@ func (s *Store) cleanupLoop() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			// Final cleanup on shutdown
 			_ = s.deleteExpired(context.Background())
 			close(s.done)
 			return
@@ -142,8 +136,6 @@ func (s *Store) Authenticate(ctx context.Context, username string, password stri
 }
 
 func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Duration) (string, error) {
-	// Expired sessions are cleaned up by background goroutine
-
 	sid, err := randHex(32)
 	if err != nil {
 		return "", err
@@ -157,8 +149,6 @@ func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Durati
 }
 
 func (s *Store) GetSession(ctx context.Context, sid string) (int64, bool, error) {
-	// Expired sessions are cleaned up by background goroutine
-
 	var userID int64
 	var expiresAt int64
 	err := s.db.QueryRowContext(ctx, `SELECT user_id, expires_at FROM sessions WHERE id = ?`, sid).Scan(&userID, &expiresAt)
@@ -197,7 +187,6 @@ func IsUniqueConstraint(err error) bool {
 	if err == nil {
 		return false
 	}
-	// modernc sqlite returns errors with text including "UNIQUE constraint failed"
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 

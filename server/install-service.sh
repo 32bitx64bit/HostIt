@@ -24,7 +24,6 @@ if [ ! -f /etc/hostit/server.env ]; then
   chmod 0644 /etc/hostit/server.env
 fi
 
-UNIT_SRC="$SCRIPT_DIR/hostit-server.service"
 UNIT_DST="/etc/systemd/system/hostit-server.service"
 
 # Generate a concrete unit with the correct absolute WorkingDirectory.

@@ -17,6 +17,7 @@ import (
 	"hostit/shared/crypto"
 	"hostit/shared/logging"
 	"hostit/shared/protocol"
+	"hostit/shared/relay"
 )
 
 type Hooks struct {
@@ -31,7 +32,6 @@ func RunWithHooks(ctx context.Context, cfg Config, hooks *Hooks) error {
 	return a.Run(ctx)
 }
 
-// Agent represents the tunnel agent.
 type Agent struct {
 	cfg   Config
 	hooks *Hooks
@@ -41,10 +41,6 @@ type Agent struct {
 	udpDataConn *net.UDPConn
 	serverUDP   *net.UDPAddr
 
-	// controlWriteMu serializes all writes to the controlConn.
-	// Multiple goroutines (keepalive ticker, ping/pong handler in handleControl)
-	// all write to the same control connection. Without a mutex, concurrent
-	// SetWriteDeadline + WritePacket calls corrupt the protocol framing.
 	controlWriteMu sync.Mutex
 
 	ctx    context.Context
@@ -100,7 +96,6 @@ func (a *Agent) connectAndRun() error {
 					return fmt.Errorf("no certificates provided by server")
 				}
 
-				// Hash the first certificate (the server's leaf cert)
 				hash := sha256.Sum256(rawCerts[0])
 				hashHex := hex.EncodeToString(hash[:])
 
@@ -159,7 +154,6 @@ func (a *Agent) connectAndRun() error {
 	connCtx, connCancel := context.WithCancel(a.ctx)
 	defer connCancel()
 
-	// UDP keep-alive (NAT punch)
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
@@ -363,8 +357,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 				}
 				dataConn.SetDeadline(time.Time{})
 
-				_, port, _ := net.SplitHostPort(rt.PublicAddr)
-				localAddr := "127.0.0.1:" + port
+				localAddr := rt.EffectiveLocalAddr()
 				localConn, err := net.DialTimeout("tcp", localAddr, 10*time.Second)
 				if err != nil {
 					logging.Global().Errorf(logging.CatTCP, "failed to dial local tcp %s: %v", localAddr, err)
@@ -393,59 +386,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					}
 				}
 
-				// Proxy data with idle timeout to prevent connection leaks.
-				// When one direction finishes (EOF, error, or idle timeout),
-				// closeOnce closes both connections so the other direction
-				// stops immediately instead of waiting for its own timeout.
-				const idleTimeout = 30 * time.Second
-
-				closeOnce := sync.Once{}
-				cleanup := func() {
-					localConn.Close()
-					dataConn.Close()
-				}
-
-				var copyWg sync.WaitGroup
-				copyWg.Add(2)
-
-				go func() {
-					defer copyWg.Done()
-					buf := make([]byte, 32*1024)
-					for {
-						dataConn.SetReadDeadline(time.Now().Add(idleTimeout))
-						n, err := dataConn.Read(buf)
-						if n > 0 {
-							localConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-							if _, werr := localConn.Write(buf[:n]); werr != nil {
-								closeOnce.Do(cleanup)
-								return
-							}
-						}
-						if err != nil {
-							return
-						}
-					}
-				}()
-				go func() {
-					defer copyWg.Done()
-					buf := make([]byte, 32*1024)
-					for {
-						localConn.SetReadDeadline(time.Now().Add(idleTimeout))
-						n, err := localConn.Read(buf)
-						if n > 0 {
-							dataConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-							if _, werr := dataConn.Write(buf[:n]); werr != nil {
-								closeOnce.Do(cleanup)
-								return
-							}
-						}
-						if err != nil {
-							return
-						}
-					}
-				}()
-				copyWg.Wait()
-				closeOnce.Do(cleanup)
+				relay.Proxy(localConn, dataConn)
 			}(routeName, clientID, rt)
 		}
 	}
@@ -496,21 +437,19 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 		}
 	}()
 
-	// Cache route configurations to avoid iterating over a.cfg.Routes on every packet
 	type routeConfig struct {
 		isEncrypted bool
 		udpCipher   cipher.AEAD
-		publicAddr  string
+		localAddr   string
 	}
 	var routeCache sync.Map
 
-	// Initialize cache
 	a.mu.RLock()
 	for _, rt := range a.cfg.Routes {
 		routeCache.Store(rt.Name, routeConfig{
 			isEncrypted: rt.Encrypted,
 			udpCipher:   rt.UDPCipher,
-			publicAddr:  rt.PublicAddr,
+			localAddr:   rt.EffectiveLocalAddr(),
 		})
 	}
 	a.mu.RUnlock()
@@ -549,7 +488,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 				rc = routeConfig{
 					isEncrypted: rt.Encrypted,
 					udpCipher:   rt.UDPCipher,
-					publicAddr:  rt.PublicAddr,
+					localAddr:   rt.EffectiveLocalAddr(),
 				}
 				routeCache.Store(pkt.Route, rc)
 			} else {
@@ -582,17 +521,15 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 				key.route = string([]byte(pkt.Route))
 				key.client = string([]byte(pkt.Client))
 
-				_, port, _ := net.SplitHostPort(rc.publicAddr)
-				localAddrStr := "127.0.0.1:" + port
-				localAddr, err := net.ResolveUDPAddr("udp", localAddrStr)
+				localAddr, err := net.ResolveUDPAddr("udp", rc.localAddr)
 				if err != nil {
-					logging.Global().Errorf(logging.CatUDP, "failed to resolve local udp addr %s: %v", localAddrStr, err)
+					logging.Global().Errorf(logging.CatUDP, "failed to resolve local udp addr %s: %v", rc.localAddr, err)
 					continue
 				}
 
 				localConn, err := net.DialUDP("udp", nil, localAddr)
 				if err != nil {
-					logging.Global().Errorf(logging.CatUDP, "failed to dial local udp %s: %v", localAddrStr, err)
+					logging.Global().Errorf(logging.CatUDP, "failed to dial local udp %s: %v", rc.localAddr, err)
 					continue
 				}
 				localConn.SetReadBuffer(8 * 1024 * 1024)

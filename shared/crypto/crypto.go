@@ -53,7 +53,6 @@ func DeriveKey(token string, alg string) ([]byte, error) {
 	}
 }
 
-// NewUDPCipher creates a new cipher.AEAD for UDP encryption.
 func NewUDPCipher(key []byte) (cipher.AEAD, error) {
 	if len(key) == 0 {
 		return nil, nil

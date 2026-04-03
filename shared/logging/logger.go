@@ -325,8 +325,6 @@ func (l *Logger) formatText(entry Entry) string {
 	return b.String()
 }
 
-// Category-specific logging methods
-
 func (l *Logger) Trace(cat Category, msg string, fields ...map[string]any) {
 	f := mergeFields(fields)
 	l.log(LevelTrace, cat, msg, f)
@@ -357,8 +355,6 @@ func (l *Logger) Fatal(cat Category, msg string, fields ...map[string]any) {
 	l.log(LevelFatal, cat, msg, f)
 	os.Exit(1)
 }
-
-// Convenience methods with formatted messages
 
 func (l *Logger) Tracef(cat Category, format string, args ...any) {
 	if LevelTrace < Level(l.level.Load()) {
@@ -408,7 +404,6 @@ func mergeFields(fields []map[string]any) map[string]any {
 	return result
 }
 
-// F is a shortcut for creating field maps.
 func F(keyvals ...any) map[string]any {
 	if len(keyvals) == 0 {
 		return nil

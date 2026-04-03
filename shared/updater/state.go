@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 )
 
 type persistedState struct {
@@ -61,11 +60,4 @@ func (s *Store) Save(st persistedState) error {
 		return err
 	}
 	return os.Rename(tmp, s.Path)
-}
-
-func unixOrZero(t time.Time) int64 {
-	if t.IsZero() {
-		return 0
-	}
-	return t.Unix()
 }

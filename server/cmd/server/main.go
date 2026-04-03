@@ -23,19 +23,17 @@ import (
 	"time"
 
 	"hostit/server/internal/auth"
-	"hostit/server/internal/configio"
 	"hostit/server/internal/serverlog"
 	"hostit/server/internal/tlsutil"
 	"hostit/server/internal/tunnel"
+	"hostit/shared/configio"
 	"hostit/shared/logging"
 	"hostit/shared/module"
+	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
 	"hostit/shared/version"
 )
 
-	if pt < 1*time.Second {
-		http.Error(w, "pair timeout must be at least 1 second", http.StatusBadRequest)
-		return
 func main() {
 	var controlAddr string
 	var dataAddr string
@@ -83,28 +81,15 @@ func main() {
 		PairTimeout: pairTimeout,
 	}
 	loaded, _ := configio.Load(configPath, &cfg)
-		cfgDir := filepath.Dir(configPath)
-		if strings.TrimSpace(cfg.WebTLSCertFile) == "" {
-			cfg.WebTLSCertFile = filepath.Join(cfgDir, "web.crt")
-
-	// Apply flag overrides after loading.
 	if disableTLS {
 		cfg.DisableTLS = true
 	}
 	if strings.TrimSpace(tlsCert) != "" {
-		mux.HandleFunc("/api/routes/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
 		cfg.TLSCertFile = tlsCert
 	}
 	if strings.TrimSpace(tlsKey) != "" {
 		cfg.TLSKeyFile = tlsKey
 	}
-
-		cfg, _, _ := runner.Get()
-		if err := configio.Save(configPath, cfg); err != nil {
-			serverlog.Log.Error(logging.CatSystem, "failed to save config after route toggle", serverlog.F("error", err))
 	if cfg.EncryptionAlgorithm == "" {
 		if !loaded {
 			cfg.EncryptionAlgorithm = "aes-128"
@@ -356,8 +341,8 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			return err
 		}
 		// If we're running under systemd, restart the service (or exit and let systemd restart).
-		if runningUnderSystemd() {
-			if systemctlAvailable() {
+		if systemdutil.RunningUnderSystemd() {
+			if systemdutil.SystemctlAvailable() {
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
 				cmd := exec.CommandContext(ctx2, "systemctl", "restart", "--no-block", "hostit-server.service")
@@ -797,7 +782,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			st := systemdStatus(r.Context(), "hostit-server.service")
+			st := systemdutil.Status(r.Context(), "hostit-server.service")
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(st)
 		})))
@@ -815,7 +800,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "csrf", http.StatusBadRequest)
 				return
 			}
-			if err := systemdAction(r.Context(), "restart", "hostit-server.service"); err != nil {
+			if err := systemdutil.Action(r.Context(), "restart", "hostit-server.service"); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -835,7 +820,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "csrf", http.StatusBadRequest)
 				return
 			}
-			if err := systemdAction(r.Context(), "stop", "hostit-server.service"); err != nil {
+			if err := systemdutil.Action(r.Context(), "stop", "hostit-server.service"); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -1039,7 +1024,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplConfig.Execute(w, data)
 		})))
 
-		// Controls (protected)
 		mux.HandleFunc("/controls", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1064,12 +1048,10 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplControls.Execute(w, data)
 		})))
 
-		// UDP max payload cap update (protected)
 		mux.HandleFunc("/api/udp/payload", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		})))
 
-		// UDP performance settings update (protected)
 		mux.HandleFunc("/api/udp/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		})))
@@ -1093,7 +1075,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "invalid pair timeout", http.StatusBadRequest)
 				return
 			}
-			// Validate pair_timeout bounds: minimum 1 second, maximum 5 minutes
 			if pt < 1*time.Second {
 				http.Error(w, "pair timeout must be at least 1 second", http.StatusBadRequest)
 				return
@@ -1160,7 +1141,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				log.Printf("tunnel tls enabled; cert sha256=%s", fp)
 			}
 
-			// Dashboard HTTPS (self-signed)
 			cfgDir := filepath.Dir(configPath)
 			if strings.TrimSpace(cfg.WebTLSCertFile) == "" {
 				cfg.WebTLSCertFile = filepath.Join(cfgDir, "web.crt")
@@ -1210,7 +1190,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/config", http.StatusSeeOther)
 		})))
 
-		// Route enable/disable toggle (protected) - runtime, no restart required
 		mux.HandleFunc("/api/routes/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1236,7 +1215,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 
-			// Save the updated config to disk
 			cfg, _, _ := runner.Get()
 			if err := configio.Save(configPath, cfg); err != nil {
 				serverlog.Log.Error(logging.CatSystem, "failed to save config after route toggle", serverlog.F("error", err))
@@ -1249,7 +1227,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			})
 		})))
 
-		// Dashboard interval update (protected)
 		mux.HandleFunc("/api/dashboard/interval", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1286,7 +1263,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/controls", http.StatusSeeOther)
 		})))
 
-		// Back-compat: old save endpoint
 		mux.HandleFunc("/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/config", http.StatusSeeOther)
 		})))
@@ -1378,7 +1354,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			if err != nil && err != http.ErrServerClosed {
 				return err
 			}
-			// Drain any queued restarts.
 			for {
 				select {
 				case <-restartCh:
@@ -2955,29 +2930,26 @@ func newIPRateLimiter(limit int, window time.Duration) *ipRateLimiter {
 func (l *ipRateLimiter) cleanupLoop() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			l.mu.Lock()
-			now := time.Now()
-			cut := now.Add(-l.window)
-			for ip, arr := range l.byIP {
-				j := 0
-				for ; j < len(arr); j++ {
-					if arr[j].After(cut) {
-						break
-					}
-				}
-				if j > 0 {
-					if j >= len(arr) {
-						delete(l.byIP, ip)
-					} else {
-						l.byIP[ip] = append([]time.Time(nil), arr[j:]...)
-					}
+	for range ticker.C {
+		l.mu.Lock()
+		now := time.Now()
+		cut := now.Add(-l.window)
+		for ip, arr := range l.byIP {
+			j := 0
+			for ; j < len(arr); j++ {
+				if arr[j].After(cut) {
+					break
 				}
 			}
-			l.mu.Unlock()
+			if j > 0 {
+				if j >= len(arr) {
+					delete(l.byIP, ip)
+				} else {
+					l.byIP[ip] = append([]time.Time(nil), arr[j:]...)
+				}
+			}
 		}
+		l.mu.Unlock()
 	}
 }
 
@@ -3111,58 +3083,6 @@ func subtleEq(a, b string) bool {
 	return v == 0
 }
 
-type systemdStatusResponse struct {
-	Available bool   `json:"available"`
-	Service   string `json:"service"`
-	Active    string `json:"active"`
-	Error     string `json:"error,omitempty"`
-}
-
-func systemctlAvailable() bool {
-	_, err := exec.LookPath("systemctl")
-	return err == nil
-}
-
-func systemdAction(ctx context.Context, action string, service string) error {
-	if !systemctlAvailable() {
-		return fmt.Errorf("systemctl not found")
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "systemctl", action, service)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("systemctl %s %s: %s", action, service, msg)
-	}
-	return nil
-}
-
-func systemdStatus(ctx context.Context, service string) systemdStatusResponse {
-	resp := systemdStatusResponse{Available: systemctlAvailable(), Service: service}
-	if !resp.Available {
-		resp.Active = "unknown"
-		return resp
-	}
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "systemctl", "is-active", service)
-	out, err := cmd.CombinedOutput()
-	resp.Active = strings.TrimSpace(string(out))
-	if resp.Active == "" {
-		resp.Active = "unknown"
-	}
-	if err != nil {
-		resp.Error = strings.TrimSpace(string(out))
-		if resp.Error == "" {
-			resp.Error = err.Error()
-		}
-	}
-	return resp
-}
 
 func setSessionCookie(w http.ResponseWriter, sid string, secure bool) {
 	http.SetCookie(w, &http.Cookie{

@@ -1,22 +1,41 @@
-package main
+package systemdutil
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 )
 
-type systemdStatusResponse struct {
+type StatusResponse struct {
 	Available bool   `json:"available"`
 	Service   string `json:"service"`
 	Active    string `json:"active"`
 	Error     string `json:"error,omitempty"`
 }
 
-func systemdAction(ctx context.Context, action string, service string) error {
-	if !systemctlAvailable() {
+func RunningUnderSystemd() bool {
+	if v := os.Getenv("INVOCATION_ID"); v != "" {
+		return true
+	}
+	if v := os.Getenv("JOURNAL_STREAM"); v != "" {
+		return true
+	}
+	if v := os.Getenv("SYSTEMD_EXEC_PID"); v != "" {
+		return true
+	}
+	return false
+}
+
+func SystemctlAvailable() bool {
+	_, err := exec.LookPath("systemctl")
+	return err == nil
+}
+
+func Action(ctx context.Context, action string, service string) error {
+	if !SystemctlAvailable() {
 		return fmt.Errorf("systemctl not found")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -33,8 +52,8 @@ func systemdAction(ctx context.Context, action string, service string) error {
 	return nil
 }
 
-func systemdStatus(ctx context.Context, service string) systemdStatusResponse {
-	resp := systemdStatusResponse{Available: systemctlAvailable(), Service: service}
+func Status(ctx context.Context, service string) StatusResponse {
+	resp := StatusResponse{Available: SystemctlAvailable(), Service: service}
 	if !resp.Available {
 		resp.Active = "unknown"
 		return resp

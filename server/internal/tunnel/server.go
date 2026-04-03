@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"hostit/shared/crypto"
 	"hostit/shared/logging"
 	"hostit/shared/protocol"
+	"hostit/shared/relay"
 )
 
 type agentSession struct {
@@ -30,11 +32,12 @@ type agentSession struct {
 type Server struct {
 	cfg ServerConfig
 
-	derivedKey []byte
-	udpCipher  cipher.AEAD
+	derivedKeys map[string][]byte
+	udpCiphers  map[string]cipher.AEAD
 
 	mu          sync.RWMutex
 	agentTCP    net.Conn
+	agentEpoch  uint64
 	agentUDP    netip.AddrPort
 	agentUDPAt  time.Time
 	udpDataConn *net.UDPConn
@@ -45,6 +48,8 @@ type Server struct {
 	publicUDP map[string]*net.UDPConn
 
 	pendingTCP map[string]chan net.Conn
+
+	clientIDCounter uint64
 
 	pongCh chan []byte
 
@@ -58,6 +63,15 @@ type Server struct {
 
 	sessionsMu sync.Mutex
 	sessions   map[string]*agentSession
+}
+
+func makePendingTCPKey(routeName, clientID string) string {
+	return routeName + ":" + clientID
+}
+
+func (s *Server) nextClientID() string {
+	id := atomic.AddUint64(&s.clientIDCounter, 1)
+	return strconv.FormatUint(id, 36)
 }
 
 type helloRoute struct {
@@ -289,9 +303,8 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		}
 	}
 
-	// Phase 2: Bandwidth test
 	bwCount := 100
-	bwPayloadBytes := 64000 // 64KB
+	bwPayloadBytes := 64000
 	var bwSent int32
 	var bwRecv int
 	var bytesSent int64
@@ -383,17 +396,27 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func NewServer(cfg ServerConfig) *Server {
-	key, _ := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
-	udpCipher, _ := crypto.NewUDPCipher(key)
 	s := &Server{
-		cfg:        cfg,
-		derivedKey: key,
-		udpCipher:  udpCipher,
-		publicTCP:  make(map[string]net.Listener),
-		publicUDP:  make(map[string]*net.UDPConn),
-		pendingTCP: make(map[string]chan net.Conn),
-		dash:       newDashState(),
-		sessions:   make(map[string]*agentSession),
+		cfg:         cfg,
+		derivedKeys: make(map[string][]byte),
+		udpCiphers:  make(map[string]cipher.AEAD),
+		publicTCP:   make(map[string]net.Listener),
+		publicUDP:   make(map[string]*net.UDPConn),
+		pendingTCP:  make(map[string]chan net.Conn),
+		dash:        newDashState(),
+		sessions:    make(map[string]*agentSession),
+	}
+	for _, rt := range cfg.Routes {
+		if rt.IsEncrypted() {
+			key, err := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
+			if err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", rt.Name, err)
+			} else {
+				s.derivedKeys[rt.Name] = key
+				cipher, _ := crypto.NewUDPCipher(key)
+				s.udpCiphers[rt.Name] = cipher
+			}
+		}
 	}
 	s.updateRouteCache()
 	return s
@@ -553,6 +576,8 @@ func (s *Server) acceptControl(ln net.Listener) {
 		s.sessionsMu.Unlock()
 
 		s.mu.Lock()
+		currentEpoch := s.agentEpoch + 1
+		s.agentEpoch = currentEpoch
 		s.agentTCP = conn
 		s.agentUDP = netip.AddrPort{}
 		s.agentUDPAt = time.Time{}
@@ -586,7 +611,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			conn.Close()
 			session.writeMu.Unlock()
 			s.mu.Lock()
-			if s.agentTCP == conn {
+			if s.agentTCP == conn && s.agentEpoch == currentEpoch {
 				s.agentTCP = nil
 			}
 			s.mu.Unlock()
@@ -598,7 +623,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 		session.writeMu.Unlock()
 
 		s.wg.Add(1)
-		go func(c net.Conn, session *agentSession, remoteAddr string) {
+		go func(c net.Conn, session *agentSession, remoteAddr string, epoch uint64) {
 			defer s.wg.Done()
 			defer func() {
 				c.Close()
@@ -624,7 +649,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 						return
 					case <-ticker.C:
 						s.mu.RLock()
-						isAgent := s.agentTCP == c
+						isAgent := s.agentTCP == c && s.agentEpoch == epoch
 						s.mu.RUnlock()
 						if isAgent {
 							session.writeMu.Lock()
@@ -645,7 +670,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 						return
 					case <-ticker.C:
 						s.mu.RLock()
-						isAgent := s.agentTCP == c
+						isAgent := s.agentTCP == c && s.agentEpoch == epoch
 						s.mu.RUnlock()
 						if isAgent {
 							lastPongTime := time.Unix(0, lastPong.Load().(int64))
@@ -696,7 +721,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			}
 
 			s.mu.Lock()
-			if s.agentTCP == c {
+			if s.agentTCP == c && s.agentEpoch == epoch {
 				s.agentTCP = nil
 				for clientID, ch := range s.pendingTCP {
 					close(ch)
@@ -705,7 +730,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 				logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
 			}
 			s.mu.Unlock()
-		}(conn, session, remoteAddr)
+		}(conn, session, remoteAddr, currentEpoch)
 	}
 }
 
@@ -741,7 +766,6 @@ func (s *Server) acceptData(ln net.Listener) {
 			conn.Close()
 			continue
 		}
-		_ = string(routeBytes) // routeName not needed here
 
 		var clientLen byte
 		if err := binary.Read(conn, binary.BigEndian, &clientLen); err != nil {
@@ -754,7 +778,7 @@ func (s *Server) acceptData(ln net.Listener) {
 			continue
 		}
 		clientID := string(clientBytes)
-		conn.SetReadDeadline(time.Time{})
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 		routeName := string(routeBytes)
 
@@ -769,12 +793,13 @@ func (s *Server) acceptData(ln net.Listener) {
 		s.mu.RUnlock()
 
 		if isEncrypted {
-			if s.derivedKey == nil {
+			key := s.derivedKeys[routeName]
+			if key == nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: key is nil", routeName)
 				conn.Close()
 				continue
 			}
-			conn, err = crypto.WrapTCP(conn, s.derivedKey)
+			conn, err = crypto.WrapTCP(conn, key)
 			if err != nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
 				conn.Close()
@@ -783,9 +808,10 @@ func (s *Server) acceptData(ln net.Listener) {
 		}
 
 		s.mu.Lock()
-		ch, ok := s.pendingTCP[clientID]
+		ch, ok := s.pendingTCP[makePendingTCPKey(routeName, clientID)]
 		if ok {
-			delete(s.pendingTCP, clientID)
+			delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
+			conn.SetReadDeadline(time.Time{})
 		}
 		s.mu.Unlock()
 
@@ -815,7 +841,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(5 * time.Second)
 		}
-		clientID := fmt.Sprintf("%s-%d", conn.RemoteAddr().String(), time.Now().UnixNano())
+		clientID := s.nextClientID()
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
 
 		s.mu.RLock()
@@ -838,7 +864,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 
 		ch := make(chan net.Conn, 1)
 		s.mu.Lock()
-		s.pendingTCP[clientID] = ch
+		s.pendingTCP[makePendingTCPKey(routeName, clientID)] = ch
 		s.mu.Unlock()
 
 		reqPkt := &protocol.Packet{
@@ -855,7 +881,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				s.sessionsMu.Unlock()
 				conn.Close()
 				s.mu.Lock()
-				delete(s.pendingTCP, clientID)
+				delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
 				s.mu.Unlock()
 				continue
 			}
@@ -864,7 +890,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			s.sessionsMu.Unlock()
 			conn.Close()
 			s.mu.Lock()
-			delete(s.pendingTCP, clientID)
+			delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
 			s.mu.Unlock()
 			continue
 		}
@@ -881,46 +907,14 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				s.dash.incActive(routeName)
 				defer s.dash.decActive(routeName)
 
-				closeOnce := sync.Once{}
-				cleanup := func() {
-					c.Close()
-					agentConn.Close()
+				countBytes := func(n int) {
+					s.dash.addBytes(time.Now(), int64(n))
 				}
-
-				const idleTimeout = 30 * time.Second
-
-				var copyWg sync.WaitGroup
-				copyWg.Add(2)
-
-				copyWithIdleTimeout := func(dst, src net.Conn) {
-					defer copyWg.Done()
-
-					buf := make([]byte, 32*1024)
-					for {
-						src.SetReadDeadline(time.Now().Add(idleTimeout))
-						n, err := src.Read(buf)
-						if n > 0 {
-							dst.SetWriteDeadline(time.Now().Add(30 * time.Second))
-							if _, werr := dst.Write(buf[:n]); werr != nil {
-								closeOnce.Do(cleanup)
-								return
-							}
-							s.dash.addBytes(time.Now(), int64(n))
-						}
-						if err != nil {
-							return
-						}
-					}
-				}
-
-				go copyWithIdleTimeout(c, agentConn)
-				go copyWithIdleTimeout(agentConn, c)
-				copyWg.Wait()
-				closeOnce.Do(cleanup)
+				relay.Proxy(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes})
 
 			case <-time.After(s.cfg.PairTimeout):
 				s.mu.Lock()
-				delete(s.pendingTCP, clientID)
+				delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
 				s.mu.Unlock()
 				select {
 				case lateConn := <-ch:
@@ -932,6 +926,33 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			}
 		}(conn, clientID)
 	}
+}
+
+type countingConn struct {
+	net.Conn
+	onRead func(int)
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 && c.onRead != nil {
+		c.onRead(n)
+	}
+	return n, err
+}
+
+func (c *countingConn) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return c.Conn.Close()
+}
+
+func (c *countingConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
 }
 
 func (s *Server) acceptAgentUDP() {
@@ -984,7 +1005,7 @@ func (s *Server) acceptAgentUDP() {
 		if pkt.Type == protocol.TypeData {
 			s.mu.RLock()
 			pubConn, ok := s.publicUDP[pkt.Route]
-			udpCipher := s.udpCipher
+			udpCipher := s.udpCiphers[pkt.Route]
 			s.mu.RUnlock()
 
 			if !ok {
@@ -1067,7 +1088,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		s.mu.RLock()
 		agentAddr := s.agentUDP
 		agentUDPAt := s.agentUDPAt
-		udpCipher := s.udpCipher
+		udpCipher := s.udpCiphers[routeName]
 		s.mu.RUnlock()
 
 		if !agentAddr.IsValid() {

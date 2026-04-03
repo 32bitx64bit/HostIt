@@ -25,7 +25,6 @@ type githubAsset struct {
 }
 
 func fetchLatestStableRelease(ctx context.Context, repo string) (githubRelease, error) {
-	// Use /releases to skip prereleases.
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases", repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

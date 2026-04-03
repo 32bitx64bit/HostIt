@@ -47,7 +47,6 @@ type DashboardSnapshot struct {
 	UDP            *UDPStats                 `json:"udp,omitempty"`
 }
 
-// UDPStats contains UDP statistics for the dashboard
 type UDPStats struct {
 	PacketsIn            int64   `json:"packetsIn"`
 	PacketsOut           int64   `json:"packetsOut"`
@@ -167,7 +166,6 @@ func (b *dashEventBatcher) flush() {
 	b.events = make(map[string][]DashboardEvent)
 	b.mu.Unlock()
 
-	// Process batches in parallel per route
 	var wg sync.WaitGroup
 	for route, events := range snapshot {
 		wg.Add(1)
@@ -245,7 +243,6 @@ func (d *dashState) addEvent(routeName string, ev DashboardEvent) {
 	if d.eventBatcher != nil {
 		d.eventBatcher.add(routeName, ev)
 	} else {
-		// Fallback if batcher not initialized
 		rd := d.route(routeName)
 		rd.mu.Lock()
 		rd.events = append(rd.events, ev)
@@ -285,7 +282,6 @@ func (d *dashState) snapshot(now time.Time, agentConnected bool) DashboardSnapsh
 		}
 		bucketMap[b.startUnix] = bucketData{bytes: b.bytes, conns: b.conns}
 	}
-	// Copy route pointers while holding lock.
 	routes := make(map[string]*routeDash, len(d.routes))
 	for k, v := range d.routes {
 		routes[k] = v
@@ -299,7 +295,6 @@ func (d *dashState) snapshot(now time.Time, agentConnected bool) DashboardSnapsh
 		series = append(series, DashboardPoint{StartUnix: t, Bytes: bd.bytes, Conns: bd.conns})
 	}
 
-	// Stable route ordering for snapshot assembly.
 	names := make([]string, 0, len(routes))
 	for name := range routes {
 		if strings.TrimSpace(name) == "" {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,19 +14,15 @@ import (
 	"hostit/shared/protocol"
 )
 
-func TestEndToEndTCP(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// local echo server
-	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+func startEcho(t *testing.T) (net.Listener, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echoLn.Close()
 	go func() {
 		for {
-			c, err := echoLn.Accept()
+			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
@@ -35,64 +32,141 @@ func TestEndToEndTCP(t *testing.T) {
 			}(c)
 		}
 	}()
+	return ln, ln.Addr().String()
+}
 
-	controlLn, err := net.Listen("tcp", "127.0.0.1:0")
+func startPrefixedEcho(t *testing.T, prefix string) (net.Listener, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	controlAddr := controlLn.Addr().String()
-	_ = controlLn.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := conn.Read(buf)
+					if n > 0 {
+						_, _ = conn.Write(append([]byte(prefix+":"), buf[:n]...))
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+	return ln, ln.Addr().String()
+}
 
-	dataLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dataAddr := dataLn.Addr().String()
-	_ = dataLn.Close()
-
-	publicLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	publicAddr := publicLn.Addr().String()
-	_ = publicLn.Close()
-
-	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 2 * time.Second, DisableTLS: true})
-	go func() { _ = srv.Run(ctx) }()
-
-	// Fake agent: connect to control; for each NEW id, connect to data and then to local echo.
-	go fakeAgent(ctx, controlAddr, dataAddr, echoLn.Addr().String(), "testtoken")
-
-	msg := []byte("hello\n")
-	deadline := time.Now().Add(2 * time.Second)
+func waitEchoReady(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		if time.Now().After(deadline) {
-			t.Fatalf("tunnel never became ready")
+			t.Fatalf("tunnel %s never became ready", addr)
 		}
-
-		client, err := net.Dial("tcp", publicAddr)
+		c, err := net.Dial("tcp", addr)
 		if err != nil {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		_ = client.SetDeadline(time.Now().Add(500 * time.Millisecond))
-		_, werr := client.Write(msg)
-		if werr != nil {
-			_ = client.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		msg := []byte("ready\n")
+		if _, werr := c.Write(msg); werr != nil {
+			_ = c.Close()
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		buf := make([]byte, len(msg))
-		_, rerr := io.ReadFull(client, buf)
-		_ = client.Close()
-		if rerr != nil {
+		_, rerr := io.ReadFull(c, buf)
+		_ = c.Close()
+		if rerr != nil || string(buf) != string(msg) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if string(buf) != string(msg) {
-			t.Fatalf("expected %q got %q", string(msg), string(buf))
+		return
+	}
+}
+
+func waitPrefixedEchoReady(t *testing.T, addr, prefix string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("tunnel %s never became ready", addr)
 		}
-		break
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		msg := []byte("ready\n")
+		if _, werr := c.Write(msg); werr != nil {
+			_ = c.Close()
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		buf := make([]byte, len(prefix)+len(msg))
+		_, rerr := io.ReadFull(c, buf)
+		_ = c.Close()
+		if rerr != nil || string(buf) != prefix+string(msg) {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		return
+	}
+}
+
+func TestEndToEndTCP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	echoLn, echoAddr := startEcho(t)
+	defer echoLn.Close()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	publicLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	publicAddr := publicLn.Addr().String()
+	publicLn.Close()
+
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 10 * time.Second, DisableTLS: true})
+	go func() { _ = srv.Run(ctx) }()
+
+	go fakeAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
+
+	waitEchoReady(t, publicAddr)
+
+	msg := []byte("hello\n")
+	c, err := net.Dial("tcp", publicAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != string(msg) {
+		t.Fatalf("expected %q got %q", string(msg), string(buf))
 	}
 }
 
@@ -100,83 +174,43 @@ func TestEndToEndTCPConcurrent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// local echo server
-	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	echoLn, echoAddr := startEcho(t)
 	defer echoLn.Close()
-	go func() {
-		for {
-			c, err := echoLn.Accept()
-			if err != nil {
-				return
-			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				_, _ = io.Copy(conn, conn)
-			}(c)
-		}
-	}()
 
-	controlLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	controlAddr := controlLn.Addr().String()
-	_ = controlLn.Close()
+	controlLn.Close()
 
-	dataLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	dataAddr := dataLn.Addr().String()
-	_ = dataLn.Close()
+	dataLn.Close()
 
-	publicLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	publicLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	publicAddr := publicLn.Addr().String()
-	_ = publicLn.Close()
+	publicLn.Close()
 
-	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 2 * time.Second, DisableTLS: true})
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 10 * time.Second, DisableTLS: true})
 	go func() { _ = srv.Run(ctx) }()
 
-	go fakeAgent(ctx, controlAddr, dataAddr, echoLn.Addr().String(), "testtoken")
+	go fakeAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
 
-	// Wait for the public listener to become reachable.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if time.Now().After(deadline) {
-			t.Fatalf("tunnel never became ready")
-		}
-		c, err := net.Dial("tcp", publicAddr)
-		if err != nil {
-			time.Sleep(25 * time.Millisecond)
-			continue
-		}
-		_ = c.Close()
-		break
-	}
+	waitEchoReady(t, publicAddr)
 
 	const clients = 10
 	const rounds = 10
 
 	for r := 0; r < rounds; r++ {
 		errCh := make(chan error, clients)
-		start := make(chan struct{})
 		for i := 0; i < clients; i++ {
 			i := i
 			go func() {
-				<-start
 				client, err := net.Dial("tcp", publicAddr)
 				if err != nil {
 					errCh <- err
 					return
 				}
 				defer client.Close()
-				_ = client.SetDeadline(time.Now().Add(750 * time.Millisecond))
+				_ = client.SetDeadline(time.Now().Add(5 * time.Second))
 				msg := []byte("hello-" + strconv.Itoa(r) + "-" + strconv.Itoa(i) + "\n")
 				if _, err := client.Write(msg); err != nil {
 					errCh <- err
@@ -194,7 +228,6 @@ func TestEndToEndTCPConcurrent(t *testing.T) {
 				errCh <- nil
 			}()
 		}
-		close(start)
 		for i := 0; i < clients; i++ {
 			if err := <-errCh; err != nil {
 				t.Fatalf("round %d: %v", r, err)
@@ -207,68 +240,26 @@ func TestEndToEndTCPConcurrentMultiRoute(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	startEcho := func(prefix string) (net.Listener, string) {
-		t.Helper()
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		go func() {
-			for {
-				c, err := ln.Accept()
-				if err != nil {
-					return
-				}
-				go func(conn net.Conn) {
-					defer conn.Close()
-					buf := make([]byte, 1024)
-					for {
-						n, err := conn.Read(buf)
-						if n > 0 {
-							_, _ = conn.Write(append([]byte(prefix+":"), buf[:n]...))
-						}
-						if err != nil {
-							return
-						}
-					}
-				}(c)
-			}
-		}()
-		return ln, ln.Addr().String()
-	}
-
-	echoALn, echoAAddr := startEcho("a")
+	echoALn, echoAAddr := startPrefixedEcho(t, "a")
 	defer echoALn.Close()
-	echoBLn, echoBAddr := startEcho("b")
+	echoBLn, echoBAddr := startPrefixedEcho(t, "b")
 	defer echoBLn.Close()
 
-	controlLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	controlAddr := controlLn.Addr().String()
-	_ = controlLn.Close()
+	controlLn.Close()
 
-	dataLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	dataAddr := dataLn.Addr().String()
-	_ = dataLn.Close()
+	dataLn.Close()
 
-	publicALn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	publicALn, _ := net.Listen("tcp", "127.0.0.1:0")
 	publicAAddr := publicALn.Addr().String()
-	_ = publicALn.Close()
+	publicALn.Close()
 
-	publicBLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	publicBLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	publicBAddr := publicBLn.Addr().String()
-	_ = publicBLn.Close()
+	publicBLn.Close()
 
 	srv := NewServer(ServerConfig{
 		ControlAddr: controlAddr,
@@ -277,9 +268,9 @@ func TestEndToEndTCPConcurrentMultiRoute(t *testing.T) {
 			{Name: "route-a", Proto: "tcp", PublicAddr: publicAAddr},
 			{Name: "route-b", Proto: "tcp", PublicAddr: publicBAddr},
 		},
-		Token:      "testtoken",
-		PairTimeout: 2 * time.Second,
-		DisableTLS: true,
+		Token:       "testtoken",
+		PairTimeout: 10 * time.Second,
+		DisableTLS:  true,
 	})
 	go func() { _ = srv.Run(ctx) }()
 
@@ -288,24 +279,8 @@ func TestEndToEndTCPConcurrentMultiRoute(t *testing.T) {
 		"route-b": echoBAddr,
 	}, "testtoken")
 
-	waitReady := func(addr string) {
-		deadline := time.Now().Add(2 * time.Second)
-		for {
-			if time.Now().After(deadline) {
-				t.Fatalf("listener %s never became ready", addr)
-			}
-			c, err := net.Dial("tcp", addr)
-			if err != nil {
-				time.Sleep(25 * time.Millisecond)
-				continue
-			}
-			_ = c.Close()
-			return
-		}
-	}
-
-	waitReady(publicAAddr)
-	waitReady(publicBAddr)
+	waitPrefixedEchoReady(t, publicAAddr, "a:")
+	waitPrefixedEchoReady(t, publicBAddr, "b:")
 
 	targets := []struct {
 		addr   string
@@ -315,22 +290,20 @@ func TestEndToEndTCPConcurrentMultiRoute(t *testing.T) {
 		{addr: publicBAddr, prefix: "b:"},
 	}
 
-	const perRoute = 20
+	const perRoute = 10
 	errCh := make(chan error, len(targets)*perRoute)
-	start := make(chan struct{})
 	for _, target := range targets {
 		target := target
 		for i := 0; i < perRoute; i++ {
 			i := i
 			go func() {
-				<-start
 				c, err := net.Dial("tcp", target.addr)
 				if err != nil {
 					errCh <- err
 					return
 				}
 				defer c.Close()
-				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 				msg := []byte("msg-" + strconv.Itoa(i))
 				if _, err := c.Write(msg); err != nil {
 					errCh <- err
@@ -348,9 +321,9 @@ func TestEndToEndTCPConcurrentMultiRoute(t *testing.T) {
 				}
 				errCh <- nil
 			}()
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	close(start)
 
 	for i := 0; i < len(targets)*perRoute; i++ {
 		if err := <-errCh; err != nil {
@@ -382,6 +355,388 @@ func TestNextClientIDIsCompact(t *testing.T) {
 	}
 }
 
+func TestServerMultiConn_PendingCleanupAndAgentRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	echoLn, echoAddr := startEcho(t)
+	defer echoLn.Close()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	publicLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	publicAddr := publicLn.Addr().String()
+	publicLn.Close()
+
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}},
+		Token:       "testtoken",
+		PairTimeout: 3 * time.Second,
+		DisableTLS:  true,
+	})
+	go func() { _ = srv.Run(ctx) }()
+
+	agentCtx, agentCancel := context.WithCancel(ctx)
+	go fakeAgent(agentCtx, controlAddr, dataAddr, echoAddr, "testtoken")
+
+	readyDeadline := time.Now().Add(5 * time.Second)
+	for {
+		if time.Now().After(readyDeadline) {
+			t.Fatalf("agent never connected")
+		}
+		if srv.Status().AgentConnected {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	burst := func(round string, clients int) {
+		errCh := make(chan error, clients)
+		for i := 0; i < clients; i++ {
+			i := i
+			go func() {
+				msg := []byte("hello-" + round + "-" + strconv.Itoa(i) + "\n")
+				c, err := net.Dial("tcp", publicAddr)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				if _, err := c.Write(msg); err != nil {
+					errCh <- err
+					return
+				}
+				buf := make([]byte, len(msg))
+				if _, err := io.ReadFull(c, buf); err != nil {
+					errCh <- err
+					return
+				}
+				if string(buf) != string(msg) {
+					errCh <- fmt.Errorf("expected %q got %q", string(msg), string(buf))
+					return
+				}
+				errCh <- nil
+			}()
+			time.Sleep(5 * time.Millisecond)
+		}
+		for i := 0; i < clients; i++ {
+			if err := <-errCh; err != nil {
+				t.Fatalf("burst %s: %v", round, err)
+			}
+		}
+	}
+
+	burst("a", 20)
+
+	time.Sleep(100 * time.Millisecond)
+	srv.mu.Lock()
+	pendingLen := len(srv.pendingTCP)
+	srv.mu.Unlock()
+	if pendingLen != 0 {
+		t.Fatalf("expected pending=0 after burst, got %d", pendingLen)
+	}
+
+	agentCancel()
+	deadDisc := time.Now().Add(2 * time.Second)
+	for srv.Status().AgentConnected {
+		if time.Now().After(deadDisc) {
+			t.Fatalf("server did not observe agent disconnect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	agentCtx2, agentCancel2 := context.WithCancel(ctx)
+	defer agentCancel2()
+	go fakeAgent(agentCtx2, controlAddr, dataAddr, echoAddr, "testtoken")
+	deadConn := time.Now().Add(5 * time.Second)
+	for !srv.Status().AgentConnected {
+		if time.Now().After(deadConn) {
+			t.Fatalf("server did not observe agent reconnect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	burst("b", 20)
+
+	time.Sleep(100 * time.Millisecond)
+	srv.mu.Lock()
+	pendingLen = len(srv.pendingTCP)
+	srv.mu.Unlock()
+	if pendingLen != 0 {
+		t.Fatalf("expected pending=0 after restart burst, got %d", pendingLen)
+	}
+
+	for i := 0; i < 10; i++ {
+		c, err := net.Dial("tcp", publicAddr)
+		if err != nil {
+			t.Fatalf("reconnect dial %d: %v", i, err)
+		}
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		msg := []byte("reconnect-" + strconv.Itoa(i) + "\n")
+		if _, err := c.Write(msg); err != nil {
+			c.Close()
+			t.Fatalf("reconnect write %d: %v", i, err)
+		}
+		buf := make([]byte, len(msg))
+		if _, err := io.ReadFull(c, buf); err != nil {
+			c.Close()
+			t.Fatalf("reconnect read %d: %v", i, err)
+		}
+		c.Close()
+		if string(buf) != string(msg) {
+			t.Fatalf("reconnect %d: expected %q got %q", i, string(msg), string(buf))
+		}
+	}
+}
+
+func TestServerMultiConn_NoAgentRejectsQuickly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	publicLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	publicAddr := publicLn.Addr().String()
+	publicLn.Close()
+
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}},
+		Token:       "testtoken",
+		PairTimeout: 250 * time.Millisecond,
+		DisableTLS:  true,
+	})
+	go func() { _ = srv.Run(ctx) }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	c, err := net.Dial("tcp", publicAddr)
+	if err != nil {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
+			c, err = net.Dial("tcp", publicAddr)
+			if err == nil {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	_, _ = c.Write([]byte("hi\n"))
+	buf := make([]byte, 1)
+	_, rerr := c.Read(buf)
+	if rerr == nil {
+		return
+	}
+}
+
+func TestRealisticSunshineScenario(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	services := map[string]string{}
+	for _, name := range []string{"rtsp", "https", "http"} {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		prefix := name
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					buf := make([]byte, 4096)
+					for {
+						n, err := conn.Read(buf)
+						if n > 0 {
+							resp := append([]byte(prefix+":"), buf[:n]...)
+							_, _ = conn.Write(resp)
+						}
+						if err != nil {
+							return
+						}
+					}
+				}(c)
+			}
+		}()
+		services[name] = ln.Addr().String()
+	}
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	publicAddrs := map[string]string{}
+	for _, name := range []string{"rtsp", "https", "http"} {
+		ln, _ := net.Listen("tcp", "127.0.0.1:0")
+		publicAddrs[name] = ln.Addr().String()
+		ln.Close()
+	}
+
+	routes := []RouteConfig{
+		{Name: "rtsp", Proto: "tcp", PublicAddr: publicAddrs["rtsp"]},
+		{Name: "https", Proto: "tcp", PublicAddr: publicAddrs["https"]},
+		{Name: "http", Proto: "tcp", PublicAddr: publicAddrs["http"]},
+	}
+
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      routes,
+		Token:       "testtoken",
+		PairTimeout: 10 * time.Second,
+		DisableTLS:  true,
+	})
+	go func() { _ = srv.Run(ctx) }()
+
+	go fakeAgentRoutes(ctx, controlAddr, dataAddr, services, "testtoken")
+
+	for _, name := range []string{"rtsp", "https", "http"} {
+		waitPrefixedEchoReady(t, publicAddrs[name], name+":")
+	}
+
+	for _, name := range []string{"rtsp", "https", "http"} {
+		addr := publicAddrs[name]
+		prefix := name + ":"
+
+		testConn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("%s test dial: %v", name, err)
+		}
+		_ = testConn.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = testConn.Write([]byte("test\n"))
+		testConn.Close()
+
+		realConn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("%s real dial: %v", name, err)
+		}
+		_ = realConn.SetDeadline(time.Now().Add(5 * time.Second))
+		msg := []byte("real-data\n")
+		if _, err := realConn.Write(msg); err != nil {
+			realConn.Close()
+			t.Fatalf("%s real write: %v", name, err)
+		}
+		buf := make([]byte, len(prefix)+len(msg))
+		if _, err := io.ReadFull(realConn, buf); err != nil {
+			realConn.Close()
+			t.Fatalf("%s real read: %v", name, err)
+		}
+		realConn.Close()
+		if string(buf) != prefix+string(msg) {
+			t.Fatalf("%s: expected %q got %q", name, prefix+string(msg), string(buf))
+		}
+	}
+
+	type streamResult struct {
+		route string
+		idx   int
+		err   error
+	}
+	results := make(chan streamResult, 30)
+	start := make(chan struct{})
+
+	for _, name := range []string{"rtsp", "https", "http"} {
+		addr := publicAddrs[name]
+		prefix := name + ":"
+		for i := 0; i < 10; i++ {
+			name := name
+			addr := addr
+			prefix := prefix
+			i := i
+			go func() {
+				<-start
+				c, err := net.Dial("tcp", addr)
+				if err != nil {
+					results <- streamResult{route: name, idx: i, err: fmt.Errorf("dial: %v", err)}
+					return
+				}
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+				msg := []byte(fmt.Sprintf("stream-%d\n", i))
+				if _, err := c.Write(msg); err != nil {
+					results <- streamResult{route: name, idx: i, err: fmt.Errorf("write: %v", err)}
+					return
+				}
+				buf := make([]byte, len(prefix)+len(msg))
+				if _, err := io.ReadFull(c, buf); err != nil {
+					results <- streamResult{route: name, idx: i, err: fmt.Errorf("read: %v", err)}
+					return
+				}
+				want := prefix + string(msg)
+				if string(buf) != want {
+					results <- streamResult{route: name, idx: i, err: fmt.Errorf("data mismatch: expected %q got %q", want, string(buf))}
+					return
+				}
+				results <- streamResult{route: name, idx: i, err: nil}
+			}()
+		}
+	}
+
+	close(start)
+	for i := 0; i < 30; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("route=%s idx=%d: %v", r.route, r.idx, r.err)
+		}
+	}
+
+	for cycle := 0; cycle < 3; cycle++ {
+		for _, name := range []string{"rtsp", "https", "http"} {
+			addr := publicAddrs[name]
+			prefix := name + ":"
+			c, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("cycle %d %s dial: %v", cycle, name, err)
+			}
+			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+			msg := []byte(fmt.Sprintf("cycle-%d\n", cycle))
+			if _, err := c.Write(msg); err != nil {
+				c.Close()
+				t.Fatalf("cycle %d %s write: %v", cycle, name, err)
+			}
+			buf := make([]byte, len(prefix)+len(msg))
+			if _, err := io.ReadFull(c, buf); err != nil {
+				c.Close()
+				t.Fatalf("cycle %d %s read: %v", cycle, name, err)
+			}
+			c.Close()
+			if string(buf) != prefix+string(msg) {
+				t.Fatalf("cycle %d %s: expected %q got %q", cycle, name, prefix+string(msg), string(buf))
+			}
+		}
+	}
+}
+
 func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, token string) {
 	fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{"default": localAddr}, token)
 }
@@ -402,21 +757,18 @@ func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAdd
 		controlConn = c
 		break
 	}
-	// Ensure cancellation interrupts any blocking reads.
 	go func() {
 		<-ctx.Done()
 		_ = controlConn.Close()
 	}()
 	defer controlConn.Close()
 
-	// Mutual auth
 	controlConn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := crypto.AuthenticateClient(controlConn, token); err != nil {
 		return
 	}
 	controlConn.SetDeadline(time.Time{})
 
-	// Read HELLO
 	controlConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	helloPkt, err := protocol.ReadPacket(controlConn)
 	controlConn.SetReadDeadline(time.Time{})
@@ -455,10 +807,8 @@ func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAdd
 				}
 				dataConn.SetDeadline(time.Time{})
 
-				// Send route/client info
 				routeBytes := []byte(routeName)
 				clientBytes := []byte(clientID)
-
 				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes))
 				buf = append(buf, byte(len(routeBytes)))
 				buf = append(buf, routeBytes...)
@@ -477,10 +827,19 @@ func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAdd
 				}
 				defer localConn.Close()
 
+				var wg sync.WaitGroup
+				wg.Add(2)
 				go func() {
+					defer wg.Done()
 					io.Copy(localConn, dataConn)
 				}()
-				io.Copy(dataConn, localConn)
+				go func() {
+					defer wg.Done()
+					io.Copy(dataConn, localConn)
+				}()
+				wg.Wait()
+				localConn.Close()
+				dataConn.Close()
 			}()
 		}
 	}

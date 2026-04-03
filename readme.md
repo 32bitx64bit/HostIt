@@ -65,15 +65,15 @@ Use systemd so it keeps running in the background and can auto-restart.
 
 - Build once: `cd server && ./build.sh`
 - Install + start (requires sudo): `sudo sh ./server/install-service.sh`
-- Logs: `journalctl -u hostit-server@$(systemd-escape -p "$(pwd)/server").service -f`
-- Stop completely: `sudo systemctl stop hostit-server@$(systemd-escape -p "$(pwd)/server").service`
+- Logs: `journalctl -u hostit-server.service -f`
+- Stop completely: `sudo systemctl stop hostit-server.service`
 
 ### Agent systemd service
 
 - Build once: `cd client && ./build.sh`
 - Install + start (requires sudo): `sudo sh ./client/install-service.sh`
-- Logs: `journalctl -u hostit-agent@$(systemd-escape -p "$(pwd)/client").service -f`
-- Stop completely: `sudo systemctl stop hostit-agent@$(systemd-escape -p "$(pwd)/client").service`
+- Logs: `journalctl -u hostit-agent.service -f`
+- Stop completely: `sudo systemctl stop hostit-agent.service`
 
 ### Restart/exit from inside the app
 

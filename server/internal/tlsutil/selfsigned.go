@@ -17,8 +17,6 @@ import (
 	"time"
 )
 
-// EnsureSelfSigned writes a self-signed ECDSA certificate/key pair if the files
-// do not already exist. It always returns the SHA256 fingerprint of the cert DER.
 func EnsureSelfSigned(certFile, keyFile string) (fingerprintHex string, err error) {
 	if certFile == "" || keyFile == "" {
 		return "", fmt.Errorf("certFile/keyFile required")
@@ -39,8 +37,6 @@ func EnsureSelfSigned(certFile, keyFile string) (fingerprintHex string, err erro
 	return writeSelfSigned(certFile, keyFile, "hostit-tunnel")
 }
 
-// RegenerateSelfSigned always overwrites the certificate/key with a new self-signed
-// ECDSA pair and returns the SHA256 fingerprint of the cert DER.
 func RegenerateSelfSigned(certFile, keyFile string) (fingerprintHex string, err error) {
 	if certFile == "" || keyFile == "" {
 		return "", fmt.Errorf("certFile/keyFile required")
@@ -48,8 +44,6 @@ func RegenerateSelfSigned(certFile, keyFile string) (fingerprintHex string, err 
 	return writeSelfSigned(certFile, keyFile, "hostit-tunnel")
 }
 
-// EnsureSelfSignedDashboard writes a self-signed ECDSA certificate/key pair if the files
-// do not already exist, using a dashboard-specific certificate identity.
 func EnsureSelfSignedDashboard(certFile, keyFile string) (fingerprintHex string, err error) {
 	if certFile == "" || keyFile == "" {
 		return "", fmt.Errorf("certFile/keyFile required")
@@ -70,8 +64,6 @@ func EnsureSelfSignedDashboard(certFile, keyFile string) (fingerprintHex string,
 	return writeSelfSigned(certFile, keyFile, "hostit-dashboard")
 }
 
-// RegenerateSelfSignedDashboard always overwrites the certificate/key with a new self-signed
-// ECDSA pair and returns the SHA256 fingerprint of the cert DER.
 func RegenerateSelfSignedDashboard(certFile, keyFile string) (fingerprintHex string, err error) {
 	if certFile == "" || keyFile == "" {
 		return "", fmt.Errorf("certFile/keyFile required")
@@ -106,7 +98,7 @@ func writeSelfSigned(certFile, keyFile string, commonName string) (fingerprintHe
 			Organization: []string{"hostit"},
 		},
 		NotBefore:             now.Add(-1 * time.Hour),
-		NotAfter:              now.Add(730 * 24 * time.Hour), // 2 years for security
+		NotAfter:              now.Add(730 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,

@@ -100,7 +100,6 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 	return nil
 }
 
-// ApplyZipFileUpdate applies an update from a local zip file path.
 func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, logw io.Writer) error {
 	if strings.TrimSpace(zipPath) == "" {
 		return errors.New("missing zip path")

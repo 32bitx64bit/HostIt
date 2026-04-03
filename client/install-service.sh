@@ -23,7 +23,6 @@ if [ ! -f /etc/hostit/agent.env ]; then
   chmod 0644 /etc/hostit/agent.env
 fi
 
-UNIT_SRC="$SCRIPT_DIR/hostit-agent.service"
 UNIT_DST="/etc/systemd/system/hostit-agent.service"
 
 printf '%s\n' \

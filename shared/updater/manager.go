@@ -487,27 +487,7 @@ func siblingSharedDir(moduleDir string) string {
 		return ""
 	}
 	shared := filepath.Join(parent, "shared")
-	if fi, err := os.Stat(shared); err == nil && fi.IsDir() {
-		return shared
-	}
 	return shared
-}
-
-type limitedWriter struct {
-	W io.Writer
-	N int
-}
-
-func (lw *limitedWriter) Write(p []byte) (int, error) {
-	if lw.N <= 0 {
-		return len(p), nil
-	}
-	if len(p) > lw.N {
-		p = p[:lw.N]
-	}
-	n, err := lw.W.Write(p)
-	lw.N -= n
-	return len(p), err
 }
 
 func (m *Manager) BuiltBinaryPath() string {

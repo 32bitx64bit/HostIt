@@ -19,8 +19,9 @@ import (
 	"time"
 
 	"hostit/client/internal/agent"
-	"hostit/client/internal/configio"
+	"hostit/shared/configio"
 	"hostit/shared/module"
+	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
 	"hostit/shared/version"
 )
@@ -296,10 +297,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		log.Printf("Built binary: %s", bin)
 
-		// If we're running under systemd, restart the service (or exit and let systemd restart).
-		if runningUnderSystemd() {
+		if systemdutil.RunningUnderSystemd() {
 			log.Printf("Running under systemd - restarting service")
-			if systemctlAvailable() {
+			if systemdutil.SystemctlAvailable() {
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
 				cmd := exec.CommandContext(ctx2, "systemctl", "restart", "--no-block", "hostit-agent.service")
@@ -355,7 +355,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux := http.NewServeMux()
 
-	// Live status API
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -387,7 +386,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// Update APIs
 	mux.HandleFunc("/api/update/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -407,13 +405,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = json.NewEncoder(w).Encode(upd.Status())
 	})
 
-	// systemd controls (best-effort; typically works when agent runs as a service).
 	mux.HandleFunc("/api/systemd/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		st := systemdStatus(r.Context(), "hostit-agent.service")
+		st := systemdutil.Status(r.Context(), "hostit-agent.service")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(st)
 	})
@@ -422,7 +419,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := systemdAction(r.Context(), "restart", "hostit-agent.service"); err != nil {
+		if err := systemdutil.Action(r.Context(), "restart", "hostit-agent.service"); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -433,14 +430,13 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := systemdAction(r.Context(), "stop", "hostit-agent.service"); err != nil {
+		if err := systemdutil.Action(r.Context(), "stop", "hostit-agent.service"); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	// Process control: exits the whole agent process.
 	mux.HandleFunc("/api/process/restart", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -537,7 +533,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.WriteHeader(http.StatusAccepted)
 	})
 
-	// Service controls
 	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -564,7 +559,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	// Single page
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -589,7 +583,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = tplHome.Execute(w, data)
 	})
 
-	// Controls page
 	mux.HandleFunc("/controls", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -610,7 +603,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = tplControls.Execute(w, data)
 	})
 
-	// Back-compat: old config page
 	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	})
@@ -645,7 +637,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// Apply immediately.
 		ctrl.Stop()
 		ctrl.SetConfig(cfg)
 		ctrl.Start()
@@ -653,11 +644,8 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	}
 
-	// Save endpoint (and back-compat path)
 	mux.HandleFunc("/save", saveHandler)
 	mux.HandleFunc("/config/save", saveHandler)
-
-	// Agent also supports explicit start/stop/restart via /start,/stop,/restart.
 
 	h := &http.Server{Addr: addr, Handler: mux}
 	go func() {

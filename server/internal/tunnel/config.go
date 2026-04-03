@@ -24,8 +24,8 @@ type RouteConfig struct {
 	Proto      string // "tcp", "udp", or "both"
 	PublicAddr string // listen address (host:port)
 	LocalAddr  string // agent-side target address (host:port). Defaults to 127.0.0.1:<publicPort>.
-	Enabled *bool
-	Encrypted *bool
+	Enabled    *bool
+	Encrypted  *bool
 }
 
 func (r RouteConfig) IsEnabled() bool {
@@ -102,19 +102,19 @@ func (r *RouteConfig) Validate() error {
 }
 
 type ServerConfig struct {
-	ControlAddr string
-	DataAddr    string
-	PublicAddr string
-	Token      string
-	DisableTLS bool
-	TLSCertFile string
-	TLSKeyFile  string
-	WebHTTPS bool
-	WebTLSCertFile string
-	WebTLSKeyFile  string
-	PairTimeout    time.Duration
-	DashboardInterval time.Duration `json:",omitempty"`
-	EncryptionAlgorithm string `json:",omitempty"`
+	ControlAddr         string
+	DataAddr            string
+	PublicAddr          string
+	Token               string
+	DisableTLS          bool
+	TLSCertFile         string
+	TLSKeyFile          string
+	WebHTTPS            bool
+	WebTLSCertFile      string
+	WebTLSKeyFile       string
+	PairTimeout         time.Duration
+	DashboardInterval   time.Duration `json:",omitempty"`
+	EncryptionAlgorithm string        `json:",omitempty"`
 	Routes              []RouteConfig
 }
 
