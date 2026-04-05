@@ -43,6 +43,8 @@ type Agent struct {
 
 	controlWriteMu sync.Mutex
 
+	routeCacheGen uint64
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -69,7 +71,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.hooks.OnDisconnected(err)
 		}
 		if err != nil {
-			logging.Global().Errorf(logging.CatSystem, "Agent error: %v", err)
+			logging.Global().RouteError("", logging.CatSystem, "Agent error", map[string]string{"error": err.Error()})
 		}
 
 		select {
@@ -145,7 +147,7 @@ func (a *Agent) connectAndRun() error {
 	data, _ := protocol.MarshalUDP(pkt, nil)
 	a.udpDataConn.WriteToUDP(data, a.serverUDP)
 
-	logging.Global().Infof(logging.CatSystem, "Agent started on control=%s data=%s", a.cfg.ControlAddr(), a.cfg.DataAddr())
+	logging.Global().RouteInfo("", logging.CatSystem, "Agent started", map[string]string{"control": a.cfg.ControlAddr(), "data": a.cfg.DataAddr()})
 
 	if a.hooks != nil && a.hooks.OnConnected != nil {
 		a.hooks.OnConnected()
@@ -269,19 +271,19 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 		if pkt.Type == protocol.TypeHello {
 			var routes map[string]RemoteRoute
 			if err := json.Unmarshal(pkt.Payload, &routes); err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to parse HELLO routes: %v", err)
+				logging.Global().RouteError("", logging.CatTCP, "failed to parse HELLO routes", map[string]string{"error": err.Error()})
 				continue
 			}
 			for k, r := range routes {
 				if r.Encrypted {
 					key, err := crypto.DeriveKey(a.cfg.Token, r.Algorithm)
 					if err != nil {
-						logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", r.Name, err)
+						logging.Global().RouteError(r.Name, logging.CatTCP, "failed to derive key for route", map[string]string{"error": err.Error()})
 					} else {
 						r.DerivedKey = key
 						udpCipher, err := crypto.NewUDPCipher(key)
 						if err != nil {
-							logging.Global().Errorf(logging.CatTCP, "failed to create udp cipher for route %s: %v", r.Name, err)
+							logging.Global().RouteError(r.Name, logging.CatTCP, "failed to create udp cipher for route", map[string]string{"error": err.Error()})
 						} else {
 							r.UDPCipher = udpCipher
 						}
@@ -291,8 +293,9 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 			}
 			a.mu.Lock()
 			a.cfg.Routes = routes
+			a.routeCacheGen++
 			a.mu.Unlock()
-			logging.Global().Infof(logging.CatSystem, "Received %d routes from server", len(routes))
+			logging.Global().RouteInfo("", logging.CatSystem, "Received routes from server", map[string]string{"count": fmt.Sprintf("%d", len(routes))})
 
 			if a.hooks != nil && a.hooks.OnRoutes != nil {
 				var routeList []RemoteRoute
@@ -313,7 +316,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 			a.mu.RUnlock()
 
 			if !ok {
-				logging.Global().Errorf(logging.CatTCP, "unknown route requested: %s", routeName)
+				logging.Global().RouteError(routeName, logging.CatTCP, "unknown route requested", map[string]string{"route": routeName})
 				continue
 			}
 
@@ -329,13 +332,13 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					dataConn, err = tls.DialWithDialer(dialer, "tcp", a.cfg.DataAddr(), tlsConfig)
 				}
 				if err != nil {
-					logging.Global().Errorf(logging.CatTCP, "failed to dial data server %s: %v", a.cfg.DataAddr(), err)
+					logging.Global().RouteError(routeName, logging.CatTCP, "failed to dial data server", map[string]string{"addr": a.cfg.DataAddr(), "error": err.Error()})
 					return
 				}
 
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
 				if err := crypto.AuthenticateClient(dataConn, a.cfg.Token); err != nil {
-					logging.Global().Errorf(logging.CatTCP, "data auth failed: %v", err)
+					logging.Global().RouteError(routeName, logging.CatTCP, "data auth failed", map[string]string{"error": err.Error()})
 					dataConn.Close()
 					return
 				}
@@ -351,16 +354,28 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 
 				dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if _, err := dataConn.Write(buf); err != nil {
-					logging.Global().Errorf(logging.CatTCP, "failed to write route/client to data conn: %v", err)
+					logging.Global().RouteError(routeName, logging.CatTCP, "failed to write route/client to data conn", map[string]string{"error": err.Error()})
 					dataConn.Close()
 					return
 				}
 				dataConn.SetDeadline(time.Time{})
 
 				localAddr := rt.EffectiveLocalAddr()
-				localConn, err := net.DialTimeout("tcp", localAddr, 10*time.Second)
+				var localConn net.Conn
+				const maxRetries = 5
+				const retryDelay = 500 * time.Millisecond
+				for i := 0; i < maxRetries; i++ {
+					localConn, err = net.DialTimeout("tcp", localAddr, 5*time.Second)
+					if err == nil {
+						break
+					}
+					if i < maxRetries-1 {
+						logging.Global().RouteDebug(routeName, logging.CatTCP, "dial local failed, retrying", map[string]string{"addr": localAddr, "attempt": fmt.Sprintf("%d/%d", i+1, maxRetries), "error": err.Error()})
+						time.Sleep(retryDelay)
+					}
+				}
 				if err != nil {
-					logging.Global().Errorf(logging.CatTCP, "failed to dial local tcp %s: %v", localAddr, err)
+					logging.Global().RouteError(routeName, logging.CatTCP, "failed to dial local tcp after max attempts", map[string]string{"addr": localAddr, "attempts": fmt.Sprintf("%d", maxRetries), "error": err.Error()})
 					dataConn.Close()
 					return
 				}
@@ -372,18 +387,19 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 
 				if rt.Encrypted {
 					if rt.DerivedKey == nil {
-						logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: key is nil", routeName)
+						logging.Global().RouteError(routeName, logging.CatTCP, "failed to derive key for route: key is nil", nil)
 						dataConn.Close()
 						localConn.Close()
 						return
 					}
-					dataConn, err = crypto.WrapTCP(dataConn, rt.DerivedKey)
+					wrappedConn, err := crypto.WrapTCP(dataConn, rt.DerivedKey)
 					if err != nil {
-						logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
+						logging.Global().RouteError(routeName, logging.CatTCP, "failed to wrap tcp", map[string]string{"error": err.Error()})
 						dataConn.Close()
 						localConn.Close()
 						return
 					}
+					dataConn = wrappedConn
 				}
 
 				relay.Proxy(localConn, dataConn)
@@ -443,8 +459,10 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 		localAddr   string
 	}
 	var routeCache sync.Map
+	var lastCacheGen uint64
 
 	a.mu.RLock()
+	lastCacheGen = a.routeCacheGen
 	for _, rt := range a.cfg.Routes {
 		routeCache.Store(rt.Name, routeConfig{
 			isEncrypted: rt.Encrypted,
@@ -461,12 +479,29 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 		default:
 		}
 
+		a.mu.RLock()
+		currentGen := a.routeCacheGen
+		a.mu.RUnlock()
+		if currentGen != lastCacheGen {
+			routeCache = sync.Map{}
+			lastCacheGen = currentGen
+			a.mu.RLock()
+			for _, rt := range a.cfg.Routes {
+				routeCache.Store(rt.Name, routeConfig{
+					isEncrypted: rt.Encrypted,
+					udpCipher:   rt.UDPCipher,
+					localAddr:   rt.EffectiveLocalAddr(),
+				})
+			}
+			a.mu.RUnlock()
+		}
+
 		n, _, err := a.udpDataConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			logging.Global().Errorf(logging.CatUDP, "udp data read error: %v", err)
+			logging.Global().RouteError("", logging.CatUDP, "udp data read error", map[string]string{"error": err.Error()})
 			continue
 		}
 
@@ -476,11 +511,12 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 		}
 
 		if pkt.Type == protocol.TypeData {
-			rcVal, ok := routeCache.Load(pkt.Route)
+			routeKey := string([]byte(pkt.Route))
+			rcVal, ok := routeCache.Load(routeKey)
 			var rc routeConfig
 			if !ok {
 				a.mu.RLock()
-				rt, ok := a.cfg.Routes[pkt.Route]
+				rt, ok := a.cfg.Routes[routeKey]
 				a.mu.RUnlock()
 				if !ok {
 					continue
@@ -490,7 +526,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 					udpCipher:   rt.UDPCipher,
 					localAddr:   rt.EffectiveLocalAddr(),
 				}
-				routeCache.Store(pkt.Route, rc)
+				routeCache.Store(routeKey, rc)
 			} else {
 				rc = rcVal.(routeConfig)
 			}
@@ -499,37 +535,33 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 			if rc.isEncrypted {
 				udpCipher := rc.udpCipher
 				if udpCipher == nil {
+					logging.Global().RouteDebug(routeKey, logging.CatUDP, "missing UDP cipher for encrypted route", nil)
 					continue
 				}
 				decrypted, err := crypto.DecryptUDP(udpCipher, decryptBuf, payload)
 				if err != nil {
+					logging.Global().RouteDebug(routeKey, logging.CatUDP, "UDP decryption failed", map[string]string{"error": err.Error()})
 					continue
 				}
 				payload = decrypted
 			}
 
-			key := sessionKey{route: pkt.Route, client: pkt.Client}
+			key := sessionKey{route: routeKey, client: string([]byte(pkt.Client))}
 
 			sessionsMu.Lock()
 			sess, exists := sessions[key]
-			if exists {
-				sess.lastSeen = time.Now()
-			}
-			sessionsMu.Unlock()
-
 			if !exists {
-				key.route = string([]byte(pkt.Route))
-				key.client = string([]byte(pkt.Client))
-
 				localAddr, err := net.ResolveUDPAddr("udp", rc.localAddr)
 				if err != nil {
-					logging.Global().Errorf(logging.CatUDP, "failed to resolve local udp addr %s: %v", rc.localAddr, err)
+					sessionsMu.Unlock()
+					logging.Global().RouteError(routeKey, logging.CatUDP, "failed to resolve local udp addr", map[string]string{"addr": rc.localAddr, "error": err.Error()})
 					continue
 				}
 
 				localConn, err := net.DialUDP("udp", nil, localAddr)
 				if err != nil {
-					logging.Global().Errorf(logging.CatUDP, "failed to dial local udp %s: %v", rc.localAddr, err)
+					sessionsMu.Unlock()
+					logging.Global().RouteError(routeKey, logging.CatUDP, "failed to dial local udp", map[string]string{"addr": rc.localAddr, "error": err.Error()})
 					continue
 				}
 				localConn.SetReadBuffer(8 * 1024 * 1024)
@@ -539,8 +571,6 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 					conn:     localConn,
 					lastSeen: time.Now(),
 				}
-
-				sessionsMu.Lock()
 				sessions[key] = sess
 				sessionsMu.Unlock()
 
@@ -604,6 +634,9 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 						a.udpDataConn.WriteToUDP(data, a.serverUDP)
 					}
 				}(key, localConn, rc.isEncrypted, rc.udpCipher)
+			} else {
+				sess.lastSeen = time.Now()
+				sessionsMu.Unlock()
 			}
 
 			sessionsMu.Lock()

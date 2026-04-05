@@ -163,6 +163,8 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	routeNames := make(map[string]bool)
+	tcpPorts := make(map[string]string)
+	udpPorts := make(map[string]string)
 	for i := range c.Routes {
 		if err := c.Routes[i].Validate(); err != nil {
 			if ve, ok := err.(*ConfigValidationError); ok {
@@ -175,10 +177,66 @@ func (c *ServerConfig) Validate() error {
 			errs = append(errs, fmt.Sprintf("duplicate route name %q", c.Routes[i].Name))
 		}
 		routeNames[c.Routes[i].Name] = true
+
+		proto := strings.ToLower(strings.TrimSpace(c.Routes[i].Proto))
+		publicAddr := strings.TrimSpace(c.Routes[i].PublicAddr)
+		if publicAddr != "" {
+			port := extractPort(publicAddr)
+			if port != "" {
+				if proto == "tcp" || proto == "both" {
+					if existingRoute, exists := tcpPorts[port]; exists {
+						errs = append(errs, fmt.Sprintf("duplicate TCP port %q used by routes %q and %q", port, existingRoute, c.Routes[i].Name))
+					} else {
+						tcpPorts[port] = c.Routes[i].Name
+					}
+				}
+				if proto == "udp" || proto == "both" {
+					if existingRoute, exists := udpPorts[port]; exists {
+						errs = append(errs, fmt.Sprintf("duplicate UDP port %q used by routes %q and %q", port, existingRoute, c.Routes[i].Name))
+					} else {
+						udpPorts[port] = c.Routes[i].Name
+					}
+				}
+			}
+		}
+	}
+
+	hasEncryptedRoute := false
+	for _, rt := range c.Routes {
+		if rt.IsEncrypted() {
+			hasEncryptedRoute = true
+			break
+		}
+	}
+	if hasEncryptedRoute {
+		alg := strings.ToLower(strings.TrimSpace(c.EncryptionAlgorithm))
+		if alg == "" {
+			errs = append(errs, "encryption_algorithm is required when any route has encrypted=true")
+		} else if alg != "aes-128" && alg != "aes-256" && alg != "none" {
+			errs = append(errs, fmt.Sprintf("encryption_algorithm must be aes-128, aes-256, or none, got %q", c.EncryptionAlgorithm))
+		}
 	}
 
 	if len(errs) > 0 {
 		return &ConfigValidationError{Errors: errs}
 	}
 	return nil
+}
+
+func extractPort(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		if strings.Contains(addr, ":") {
+			parts := strings.Split(addr, ":")
+			if len(parts) >= 2 {
+				return parts[len(parts)-1]
+			}
+		}
+		return ""
+	}
+	return port
 }

@@ -410,16 +410,53 @@ func NewServer(cfg ServerConfig) *Server {
 		if rt.IsEncrypted() {
 			key, err := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
 			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", rt.Name, err)
+				logging.Global().RouteError(rt.Name, logging.CatTCP, "failed to derive key", map[string]string{"error": err.Error()})
+			} else if len(key) == 0 {
+				logging.Global().RouteError(rt.Name, logging.CatTCP, "encryption_algorithm not set for encrypted route", nil)
 			} else {
 				s.derivedKeys[rt.Name] = key
-				cipher, _ := crypto.NewUDPCipher(key)
-				s.udpCiphers[rt.Name] = cipher
+				cipher, err := crypto.NewUDPCipher(key)
+				if err != nil {
+					logging.Global().RouteError(rt.Name, logging.CatTCP, "failed to create UDP cipher", map[string]string{"error": err.Error()})
+				} else {
+					s.udpCiphers[rt.Name] = cipher
+				}
 			}
 		}
 	}
 	s.updateRouteCache()
+	s.setupLoggingHook()
 	return s
+}
+
+func (s *Server) setupLoggingHook() {
+	logging.Global().AddHook(func(entry logging.LogEntry) {
+		if entry.Route == "" {
+			return
+		}
+		ev := DashboardEvent{
+			TimeUnix: entry.Timestamp / 1000,
+			Kind:     entry.Level + "_" + entry.Category,
+			Detail:   entry.Message,
+			Route:    entry.Route,
+		}
+		if entry.Fields != nil {
+			if ip, ok := entry.Fields["remote"]; ok {
+				ev.RemoteIP = ip
+			}
+			if ip, ok := entry.Fields["ip"]; ok {
+				ev.RemoteIP = ip
+			}
+			if detail, ok := entry.Fields["detail"]; ok {
+				if ev.Detail != "" {
+					ev.Detail += " " + detail
+				} else {
+					ev.Detail = detail
+				}
+			}
+		}
+		s.dash.addEvent(entry.Route, ev)
+	})
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -479,7 +516,7 @@ func (s *Server) Start(ctx context.Context) error {
 		if rt.Proto == "tcp" || rt.Proto == "both" {
 			ln, err := net.Listen("tcp", rt.PublicAddr)
 			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to listen on public tcp %s: %v", rt.PublicAddr, err)
+				logging.Global().RouteError(rt.Name, logging.CatTCP, "failed to listen on public tcp", map[string]string{"addr": rt.PublicAddr, "error": err.Error()})
 				continue
 			}
 			s.publicTCP[rt.Name] = ln
@@ -489,12 +526,12 @@ func (s *Server) Start(ctx context.Context) error {
 		if rt.Proto == "udp" || rt.Proto == "both" {
 			addr, err := net.ResolveUDPAddr("udp", rt.PublicAddr)
 			if err != nil {
-				logging.Global().Errorf(logging.CatUDP, "failed to resolve public udp %s: %v", rt.PublicAddr, err)
+				logging.Global().RouteError(rt.Name, logging.CatUDP, "failed to resolve public udp", map[string]string{"addr": rt.PublicAddr, "error": err.Error()})
 				continue
 			}
 			conn, err := net.ListenUDP("udp", addr)
 			if err != nil {
-				logging.Global().Errorf(logging.CatUDP, "failed to listen on public udp %s: %v", rt.PublicAddr, err)
+				logging.Global().RouteError(rt.Name, logging.CatUDP, "failed to listen on public udp", map[string]string{"addr": rt.PublicAddr, "error": err.Error()})
 				continue
 			}
 			conn.SetReadBuffer(8 * 1024 * 1024)
@@ -505,7 +542,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	logging.Global().Infof(logging.CatSystem, "Server started on control=%s data=%s", s.cfg.ControlAddr, s.cfg.DataAddr)
+	logging.Global().RouteInfo("", logging.CatSystem, "Server started", map[string]string{"control": s.cfg.ControlAddr, "data": s.cfg.DataAddr})
 	return nil
 }
 
@@ -539,23 +576,28 @@ func (s *Server) acceptControl(ln net.Listener) {
 			if s.ctx.Err() != nil {
 				return
 			}
-			logging.Global().Errorf(logging.CatTCP, "control accept error: %v", err)
+			logging.Global().RouteError("", logging.CatTCP, "control accept error", map[string]string{"error": err.Error()})
 			continue
 		}
 
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "control auth failed from %s: %v", conn.RemoteAddr(), err)
+			logging.Global().RouteError("", logging.CatTCP, "control auth failed", map[string]string{"remote": conn.RemoteAddr().String(), "error": err.Error()})
 			conn.Close()
 			continue
 		}
 		conn.SetDeadline(time.Time{})
 
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+
 		remoteAddr := conn.RemoteAddr().String()
 
 		s.sessionsMu.Lock()
 		if oldSession, exists := s.sessions[remoteAddr]; exists {
-			logging.Global().Infof(logging.CatTCP, "Terminating previous session from %s", remoteAddr)
+			logging.Global().RouteInfo("", logging.CatTCP, "Terminating previous session", map[string]string{"remote": remoteAddr})
 			if oldSession.cancel != nil {
 				oldSession.cancel()
 			}
@@ -587,7 +629,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 		}
 		s.mu.Unlock()
 
-		logging.Global().Infof(logging.CatTCP, "Agent connected to control from %s", remoteAddr)
+		logging.Global().RouteInfo("", logging.CatTCP, "Agent connected to control", map[string]string{"remote": remoteAddr})
 
 		routesMap := make(map[string]helloRoute)
 		for _, rt := range s.cfg.Routes {
@@ -607,7 +649,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 		session.writeMu.Lock()
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if err := protocol.WritePacket(conn, helloPkt); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
+			logging.Global().RouteError("", logging.CatTCP, "failed to send HELLO", map[string]string{"error": err.Error()})
 			conn.Close()
 			session.writeMu.Unlock()
 			s.mu.Lock()
@@ -674,8 +716,8 @@ func (s *Server) acceptControl(ln net.Listener) {
 						s.mu.RUnlock()
 						if isAgent {
 							lastPongTime := time.Unix(0, lastPong.Load().(int64))
-							if time.Since(lastPongTime) > 60*time.Second {
-								logging.Global().Errorf(logging.CatTCP, "agent health check timeout, closing connection")
+							if time.Since(lastPongTime) >= 60*time.Second {
+								logging.Global().RouteError("", logging.CatTCP, "agent health check timeout, closing connection", nil)
 								c.Close()
 								return
 							}
@@ -727,7 +769,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 					close(ch)
 					delete(s.pendingTCP, clientID)
 				}
-				logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
+				logging.Global().RouteInfo("", logging.CatTCP, "Agent disconnected from control", nil)
 			}
 			s.mu.Unlock()
 		}(conn, session, remoteAddr, currentEpoch)
@@ -744,13 +786,13 @@ func (s *Server) acceptData(ln net.Listener) {
 			if s.ctx.Err() != nil {
 				return
 			}
-			logging.Global().Errorf(logging.CatTCP, "data accept error: %v", err)
+			logging.Global().RouteError("", logging.CatTCP, "data accept error", map[string]string{"error": err.Error()})
 			continue
 		}
 
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "data auth failed from %s: %v", conn.RemoteAddr(), err)
+			logging.Global().RouteError("", logging.CatTCP, "data auth failed", map[string]string{"remote": conn.RemoteAddr().String(), "error": err.Error()})
 			conn.Close()
 			continue
 		}
@@ -784,27 +826,36 @@ func (s *Server) acceptData(ln net.Listener) {
 
 		s.mu.RLock()
 		var isEncrypted bool
+		routeFound := false
 		for _, rt := range s.cfg.Routes {
 			if rt.Name == routeName {
 				isEncrypted = rt.IsEncrypted()
+				routeFound = true
 				break
 			}
 		}
 		s.mu.RUnlock()
 
+		if !routeFound {
+			logging.Global().RouteError("", logging.CatTCP, "unknown route from agent data connection", map[string]string{"route": routeName})
+			conn.Close()
+			continue
+		}
+
 		if isEncrypted {
 			key := s.derivedKeys[routeName]
 			if key == nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: key is nil", routeName)
+				logging.Global().RouteError(routeName, logging.CatTCP, "failed to derive key: key is nil", nil)
 				conn.Close()
 				continue
 			}
-			conn, err = crypto.WrapTCP(conn, key)
+			wrappedConn, err := crypto.WrapTCP(conn, key)
 			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
+				logging.Global().RouteError(routeName, logging.CatTCP, "failed to wrap tcp", map[string]string{"error": err.Error()})
 				conn.Close()
 				continue
 			}
+			conn = wrappedConn
 		}
 
 		s.mu.Lock()
@@ -818,6 +869,7 @@ func (s *Server) acceptData(ln net.Listener) {
 		if ok {
 			ch <- conn
 		} else {
+			logging.Global().RouteWarn(routeName, logging.CatTCP, "no pending connection, closing agent data connection", map[string]string{"route": routeName, "client": clientID})
 			conn.Close()
 		}
 	}
@@ -833,7 +885,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			if s.ctx.Err() != nil {
 				return
 			}
-			logging.Global().Errorf(logging.CatTCP, "public tcp accept error: %v", err)
+			logging.Global().RouteError(routeName, logging.CatTCP, "public tcp accept error", map[string]string{"error": err.Error()})
 			continue
 		}
 
@@ -842,20 +894,35 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			tcpConn.SetKeepAlivePeriod(5 * time.Second)
 		}
 		clientID := s.nextClientID()
-		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
+		logging.Global().RouteInfo(routeName, logging.CatTCP, "New public TCP connection", map[string]string{"route": routeName, "client": clientID})
 
 		s.mu.RLock()
 		agent := s.agentTCP
 		enabled := false
+		routeFound := false
 		for _, rt := range s.cfg.Routes {
 			if rt.Name == routeName {
 				enabled = rt.IsEnabled()
+				routeFound = true
 				break
 			}
 		}
 		s.mu.RUnlock()
 
-		if agent == nil || !enabled {
+		if !routeFound {
+			logging.Global().RouteWarn(routeName, logging.CatTCP, "public tcp connection for unknown route, closing", map[string]string{"route": routeName})
+			conn.Close()
+			continue
+		}
+
+		if !enabled {
+			logging.Global().RouteWarn(routeName, logging.CatTCP, "route is disabled, closing public tcp connection", map[string]string{"route": routeName})
+			conn.Close()
+			continue
+		}
+
+		if agent == nil {
+			logging.Global().RouteWarn(routeName, logging.CatTCP, "no agent connected, closing public tcp connection", map[string]string{"route": routeName})
 			conn.Close()
 			continue
 		}
@@ -905,7 +972,9 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				}
 				s.dash.addConn(time.Now())
 				s.dash.incActive(routeName)
+				logging.Global().RouteInfo(routeName, logging.CatTCP, "Connection established", map[string]string{"client": clientID})
 				defer s.dash.decActive(routeName)
+				defer logging.Global().RouteInfo(routeName, logging.CatTCP, "Connection closed", map[string]string{"client": clientID})
 
 				countBytes := func(n int) {
 					s.dash.addBytes(time.Now(), int64(n))
@@ -913,6 +982,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				relay.Proxy(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes})
 
 			case <-time.After(s.cfg.PairTimeout):
+				logging.Global().RouteWarn(routeName, logging.CatTCP, "timeout waiting for agent data connection", map[string]string{"route": routeName, "client": clientID})
 				s.mu.Lock()
 				delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
 				s.mu.Unlock()
@@ -964,6 +1034,7 @@ func (s *Server) acceptAgentUDP() {
 	var pkt protocol.Packet
 
 	addrCache := sync.Map{}
+	addrCacheSize := 0
 
 	for {
 		select {
@@ -989,7 +1060,7 @@ func (s *Server) acceptAgentUDP() {
 		if pkt.Type == protocol.TypeRegister {
 			if !s.agentUDP.IsValid() || s.agentUDP != addr {
 				s.agentUDP = addr
-				logging.Global().Infof(logging.CatUDP, "Agent UDP address registered: %s", addr.String())
+				logging.Global().RouteInfo("", logging.CatUDP, "Agent UDP address registered", map[string]string{"addr": addr.String()})
 			}
 			s.agentUDPAt = time.Now()
 		} else if !s.agentUDP.IsValid() || s.agentUDP != addr {
@@ -1015,29 +1086,38 @@ func (s *Server) acceptAgentUDP() {
 			cache := s.routeCache.Load().(map[string]routeConfig)
 			rc, ok := cache[pkt.Route]
 			if !ok {
+				logging.Global().RouteDebug(pkt.Route, logging.CatUDP, "no route config in acceptAgentUDP", nil)
 				continue
 			}
 
 			payload := pkt.Payload
 			if rc.isEncrypted {
 				if udpCipher == nil {
+					logging.Global().RouteDebug(pkt.Route, logging.CatUDP, "missing UDP cipher for encrypted route", nil)
 					continue
 				}
 				decrypted, err := crypto.DecryptUDP(udpCipher, decryptBuf, payload)
 				if err != nil {
+					logging.Global().RouteDebug(pkt.Route, logging.CatUDP, "UDP decryption failed", map[string]string{"error": err.Error()})
 					continue
 				}
 				payload = decrypted
 			}
 
-			clientAddrVal, ok := addrCache.Load(pkt.Client)
+			clientKey := string([]byte(pkt.Client))
+			clientAddrVal, ok := addrCache.Load(clientKey)
 			if !ok {
-				clientAddr, err := net.ResolveUDPAddr("udp", pkt.Client)
+				clientAddr, err := net.ResolveUDPAddr("udp", clientKey)
 				if err != nil {
 					continue
 				}
 				clientAddrVal = clientAddr
-				addrCache.Store(pkt.Client, clientAddrVal)
+				addrCache.Store(clientKey, clientAddrVal)
+				addrCacheSize++
+				if addrCacheSize > 10000 {
+					addrCache = sync.Map{}
+					addrCacheSize = 0
+				}
 			}
 			clientAddr, ok := clientAddrVal.(*net.UDPAddr)
 			if !ok || clientAddr == nil {
@@ -1098,7 +1178,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		if !agentUDPAt.IsZero() && time.Since(agentUDPAt) > 60*time.Second {
 			s.mu.Lock()
 			if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > 60*time.Second {
-				logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
+				logging.Global().RouteInfo("", logging.CatUDP, "Agent UDP address timed out after 60s inactivity", nil)
 				s.agentUDP = netip.AddrPort{}
 			}
 			s.mu.Unlock()
@@ -1107,17 +1187,24 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 
 		cache := s.routeCache.Load().(map[string]routeConfig)
 		rc, ok := cache[routeName]
-		if !ok || !agentAddr.IsValid() || !rc.enabled {
+		if !ok {
+			logging.Global().RouteDebug(routeName, logging.CatUDP, "no route config in acceptPublicUDP", nil)
+			continue
+		}
+		if !rc.enabled {
+			logging.Global().RouteDebug(routeName, logging.CatUDP, "route is disabled", nil)
 			continue
 		}
 
 		payload := buf[:n]
 		if rc.isEncrypted {
 			if udpCipher == nil {
+				logging.Global().RouteDebug(routeName, logging.CatUDP, "missing UDP cipher for encrypted route", nil)
 				continue
 			}
 			encrypted, err := crypto.EncryptUDP(udpCipher, encryptBuf, payload)
 			if err != nil {
+				logging.Global().RouteDebug(routeName, logging.CatUDP, "UDP encryption failed", map[string]string{"error": err.Error()})
 				continue
 			}
 			payload = encrypted

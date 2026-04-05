@@ -15,6 +15,8 @@
 **/*.tmp
 **/*.log
 *.zip
+*.tar.gz
+zip.sh
 
 # Editors / OS
 .DS_Store

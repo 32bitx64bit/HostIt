@@ -101,7 +101,7 @@ func main() {
 	if strings.TrimSpace(cfg.Token) == "" {
 		cfg.Token = genToken()
 		_ = configio.Save(configPath, cfg)
-		slog.Info(logging.CatSystem, "generated new server token (was empty)")
+		slog.Infof(logging.CatSystem, "generated new server token (was empty)")
 	}
 
 	if !cfg.DisableTLS {
@@ -114,10 +114,11 @@ func main() {
 		}
 		fp, err := tlsutil.EnsureSelfSigned(cfg.TLSCertFile, cfg.TLSKeyFile)
 		if err != nil {
-			slog.Fatal(logging.CatSystem, "TLS setup failed", serverlog.F("error", err))
+			slog.Errorf(logging.CatSystem, "TLS setup failed: %v", err)
+			os.Exit(1)
 		}
 		_ = configio.Save(configPath, cfg)
-		slog.Info(logging.CatEncryption, "tunnel TLS enabled", serverlog.F("cert_sha256", fp))
+		slog.Infof(logging.CatEncryption, "tunnel TLS enabled, cert_sha256=%s", fp)
 	}
 
 	// Enable WebHTTPS by default for new configurations and generate dashboard TLS cert
@@ -130,7 +131,7 @@ func main() {
 		}
 		if _, err := os.Stat(webCert); os.IsNotExist(err) {
 			cfg.WebHTTPS = true
-			slog.Info(logging.CatSystem, "enabling WebHTTPS by default for new installation")
+			slog.Infof(logging.CatSystem, "enabling WebHTTPS by default for new installation")
 		}
 	}
 	if cfg.WebHTTPS {
@@ -142,26 +143,22 @@ func main() {
 		}
 		fp, err := tlsutil.EnsureSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
 		if err != nil {
-			slog.Error(logging.CatSystem, "dashboard TLS setup failed", serverlog.F("error", err))
+			slog.Errorf(logging.CatSystem, "dashboard TLS setup failed: %v", err)
 		} else {
 			_ = configio.Save(configPath, cfg)
-			slog.Info(logging.CatEncryption, "dashboard HTTPS enabled", serverlog.F("cert_sha256", fp))
+			slog.Infof(logging.CatEncryption, "dashboard HTTPS enabled, cert_sha256=%s", fp)
 		}
 	}
 
 	runner := newServerRunner(ctx, cfg)
 	runner.Start()
-	slog.Info(logging.CatSystem, "server started", serverlog.F(
-		"control_addr", cfg.ControlAddr,
-		"data_addr", cfg.DataAddr,
-		"tls_enabled", !cfg.DisableTLS,
-	))
+	slog.Infof(logging.CatSystem, "server started control=%s data=%s tls=%v", cfg.ControlAddr, cfg.DataAddr, !cfg.DisableTLS)
 
 	if webAddr != "" {
 		go func() {
 			store, err := auth.Open(authDBPath)
 			if err != nil {
-				slog.Error(logging.CatAuth, "auth database open failed", serverlog.F("error", err, "path", authDBPath))
+				slog.Errorf(logging.CatAuth, "auth database open failed: %v path=%s", err, authDBPath)
 				return
 			}
 			defer store.Close()
@@ -170,9 +167,9 @@ func main() {
 			if cfg.WebHTTPS {
 				scheme = "https"
 			}
-			slog.Info(logging.CatDashboard, "web dashboard starting", serverlog.F("url", scheme+"://"+webAddr))
+			slog.Infof(logging.CatDashboard, "web dashboard starting url=%s", scheme+"://"+webAddr)
 			if err := serveServerDashboard(ctx, webAddr, configPath, authDBPath, runner, store, cookieSecure, sessionTTL, webShutdownTimeout); err != nil {
-				slog.Error(logging.CatDashboard, "web dashboard error", serverlog.F("error", err))
+				slog.Errorf(logging.CatDashboard, "web dashboard error: %v", err)
 			}
 		}()
 	}
@@ -637,6 +634,74 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(resp)
+		})))
+
+		mux.HandleFunc("/api/logs", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			route := strings.TrimSpace(r.URL.Query().Get("route"))
+			var logs []logging.LogEntry
+			if route == "" {
+				logs = logging.Global().GetAllLogs()
+			} else if route == "system" {
+				logs = logging.Global().GetSystemLogs()
+			} else {
+				logs = logging.Global().GetLogs(route)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"logs":       logs,
+				"routeNames": logging.Global().GetRouteNames(),
+			})
+		})))
+
+		mux.HandleFunc("/api/logs/system", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			logs := logging.Global().GetSystemLogs()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"logs": logs})
+		})))
+
+		mux.HandleFunc("/api/events", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			route := strings.TrimSpace(r.URL.Query().Get("route"))
+			events := logging.Global().GetEvents(route)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"events": events})
+		})))
+
+		mux.HandleFunc("/api/log-level", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				level := serverlog.GetLevel()
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"level": level.String()})
+			case http.MethodPost:
+				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+				if err := r.ParseForm(); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if !checkCSRF(r) {
+					http.Error(w, "csrf", http.StatusBadRequest)
+					return
+				}
+				levelStr := strings.TrimSpace(r.Form.Get("level"))
+				level := logging.ParseLevel(levelStr)
+				serverlog.SetLevel(level)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"level": level.String()})
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
 		})))
 
 		mux.HandleFunc("/api/nettest/ping", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1217,7 +1282,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 
 			cfg, _, _ := runner.Get()
 			if err := configio.Save(configPath, cfg); err != nil {
-				serverlog.Log.Error(logging.CatSystem, "failed to save config after route toggle", serverlog.F("error", err))
+				logging.Global().Errorf(logging.CatSystem, "failed to save config after route toggle: %v", err)
 			}
 
 			w.Header().Set("Content-Type", "application/json")
@@ -2488,6 +2553,21 @@ const serverControlsHTML = `<!doctype html>
 					</form>
 				</div>
 
+				<div class="secHead"><h2>Logging</h2></div>
+				<div class="card">
+					<div class="row"><b>Log Level:</b> <code id="curLogLevel">info</code></div>
+					<div class="muted" style="margin-bottom:8px;font-size:12px">Controls verbosity of route and system logs displayed in the dashboard. Debug shows all logs; Error shows only errors.</div>
+					<div class="flex">
+						<select id="logLevelSelect" class="btn sm" style="appearance:auto;padding:5px 8px">
+							<option value="debug">debug</option>
+							<option value="info" selected>info</option>
+							<option value="warn">warn</option>
+							<option value="error">error</option>
+						</select>
+						<button type="button" id="applyLogLevelBtn" class="btn sm primary">Apply</button>
+					</div>
+				</div>
+
 				<div class="secHead"><h2>Updates</h2></div>
 				<div class="card">
 					<div class="row"><b>Current:</b> <code>{{.Version}}</code></div>
@@ -2538,6 +2618,34 @@ const serverControlsHTML = `<!doctype html>
 	<script>
 	var csrf = {{printf "%q" .CSRF}};
 	function body(){var b=new URLSearchParams();b.set('csrf',csrf);return b;}
+	async function refreshLogLevel(){
+		try{
+			var r=await fetch('/api/log-level',{credentials:'include'});
+			if(r.ok){
+				var j=await r.json();
+				document.getElementById('curLogLevel').textContent=j.level||'info';
+				var sel=document.getElementById('logLevelSelect');
+				if(sel&&j.level){sel.value=j.level;}
+			}
+		}catch(e){}
+	}
+	async function applyLogLevel(){
+		var sel=document.getElementById('logLevelSelect');
+		if(!sel)return;
+		var level=sel.value;
+		var b=new URLSearchParams();
+		b.set('csrf',csrf);
+		b.set('level',level);
+		try{
+			var r=await fetch('/api/log-level',{method:'POST',body:b,credentials:'include'});
+			if(r.ok){
+				var j=await r.json();
+				document.getElementById('curLogLevel').textContent=j.level||level;
+			}
+		}catch(e){}
+	}
+	document.getElementById('applyLogLevelBtn').onclick=applyLogLevel;
+	refreshLogLevel();
 	function setUpd(st){
 		if(!st)return;
 		document.getElementById('availableVersion').textContent=st.latestVersion||st.availableVersion||'—';
@@ -3082,7 +3190,6 @@ func subtleEq(a, b string) bool {
 	}
 	return v == 0
 }
-
 
 func setSessionCookie(w http.ResponseWriter, sid string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
