@@ -16,6 +16,7 @@ import (
 
 	"hostit/shared/crypto"
 	"hostit/shared/logging"
+	"hostit/shared/netutil"
 	"hostit/shared/protocol"
 	"hostit/shared/relay"
 )
@@ -113,7 +114,7 @@ func (a *Agent) connectAndRun() error {
 	if err != nil {
 		return fmt.Errorf("control dial failed: %w", err)
 	}
-	setTCPKeepAlive(conn, 15*time.Second)
+	netutil.SetTCPKeepAlive(conn, 15*time.Second)
 	a.controlConn = conn
 	defer conn.Close()
 
@@ -339,7 +340,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					logging.Global().Errorf(logging.CatTCP, "failed to dial data server %s: %v", a.cfg.DataAddr(), err)
 					return
 				}
-				setTCPKeepAlive(dataConn, 15*time.Second)
+				netutil.SetTCPKeepAlive(dataConn, 15*time.Second)
 
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
 				if err := crypto.AuthenticateClient(dataConn, a.cfg.Token); err != nil {
@@ -412,7 +413,7 @@ func dialLocalTCP(localAddr string) (net.Conn, error) {
 		dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 15 * time.Second}
 		conn, err := dialer.Dial("tcp", localAddr)
 		if err == nil {
-			setTCPKeepAlive(conn, 15*time.Second)
+			netutil.SetTCPKeepAlive(conn, 15*time.Second)
 			return conn, nil
 		}
 		lastErr = err
@@ -422,32 +423,6 @@ func dialLocalTCP(localAddr string) (net.Conn, error) {
 	}
 
 	return nil, lastErr
-}
-
-func setTCPKeepAlive(conn net.Conn, period time.Duration) {
-	if period <= 0 || conn == nil {
-		return
-	}
-	tcpConn := unwrapTCPConn(conn)
-	if tcpConn == nil {
-		return
-	}
-	_ = tcpConn.SetKeepAlive(true)
-	_ = tcpConn.SetKeepAlivePeriod(period)
-}
-
-func unwrapTCPConn(conn net.Conn) *net.TCPConn {
-	if conn == nil {
-		return nil
-	}
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		return tcpConn
-	}
-	type netConner interface{ NetConn() net.Conn }
-	if wrapped, ok := conn.(netConner); ok {
-		return unwrapTCPConn(wrapped.NetConn())
-	}
-	return nil
 }
 
 type agentUDPSession struct {

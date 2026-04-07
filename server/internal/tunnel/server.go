@@ -19,6 +19,7 @@ import (
 
 	"hostit/shared/crypto"
 	"hostit/shared/logging"
+	"hostit/shared/netutil"
 	"hostit/shared/protocol"
 	"hostit/shared/relay"
 )
@@ -71,32 +72,9 @@ type Server struct {
 
 	sessionsMu sync.Mutex
 	sessions   map[string]*agentSession
-}
 
-func setTCPKeepAlive(conn net.Conn, period time.Duration) {
-	if period <= 0 || conn == nil {
-		return
-	}
-	tcpConn := unwrapTCPConn(conn)
-	if tcpConn == nil {
-		return
-	}
-	_ = tcpConn.SetKeepAlive(true)
-	_ = tcpConn.SetKeepAlivePeriod(period)
-}
-
-func unwrapTCPConn(conn net.Conn) *net.TCPConn {
-	if conn == nil {
-		return nil
-	}
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		return tcpConn
-	}
-	type netConner interface{ NetConn() net.Conn }
-	if wrapped, ok := conn.(netConner); ok {
-		return unwrapTCPConn(wrapped.NetConn())
-	}
-	return nil
+	lastAgentConnectAt    time.Time
+	lastAgentDisconnectAt time.Time
 }
 
 func makePendingTCPKey(routeName, clientID string) string {
@@ -152,9 +130,13 @@ type AgentNettestResult struct {
 func (s *Server) Dashboard(now time.Time) DashboardSnapshot {
 	s.mu.RLock()
 	connected := s.agentTCP != nil
+	lastAgentConnectAt := s.lastAgentConnectAt
+	lastAgentDisconnectAt := s.lastAgentDisconnectAt
 	s.mu.RUnlock()
 
-	return s.dash.snapshot(now, connected)
+	snap := s.dash.snapshot(now, connected)
+	snap.Runtime = s.runtimeStats(lastAgentConnectAt, lastAgentDisconnectAt)
+	return snap
 }
 
 type routeConfig struct {
@@ -176,6 +158,73 @@ func (s *Server) updateRouteCache() {
 	s.routeCache.Store(newCache)
 }
 
+func buildHelloRoutes(cfg ServerConfig) map[string]helloRoute {
+	routes := make(map[string]helloRoute, len(cfg.Routes))
+	for _, rt := range cfg.Routes {
+		routes[rt.Name] = helloRoute{
+			Name:       rt.Name,
+			Proto:      rt.Proto,
+			PublicAddr: rt.PublicAddr,
+			LocalAddr:  rt.LocalAddr,
+			Encrypted:  rt.IsEncrypted(),
+			Algorithm:  cfg.EncryptionAlgorithm,
+		}
+	}
+	return routes
+}
+
+func (s *Server) buildHelloPacket() (*protocol.Packet, error) {
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	payload, err := json.Marshal(buildHelloRoutes(cfg))
+	if err != nil {
+		return nil, err
+	}
+	return &protocol.Packet{Type: protocol.TypeHello, Payload: payload}, nil
+}
+
+func (s *Server) runtimeStats(lastAgentConnectAt, lastAgentDisconnectAt time.Time) *DashboardRuntime {
+	s.mu.RLock()
+	pendingTCP := len(s.pendingTCP)
+	managedDomains := 0
+	for _, rt := range s.cfg.Routes {
+		if rt.IsEnabled() && rt.IsDomainEnabled() {
+			managedDomains++
+		}
+	}
+	cache, _ := s.routeCache.Load().(map[string]routeConfig)
+	routeCacheEntries := len(cache)
+	s.mu.RUnlock()
+
+	s.sessionsMu.Lock()
+	agentSessions := len(s.sessions)
+	s.sessionsMu.Unlock()
+
+	managedProxyRoutes := 0
+	s.domainProxyCache.Range(func(_, _ any) bool {
+		managedProxyRoutes++
+		return true
+	})
+
+	return &DashboardRuntime{
+		PendingTCP:              pendingTCP,
+		AgentSessions:           agentSessions,
+		ManagedProxyRoutes:      managedProxyRoutes,
+		ManagedDomains:          managedDomains,
+		RouteCacheEntries:       routeCacheEntries,
+		LastAgentConnectUnix:    unixOrZero(lastAgentConnectAt),
+		LastAgentDisconnectUnix: unixOrZero(lastAgentDisconnectAt),
+	}
+}
+
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
 func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 	s.mu.Lock()
 	for i, rt := range s.cfg.Routes {
@@ -188,21 +237,10 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 
 			s.mu.Lock()
 			if s.agentTCP != nil {
-				routesMap := make(map[string]helloRoute)
-				for _, r := range s.cfg.Routes {
-					routesMap[r.Name] = helloRoute{
-						Name:       r.Name,
-						Proto:      r.Proto,
-						PublicAddr: r.PublicAddr,
-						LocalAddr:  r.LocalAddr,
-						Encrypted:  r.IsEncrypted(),
-						Algorithm:  s.cfg.EncryptionAlgorithm,
-					}
-				}
-				routesJSON, _ := json.Marshal(routesMap)
-				helloPkt := &protocol.Packet{
-					Type:    protocol.TypeHello,
-					Payload: routesJSON,
+				helloPkt, err := s.buildHelloPacket()
+				if err != nil {
+					s.mu.Unlock()
+					return false
 				}
 				remoteAddr := s.agentTCP.RemoteAddr().String()
 				s.mu.Unlock()
@@ -595,7 +633,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			logging.Global().Errorf(logging.CatTCP, "control accept error: %v", err)
 			continue
 		}
-		setTCPKeepAlive(conn, 15*time.Second)
+		netutil.SetTCPKeepAlive(conn, 15*time.Second)
 
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
@@ -635,6 +673,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 		s.agentTCP = conn
 		s.agentUDP = netip.AddrPort{}
 		s.agentUDPAt = time.Time{}
+		s.lastAgentConnectAt = time.Now()
 		for clientID, ch := range s.pendingTCP {
 			close(ch)
 			delete(s.pendingTCP, clientID)
@@ -643,21 +682,11 @@ func (s *Server) acceptControl(ln net.Listener) {
 
 		logging.Global().Infof(logging.CatTCP, "Agent connected to control from %s", remoteAddr)
 
-		routesMap := make(map[string]helloRoute)
-		for _, rt := range s.cfg.Routes {
-			routesMap[rt.Name] = helloRoute{
-				Name:       rt.Name,
-				Proto:      rt.Proto,
-				PublicAddr: rt.PublicAddr,
-				LocalAddr:  rt.LocalAddr,
-				Encrypted:  rt.IsEncrypted(),
-				Algorithm:  s.cfg.EncryptionAlgorithm,
-			}
-		}
-		routesJSON, _ := json.Marshal(routesMap)
-		helloPkt := &protocol.Packet{
-			Type:    protocol.TypeHello,
-			Payload: routesJSON,
+		helloPkt, err := s.buildHelloPacket()
+		if err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to build HELLO packet: %v", err)
+			conn.Close()
+			continue
 		}
 		session.writeMu.Lock()
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -778,6 +807,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.mu.Lock()
 			if s.agentTCP == c && s.agentEpoch == epoch {
 				s.agentTCP = nil
+				s.lastAgentDisconnectAt = time.Now()
 				s.closeDomainProxyIdleConnections()
 				for clientID, ch := range s.pendingTCP {
 					close(ch)
@@ -803,7 +833,7 @@ func (s *Server) acceptData(ln net.Listener) {
 			logging.Global().Errorf(logging.CatTCP, "data accept error: %v", err)
 			continue
 		}
-		setTCPKeepAlive(conn, 15*time.Second)
+		netutil.SetTCPKeepAlive(conn, 15*time.Second)
 
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
@@ -894,7 +924,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			continue
 		}
 
-		setTCPKeepAlive(conn, 15*time.Second)
+		netutil.SetTCPKeepAlive(conn, 15*time.Second)
 		clientID := s.nextClientID()
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
 

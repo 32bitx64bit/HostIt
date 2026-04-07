@@ -252,9 +252,14 @@ func TestManagedDomainProxyTransportAllowsLongPosts(t *testing.T) {
 		t.Fatal("domainProxy() returned nil")
 	}
 
-	transport, ok := proxy.Transport.(*http.Transport)
+	managedTransport, ok := proxy.Transport.(*managedProxyTransport)
+	if !ok || managedTransport == nil {
+		t.Fatalf("proxy transport = %T, want *managedProxyTransport", proxy.Transport)
+	}
+
+	transport := managedTransport.base
 	if !ok || transport == nil {
-		t.Fatalf("proxy transport = %T, want *http.Transport", proxy.Transport)
+		t.Fatal("managed proxy transport missing base *http.Transport")
 	}
 	if transport.ResponseHeaderTimeout != 0 {
 		t.Fatalf("ResponseHeaderTimeout = %v, want 0 so long POST handlers are not turned into 502s", transport.ResponseHeaderTimeout)

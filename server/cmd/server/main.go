@@ -643,6 +643,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"activeClients":  snap.ActiveClients,
 				"bytesTotal":     snap.BytesTotal,
 				"udp":            snap.UDP,
+				"runtime":        snap.Runtime,
 				"series":         snap.Series,
 				"routes":         outRoutes,
 				"systemEvents":   snap.Routes["_system"].Events,

@@ -45,6 +45,17 @@ type DashboardSnapshot struct {
 	Series         []DashboardPoint          `json:"series"`
 	Routes         map[string]DashboardRoute `json:"routes"`
 	UDP            *UDPStats                 `json:"udp,omitempty"`
+	Runtime        *DashboardRuntime         `json:"runtime,omitempty"`
+}
+
+type DashboardRuntime struct {
+	PendingTCP              int   `json:"pendingTcp"`
+	AgentSessions           int   `json:"agentSessions"`
+	ManagedProxyRoutes      int   `json:"managedProxyRoutes"`
+	ManagedDomains          int   `json:"managedDomains"`
+	RouteCacheEntries       int   `json:"routeCacheEntries"`
+	LastAgentConnectUnix    int64 `json:"lastAgentConnectUnix"`
+	LastAgentDisconnectUnix int64 `json:"lastAgentDisconnectUnix"`
 }
 
 type UDPStats struct {

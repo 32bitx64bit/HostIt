@@ -372,9 +372,18 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 	})
 	go func() { _ = srv.Run(ctx) }()
 
-	conn, err := net.Dial("tcp", controlAddr)
-	if err != nil {
-		t.Fatal(err)
+	var conn net.Conn
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var err error
+		conn, err = net.Dial("tcp", controlAddr)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
