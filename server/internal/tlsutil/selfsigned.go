@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -71,7 +72,46 @@ func RegenerateSelfSignedDashboard(certFile, keyFile string) (fingerprintHex str
 	return writeSelfSigned(certFile, keyFile, "hostit-dashboard")
 }
 
+func EnsureSelfSignedHost(certFile, keyFile string, host string) (fingerprintHex string, err error) {
+	if certFile == "" || keyFile == "" {
+		return "", fmt.Errorf("certFile/keyFile required")
+	}
+
+	certExists := fileExists(certFile)
+	keyExists := fileExists(keyFile)
+
+	if certExists && keyExists {
+		der, err := readFirstCertDER(certFile)
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256(der)
+		return hex.EncodeToString(sum[:]), nil
+	}
+
+	return writeSelfSignedHost(certFile, keyFile, host)
+}
+
+func RegenerateSelfSignedHost(certFile, keyFile string, host string) (fingerprintHex string, err error) {
+	if certFile == "" || keyFile == "" {
+		return "", fmt.Errorf("certFile/keyFile required")
+	}
+	return writeSelfSignedHost(certFile, keyFile, host)
+}
+
 func writeSelfSigned(certFile, keyFile string, commonName string) (fingerprintHex string, err error) {
+	return writeSelfSignedWithSANs(certFile, keyFile, commonName, []string{"localhost"}, []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback})
+}
+
+func writeSelfSignedHost(certFile, keyFile string, host string) (fingerprintHex string, err error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", fmt.Errorf("host required")
+	}
+	return writeSelfSignedWithSANs(certFile, keyFile, host, []string{host}, nil)
+}
+
+func writeSelfSignedWithSANs(certFile, keyFile string, commonName string, dnsNames []string, ipAddrs []net.IP) (fingerprintHex string, err error) {
 	if err := os.MkdirAll(filepath.Dir(certFile), 0o755); err != nil && filepath.Dir(certFile) != "." {
 		return "", err
 	}
@@ -102,8 +142,8 @@ func writeSelfSigned(certFile, keyFile string, commonName string) (fingerprintHe
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+		DNSNames:              dnsNames,
+		IPAddresses:           ipAddrs,
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)

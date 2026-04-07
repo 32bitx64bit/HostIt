@@ -5,46 +5,57 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Level int
 
 const (
-	LevelDebug Level = iota
+	LevelTrace Level = iota
+	LevelDebug
 	LevelInfo
 	LevelWarn
 	LevelError
+	LevelFatal
 )
 
 func (l Level) String() string {
 	switch l {
+	case LevelTrace:
+		return "TRACE"
 	case LevelDebug:
-		return "debug"
+		return "DEBUG"
 	case LevelInfo:
-		return "info"
+		return "INFO"
 	case LevelWarn:
-		return "warn"
+		return "WARN"
 	case LevelError:
-		return "error"
+		return "ERROR"
+	case LevelFatal:
+		return "FATAL"
 	default:
-		return "unknown"
+		return "UNKNOWN"
 	}
 }
 
 func ParseLevel(s string) Level {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "debug":
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "TRACE":
+		return LevelTrace
+	case "DEBUG":
 		return LevelDebug
-	case "info":
+	case "INFO":
 		return LevelInfo
-	case "warn", "warning":
+	case "WARN", "WARNING":
 		return LevelWarn
-	case "error":
+	case "ERROR":
 		return LevelError
+	case "FATAL":
+		return LevelFatal
 	default:
 		return LevelInfo
 	}
@@ -66,144 +77,32 @@ const (
 	CatEncryption Category = "encryption"
 )
 
-type LogEntry struct {
-	Timestamp int64             `json:"ts"`
-	Level     string            `json:"level"`
-	Route     string            `json:"route"`
-	Category  string            `json:"cat"`
-	Message   string            `json:"msg"`
-	Fields    map[string]string `json:"fields,omitempty"`
+type Entry struct {
+	Time      time.Time      `json:"time"`
+	Level     Level          `json:"level"`
+	LevelStr  string         `json:"level_str"`
+	Category  Category       `json:"category"`
+	Component string         `json:"component"`
+	Message   string         `json:"message"`
+	Fields    map[string]any `json:"fields,omitempty"`
+	Error     error          `json:"-"`
+	ErrorStr  string         `json:"error,omitempty"`
+	Caller    string         `json:"caller,omitempty"`
 }
 
-type LogBuffer struct {
-	mu       sync.RWMutex
-	entries  []LogEntry
-	capacity int
-	head     int
-	size     int
-}
-
-func NewLogBuffer(capacity int) *LogBuffer {
-	return &LogBuffer{
-		entries:  make([]LogEntry, capacity),
-		capacity: capacity,
-	}
-}
-
-func (b *LogBuffer) Add(entry LogEntry) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.entries[b.head] = entry
-	b.head = (b.head + 1) % b.capacity
-	if b.size < b.capacity {
-		b.size++
-	}
-}
-
-func (b *LogBuffer) GetAll() []LogEntry {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if b.size == 0 {
-		return nil
-	}
-	result := make([]LogEntry, b.size)
-	if b.head >= b.size {
-		copy(result, b.entries[b.head-b.size:b.head])
-	} else {
-		start := b.capacity - (b.size - b.head)
-		copy(result, b.entries[start:b.capacity])
-		copy(result[b.capacity-start:], b.entries[:b.head])
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Timestamp < result[j].Timestamp
-	})
-	return result
-}
-
-func (b *LogBuffer) GetSince(timestamp int64) []LogEntry {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if b.size == 0 {
-		return nil
-	}
-	all := b.GetAll()
-	result := make([]LogEntry, 0)
-	for _, e := range all {
-		if e.Timestamp > timestamp {
-			result = append(result, e)
-		}
-	}
-	return result
-}
-
-func (b *LogBuffer) Clear() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.entries = make([]LogEntry, b.capacity)
-	b.head = 0
-	b.size = 0
-}
+type Hook func(entry Entry)
 
 type Logger struct {
-	mu        sync.RWMutex
-	systemBuf *LogBuffer
-	routeBufs map[string]*LogBuffer
-	eventBufs map[string]*LogBuffer
-	output    io.Writer
-	minLevel  Level
-	systemCap int
-	routeCap  int
-	eventCap  int
-	component string
-	hooks     []func(LogEntry)
-}
+	mu         sync.RWMutex
+	level      atomic.Int32
+	output     io.Writer
+	component  string
+	hooks      []Hook
+	fields     map[string]any
+	jsonFormat bool
+	showCaller bool
 
-const (
-	DefaultSystemCap = 1000
-	DefaultRouteCap  = 500
-	DefaultEventCap  = 200
-)
-
-var (
-	globalLogger     *Logger
-	globalLoggerOnce sync.Once
-)
-
-func Global() *Logger {
-	globalLoggerOnce.Do(func() {
-		globalLogger = NewLogger(DefaultSystemCap, DefaultRouteCap, DefaultEventCap)
-	})
-	return globalLogger
-}
-
-func SetGlobal(l *Logger) {
-	globalLoggerOnce.Do(func() {})
-	globalLogger = l
-}
-
-func NewLogger(systemCap, routeCap, eventCap int) *Logger {
-	return &Logger{
-		systemBuf: NewLogBuffer(systemCap),
-		routeBufs: make(map[string]*LogBuffer),
-		eventBufs: make(map[string]*LogBuffer),
-		output:    os.Stderr,
-		minLevel:  LevelInfo,
-		systemCap: systemCap,
-		routeCap:  routeCap,
-		eventCap:  eventCap,
-	}
-}
-
-func New(cfg Config) *Logger {
-	l := NewLogger(DefaultSystemCap, DefaultRouteCap, DefaultEventCap)
-	if cfg.Output != nil {
-		l.output = cfg.Output
-	}
-	if cfg.Level >= LevelDebug && cfg.Level <= LevelError {
-		l.minLevel = cfg.Level
-	}
-	l.component = cfg.Component
-	return l
+	rateLimiter *rateLimiter
 }
 
 type Config struct {
@@ -212,6 +111,7 @@ type Config struct {
 	Component  string
 	JSONFormat bool
 	ShowCaller bool
+	RateLimit  time.Duration
 }
 
 func DefaultConfig(component string) Config {
@@ -221,19 +121,50 @@ func DefaultConfig(component string) Config {
 		Component:  component,
 		JSONFormat: false,
 		ShowCaller: false,
+		RateLimit:  100 * time.Millisecond,
 	}
 }
 
+func New(cfg Config) *Logger {
+	if cfg.Output == nil {
+		cfg.Output = os.Stderr
+	}
+	l := &Logger{
+		output:      cfg.Output,
+		component:   cfg.Component,
+		hooks:       make([]Hook, 0),
+		fields:      make(map[string]any),
+		jsonFormat:  cfg.JSONFormat,
+		showCaller:  cfg.ShowCaller,
+		rateLimiter: newRateLimiter(cfg.RateLimit),
+	}
+	l.level.Store(int32(cfg.Level))
+	return l
+}
+
+var (
+	globalLogger     *Logger
+	globalLoggerOnce sync.Once
+)
+
+func Global() *Logger {
+	globalLoggerOnce.Do(func() {
+		globalLogger = New(DefaultConfig("app"))
+	})
+	return globalLogger
+}
+
+func SetGlobal(l *Logger) {
+	globalLoggerOnce.Do(func() {})
+	globalLogger = l
+}
+
 func (l *Logger) SetLevel(level Level) {
-	l.mu.Lock()
-	l.minLevel = level
-	l.mu.Unlock()
+	l.level.Store(int32(level))
 }
 
 func (l *Logger) GetLevel() Level {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.minLevel
+	return Level(l.level.Load())
 }
 
 func (l *Logger) SetLevelFromEnv() {
@@ -246,81 +177,157 @@ func (l *Logger) SetLevelFromEnv() {
 	}
 }
 
-func (l *Logger) SetOutput(w io.Writer) {
-	l.mu.Lock()
-	l.output = w
-	l.mu.Unlock()
-}
-
-func (l *Logger) getRouteBuffer(route string) *LogBuffer {
+func (l *Logger) AddHook(hook Hook) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	buf, ok := l.routeBufs[route]
-	if !ok {
-		buf = NewLogBuffer(l.routeCap)
-		l.routeBufs[route] = buf
-	}
-	return buf
+	l.hooks = append(l.hooks, hook)
 }
 
-func (l *Logger) getEventBuffer(route string) *LogBuffer {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	buf, ok := l.eventBufs[route]
-	if !ok {
-		buf = NewLogBuffer(l.eventCap)
-		l.eventBufs[route] = buf
-	}
-	return buf
-}
-
-func (l *Logger) addEntry(level Level, route string, category Category, msg string, fields map[string]string) {
+func (l *Logger) WithFields(fields map[string]any) *Logger {
 	l.mu.RLock()
-	minLevel := l.minLevel
-	output := l.output
-	l.mu.RUnlock()
+	defer l.mu.RUnlock()
 
-	if level < minLevel {
-		return
+	newFields := make(map[string]any, len(l.fields)+len(fields))
+	for k, v := range l.fields {
+		newFields[k] = v
+	}
+	for k, v := range fields {
+		newFields[k] = v
 	}
 
-	entry := LogEntry{
-		Timestamp: time.Now().UnixMilli(),
-		Level:     level.String(),
-		Route:     route,
-		Category:  string(category),
-		Message:   msg,
-		Fields:    fields,
+	return &Logger{
+		output:      l.output,
+		component:   l.component,
+		hooks:       l.hooks,
+		fields:      newFields,
+		jsonFormat:  l.jsonFormat,
+		showCaller:  l.showCaller,
+		rateLimiter: l.rateLimiter,
 	}
-
-	if route == "" {
-		l.systemBuf.Add(entry)
-	} else {
-		l.getRouteBuffer(route).Add(entry)
-	}
-
-	if level == LevelError || level == LevelWarn {
-		l.getEventBuffer(route).Add(entry)
-	}
-
-	if output != nil {
-		data, _ := json.Marshal(entry)
-		output.Write(append(data, '\n'))
-	}
-
-	l.runHooks(entry)
 }
 
-func (l *Logger) logf(level Level, cat Category, format string, args ...any) {
-	l.addEntry(level, "", cat, fmt.Sprintf(format, args...), nil)
+func (l *Logger) WithField(key string, value any) *Logger {
+	return l.WithFields(map[string]any{key: value})
+}
+
+func (l *Logger) WithError(err error) *Logger {
+	return l.WithField("error", err)
+}
+
+func (l *Logger) WithCategory(cat Category) *Logger {
+	return l.WithField("category", string(cat))
 }
 
 func (l *Logger) log(level Level, cat Category, msg string, fields map[string]any) {
-	strFields := make(map[string]string)
-	for k, v := range fields {
-		strFields[k] = fmt.Sprintf("%v", v)
+	if level < Level(l.level.Load()) {
+		return
 	}
-	l.addEntry(level, "", cat, msg, strFields)
+
+	entry := Entry{
+		Time:      time.Now(),
+		Level:     level,
+		LevelStr:  level.String(),
+		Category:  cat,
+		Component: l.component,
+		Message:   msg,
+	}
+
+	l.mu.RLock()
+	loggerFields := l.fields
+	hooks := l.hooks
+	l.mu.RUnlock()
+
+	if len(loggerFields) > 0 || len(fields) > 0 {
+		entry.Fields = make(map[string]any, len(loggerFields)+len(fields))
+		for k, v := range loggerFields {
+			entry.Fields[k] = v
+		}
+		for k, v := range fields {
+			if k == "error" {
+				if err, ok := v.(error); ok {
+					entry.Error = err
+					entry.ErrorStr = err.Error()
+					continue
+				}
+			}
+			entry.Fields[k] = v
+		}
+	}
+
+	if l.showCaller {
+		if _, file, line, ok := runtime.Caller(3); ok {
+			if idx := strings.LastIndex(file, "/"); idx >= 0 {
+				file = file[idx+1:]
+			}
+			entry.Caller = fmt.Sprintf("%s:%d", file, line)
+		}
+	}
+
+	l.write(entry)
+
+	for _, hook := range hooks {
+		hook(entry)
+	}
+}
+
+func (l *Logger) write(entry Entry) {
+	var output string
+	if l.jsonFormat {
+		data, _ := json.Marshal(entry)
+		output = string(data) + "\n"
+	} else {
+		output = l.formatText(entry)
+	}
+
+	l.mu.Lock()
+	_, _ = io.WriteString(l.output, output)
+	l.mu.Unlock()
+}
+
+func (l *Logger) formatText(entry Entry) string {
+	var b strings.Builder
+
+	b.WriteString(entry.Time.Format("2006/01/02 15:04:05"))
+	b.WriteString(" ")
+
+	b.WriteString(fmt.Sprintf("%-5s", entry.LevelStr))
+	b.WriteString(" ")
+
+	if entry.Category != "" {
+		b.WriteString("[")
+		b.WriteString(string(entry.Category))
+		b.WriteString("] ")
+	}
+
+	b.WriteString(entry.Message)
+
+	if len(entry.Fields) > 0 {
+		for k, v := range entry.Fields {
+			if k == "category" {
+				continue
+			}
+			b.WriteString(fmt.Sprintf(" %s=%v", k, v))
+		}
+	}
+
+	if entry.ErrorStr != "" {
+		b.WriteString(" error=\"")
+		b.WriteString(entry.ErrorStr)
+		b.WriteString("\"")
+	}
+
+	if entry.Caller != "" {
+		b.WriteString(" caller=")
+		b.WriteString(entry.Caller)
+	}
+
+	b.WriteString("\n")
+	return b.String()
+}
+
+func (l *Logger) Trace(cat Category, msg string, fields ...map[string]any) {
+	f := mergeFields(fields)
+	l.log(LevelTrace, cat, msg, f)
 }
 
 func (l *Logger) Debug(cat Category, msg string, fields ...map[string]any) {
@@ -345,166 +352,43 @@ func (l *Logger) Error(cat Category, msg string, fields ...map[string]any) {
 
 func (l *Logger) Fatal(cat Category, msg string, fields ...map[string]any) {
 	f := mergeFields(fields)
-	l.log(LevelError, cat, msg, f)
+	l.log(LevelFatal, cat, msg, f)
 	os.Exit(1)
 }
 
-func (l *Logger) Debugf(cat Category, format string, args ...any) {
-	if LevelDebug < l.minLevel {
+func (l *Logger) Tracef(cat Category, format string, args ...any) {
+	if LevelTrace < Level(l.level.Load()) {
 		return
 	}
-	l.logf(LevelDebug, cat, format, args...)
+	l.Trace(cat, fmt.Sprintf(format, args...))
+}
+
+func (l *Logger) Debugf(cat Category, format string, args ...any) {
+	if LevelDebug < Level(l.level.Load()) {
+		return
+	}
+	l.Debug(cat, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Infof(cat Category, format string, args ...any) {
-	if LevelInfo < l.minLevel {
+	if LevelInfo < Level(l.level.Load()) {
 		return
 	}
-	l.logf(LevelInfo, cat, format, args...)
+	l.Info(cat, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Warnf(cat Category, format string, args ...any) {
-	if LevelWarn < l.minLevel {
+	if LevelWarn < Level(l.level.Load()) {
 		return
 	}
-	l.logf(LevelWarn, cat, format, args...)
+	l.Warn(cat, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Errorf(cat Category, format string, args ...any) {
-	if LevelError < l.minLevel {
+	if LevelError < Level(l.level.Load()) {
 		return
 	}
-	l.logf(LevelError, cat, format, args...)
-}
-
-func (l *Logger) WithField(key string, value any) *Logger {
-	return l
-}
-
-func (l *Logger) WithFields(fields map[string]any) *Logger {
-	return l
-}
-
-func (l *Logger) WithCategory(cat Category) *Logger {
-	return l
-}
-
-func (l *Logger) WithError(err error) *Logger {
-	return l
-}
-
-func (l *Logger) AddHook(hook func(LogEntry)) {
-	l.mu.Lock()
-	l.hooks = append(l.hooks, hook)
-	l.mu.Unlock()
-}
-
-func (l *Logger) runHooks(entry LogEntry) {
-	l.mu.RLock()
-	hooks := l.hooks
-	l.mu.RUnlock()
-	for _, h := range hooks {
-		if h != nil {
-			h(entry)
-		}
-	}
-}
-
-func (l *Logger) RouteLog(level Level, route string, category Category, msg string, fields map[string]string) {
-	l.addEntry(level, route, category, msg, fields)
-}
-
-func (l *Logger) RouteInfo(route string, category Category, msg string, fields map[string]string) {
-	l.addEntry(LevelInfo, route, category, msg, fields)
-}
-
-func (l *Logger) RouteWarn(route string, category Category, msg string, fields map[string]string) {
-	l.addEntry(LevelWarn, route, category, msg, fields)
-}
-
-func (l *Logger) RouteError(route string, category Category, msg string, fields map[string]string) {
-	l.addEntry(LevelError, route, category, msg, fields)
-}
-
-func (l *Logger) RouteDebug(route string, category Category, msg string, fields map[string]string) {
-	l.addEntry(LevelDebug, route, category, msg, fields)
-}
-
-func (l *Logger) GetLogs(route string) []LogEntry {
-	if route == "" {
-		return l.systemBuf.GetAll()
-	}
-	l.mu.RLock()
-	buf, ok := l.routeBufs[route]
-	l.mu.RUnlock()
-	if !ok {
-		return nil
-	}
-	return buf.GetAll()
-}
-
-func (l *Logger) GetSystemLogs() []LogEntry {
-	return l.systemBuf.GetAll()
-}
-
-func (l *Logger) GetAllLogs() []LogEntry {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	result := make([]LogEntry, 0)
-	result = append(result, l.systemBuf.GetAll()...)
-
-	for _, buf := range l.routeBufs {
-		result = append(result, buf.GetAll()...)
-	}
-
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Timestamp < result[j].Timestamp
-	})
-	return result
-}
-
-func (l *Logger) GetEvents(route string) []LogEntry {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	if route == "" {
-		result := make([]LogEntry, 0)
-		for _, buf := range l.eventBufs {
-			result = append(result, buf.GetAll()...)
-		}
-		sort.Slice(result, func(i, j int) bool {
-			return result[i].Timestamp < result[j].Timestamp
-		})
-		return result
-	}
-
-	buf, ok := l.eventBufs[route]
-	if !ok {
-		return nil
-	}
-	return buf.GetAll()
-}
-
-func (l *Logger) GetRouteNames() []string {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	names := make([]string, 0, len(l.routeBufs))
-	for name := range l.routeBufs {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func (l *Logger) ClearAll() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.systemBuf.Clear()
-	l.routeBufs = make(map[string]*LogBuffer)
-	l.eventBufs = make(map[string]*LogBuffer)
+	l.Error(cat, fmt.Sprintf(format, args...))
 }
 
 func mergeFields(fields []map[string]any) map[string]any {

@@ -8,13 +8,26 @@ import (
 
 var (
 	Log *logging.Logger
+
+	Dashboard *logging.DashboardHook
 )
 
 func Init() {
-	Log = logging.NewLogger(logging.DefaultSystemCap, logging.DefaultRouteCap, logging.DefaultEventCap)
-	Log.SetOutput(os.Stderr)
-	Log.SetLevel(logging.LevelInfo)
+	cfg := logging.Config{
+		Level:      logging.LevelInfo,
+		Output:     os.Stderr,
+		Component:  "server",
+		JSONFormat: false,
+		ShowCaller: false,
+		RateLimit:  100 * 1e6, // 100ms in nanoseconds
+	}
+
+	Log = logging.New(cfg)
 	Log.SetLevelFromEnv()
+
+	Dashboard = logging.NewDashboardHook(500, logging.LevelInfo)
+	Log.AddHook(Dashboard.Hook())
+
 	logging.SetGlobal(Log)
 }
 
@@ -22,13 +35,6 @@ func SetLevel(level logging.Level) {
 	if Log != nil {
 		Log.SetLevel(level)
 	}
-}
-
-func GetLevel() logging.Level {
-	if Log != nil {
-		return Log.GetLevel()
-	}
-	return logging.LevelInfo
 }
 
 func SetDebug(enabled bool) {
@@ -42,10 +48,49 @@ func SetDebug(enabled bool) {
 	}
 }
 
-func AddHook(hook func(logging.LogEntry)) {
-	if Log != nil {
-		Log.AddHook(hook)
+func SetTrace(enabled bool) {
+	if Log == nil {
+		return
 	}
+	if enabled {
+		Log.SetLevel(logging.LevelTrace)
+	}
+}
+
+func System() *logging.Logger {
+	return Log.WithCategory(logging.CatSystem)
+}
+
+func Control() *logging.Logger {
+	return Log.WithCategory(logging.CatControl)
+}
+
+func Data() *logging.Logger {
+	return Log.WithCategory(logging.CatData)
+}
+
+func UDP() *logging.Logger {
+	return Log.WithCategory(logging.CatUDP)
+}
+
+func TCP() *logging.Logger {
+	return Log.WithCategory(logging.CatTCP)
+}
+
+func Pairing() *logging.Logger {
+	return Log.WithCategory(logging.CatPairing)
+}
+
+func Auth() *logging.Logger {
+	return Log.WithCategory(logging.CatAuth)
+}
+
+func Health() *logging.Logger {
+	return Log.WithCategory(logging.CatHealth)
+}
+
+func Encryption() *logging.Logger {
+	return Log.WithCategory(logging.CatEncryption)
 }
 
 func F(keyvals ...any) map[string]any {

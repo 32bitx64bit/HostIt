@@ -101,7 +101,7 @@ func main() {
 	if strings.TrimSpace(cfg.Token) == "" {
 		cfg.Token = genToken()
 		_ = configio.Save(configPath, cfg)
-		slog.Infof(logging.CatSystem, "generated new server token (was empty)")
+		slog.Info(logging.CatSystem, "generated new server token (was empty)")
 	}
 
 	if !cfg.DisableTLS {
@@ -114,15 +114,31 @@ func main() {
 		}
 		fp, err := tlsutil.EnsureSelfSigned(cfg.TLSCertFile, cfg.TLSKeyFile)
 		if err != nil {
-			slog.Errorf(logging.CatSystem, "TLS setup failed: %v", err)
-			os.Exit(1)
+			slog.Fatal(logging.CatSystem, "TLS setup failed", serverlog.F("error", err))
 		}
 		_ = configio.Save(configPath, cfg)
-		slog.Infof(logging.CatEncryption, "tunnel TLS enabled, cert_sha256=%s", fp)
+		slog.Info(logging.CatEncryption, "tunnel TLS enabled", serverlog.F("cert_sha256", fp))
 	}
 
 	// Enable WebHTTPS by default for new configurations and generate dashboard TLS cert
 	cfgDir := filepath.Dir(configPath)
+	if cfg.DomainRenewBefore <= 0 {
+		cfg.DomainRenewBefore = 7 * 24 * time.Hour
+	}
+	if strings.TrimSpace(cfg.DomainHTTPAddr) == "" {
+		cfg.DomainHTTPAddr = ":80"
+	}
+	if strings.TrimSpace(cfg.DomainHTTPSAddr) == "" {
+		cfg.DomainHTTPSAddr = ":443"
+	}
+	if strings.TrimSpace(cfg.DomainCertDir) == "" {
+		cfg.DomainCertDir = filepath.Join(cfgDir, "domains")
+	}
+	cfg.DomainBase = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.DomainBase)), ".")
+	cfg.DomainACMEEmail = strings.TrimSpace(cfg.DomainACMEEmail)
+	for i := range cfg.Routes {
+		cfg.Routes[i].Domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.Routes[i].Domain)), ".")
+	}
 	if !cfg.WebHTTPS {
 		// Check if this is a fresh config (no dashboard cert exists yet) - enable HTTPS by default
 		webCert := strings.TrimSpace(cfg.WebTLSCertFile)
@@ -131,7 +147,7 @@ func main() {
 		}
 		if _, err := os.Stat(webCert); os.IsNotExist(err) {
 			cfg.WebHTTPS = true
-			slog.Infof(logging.CatSystem, "enabling WebHTTPS by default for new installation")
+			slog.Info(logging.CatSystem, "enabling WebHTTPS by default for new installation")
 		}
 	}
 	if cfg.WebHTTPS {
@@ -143,22 +159,26 @@ func main() {
 		}
 		fp, err := tlsutil.EnsureSelfSignedDashboard(cfg.WebTLSCertFile, cfg.WebTLSKeyFile)
 		if err != nil {
-			slog.Errorf(logging.CatSystem, "dashboard TLS setup failed: %v", err)
+			slog.Error(logging.CatSystem, "dashboard TLS setup failed", serverlog.F("error", err))
 		} else {
 			_ = configio.Save(configPath, cfg)
-			slog.Infof(logging.CatEncryption, "dashboard HTTPS enabled, cert_sha256=%s", fp)
+			slog.Info(logging.CatEncryption, "dashboard HTTPS enabled", serverlog.F("cert_sha256", fp))
 		}
 	}
 
 	runner := newServerRunner(ctx, cfg)
 	runner.Start()
-	slog.Infof(logging.CatSystem, "server started control=%s data=%s tls=%v", cfg.ControlAddr, cfg.DataAddr, !cfg.DisableTLS)
+	slog.Info(logging.CatSystem, "server started", serverlog.F(
+		"control_addr", cfg.ControlAddr,
+		"data_addr", cfg.DataAddr,
+		"tls_enabled", !cfg.DisableTLS,
+	))
 
 	if webAddr != "" {
 		go func() {
 			store, err := auth.Open(authDBPath)
 			if err != nil {
-				slog.Errorf(logging.CatAuth, "auth database open failed: %v path=%s", err, authDBPath)
+				slog.Error(logging.CatAuth, "auth database open failed", serverlog.F("error", err, "path", authDBPath))
 				return
 			}
 			defer store.Close()
@@ -167,9 +187,9 @@ func main() {
 			if cfg.WebHTTPS {
 				scheme = "https"
 			}
-			slog.Infof(logging.CatDashboard, "web dashboard starting url=%s", scheme+"://"+webAddr)
+			slog.Info(logging.CatDashboard, "web dashboard starting", serverlog.F("url", scheme+"://"+webAddr))
 			if err := serveServerDashboard(ctx, webAddr, configPath, authDBPath, runner, store, cookieSecure, sessionTTL, webShutdownTimeout); err != nil {
-				slog.Errorf(logging.CatDashboard, "web dashboard error: %v", err)
+				slog.Error(logging.CatDashboard, "web dashboard error", serverlog.F("error", err))
 			}
 		}()
 	}
@@ -315,6 +335,7 @@ const (
 func serveServerDashboard(ctx context.Context, addr string, configPath string, authDBPath string, runner *serverRunner, store *auth.Store, cookieSecure bool, sessionTTL time.Duration, shutdownTimeout time.Duration) error {
 	tplStats := template.Must(template.New("stats").Parse(serverStatsHTML))
 	tplConfig := template.Must(template.New("config").Parse(serverConfigHTML))
+	tplDomainGuide := template.Must(template.New("domain-guide").Parse(serverDomainGuideHTML))
 	tplControls := template.Must(template.New("controls").Parse(serverControlsHTML))
 	tplNetwork := template.Must(template.New("network").Parse(serverNetworkTestHTML))
 	tplLogin := template.Must(template.New("login").Parse(loginPageHTML))
@@ -634,74 +655,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(resp)
-		})))
-
-		mux.HandleFunc("/api/logs", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			route := strings.TrimSpace(r.URL.Query().Get("route"))
-			var logs []logging.LogEntry
-			if route == "" {
-				logs = logging.Global().GetAllLogs()
-			} else if route == "system" {
-				logs = logging.Global().GetSystemLogs()
-			} else {
-				logs = logging.Global().GetLogs(route)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"logs":       logs,
-				"routeNames": logging.Global().GetRouteNames(),
-			})
-		})))
-
-		mux.HandleFunc("/api/logs/system", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			logs := logging.Global().GetSystemLogs()
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"logs": logs})
-		})))
-
-		mux.HandleFunc("/api/events", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			route := strings.TrimSpace(r.URL.Query().Get("route"))
-			events := logging.Global().GetEvents(route)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"events": events})
-		})))
-
-		mux.HandleFunc("/api/log-level", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			switch r.Method {
-			case http.MethodGet:
-				level := serverlog.GetLevel()
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{"level": level.String()})
-			case http.MethodPost:
-				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-				if err := r.ParseForm(); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-				if !checkCSRF(r) {
-					http.Error(w, "csrf", http.StatusBadRequest)
-					return
-				}
-				levelStr := strings.TrimSpace(r.Form.Get("level"))
-				level := logging.ParseLevel(levelStr)
-				serverlog.SetLevel(level)
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{"level": level.String()})
-			default:
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			}
 		})))
 
 		mux.HandleFunc("/api/nettest/ping", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1061,15 +1014,25 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			cfg, st, err := runner.Get()
 			routes := cfg.Routes
 			type routeView struct {
-				Name        string
-				Proto       string
-				PublicAddr  string
-				LocalAddr   string
-				IsEncrypted bool
+				Name            string
+				Proto           string
+				PublicAddr      string
+				LocalAddr       string
+				Domain          string
+				IsEncrypted     bool
+				IsDomainEnabled bool
 			}
 			routeViews := make([]routeView, 0, len(routes))
 			for _, rt := range routes {
-				routeViews = append(routeViews, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, LocalAddr: rt.LocalAddr, IsEncrypted: rt.IsEncrypted()})
+				routeViews = append(routeViews, routeView{
+					Name:            rt.Name,
+					Proto:           rt.Proto,
+					PublicAddr:      rt.PublicAddr,
+					LocalAddr:       rt.LocalAddr,
+					Domain:          rt.Domain,
+					IsEncrypted:     rt.IsEncrypted(),
+					IsDomainEnabled: rt.IsDomainEnabled(),
+				})
 			}
 			data := map[string]any{
 				"Cfg":        cfg,
@@ -1089,6 +1052,25 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplConfig.Execute(w, data)
 		})))
 
+		mux.HandleFunc("/domain-manager-info", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			csrf := ensureCSRF(w, r, cookieSecure)
+			cfg, st, err := runner.Get()
+			data := map[string]any{
+				"Cfg":        cfg,
+				"Status":     st,
+				"ConfigPath": configPath,
+				"Msg":        getMsg(),
+				"Err":        err,
+				"CSRF":       csrf,
+				"Version":    version.Current,
+			}
+			_ = tplDomainGuide.Execute(w, data)
+		})))
+
 		mux.HandleFunc("/controls", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1100,15 +1082,20 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			if dashInterval <= 0 {
 				dashInterval = 30 * time.Second
 			}
+			domainRenewBefore := cfg.DomainRenewBefore
+			if domainRenewBefore <= 0 {
+				domainRenewBefore = 7 * 24 * time.Hour
+			}
 			data := map[string]any{
-				"Cfg":          cfg,
-				"Status":       st,
-				"ConfigPath":   configPath,
-				"Msg":          getMsg(),
-				"Err":          err,
-				"CSRF":         csrf,
-				"Version":      version.Current,
-				"DashInterval": dashInterval.String(),
+				"Cfg":               cfg,
+				"Status":            st,
+				"ConfigPath":        configPath,
+				"Msg":               getMsg(),
+				"Err":               err,
+				"CSRF":              csrf,
+				"Version":           version.Current,
+				"DashInterval":      dashInterval.String(),
+				"DomainRenewBefore": domainRenewBefore.String(),
 			}
 			_ = tplControls.Execute(w, data)
 		})))
@@ -1164,6 +1151,12 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			cfg.Token = strings.TrimSpace(r.Form.Get("token"))
 			cfg.PairTimeout = pt
 			cfg.WebHTTPS = strings.TrimSpace(r.Form.Get("web_https")) != ""
+			cfg.DomainManagerEnabled = strings.TrimSpace(r.Form.Get("domain_manager_enabled")) != ""
+			cfg.DomainHTTPAddr = strings.TrimSpace(r.Form.Get("domain_http_addr"))
+			cfg.DomainHTTPSAddr = strings.TrimSpace(r.Form.Get("domain_https_addr"))
+			cfg.DomainBase = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(r.Form.Get("domain_base"))), ".")
+			cfg.DomainAutoTLS = strings.TrimSpace(r.Form.Get("domain_auto_tls")) != ""
+			cfg.DomainACMEEmail = strings.TrimSpace(r.Form.Get("domain_acme_email"))
 			cfg.EncryptionAlgorithm = r.Form.Get("encryption_algorithm")
 			if cfg.Token == "" {
 				cfg.Token = genToken()
@@ -1207,6 +1200,18 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 
 			cfgDir := filepath.Dir(configPath)
+			if cfg.DomainRenewBefore <= 0 {
+				cfg.DomainRenewBefore = 7 * 24 * time.Hour
+			}
+			if strings.TrimSpace(cfg.DomainHTTPAddr) == "" {
+				cfg.DomainHTTPAddr = ":80"
+			}
+			if strings.TrimSpace(cfg.DomainHTTPSAddr) == "" {
+				cfg.DomainHTTPSAddr = ":443"
+			}
+			if strings.TrimSpace(cfg.DomainCertDir) == "" {
+				cfg.DomainCertDir = filepath.Join(cfgDir, "domains")
+			}
 			if strings.TrimSpace(cfg.WebTLSCertFile) == "" {
 				cfg.WebTLSCertFile = filepath.Join(cfgDir, "web.crt")
 			}
@@ -1228,6 +1233,11 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 					return
 				}
 				addMsg("Dashboard HTTPS enabled (self-signed); cert sha256=" + fp)
+			}
+
+			if err := cfg.Validate(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
 			}
 
 			if err := configio.Save(configPath, cfg); err != nil {
@@ -1282,7 +1292,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 
 			cfg, _, _ := runner.Get()
 			if err := configio.Save(configPath, cfg); err != nil {
-				logging.Global().Errorf(logging.CatSystem, "failed to save config after route toggle: %v", err)
+				serverlog.Log.Error(logging.CatSystem, "failed to save config after route toggle", serverlog.F("error", err))
 			}
 
 			w.Header().Set("Content-Type", "application/json")
@@ -1493,7 +1503,8 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		proto := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_proto"))
 		pub := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_public"))
 		local := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_local"))
-		if name == "" && proto == "" && pub == "" && local == "" {
+		domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(r.Form.Get("route_"+strconv.Itoa(i)+"_domain"))), ".")
+		if name == "" && proto == "" && pub == "" && local == "" && domain == "" {
 			continue
 		}
 		if name == "" {
@@ -1521,7 +1532,12 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		if encrypted {
 			encPtr = &encrypted
 		}
-		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, LocalAddr: local, Encrypted: encPtr})
+		domainEnabled := strings.TrimSpace(r.Form.Get("route_"+strconv.Itoa(i)+"_domain_enabled")) == "1"
+		var domainPtr *bool
+		if domainEnabled {
+			domainPtr = &domainEnabled
+		}
+		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, LocalAddr: local, Encrypted: encPtr, Domain: domain, DomainEnabled: domainPtr})
 	}
 	return routes
 }
@@ -2270,6 +2286,8 @@ const serverConfigHTML = `<!doctype html>
 		.btn.primary:hover{background:rgba(91,141,239,.25)}
 		.btn.warn{background:var(--redDim);border-color:var(--redBorder);color:var(--red)}
 		.btn.sm{font-size:12px;padding:5px 10px}
+		.iconLink{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:999px;border:1px solid var(--accentBorder);background:var(--accentDim);color:var(--accent);font-size:11px;font-weight:700;text-decoration:none;vertical-align:middle;margin-left:6px}
+		.iconLink:hover{text-decoration:none;background:rgba(91,141,239,.25)}
 		label{font-weight:600;display:block;margin:0 0 4px;font-size:13px}
 		.help{font-size:12px;margin:0 0 8px;color:var(--textMuted);line-height:1.35}
 		input,select{width:100%;max-width:100%;box-sizing:border-box;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:var(--font);font-size:13px}
@@ -2369,8 +2387,48 @@ const serverConfigHTML = `<!doctype html>
 				</div>
 			</div>
 
+			<div class="secHead"><h2>Domain Manager</h2></div>
+			<div class="grid2">
+				<div>
+					<label>Enable Domain Manager <a class="iconLink" href="/domain-manager-info" title="Domain manager setup guide" aria-label="Domain manager setup guide">i</a></label>
+					<div class="help">Serve web traffic by hostname and forward it through the encrypted tunnel to the agent.</div>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
+						<input type="checkbox" name="domain_manager_enabled" value="1" {{if .Cfg.DomainManagerEnabled}}checked{{end}} />
+						<span>Enable hostname-based web routing</span>
+					</label>
+				</div>
+				<div>
+					<label>Base Domain</label>
+					<div class="help">Routes must use this apex domain or one of its subdomains, for example <code>example.com</code>.</div>
+					<input name="domain_base" value="{{.Cfg.DomainBase}}" placeholder="example.com" />
+				</div>
+				<div>
+					<label>Automatic TLS</label>
+					<div class="help">Issue and renew public certificates automatically. Renewal target: {{.DomainRenewBefore}} before expiry.</div>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
+						<input type="checkbox" name="domain_auto_tls" value="1" {{if .Cfg.DomainAutoTLS}}checked{{end}} />
+						<span>Automatically provision and renew certificates</span>
+					</label>
+				</div>
+				<div>
+					<label>HTTP Bind</label>
+					<div class="help">Plain HTTP listener used for redirects and ACME HTTP-01 challenges.</div>
+					<input name="domain_http_addr" value="{{.Cfg.DomainHTTPAddr}}" placeholder=":80" />
+				</div>
+				<div>
+					<label>HTTPS Bind</label>
+					<div class="help">TLS listener for managed domains. Use a public 443-style bind for normal browser access.</div>
+					<input name="domain_https_addr" value="{{.Cfg.DomainHTTPSAddr}}" placeholder=":443" />
+				</div>
+				<div>
+					<label>ACME Email</label>
+					<div class="help">Used for certificate registration and expiry notices.</div>
+					<input name="domain_acme_email" value="{{.Cfg.DomainACMEEmail}}" placeholder="admin@example.com" />
+				</div>
+			</div>
+
 			<div class="secHead"><h2>Routes</h2></div>
-			<div class="help">Each route is a public listener. The agent forwards traffic to the local port.</div>
+			<div class="help">Each route can expose a raw public listener, a managed hostname, or both. Hostname routing forwards to the route's local target.</div>
 
 			<input type="hidden" name="route_count" id="route_count" value="{{.RouteCount}}" />
 
@@ -2404,10 +2462,22 @@ const serverConfigHTML = `<!doctype html>
 								<input name="route_{{$i}}_local" value="{{$r.LocalAddr}}" placeholder="127.0.0.1:3000" />
 							</div>
 							<div>
+								<label>Managed Domain</label>
+								<input name="route_{{$i}}_domain" value="{{$r.Domain}}" placeholder="app.example.com" />
+								<div class="help">No port. Use the route's local target for the backend service.</div>
+							</div>
+							<div>
 								<label>Encryption</label>
 								<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
 									<input type="checkbox" name="route_{{$i}}_encrypted" value="1" {{if $r.IsEncrypted}}checked{{end}} />
 									<span>Enable encryption for this route</span>
+								</label>
+							</div>
+							<div>
+								<label>Domain Routing</label>
+								<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
+									<input type="checkbox" name="route_{{$i}}_domain_enabled" value="1" {{if $r.IsDomainEnabled}}checked{{end}} />
+									<span>Enable hostname routing for this route</span>
 								</label>
 							</div>
 						</div>
@@ -2434,11 +2504,19 @@ const serverConfigHTML = `<!doctype html>
 				<div><label>Protocol</label><select name="route_IDX_proto"><option value="tcp" selected>tcp</option><option value="udp">udp</option><option value="both">both</option></select></div>
 				<div><label>Port (e.g. :25565)</label><input name="route_IDX_public" value="" placeholder=":25565" /></div>
 				<div><label>Local target (optional)</label><input name="route_IDX_local" value="" placeholder="127.0.0.1:3000" /></div>
+				<div><label>Managed Domain</label><input name="route_IDX_domain" value="" placeholder="app.example.com" /></div>
 				<div>
 					<label>Encryption</label>
 					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
 						<input type="checkbox" name="route_IDX_encrypted" value="1" />
 						<span>Enable encryption for this route</span>
+					</label>
+				</div>
+				<div>
+					<label>Domain Routing</label>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px">
+						<input type="checkbox" name="route_IDX_domain_enabled" value="1" />
+						<span>Enable hostname routing for this route</span>
 					</label>
 				</div>
 			</div>
@@ -2553,21 +2631,6 @@ const serverControlsHTML = `<!doctype html>
 					</form>
 				</div>
 
-				<div class="secHead"><h2>Logging</h2></div>
-				<div class="card">
-					<div class="row"><b>Log Level:</b> <code id="curLogLevel">info</code></div>
-					<div class="muted" style="margin-bottom:8px;font-size:12px">Controls verbosity of route and system logs displayed in the dashboard. Debug shows all logs; Error shows only errors.</div>
-					<div class="flex">
-						<select id="logLevelSelect" class="btn sm" style="appearance:auto;padding:5px 8px">
-							<option value="debug">debug</option>
-							<option value="info" selected>info</option>
-							<option value="warn">warn</option>
-							<option value="error">error</option>
-						</select>
-						<button type="button" id="applyLogLevelBtn" class="btn sm primary">Apply</button>
-					</div>
-				</div>
-
 				<div class="secHead"><h2>Updates</h2></div>
 				<div class="card">
 					<div class="row"><b>Current:</b> <code>{{.Version}}</code></div>
@@ -2618,34 +2681,6 @@ const serverControlsHTML = `<!doctype html>
 	<script>
 	var csrf = {{printf "%q" .CSRF}};
 	function body(){var b=new URLSearchParams();b.set('csrf',csrf);return b;}
-	async function refreshLogLevel(){
-		try{
-			var r=await fetch('/api/log-level',{credentials:'include'});
-			if(r.ok){
-				var j=await r.json();
-				document.getElementById('curLogLevel').textContent=j.level||'info';
-				var sel=document.getElementById('logLevelSelect');
-				if(sel&&j.level){sel.value=j.level;}
-			}
-		}catch(e){}
-	}
-	async function applyLogLevel(){
-		var sel=document.getElementById('logLevelSelect');
-		if(!sel)return;
-		var level=sel.value;
-		var b=new URLSearchParams();
-		b.set('csrf',csrf);
-		b.set('level',level);
-		try{
-			var r=await fetch('/api/log-level',{method:'POST',body:b,credentials:'include'});
-			if(r.ok){
-				var j=await r.json();
-				document.getElementById('curLogLevel').textContent=j.level||level;
-			}
-		}catch(e){}
-	}
-	document.getElementById('applyLogLevelBtn').onclick=applyLogLevel;
-	refreshLogLevel();
 	function setUpd(st){
 		if(!st)return;
 		document.getElementById('availableVersion').textContent=st.latestVersion||st.availableVersion||'—';
@@ -2709,6 +2744,119 @@ const serverControlsHTML = `<!doctype html>
 	};
 	refreshUpd();refreshSys();
 	</script>
+</body>
+</html>`
+
+const serverDomainGuideHTML = `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Tunnel Server — Domain Manager Guide</title>
+	<style>
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.55}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		code{font-family:var(--mono);font-size:.84em;background:var(--surface);padding:2px 6px;border-radius:4px}
+		.wrap{max-width:980px;margin:0 auto;padding:20px 16px 60px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0;letter-spacing:-.02em}
+		.subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}
+		.nav a,.nav button{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;transition:all .15s;text-decoration:none}
+		.nav a:hover,.nav button:hover{background:var(--surfaceHover);border-color:var(--borderHover);text-decoration:none}
+		.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:18px;margin-top:14px}
+		.secHead{margin:24px 0 10px}
+		.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		ol,ul{margin:10px 0 0 20px;padding:0}
+		li{margin:8px 0}
+		.kv{display:grid;grid-template-columns:180px 1fr;gap:10px 16px}
+		@media(max-width:720px){.kv{grid-template-columns:1fr}}
+		.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid var(--greenBorder);background:var(--greenDim);color:var(--green)}
+		.note{font-size:13px;color:var(--textMuted)}
+	</style>
+</head>
+<body>
+	<div class="wrap">
+		<div class="topbar">
+			<div>
+				<h1>Tunnel Server</h1>
+				<div class="subtitle">Domain Manager Guide</div>
+			</div>
+			<div class="nav">
+				<a href="/">Dashboard</a>
+				<a href="/config">Config</a>
+				<a href="/controls">Controls</a>
+				<a class="active" href="/domain-manager-info">Domain Guide</a>
+			</div>
+		</div>
+
+		<div class="card">
+			<div class="pill">Quick setup</div>
+			<div class="secHead"><h2>Add a managed domain</h2></div>
+			<ol>
+				<li>Open <a href="/config">Config</a> and enable <code>Domain Manager</code>.</li>
+				<li>Set <code>Base Domain</code> to the apex domain you control, for example <code>example.com</code>.</li>
+				<li>Set <code>HTTP Bind</code> to a public listener, normally <code>:80</code>.</li>
+				<li>Set <code>HTTPS Bind</code> to a public listener, normally <code>:443</code>.</li>
+				<li>In the route you want to expose, fill in:
+					<ul>
+						<li><code>Managed Domain</code> such as <code>app.example.com</code></li>
+						<li><code>Local target</code> such as <code>127.0.0.1:3234</code></li>
+						<li><code>Domain Routing</code> enabled</li>
+					</ul>
+				</li>
+				<li>Save and restart the server.</li>
+			</ol>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>DNS requirements</h2></div>
+			<ul>
+				<li>Create an <code>A</code> record for your domain or subdomain pointing to this server's public IPv4 address.</li>
+				<li>If you use IPv6, also create an <code>AAAA</code> record pointing to this server's public IPv6 address.</li>
+				<li>Make sure ports <code>80</code> and <code>443</code> reach this server if you want automatic public TLS.</li>
+				<li>The configured route hostname must match the configured base domain.</li>
+			</ul>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>How automatic TLS works</h2></div>
+			<ol>
+				<li>Enable <code>Automatic TLS</code>.</li>
+				<li>Enter a valid <code>ACME Email</code>.</li>
+				<li>Leave <code>HTTP Bind</code> reachable from the internet so the ACME HTTP-01 challenge can complete.</li>
+				<li>When a request arrives for a configured managed domain, the server obtains a certificate and stores it under the domain certificate directory.</li>
+				<li>Certificates are renewed automatically when they are within 7 days of expiry.</li>
+			</ol>
+			<p class="note">If automatic TLS is disabled or issuance is unavailable, the server falls back to a self-signed certificate for that hostname.</p>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Field reference</h2></div>
+			<div class="kv">
+				<div><code>Domain Manager</code></div><div>Turns on hostname-based web routing.</div>
+				<div><code>Base Domain</code></div><div>Limits allowed managed domains to one domain tree such as <code>example.com</code>.</div>
+				<div><code>HTTP Bind</code></div><div>Listener for redirects and ACME validation, usually <code>:80</code>.</div>
+				<div><code>HTTPS Bind</code></div><div>Listener for browser traffic, usually <code>:443</code>.</div>
+				<div><code>Managed Domain</code></div><div>The public hostname to expose, with no port.</div>
+				<div><code>Local target</code></div><div>The web service on the agent side, such as <code>127.0.0.1:3234</code>.</div>
+			</div>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Troubleshooting</h2></div>
+			<ul>
+				<li>If certificate issuance fails, verify the DNS record points to this server and port <code>80</code> is reachable.</li>
+				<li>If the page returns <code>502</code>, verify the agent is connected and the route's local target is listening.</li>
+				<li>If the hostname is rejected, check that it belongs to the configured base domain and does not include a port.</li>
+				<li>If another web server already uses <code>:80</code> or <code>:443</code>, move that service or change the bind addresses.</li>
+			</ul>
+		</div>
+	</div>
 </body>
 </html>`
 

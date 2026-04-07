@@ -40,5 +40,11 @@ func normalizeRoutes(cfg *ServerConfig) {
 		}
 		cfg.Routes[i].PublicAddr = strings.TrimSpace(cfg.Routes[i].PublicAddr)
 		cfg.Routes[i].LocalAddr = strings.TrimSpace(cfg.Routes[i].LocalAddr)
+		cfg.Routes[i].Domain = normalizeHostname(cfg.Routes[i].Domain)
 	}
+
+	cfg.DomainHTTPAddr = strings.TrimSpace(cfg.DomainHTTPAddr)
+	cfg.DomainHTTPSAddr = strings.TrimSpace(cfg.DomainHTTPSAddr)
+	cfg.DomainBase = normalizeHostname(cfg.DomainBase)
+	cfg.DomainACMEEmail = strings.TrimSpace(cfg.DomainACMEEmail)
 }
