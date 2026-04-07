@@ -26,6 +26,28 @@ func (m *mockConn) Write(b []byte) (n int, err error) {
 	return m.w.Write(b)
 }
 
+type closeTrackingConn struct {
+	net.Conn
+	closed bool
+}
+
+func (c *closeTrackingConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
+func (c *closeTrackingConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *closeTrackingConn) Close() error {
+	c.closed = true
+	return nil
+}
+func (c *closeTrackingConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (c *closeTrackingConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (c *closeTrackingConn) SetDeadline(time.Time) error      { return nil }
+func (c *closeTrackingConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *closeTrackingConn) SetWriteDeadline(time.Time) error { return nil }
+
+type dummyAddr string
+
+func (d dummyAddr) Network() string { return "tcp" }
+func (d dummyAddr) String() string  { return string(d) }
+
 func BenchmarkCryptoConn_Write(b *testing.B) {
 	key := make([]byte, 32)
 	rand.Read(key)
@@ -260,5 +282,29 @@ func TestCryptoConnWriteHandlesShortWrites(t *testing.T) {
 	cipher.NewCTR(block, iv).XORKeyStream(expected, payload)
 	if got := underlying.w.Bytes(); !bytes.Equal(got, expected) {
 		t.Fatalf("ciphertext mismatch: wrote %d bytes, expected %d", len(got), len(expected))
+	}
+}
+
+func TestCryptoConnCloseWriteFallsBackToClose(t *testing.T) {
+	base := &closeTrackingConn{}
+	cc := &cryptoConn{Conn: base}
+
+	if err := cc.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite() error = %v", err)
+	}
+	if !base.closed {
+		t.Fatal("CloseWrite() did not close underlying conn when half-close unsupported")
+	}
+}
+
+func TestCryptoConnCloseReadFallsBackToClose(t *testing.T) {
+	base := &closeTrackingConn{}
+	cc := &cryptoConn{Conn: base}
+
+	if err := cc.CloseRead(); err != nil {
+		t.Fatalf("CloseRead() error = %v", err)
+	}
+	if !base.closed {
+		t.Fatal("CloseRead() did not close underlying conn when half-close unsupported")
 	}
 }

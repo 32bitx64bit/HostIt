@@ -159,14 +159,34 @@ func (c *cryptoConn) CloseRead() error {
 	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
 		return cr.CloseRead()
 	}
-	return nil
+	type netConner interface{ NetConn() net.Conn }
+	if wrapped, ok := c.Conn.(netConner); ok {
+		if nc := wrapped.NetConn(); nc != nil && nc != c.Conn {
+			if cr, ok := nc.(interface{ CloseRead() error }); ok {
+				return cr.CloseRead()
+			}
+		}
+	}
+	return c.Conn.Close()
 }
 
 func (c *cryptoConn) CloseWrite() error {
 	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
-	return nil
+	type netConner interface{ NetConn() net.Conn }
+	if wrapped, ok := c.Conn.(netConner); ok {
+		if nc := wrapped.NetConn(); nc != nil && nc != c.Conn {
+			if cw, ok := nc.(interface{ CloseWrite() error }); ok {
+				return cw.CloseWrite()
+			}
+		}
+	}
+	return c.Conn.Close()
+}
+
+func (c *cryptoConn) NetConn() net.Conn {
+	return c.Conn
 }
 
 func (c *cryptoConn) Read(b []byte) (n int, err error) {

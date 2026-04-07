@@ -244,3 +244,56 @@ func TestManagedDomainHTTPSProxyReusesBackendConnections(t *testing.T) {
 		t.Fatalf("backend connection count = %d, want 1 reused connection", got)
 	}
 }
+
+func TestManagedDomainProxyTransportAllowsLongPosts(t *testing.T) {
+	srv := NewServer(ServerConfig{})
+	proxy := srv.domainProxy("web", "app.example.test")
+	if proxy == nil {
+		t.Fatal("domainProxy() returned nil")
+	}
+
+	transport, ok := proxy.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("proxy transport = %T, want *http.Transport", proxy.Transport)
+	}
+	if transport.ResponseHeaderTimeout != 0 {
+		t.Fatalf("ResponseHeaderTimeout = %v, want 0 so long POST handlers are not turned into 502s", transport.ResponseHeaderTimeout)
+	}
+	if transport.ExpectContinueTimeout != 5*time.Second {
+		t.Fatalf("ExpectContinueTimeout = %v, want %v", transport.ExpectContinueTimeout, 5*time.Second)
+	}
+}
+
+func TestRequiresFreshTunnelConn(t *testing.T) {
+	tests := []struct {
+		method string
+		want   bool
+	}{
+		{method: http.MethodGet, want: false},
+		{method: http.MethodHead, want: false},
+		{method: http.MethodOptions, want: false},
+		{method: http.MethodPost, want: true},
+		{method: http.MethodPut, want: true},
+		{method: http.MethodPatch, want: true},
+		{method: http.MethodDelete, want: true},
+	}
+
+	for _, tt := range tests {
+		req, err := http.NewRequest(tt.method, "https://app.example.test/api/chat", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := requiresFreshTunnelConn(req); got != tt.want {
+			t.Fatalf("requiresFreshTunnelConn(%s) = %v, want %v", tt.method, got, tt.want)
+		}
+	}
+}
+
+func TestManagedProxyTransportClosesIdleConnections(t *testing.T) {
+	base := &http.Transport{}
+	rt := &managedProxyTransport{base: base}
+	rt.CloseIdleConnections()
+	if rt.base != base {
+		t.Fatal("CloseIdleConnections unexpectedly changed base transport")
+	}
+}

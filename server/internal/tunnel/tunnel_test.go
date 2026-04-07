@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -337,6 +338,67 @@ func TestPendingTCPKeyIncludesRoute(t *testing.T) {
 	b := makePendingTCPKey("route-b", "client-1")
 	if a == b {
 		t.Fatalf("pending TCP keys must differ across routes: %#v %#v", a, b)
+	}
+}
+
+func TestHelloIncludesLocalAddr(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	publicLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	publicAddr := publicLn.Addr().String()
+	publicLn.Close()
+
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes: []RouteConfig{{
+			Name:       "game",
+			Proto:      "both",
+			PublicAddr: publicAddr,
+			LocalAddr:  "127.0.0.1:47990",
+		}},
+		Token:       "testtoken",
+		PairTimeout: 3 * time.Second,
+		DisableTLS:  true,
+	})
+	go func() { _ = srv.Run(ctx) }()
+
+	conn, err := net.Dial("tcp", controlAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+		t.Fatal(err)
+	}
+	pkt, err := protocol.ReadPacket(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Type != protocol.TypeHello {
+		t.Fatalf("first packet type = %d, want HELLO", pkt.Type)
+	}
+
+	var routes map[string]helloRoute
+	if err := json.Unmarshal(pkt.Payload, &routes); err != nil {
+		t.Fatal(err)
+	}
+	rt, ok := routes["game"]
+	if !ok {
+		t.Fatalf("HELLO routes missing game route: %#v", routes)
+	}
+	if rt.LocalAddr != "127.0.0.1:47990" {
+		t.Fatalf("HELLO LocalAddr = %q, want %q", rt.LocalAddr, "127.0.0.1:47990")
 	}
 }
 

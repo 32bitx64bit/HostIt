@@ -84,8 +84,9 @@ func (a *Agent) Run(ctx context.Context) error {
 func (a *Agent) connectAndRun() error {
 	var conn net.Conn
 	var err error
+	controlDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
 	if a.cfg.DisableTLS {
-		conn, err = net.Dial("tcp", a.cfg.ControlAddr())
+		conn, err = controlDialer.Dial("tcp", a.cfg.ControlAddr())
 	} else {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
@@ -107,11 +108,12 @@ func (a *Agent) connectAndRun() error {
 			}
 		}
 
-		conn, err = tls.Dial("tcp", a.cfg.ControlAddr(), tlsConfig)
+		conn, err = tls.DialWithDialer(controlDialer, "tcp", a.cfg.ControlAddr(), tlsConfig)
 	}
 	if err != nil {
 		return fmt.Errorf("control dial failed: %w", err)
 	}
+	setTCPKeepAlive(conn, 15*time.Second)
 	a.controlConn = conn
 	defer conn.Close()
 
@@ -326,17 +328,18 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 				var dataConn net.Conn
 				var err error
 				dialTimeout := 10 * time.Second
+				dataDialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 15 * time.Second}
 				if a.cfg.DisableTLS {
-					dataConn, err = net.DialTimeout("tcp", a.cfg.DataAddr(), dialTimeout)
+					dataConn, err = dataDialer.Dial("tcp", a.cfg.DataAddr())
 				} else {
 					tlsConfig := &tls.Config{InsecureSkipVerify: true}
-					dialer := &net.Dialer{Timeout: dialTimeout}
-					dataConn, err = tls.DialWithDialer(dialer, "tcp", a.cfg.DataAddr(), tlsConfig)
+					dataConn, err = tls.DialWithDialer(dataDialer, "tcp", a.cfg.DataAddr(), tlsConfig)
 				}
 				if err != nil {
 					logging.Global().Errorf(logging.CatTCP, "failed to dial data server %s: %v", a.cfg.DataAddr(), err)
 					return
 				}
+				setTCPKeepAlive(dataConn, 15*time.Second)
 
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
 				if err := crypto.AuthenticateClient(dataConn, a.cfg.Token); err != nil {
@@ -372,7 +375,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 
 				if tcpConn, ok := localConn.(*net.TCPConn); ok {
 					tcpConn.SetKeepAlive(true)
-					tcpConn.SetKeepAlivePeriod(30 * time.Second)
+					tcpConn.SetKeepAlivePeriod(15 * time.Second)
 				}
 
 				if rt.Encrypted {
@@ -406,8 +409,10 @@ func dialLocalTCP(localAddr string) (net.Conn, error) {
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		conn, err := net.DialTimeout("tcp", localAddr, dialTimeout)
+		dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 15 * time.Second}
+		conn, err := dialer.Dial("tcp", localAddr)
 		if err == nil {
+			setTCPKeepAlive(conn, 15*time.Second)
 			return conn, nil
 		}
 		lastErr = err
@@ -417,6 +422,32 @@ func dialLocalTCP(localAddr string) (net.Conn, error) {
 	}
 
 	return nil, lastErr
+}
+
+func setTCPKeepAlive(conn net.Conn, period time.Duration) {
+	if period <= 0 || conn == nil {
+		return
+	}
+	tcpConn := unwrapTCPConn(conn)
+	if tcpConn == nil {
+		return
+	}
+	_ = tcpConn.SetKeepAlive(true)
+	_ = tcpConn.SetKeepAlivePeriod(period)
+}
+
+func unwrapTCPConn(conn net.Conn) *net.TCPConn {
+	if conn == nil {
+		return nil
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		return tcpConn
+	}
+	type netConner interface{ NetConn() net.Conn }
+	if wrapped, ok := conn.(netConner); ok {
+		return unwrapTCPConn(wrapped.NetConn())
+	}
+	return nil
 }
 
 type agentUDPSession struct {

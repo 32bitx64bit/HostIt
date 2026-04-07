@@ -22,6 +22,48 @@ import (
 	"hostit/shared/protocol"
 )
 
+const (
+	managedProxyResponseHeaderTimeout = 0
+	managedProxyExpectContinueTimeout = 5 * time.Second
+)
+
+type managedProxyTransport struct {
+	base *http.Transport
+}
+
+func (t *managedProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t == nil || t.base == nil {
+		return nil, fmt.Errorf("managed proxy transport is not configured")
+	}
+
+	if requiresFreshTunnelConn(req) {
+		t.base.CloseIdleConnections()
+		clone := req.Clone(req.Context())
+		clone.Close = true
+		req = clone
+	}
+
+	return t.base.RoundTrip(req)
+}
+
+func (t *managedProxyTransport) CloseIdleConnections() {
+	if t != nil && t.base != nil {
+		t.base.CloseIdleConnections()
+	}
+}
+
+func requiresFreshTunnelConn(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
 type domainCertManager struct {
 	server      *Server
 	autocert    *autocert.Manager
@@ -254,8 +296,8 @@ func (s *Server) domainProxy(routeName string, host string) *httputil.ReversePro
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: managedProxyResponseHeaderTimeout,
+		ExpectContinueTimeout: managedProxyExpectContinueTimeout,
 		ForceAttemptHTTP2:     false,
 	}
 
@@ -266,8 +308,9 @@ func (s *Server) domainProxy(routeName string, host string) *httputil.ReversePro
 			pr.Out.URL.Host = "tunnel-backend"
 			pr.Out.Host = pr.In.Host
 		},
-		Transport: transport,
+		Transport: &managedProxyTransport{base: transport},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			transport.CloseIdleConnections()
 			logging.Global().Errorf(logging.CatTCP, "managed domain proxy error host=%s route=%s: %v", host, routeName, err)
 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		},
@@ -289,8 +332,8 @@ func (s *Server) closeDomainProxyIdleConnections() {
 		if !ok || proxy == nil {
 			return true
 		}
-		transport, ok := proxy.Transport.(*http.Transport)
-		if ok && transport != nil {
+		type idleCloser interface{ CloseIdleConnections() }
+		if transport, ok := proxy.Transport.(idleCloser); ok && transport != nil {
 			transport.CloseIdleConnections()
 		}
 		return true

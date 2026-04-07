@@ -73,6 +73,32 @@ type Server struct {
 	sessions   map[string]*agentSession
 }
 
+func setTCPKeepAlive(conn net.Conn, period time.Duration) {
+	if period <= 0 || conn == nil {
+		return
+	}
+	tcpConn := unwrapTCPConn(conn)
+	if tcpConn == nil {
+		return
+	}
+	_ = tcpConn.SetKeepAlive(true)
+	_ = tcpConn.SetKeepAlivePeriod(period)
+}
+
+func unwrapTCPConn(conn net.Conn) *net.TCPConn {
+	if conn == nil {
+		return nil
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		return tcpConn
+	}
+	type netConner interface{ NetConn() net.Conn }
+	if wrapped, ok := conn.(netConner); ok {
+		return unwrapTCPConn(wrapped.NetConn())
+	}
+	return nil
+}
+
 func makePendingTCPKey(routeName, clientID string) string {
 	return routeName + ":" + clientID
 }
@@ -86,6 +112,7 @@ type helloRoute struct {
 	Name       string
 	Proto      string
 	PublicAddr string
+	LocalAddr  string
 	Encrypted  bool
 	Algorithm  string
 }
@@ -167,6 +194,7 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 						Name:       r.Name,
 						Proto:      r.Proto,
 						PublicAddr: r.PublicAddr,
+						LocalAddr:  r.LocalAddr,
 						Encrypted:  r.IsEncrypted(),
 						Algorithm:  s.cfg.EncryptionAlgorithm,
 					}
@@ -567,6 +595,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			logging.Global().Errorf(logging.CatTCP, "control accept error: %v", err)
 			continue
 		}
+		setTCPKeepAlive(conn, 15*time.Second)
 
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
@@ -620,6 +649,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 				Name:       rt.Name,
 				Proto:      rt.Proto,
 				PublicAddr: rt.PublicAddr,
+				LocalAddr:  rt.LocalAddr,
 				Encrypted:  rt.IsEncrypted(),
 				Algorithm:  s.cfg.EncryptionAlgorithm,
 			}
@@ -748,6 +778,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.mu.Lock()
 			if s.agentTCP == c && s.agentEpoch == epoch {
 				s.agentTCP = nil
+				s.closeDomainProxyIdleConnections()
 				for clientID, ch := range s.pendingTCP {
 					close(ch)
 					delete(s.pendingTCP, clientID)
@@ -772,6 +803,7 @@ func (s *Server) acceptData(ln net.Listener) {
 			logging.Global().Errorf(logging.CatTCP, "data accept error: %v", err)
 			continue
 		}
+		setTCPKeepAlive(conn, 15*time.Second)
 
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
@@ -862,10 +894,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			continue
 		}
 
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(5 * time.Second)
-		}
+		setTCPKeepAlive(conn, 15*time.Second)
 		clientID := s.nextClientID()
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
 
