@@ -569,6 +569,199 @@ func TestServerMultiConn_PendingCleanupAndAgentRestart(t *testing.T) {
 	}
 }
 
+func TestServerRapidReconnectWithStaleControlSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	echoLn, echoAddr := startEcho(t)
+	defer echoLn.Close()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	publicLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	publicAddr := publicLn.Addr().String()
+	publicLn.Close()
+
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}},
+		Token:       "testtoken",
+		PairTimeout: 5 * time.Second,
+		DisableTLS:  true,
+	})
+	go func() { _ = srv.Run(ctx) }()
+
+	dialControl := func(t *testing.T) net.Conn {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			conn, err := net.Dial("tcp", controlAddr)
+			if err != nil {
+				if time.Now().After(deadline) {
+					t.Fatal(err)
+				}
+				time.Sleep(25 * time.Millisecond)
+				continue
+			}
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+				_ = conn.Close()
+				t.Fatal(err)
+			}
+			pkt, err := protocol.ReadPacket(conn)
+			if err != nil {
+				_ = conn.Close()
+				t.Fatal(err)
+			}
+			if pkt.Type != protocol.TypeHello {
+				_ = conn.Close()
+				t.Fatalf("first packet type = %d, want HELLO", pkt.Type)
+			}
+			_ = conn.SetDeadline(time.Time{})
+			return conn
+		}
+	}
+
+	serveConnects := func(conn net.Conn) chan error {
+		errCh := make(chan error, 1)
+		go func() {
+			defer close(errCh)
+			for {
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				pkt, err := protocol.ReadPacket(conn)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				switch pkt.Type {
+				case protocol.TypePing:
+					_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypePong, Payload: pkt.Payload}); err != nil {
+						errCh <- err
+						return
+					}
+					_ = conn.SetWriteDeadline(time.Time{})
+				case protocol.TypeConnect:
+					dataConn, err := net.Dial("tcp", dataAddr)
+					if err != nil {
+						errCh <- err
+						return
+					}
+
+					_ = dataConn.SetDeadline(time.Now().Add(5 * time.Second))
+					if err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
+						_ = dataConn.Close()
+						errCh <- err
+						return
+					}
+
+					routeBytes := []byte(pkt.Route)
+					clientBytes := []byte(pkt.Client)
+					buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes))
+					buf = append(buf, byte(len(routeBytes)))
+					buf = append(buf, routeBytes...)
+					buf = append(buf, byte(len(clientBytes)))
+					buf = append(buf, clientBytes...)
+
+					if _, err := dataConn.Write(buf); err != nil {
+						_ = dataConn.Close()
+						errCh <- err
+						return
+					}
+					_ = dataConn.SetDeadline(time.Time{})
+
+					localConn, err := net.Dial("tcp", echoAddr)
+					if err != nil {
+						_ = dataConn.Close()
+						errCh <- err
+						return
+					}
+
+					go func() {
+						defer dataConn.Close()
+						defer localConn.Close()
+						var wg sync.WaitGroup
+						wg.Add(2)
+						go func() {
+							defer wg.Done()
+							_, _ = io.Copy(localConn, dataConn)
+						}()
+						go func() {
+							defer wg.Done()
+							_, _ = io.Copy(dataConn, localConn)
+						}()
+						wg.Wait()
+					}()
+				}
+			}
+		}()
+		return errCh
+	}
+
+	ctrl1 := dialControl(t)
+	defer ctrl1.Close()
+
+	staleConn, err := net.Dial("tcp", publicAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer staleConn.Close()
+	_ = staleConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	_ = ctrl1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	pkt, err := protocol.ReadPacket(ctrl1)
+	if err != nil {
+		t.Fatalf("first control session never received connect request: %v", err)
+	}
+	if pkt.Type != protocol.TypeConnect {
+		t.Fatalf("expected CONNECT on first control session, got %d", pkt.Type)
+	}
+	_ = ctrl1.SetReadDeadline(time.Time{})
+
+	ctrl2 := dialControl(t)
+	defer ctrl2.Close()
+	ctrl2ErrCh := serveConnects(ctrl2)
+
+	buf := make([]byte, 1)
+	if _, err := staleConn.Read(buf); err == nil {
+		t.Fatalf("expected stale pending public connection to be closed after reconnect")
+	}
+
+	clientConn, err := net.Dial("tcp", publicAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+
+	msg := []byte("after-reconnect\n")
+	_ = clientConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := clientConn.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, len(msg))
+	if _, err := io.ReadFull(clientConn, reply); err != nil {
+		t.Fatal(err)
+	}
+	if string(reply) != string(msg) {
+		t.Fatalf("expected %q got %q", string(msg), string(reply))
+	}
+
+	select {
+	case err := <-ctrl2ErrCh:
+		if err != nil {
+			t.Fatalf("second control session failed: %v", err)
+		}
+	default:
+	}
+}
+
 func TestServerMultiConn_NoAgentRejectsQuickly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

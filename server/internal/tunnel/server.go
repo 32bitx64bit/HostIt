@@ -81,6 +81,16 @@ func makePendingTCPKey(routeName, clientID string) string {
 	return routeName + ":" + clientID
 }
 
+func (s *Server) abortPendingTCPLocked() {
+	for clientID, ch := range s.pendingTCP {
+		delete(s.pendingTCP, clientID)
+		select {
+		case ch <- nil:
+		default:
+		}
+	}
+}
+
 func (s *Server) nextClientID() string {
 	id := atomic.AddUint64(&s.clientIDCounter, 1)
 	return strconv.FormatUint(id, 36)
@@ -645,18 +655,11 @@ func (s *Server) acceptControl(ln net.Listener) {
 
 		remoteAddr := conn.RemoteAddr().String()
 
+		var oldSession *agentSession
 		s.sessionsMu.Lock()
-		if oldSession, exists := s.sessions[remoteAddr]; exists {
-			logging.Global().Infof(logging.CatTCP, "Terminating previous session from %s", remoteAddr)
-			if oldSession.cancel != nil {
-				oldSession.cancel()
-			}
-			if oldSession.conn != nil {
-				oldSession.conn.Close()
-			}
-			delete(s.sessions, remoteAddr)
+		if existing := s.sessions[remoteAddr]; existing != nil {
+			oldSession = existing
 		}
-
 		sessionCtx, sessionCancel := context.WithCancel(s.ctx)
 		session := &agentSession{
 			conn:        conn,
@@ -667,6 +670,16 @@ func (s *Server) acceptControl(ln net.Listener) {
 		s.sessions[remoteAddr] = session
 		s.sessionsMu.Unlock()
 
+		if oldSession != nil {
+			logging.Global().Infof(logging.CatTCP, "Terminating previous session from %s", remoteAddr)
+			if oldSession.cancel != nil {
+				oldSession.cancel()
+			}
+			if oldSession.conn != nil {
+				oldSession.conn.Close()
+			}
+		}
+
 		s.mu.Lock()
 		currentEpoch := s.agentEpoch + 1
 		s.agentEpoch = currentEpoch
@@ -674,10 +687,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 		s.agentUDP = netip.AddrPort{}
 		s.agentUDPAt = time.Time{}
 		s.lastAgentConnectAt = time.Now()
-		for clientID, ch := range s.pendingTCP {
-			close(ch)
-			delete(s.pendingTCP, clientID)
-		}
+		s.abortPendingTCPLocked()
 		s.mu.Unlock()
 
 		logging.Global().Infof(logging.CatTCP, "Agent connected to control from %s", remoteAddr)
@@ -809,10 +819,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 				s.agentTCP = nil
 				s.lastAgentDisconnectAt = time.Now()
 				s.closeDomainProxyIdleConnections()
-				for clientID, ch := range s.pendingTCP {
-					close(ch)
-					delete(s.pendingTCP, clientID)
-				}
+				s.abortPendingTCPLocked()
 				logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
 			}
 			s.mu.Unlock()
