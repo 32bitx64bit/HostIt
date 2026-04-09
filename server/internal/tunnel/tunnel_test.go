@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"hostit/shared/emailcfg"
 	"hostit/shared/crypto"
 	"hostit/shared/protocol"
 )
@@ -360,6 +361,11 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 	srv := NewServer(ServerConfig{
 		ControlAddr: controlAddr,
 		DataAddr:    dataAddr,
+		Email: emailcfg.Config{
+			Enabled:  true,
+			Domain:   "example.com",
+			MailHost: "mail.example.com",
+		},
 		Routes: []RouteConfig{{
 			Name:       "game",
 			Proto:      "both",
@@ -398,16 +404,19 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 		t.Fatalf("first packet type = %d, want HELLO", pkt.Type)
 	}
 
-	var routes map[string]helloRoute
-	if err := json.Unmarshal(pkt.Payload, &routes); err != nil {
+	var hello helloPayload
+	if err := json.Unmarshal(pkt.Payload, &hello); err != nil {
 		t.Fatal(err)
 	}
-	rt, ok := routes["game"]
+	rt, ok := hello.Routes["game"]
 	if !ok {
-		t.Fatalf("HELLO routes missing game route: %#v", routes)
+		t.Fatalf("HELLO routes missing game route: %#v", hello.Routes)
 	}
 	if rt.LocalAddr != "127.0.0.1:47990" {
 		t.Fatalf("HELLO LocalAddr = %q, want %q", rt.LocalAddr, "127.0.0.1:47990")
+	}
+	if hello.Email.EffectiveMailHost() != "mail.example.com" {
+		t.Fatalf("HELLO Email.EffectiveMailHost() = %q, want %q", hello.Email.EffectiveMailHost(), "mail.example.com")
 	}
 }
 

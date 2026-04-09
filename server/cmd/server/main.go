@@ -27,11 +27,14 @@ import (
 	"hostit/server/internal/tlsutil"
 	"hostit/server/internal/tunnel"
 	"hostit/shared/configio"
+	"hostit/shared/emailcfg"
 	"hostit/shared/logging"
 	"hostit/shared/module"
 	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
 	"hostit/shared/version"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func main() {
@@ -335,6 +338,8 @@ const (
 func serveServerDashboard(ctx context.Context, addr string, configPath string, authDBPath string, runner *serverRunner, store *auth.Store, cookieSecure bool, sessionTTL time.Duration, shutdownTimeout time.Duration) error {
 	tplStats := template.Must(template.New("stats").Parse(serverStatsHTML))
 	tplConfig := template.Must(template.New("config").Parse(serverConfigHTML))
+	tplEmail := template.Must(template.New("email").Parse(serverEmailHTML))
+	tplEmailSetup := template.Must(template.New("email-setup").Parse(serverEmailSetupHTML))
 	tplDomainGuide := template.Must(template.New("domain-guide").Parse(serverDomainGuideHTML))
 	tplControls := template.Must(template.New("controls").Parse(serverControlsHTML))
 	tplNetwork := template.Must(template.New("network").Parse(serverNetworkTestHTML))
@@ -352,7 +357,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 	updStatePath := filepath.Join(filepath.Dir(absCfg), "update_state_server.json")
 	moduleDir := module.DetectModuleDir(absCfg)
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentServer, "server.zip", moduleDir, updStatePath)
-	upd.PreservePaths = []string{absCfg, absAuthDB}
+	upd.PreservePaths = serverUpdaterPreservePaths(absCfg, absAuthDB, runner)
 	upd.Restart = func() error {
 		bin := upd.BuiltBinaryPath()
 		if _, err := os.Stat(bin); err != nil {
@@ -1053,6 +1058,82 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplConfig.Execute(w, data)
 		})))
 
+		mux.HandleFunc("/email", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			csrf := ensureCSRF(w, r, cookieSecure)
+			cfg, st, err := runner.Get()
+			type emailAccountView struct {
+				Username    string
+				Address     string
+				PasswordSet bool
+				Enabled     bool
+			}
+			accounts := make([]emailAccountView, 0, len(cfg.Email.Accounts))
+			for _, acct := range cfg.Email.Accounts {
+				accounts = append(accounts, emailAccountView{
+					Username:    acct.Username,
+					Address:     cfg.Email.AddressFor(acct.Username),
+					PasswordSet: acct.PasswordSet || strings.TrimSpace(acct.PasswordHash) != "",
+					Enabled:     acct.Enabled,
+				})
+			}
+			data := map[string]any{
+				"Cfg":          cfg,
+				"Status":       st,
+				"ConfigPath":   configPath,
+				"Msg":          getMsg(),
+				"Err":          err,
+				"CSRF":         csrf,
+				"Version":      version.Current,
+				"EmailAccounts": accounts,
+				"EmailCount":   len(accounts),
+				"EmailMaxMessageMB": cfg.Email.MaxMessageBytes / (1 << 20),
+			}
+			_ = tplEmail.Execute(w, data)
+		})))
+
+		mux.HandleFunc("/email/setup", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			csrf := ensureCSRF(w, r, cookieSecure)
+			cfg, st, err := runner.Get()
+			emailDomain := cfg.Email.Domain
+			mailHost := cfg.Email.EffectiveMailHost()
+			dkimSelector := cfg.Email.DKIMSelector
+			if dkimSelector == "" {
+				dkimSelector = "hostit"
+			}
+			spfValue := ""
+			dmarcValue := ""
+			dkimName := ""
+			if emailDomain != "" && mailHost != "" {
+				spfValue = fmt.Sprintf("v=spf1 mx a:%s -all", mailHost)
+				dmarcValue = fmt.Sprintf("v=DMARC1; p=quarantine; adkim=s; aspf=s; rua=mailto:postmaster@%s", emailDomain)
+				dkimName = dkimSelector + "._domainkey." + emailDomain
+			}
+			data := map[string]any{
+				"Cfg":         cfg,
+				"Status":      st,
+				"ConfigPath":  configPath,
+				"Msg":         getMsg(),
+				"Err":         err,
+				"CSRF":        csrf,
+				"Version":     version.Current,
+				"EmailDomain": emailDomain,
+				"MailHost":    mailHost,
+				"DKIMSelector": dkimSelector,
+				"DKIMDNSName": dkimName,
+				"SPFValue":    spfValue,
+				"DMARCValue":  dmarcValue,
+			}
+			_ = tplEmailSetup.Execute(w, data)
+		})))
+
 		mux.HandleFunc("/domain-manager-info", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1266,6 +1347,40 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/config", http.StatusSeeOther)
 		})))
 
+		mux.HandleFunc("/email/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			cfg, _, _ := runner.Get()
+			emailCfg, err := parseServerEmailForm(r, cfg.Email)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			cfg.Email = emailCfg
+			if err := cfg.Validate(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := configio.Save(configPath, cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			runner.Restart(cfg)
+			setMsg("Saved email settings + restarted")
+			http.Redirect(w, r, "/email", http.StatusSeeOther)
+		})))
+
 		mux.HandleFunc("/api/routes/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1449,6 +1564,63 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 	}
 }
 
+func serverUpdaterPreservePaths(absCfg string, absAuthDB string, runner *serverRunner) []string {
+	paths := make([]string, 0, 8)
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(filepath.Dir(absCfg), path)
+		}
+		if p, err := filepath.Abs(path); err == nil {
+			path = p
+		}
+		for _, existing := range paths {
+			if existing == path {
+				return
+			}
+		}
+		paths = append(paths, path)
+	}
+
+	add(absCfg)
+	add(absAuthDB)
+
+	cfgDir := filepath.Dir(absCfg)
+	cfg, _, _ := runner.Get()
+
+	serverCert := strings.TrimSpace(cfg.TLSCertFile)
+	if serverCert == "" {
+		serverCert = filepath.Join(cfgDir, "server.crt")
+	}
+	serverKey := strings.TrimSpace(cfg.TLSKeyFile)
+	if serverKey == "" {
+		serverKey = filepath.Join(cfgDir, "server.key")
+	}
+	webCert := strings.TrimSpace(cfg.WebTLSCertFile)
+	if webCert == "" {
+		webCert = filepath.Join(cfgDir, "web.crt")
+	}
+	webKey := strings.TrimSpace(cfg.WebTLSKeyFile)
+	if webKey == "" {
+		webKey = filepath.Join(cfgDir, "web.key")
+	}
+	domainCertDir := strings.TrimSpace(cfg.DomainCertDir)
+	if domainCertDir == "" {
+		domainCertDir = filepath.Join(cfgDir, "domains")
+	}
+
+	add(serverCert)
+	add(serverKey)
+	add(webCert)
+	add(webKey)
+	add(domainCertDir)
+
+	return paths
+}
+
 func genToken() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
@@ -1541,6 +1713,86 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, LocalAddr: local, Encrypted: encPtr, Domain: domain, DomainEnabled: domainPtr})
 	}
 	return routes
+}
+
+func parseServerEmailForm(r *http.Request, existing emailcfg.Config) (emailcfg.Config, error) {
+	existing = emailcfg.Normalize(existing)
+	existingByUser := make(map[string]emailcfg.Account, len(existing.Accounts))
+	for _, acct := range existing.Accounts {
+		existingByUser[strings.ToLower(strings.TrimSpace(acct.Username))] = acct
+	}
+
+	count, _ := strconv.Atoi(strings.TrimSpace(r.Form.Get("email_account_count")))
+	if count < 0 {
+		count = 0
+	}
+	if count > 128 {
+		count = 128
+	}
+
+	cfg := emailcfg.Config{
+		Enabled:         strings.TrimSpace(r.Form.Get("email_enabled")) != "",
+		Domain:          strings.TrimSpace(r.Form.Get("email_domain")),
+		MailHost:        strings.TrimSpace(r.Form.Get("email_mail_host")),
+		AutoTLS:         strings.TrimSpace(r.Form.Get("email_auto_tls")) != "",
+		ACMEEmail:       strings.TrimSpace(r.Form.Get("email_acme_email")),
+		ACMEHTTPAddr:    strings.TrimSpace(r.Form.Get("email_acme_http_addr")),
+		TLSCertPath:     strings.TrimSpace(r.Form.Get("email_tls_cert_path")),
+		TLSKeyPath:      strings.TrimSpace(r.Form.Get("email_tls_key_path")),
+		DKIMSelector:    strings.TrimSpace(r.Form.Get("email_dkim_selector")),
+		DKIMKeyPath:     strings.TrimSpace(r.Form.Get("email_dkim_key_path")),
+		SubmissionAddr:  strings.TrimSpace(r.Form.Get("email_submission_addr")),
+		IMAPAddr:        strings.TrimSpace(r.Form.Get("email_imap_addr")),
+		InboundSMTP:     strings.TrimSpace(r.Form.Get("email_inbound_smtp")) != "",
+		InboundSMTPAddr: strings.TrimSpace(r.Form.Get("email_inbound_smtp_addr")),
+		MaxMessageBytes: parseInt64Default(strings.TrimSpace(r.Form.Get("email_max_message_mb")), 25) * (1 << 20),
+		MaxRecipients:   parseIntDefault(strings.TrimSpace(r.Form.Get("email_max_recipients")), 100),
+		Accounts:        make([]emailcfg.Account, 0, count),
+	}
+
+	for i := 0; i < count; i++ {
+		prefix := "email_account_" + strconv.Itoa(i) + "_"
+		if strings.TrimSpace(r.Form.Get(prefix+"delete")) != "" && strings.TrimSpace(r.Form.Get(prefix+"delete")) != "0" {
+			continue
+		}
+		username := strings.ToLower(strings.TrimSpace(r.Form.Get(prefix + "username")))
+		password := r.Form.Get(prefix + "password")
+		enabled := strings.TrimSpace(r.Form.Get(prefix+"enabled")) != ""
+		if username == "" && strings.TrimSpace(password) == "" {
+			continue
+		}
+		acct := emailcfg.Account{Username: username, Enabled: enabled}
+		if password != "" {
+			hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			if err != nil {
+				return emailcfg.Config{}, err
+			}
+			acct.PasswordHash = string(hash)
+			acct.PasswordSet = true
+		} else if prev, ok := existingByUser[username]; ok {
+			acct.PasswordHash = prev.PasswordHash
+			acct.PasswordSet = prev.PasswordSet || strings.TrimSpace(prev.PasswordHash) != ""
+		}
+		cfg.Accounts = append(cfg.Accounts, acct)
+	}
+
+	return emailcfg.Normalize(cfg), nil
+}
+
+func parseIntDefault(raw string, fallback int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
+}
+
+func parseInt64Default(raw string, fallback int64) int64 {
+	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
 }
 
 const serverStatsHTML = `<!doctype html>
@@ -1679,7 +1931,8 @@ const serverStatsHTML = `<!doctype html>
       <div class="flex">
         <div class="nav">
           <a class="active" href="/">Dashboard</a>
-          <a href="/config">Config</a>
+			  <a href="/config">Config</a>
+			  <a href="/email">Email</a>
           <a href="/controls">Controls</a>
 					<a href="/network-test">Network Test</a>
         </div>
@@ -2312,6 +2565,7 @@ const serverConfigHTML = `<!doctype html>
 				<div class="nav">
 					<a href="/">Dashboard</a>
 					<a class="active" href="/config">Config</a>
+					<a href="/email">Email</a>
 					<a href="/controls">Controls</a>
 					<a href="/network-test">Network Test</a>
 				</div>
@@ -2543,6 +2797,214 @@ const serverConfigHTML = `<!doctype html>
 	</script>
 </body>
 </html>`
+
+const serverEmailHTML = `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Tunnel Server — Email</title>
+	<style>
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--redDim:rgba(248,81,73,.08);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		code{font-family:var(--mono);font-size:.8em;background:var(--surface);padding:2px 6px;border-radius:4px}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 60px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0}.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}.nav a,.nav button{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;transition:all .15s;text-decoration:none}.nav a:hover,.nav button:hover{background:var(--surfaceHover);border-color:var(--borderHover);text-decoration:none}.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;transition:border-color .15s}.card:hover{border-color:var(--borderHover)}
+		.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+		.flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.secHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:24px 0 10px}.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		.btn{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;transition:all .15s}.btn:hover{background:var(--surfaceHover);border-color:var(--borderHover)}.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}.btn.warn{background:var(--redDim);border-color:var(--redBorder);color:var(--red)}.btn.sm{font-size:12px;padding:5px 10px}
+		label{font-weight:600;display:block;margin:0 0 4px;font-size:13px}.help{font-size:12px;margin:0 0 8px;color:var(--textMuted);line-height:1.35}
+		input{width:100%;max-width:100%;box-sizing:border-box;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:var(--font);font-size:13px}input:focus{outline:none;border-color:var(--accentBorder)}input[type=checkbox]{width:auto}
+		.flash{padding:10px 14px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--greenDim);border:1px solid var(--greenBorder);color:var(--green)}
+		.accountCard{margin-top:10px}.accountHead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.muted{color:var(--textMuted)}
+	</style>
+</head>
+<body>
+	<div class="wrap">
+		<div class="topbar">
+			<div>
+				<h1>Tunnel Server</h1>
+				<div class="subtitle">Email</div>
+			</div>
+			<div class="flex">
+				<div class="nav">
+					<a href="/">Dashboard</a>
+					<a href="/config">Config</a>
+					<a class="active" href="/email">Email</a>
+					<a href="/controls">Controls</a>
+					<a href="/network-test">Network Test</a>
+				</div>
+				<form method="post" action="/logout" style="margin:0">
+					<input type="hidden" name="csrf" value="{{.CSRF}}" />
+					<button type="submit" class="btn sm">Logout</button>
+				</form>
+			</div>
+		</div>
+
+		{{if .Msg}}<div class="flash">{{.Msg}}</div>{{end}}
+
+		<form method="post" action="/email/save" class="card">
+			<input type="hidden" name="csrf" value="{{.CSRF}}" />
+			<div class="flex" style="justify-content:space-between;align-items:center;margin-bottom:10px">
+				<div class="help" style="margin:0">Configure the agent-local mail stack and mailbox accounts.</div>
+				<a class="btn" href="/email/setup">DNS setup guide</a>
+			</div>
+			<div class="help" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg2)">
+				<b>Important:</b> <code>Domain</code> is the part after the <code>@</code> in your email address. If your mailbox is <code>alice@example.com</code>, use <code>example.com</code>. If your mailbox is <code>alice@email.example.com</code>, use <code>email.example.com</code>. <code>Mail Host</code> is the server hostname other mail servers connect to, usually <code>mail.&lt;your-domain&gt;</code>.
+			</div>
+
+			<div class="secHead" style="margin-top:0"><h2>Mail Service</h2></div>
+			<div class="grid2">
+				<div>
+					<label>Enable Email</label>
+					<div class="help">Turns on the built-in local mail stack on the agent.</div>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" name="email_enabled" value="1" {{if .Cfg.Email.Enabled}}checked{{end}} /><span>Enable built-in email service</span></label>
+				</div>
+				<div>
+					<label>Domain</label>
+					<div class="help">Mailbox domain. This is the exact part after <code>@</code> in your addresses. Example: for <code>alice@email.example.com</code>, enter <code>email.example.com</code>.</div>
+					<input name="email_domain" value="{{.Cfg.Email.Domain}}" placeholder="example.com" />
+				</div>
+				<div>
+					<label>Mail Host</label>
+					<div class="help">Public server hostname for SMTP/TLS. Other mail servers connect here. This is usually <code>mail.{{if .Cfg.Email.Domain}}{{.Cfg.Email.Domain}}{{else}}example.com{{end}}</code>, not the bare mailbox domain.</div>
+					<input name="email_mail_host" value="{{.Cfg.Email.MailHost}}" placeholder="mail.example.com" />
+				</div>
+				<div>
+					<label>Automatic Public TLS</label>
+					<div class="help">Use Let's Encrypt for the mail host so IMAP/SMTP clients get a trusted certificate without warnings. Requires the mail host DNS record to point to the agent and the ACME HTTP bind below to be publicly reachable.</div>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" name="email_auto_tls" value="1" {{if .Cfg.Email.AutoTLS}}checked{{end}} /><span>Enable automatic public TLS for mail</span></label>
+				</div>
+				<div>
+					<label>ACME Email</label>
+					<div class="help">Let's Encrypt registration email. Required when Automatic Public TLS is enabled.</div>
+					<input name="email_acme_email" value="{{.Cfg.Email.ACMEEmail}}" placeholder="admin@example.com" />
+				</div>
+				<div>
+					<label>ACME HTTP Bind</label>
+					<div class="help">Public HTTP listener for Let's Encrypt HTTP-01 validation, usually <code>:80</code>. This cannot share the same host/port with another service.</div>
+					<input name="email_acme_http_addr" value="{{.Cfg.Email.ACMEHTTPAddr}}" placeholder=":80" />
+				</div>
+				<div>
+					<label>TLS Cert Path</label>
+					<div class="help">Optional PEM certificate path on the agent. Leave blank to auto-generate a self-signed cert, or enable Automatic Public TLS above for Let's Encrypt. Do not combine manual cert paths with Automatic Public TLS.</div>
+					<input name="email_tls_cert_path" value="{{.Cfg.Email.TLSCertPath}}" placeholder="/etc/ssl/mail/fullchain.pem" />
+				</div>
+				<div>
+					<label>TLS Key Path</label>
+					<div class="help">Optional PEM private key path on the agent. Must be set together with the cert path.</div>
+					<input name="email_tls_key_path" value="{{.Cfg.Email.TLSKeyPath}}" placeholder="/etc/ssl/mail/privkey.pem" />
+				</div>
+				<div>
+					<label>DKIM Selector</label>
+					<div class="help">DNS label used for the DKIM TXT record. Leave blank for <code>hostit</code>.</div>
+					<input name="email_dkim_selector" value="{{.Cfg.Email.DKIMSelector}}" placeholder="hostit" />
+				</div>
+				<div>
+					<label>DKIM Key Path</label>
+					<div class="help">Optional PEM private key path on the agent. Leave blank to auto-generate and keep the private key local.</div>
+					<input name="email_dkim_key_path" value="{{.Cfg.Email.DKIMKeyPath}}" placeholder="/var/lib/hostit/mail/dkim.pem" />
+				</div>
+				<div>
+					<label>Submission Bind</label>
+					<div class="help">Local authenticated SMTP submission listener for your own users and apps to send mail out. This is for sending, not for internet mail delivery into your domain. STARTTLS is advertised and plaintext auth is blocked.</div>
+					<input name="email_submission_addr" value="{{.Cfg.Email.SubmissionAddr}}" placeholder="127.0.0.1:1587" />
+				</div>
+				<div>
+					<label>IMAP Bind</label>
+					<div class="help">Local IMAP listener for webmail and mail clients. STARTTLS is required before login.</div>
+					<input name="email_imap_addr" value="{{.Cfg.Email.IMAPAddr}}" placeholder="127.0.0.1:1993" />
+				</div>
+				<div>
+					<label>Inbound SMTP</label>
+					<div class="help">Accept direct inbound SMTP delivery from the internet for your mailbox domain. Turn this on if you want to receive mail from Gmail, Outlook, and other servers. This does <b>not</b> control whether your own users can send mail; that is handled by Submission above.</div>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" name="email_inbound_smtp" value="1" {{if .Cfg.Email.InboundSMTP}}checked{{end}} /><span>Enable local inbound SMTP listener</span></label>
+					<div style="margin-top:8px"><input name="email_inbound_smtp_addr" value="{{.Cfg.Email.InboundSMTPAddr}}" placeholder="127.0.0.1:1025" /></div>
+				</div>
+				<div>
+					<label>Max Message Size (MB)</label>
+					<div class="help">Reject oversized messages early. Default 25 MB.</div>
+					<input name="email_max_message_mb" value="{{if .EmailMaxMessageMB}}{{.EmailMaxMessageMB}}{{else}}25{{end}}" placeholder="25" />
+				</div>
+				<div>
+					<label>Max Recipients Per Email</label>
+					<div class="help">Per-email recipient cap for submission and inbound SMTP. This is not a mailbox storage limit. Default 100.</div>
+					<input name="email_max_recipients" value="{{if .Cfg.Email.MaxRecipients}}{{.Cfg.Email.MaxRecipients}}{{else}}100{{end}}" placeholder="100" />
+				</div>
+				<div>
+					<label>Storage</label>
+					<div class="help">Stored mail is currently unlimited except for available disk space. There is no arbitrary message-count cap.</div>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" checked disabled /><span>Unlimited mail storage</span></label>
+				</div>
+			</div>
+
+			<div class="secHead"><h2>Accounts</h2></div>
+			<div class="help">Enter only the username part. Leave password blank to keep an existing password hash.</div>
+			<input type="hidden" name="email_account_count" id="email_account_count" value="{{.EmailCount}}" />
+			<div id="emailAccounts">
+				{{range $i, $acct := .EmailAccounts}}
+				<div class="card accountCard" data-email-account>
+					<div class="accountHead">
+						<b>{{$acct.Address}}</b>
+						<button type="button" class="btn sm warn" data-remove-email-account>Remove</button>
+					</div>
+					<input type="hidden" name="email_account_{{$i}}_delete" value="0" data-email-account-delete />
+					<div class="grid2" style="margin-top:10px">
+						<div>
+							<label>Username</label>
+							<input name="email_account_{{$i}}_username" value="{{$acct.Username}}" placeholder="alice" />
+						</div>
+						<div>
+							<label>Password</label>
+							<input type="password" name="email_account_{{$i}}_password" value="" placeholder="{{if $acct.PasswordSet}}Leave blank to keep existing{{else}}Set password{{end}}" />
+							<div class="help">{{if $acct.PasswordSet}}Password already set.{{else}}No password set yet.{{end}}</div>
+						</div>
+						<div>
+							<label>Enabled</label>
+							<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" name="email_account_{{$i}}_enabled" value="1" {{if $acct.Enabled}}checked{{end}} /><span>Allow login and delivery</span></label>
+						</div>
+					</div>
+				</div>
+				{{end}}
+			</div>
+
+			<div class="flex" style="margin-top:14px">
+				<button type="button" id="addEmailAccount" class="btn">+ Add account</button>
+				<button type="submit" class="btn primary">Save email settings + restart</button>
+			</div>
+		</form>
+	</div>
+
+	<template id="emailAccountTemplate">
+		<div class="card accountCard" data-email-account>
+			<div class="accountHead"><b>new@domain</b><button type="button" class="btn sm warn" data-remove-email-account>Remove</button></div>
+			<input type="hidden" name="email_account_IDX_delete" value="0" data-email-account-delete />
+			<div class="grid2" style="margin-top:10px">
+				<div><label>Username</label><input name="email_account_IDX_username" value="" placeholder="alice" /></div>
+				<div><label>Password</label><input type="password" name="email_account_IDX_password" value="" placeholder="Set password" /><div class="help">Required for new accounts.</div></div>
+				<div><label>Enabled</label><label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" name="email_account_IDX_enabled" value="1" checked /><span>Allow login and delivery</span></label></div>
+			</div>
+		</div>
+	</template>
+
+	<script>
+	(function(){
+		var btn=document.getElementById('addEmailAccount'),wrap=document.getElementById('emailAccounts'),cnt=document.getElementById('email_account_count'),tpl=document.getElementById('emailAccountTemplate');
+		if(!btn||!wrap||!cnt||!tpl)return;
+		wrap.addEventListener('click',function(e){var t=e.target;if(!t||!t.matches||!t.matches('[data-remove-email-account]'))return;e.preventDefault();var c=t.closest('[data-email-account]');if(!c)return;var d=c.querySelector('[data-email-account-delete]');if(d)d.value='1';c.style.display='none';});
+		btn.addEventListener('click',function(){var i=parseInt(cnt.value||'0',10);var html=tpl.innerHTML.split('IDX').join(String(i));var w=document.createElement('div');w.innerHTML=html;wrap.appendChild(w.firstElementChild);cnt.value=String(i+1);});
+	})();
+	</script>
+</body>
+</html>`
+
 const serverControlsHTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -2597,6 +3059,7 @@ const serverControlsHTML = `<!doctype html>
 				<div class="nav">
 					<a href="/">Dashboard</a>
 					<a href="/config">Config</a>
+					<a href="/email">Email</a>
 					<a class="active" href="/controls">Controls</a>
 					<a href="/network-test">Network Test</a>
 				</div>
@@ -2748,6 +3211,122 @@ const serverControlsHTML = `<!doctype html>
 </body>
 </html>`
 
+const serverEmailSetupHTML = `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Tunnel Server — Email DNS Setup</title>
+	<style>
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--yellow:#d29922;--yellowDim:rgba(210,153,34,.12);--yellowBorder:rgba(210,153,34,.35);--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--yellowDim:rgba(210,153,34,.10);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		code,pre{font-family:var(--mono)}
+		code{font-size:.84em;background:var(--surface);padding:2px 6px;border-radius:4px}
+		pre{white-space:pre-wrap;word-break:break-word;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 0}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 50px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0}
+		.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}
+		.nav a{font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);text-decoration:none}.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;margin-bottom:14px}
+		.secHead{margin:0 0 10px}.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		.kv{display:grid;grid-template-columns:180px 1fr;gap:8px 12px}.muted{color:var(--textMuted)}
+		.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid var(--yellowBorder);color:var(--yellow);background:var(--yellowDim)}
+		@media(max-width:760px){.kv{grid-template-columns:1fr}}
+	</style>
+</head>
+<body>
+	<div class="wrap">
+		<div class="topbar">
+			<div>
+				<h1>Tunnel Server</h1>
+				<div class="subtitle">Email DNS setup guide</div>
+			</div>
+			<div class="nav">
+				<a href="/">Dashboard</a>
+				<a href="/config">Config</a>
+				<a href="/email">Email</a>
+				<a class="active" href="/email/setup">Email DNS Setup</a>
+				<a href="/controls">Controls</a>
+				<a href="/network-test">Network Test</a>
+			</div>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Which domain goes where?</h2></div>
+			<ul>
+				<li>If your mailbox is <code>alice@example.com</code>, set <code>Domain</code> to <code>example.com</code>.</li>
+				<li>If your mailbox is <code>alice@email.example.com</code>, set <code>Domain</code> to <code>email.example.com</code>.</li>
+				<li><code>Mail Host</code> is usually a server name under that mailbox domain, such as <code>mail.{{if .EmailDomain}}{{.EmailDomain}}{{else}}example.com{{end}}</code>.</li>
+				<li><code>MX</code>, <code>SPF</code>, <code>DMARC</code>, and <code>DKIM</code> follow the mailbox domain, not necessarily your site's apex domain.</li>
+			</ul>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Before you add DNS records</h2></div>
+			<ol>
+				<li>Set <code>Domain</code> on the <a href="/email">Email</a> page to the exact mailbox domain, meaning the part after the <code>@</code> in your email addresses.</li>
+				<li>Choose or confirm <code>Mail Host</code>. This is the public hostname other servers use to reach your server, usually <code>mail.{{if .EmailDomain}}{{.EmailDomain}}{{else}}example.com{{end}}</code>.</li>
+				<li>Enable <code>Inbound SMTP</code> if you want to receive mail directly from the internet. Leave it off if you only want local submission/outbound sending.</li>
+				<li>If you want trusted certificates without mail-client warnings, either enable <code>Automatic Public TLS</code> or provide your own TLS cert and key for the mail host.</li>
+				<li>Save and restart the server so the agent receives the mail config.</li>
+				<li>Open the agent dashboard after the service starts. The exact DKIM TXT value is shown there because the private key stays on the agent.</li>
+			</ol>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Trusted TLS for mail clients</h2></div>
+			<ul>
+				<li>If you leave TLS cert paths blank, the agent uses a self-signed cert. Traffic is encrypted, but clients will warn.</li>
+				<li>If you enable <code>Automatic Public TLS</code>, the agent requests a Let's Encrypt certificate for <code>{{if .MailHost}}{{.MailHost}}{{else}}mail.example.com{{end}}</code>.</li>
+				<li>Let's Encrypt requires the mail host DNS record to point to the system running the agent and port <code>80</code> on the configured ACME bind to be reachable from the internet.</li>
+				<li>If you already manage certificates elsewhere, leave automatic TLS off and provide <code>TLS Cert Path</code> and <code>TLS Key Path</code> instead.</li>
+			</ul>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Records to create</h2></div>
+			<div class="kv">
+				<div><code>A / AAAA</code></div><div>Point <code>{{if .MailHost}}{{.MailHost}}{{else}}mail.example.com{{end}}</code> to the public IP of the agent or edge that accepts mail.</div>
+				<div><code>MX</code></div><div>Create an MX record for the mailbox domain <code>{{if .EmailDomain}}{{.EmailDomain}}{{else}}example.com{{end}}</code> pointing to <code>{{if .MailHost}}{{.MailHost}}{{else}}mail.example.com{{end}}</code> with priority <code>10</code>.</div>
+				<div><code>SPF TXT</code></div><div>Create a TXT record on the mailbox domain <code>{{if .EmailDomain}}{{.EmailDomain}}{{else}}example.com{{end}}</code> with:</div>
+				<div></div><div><pre>{{if .SPFValue}}{{.SPFValue}}{{else}}v=spf1 mx a:mail.example.com -all{{end}}</pre></div>
+				<div><code>DMARC TXT</code></div><div>Create a TXT record named <code>_dmarc.{{if .EmailDomain}}{{.EmailDomain}}{{else}}example.com{{end}}</code> with:</div>
+				<div></div><div><pre>{{if .DMARCValue}}{{.DMARCValue}}{{else}}v=DMARC1; p=quarantine; adkim=s; aspf=s; rua=mailto:postmaster@example.com{{end}}</pre></div>
+				<div><code>DKIM TXT</code></div><div>Create a TXT record named <code>{{if .DKIMDNSName}}{{.DKIMDNSName}}{{else}}hostit._domainkey.example.com{{end}}</code>. Copy the exact TXT value from the agent dashboard. This record also belongs under the mailbox domain.</div>
+			</div>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Quick examples</h2></div>
+			<ul>
+				<li>For <code>alice@example.com</code>: mailbox domain = <code>example.com</code>, mail host = <code>mail.example.com</code>.</li>
+				<li>For <code>alice@email.example.com</code>: mailbox domain = <code>email.example.com</code>, mail host = <code>mail.email.example.com</code>.</li>
+			</ul>
+		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Provider-side details</h2></div>
+			<ul>
+				<li>Reverse DNS / <code>PTR</code> is usually set where you rent the IP, not in your DNS zone. Set it to <code>{{if .MailHost}}{{.MailHost}}{{else}}mail.example.com{{end}}</code>.</li>
+				<li>Open port <code>25</code> inbound for direct mail receipt. Keep <code>587</code> and IMAP reachable only where needed.</li>
+				<li>Make sure the mail host certificate matches <code>{{if .MailHost}}{{.MailHost}}{{else}}mail.example.com{{end}}</code> if you use a custom TLS certificate.</li>
+			</ul>
+		</div>
+
+		<div class="card">
+			<div class="pill">Important</div>
+			<div class="secHead" style="margin-top:10px"><h2>Why DKIM is shown on the agent</h2></div>
+			<p class="muted">This stack keeps the DKIM private key on the agent by default. That means the server UI can tell you the DNS record name, but the exact public TXT value is generated locally and displayed in the agent dashboard once the mail service starts.</p>
+		</div>
+	</div>
+</body>
+</html>`
+
 const serverDomainGuideHTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -2790,6 +3369,7 @@ const serverDomainGuideHTML = `<!doctype html>
 			<div class="nav">
 				<a href="/">Dashboard</a>
 				<a href="/config">Config</a>
+				<a href="/email">Email</a>
 				<a href="/controls">Controls</a>
 				<a class="active" href="/domain-manager-info">Domain Guide</a>
 			</div>
@@ -2903,6 +3483,7 @@ const serverNetworkTestHTML = `<!doctype html>
 			<div class="nav">
 				<a href="/">Dashboard</a>
 				<a href="/config">Config</a>
+				<a href="/email">Email</a>
 				<a href="/controls">Controls</a>
 				<a class="active" href="/network-test">Network Test</a>
 			</div>

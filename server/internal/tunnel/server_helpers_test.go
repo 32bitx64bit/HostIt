@@ -4,12 +4,20 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"hostit/shared/emailcfg"
 )
 
-func TestBuildHelloRoutesIncludesLocalAddrAndAlgorithm(t *testing.T) {
+func TestBuildHelloPayloadIncludesRoutesAndEmailConfig(t *testing.T) {
 	encrypted := true
 	cfg := ServerConfig{
 		EncryptionAlgorithm: "aes-256",
+		Email: emailcfg.Config{
+			Enabled:  true,
+			Domain:   "example.com",
+			MailHost: "mail.example.com",
+			Accounts: []emailcfg.Account{{Username: "admin", PasswordSet: true, Enabled: true}},
+		},
 		Routes: []RouteConfig{{
 			Name:       "web",
 			Proto:      "both",
@@ -19,10 +27,10 @@ func TestBuildHelloRoutesIncludesLocalAddrAndAlgorithm(t *testing.T) {
 		}},
 	}
 
-	routes := buildHelloRoutes(cfg)
-	rt, ok := routes["web"]
+	payload := buildHelloPayload(cfg)
+	rt, ok := payload.Routes["web"]
 	if !ok {
-		t.Fatalf("buildHelloRoutes() missing route: %#v", routes)
+		t.Fatalf("buildHelloPayload() missing route: %#v", payload.Routes)
 	}
 	if rt.LocalAddr != "127.0.0.1:3000" {
 		t.Fatalf("LocalAddr = %q, want %q", rt.LocalAddr, "127.0.0.1:3000")
@@ -32,6 +40,15 @@ func TestBuildHelloRoutesIncludesLocalAddrAndAlgorithm(t *testing.T) {
 	}
 	if !rt.Encrypted {
 		t.Fatal("Encrypted = false, want true")
+	}
+	if !payload.Email.Enabled {
+		t.Fatal("Email.Enabled = false, want true")
+	}
+	if payload.Email.EffectiveMailHost() != "mail.example.com" {
+		t.Fatalf("EffectiveMailHost = %q, want %q", payload.Email.EffectiveMailHost(), "mail.example.com")
+	}
+	if len(payload.Email.Accounts) != 1 || payload.Email.Accounts[0].Username != "admin" {
+		t.Fatalf("Email accounts = %#v, want one admin account", payload.Email.Accounts)
 	}
 }
 

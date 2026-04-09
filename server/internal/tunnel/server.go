@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"hostit/shared/emailcfg"
 	"hostit/shared/crypto"
 	"hostit/shared/logging"
 	"hostit/shared/netutil"
@@ -105,6 +106,11 @@ type helloRoute struct {
 	Algorithm  string
 }
 
+type helloPayload struct {
+	Routes map[string]helloRoute `json:"routes"`
+	Email  emailcfg.Config       `json:"email,omitempty"`
+}
+
 type ServerStatus struct {
 	AgentConnected bool
 }
@@ -183,11 +189,18 @@ func buildHelloRoutes(cfg ServerConfig) map[string]helloRoute {
 	return routes
 }
 
+func buildHelloPayload(cfg ServerConfig) helloPayload {
+	return helloPayload{
+		Routes: buildHelloRoutes(cfg),
+		Email:  emailcfg.Normalize(cfg.Email),
+	}
+}
+
 func (s *Server) buildHelloPacket() (*protocol.Packet, error) {
 	s.mu.RLock()
 	cfg := s.cfg
 	s.mu.RUnlock()
-	payload, err := json.Marshal(buildHelloRoutes(cfg))
+	payload, err := json.Marshal(buildHelloPayload(cfg))
 	if err != nil {
 		return nil, err
 	}

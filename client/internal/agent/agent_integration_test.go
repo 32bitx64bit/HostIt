@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"hostit/shared/emailcfg"
 	sharedcrypto "hostit/shared/crypto"
 	"hostit/shared/protocol"
 )
@@ -128,15 +129,80 @@ func (s *fakeTunnelServer) waitForControl(t *testing.T) net.Conn {
 	return s.controlConn
 }
 
-func (s *fakeTunnelServer) sendHello(t *testing.T, routes map[string]RemoteRoute) {
+func (s *fakeTunnelServer) sendHello(t *testing.T, routes map[string]RemoteRoute, email ...emailcfg.Config) {
 	t.Helper()
 	conn := s.waitForControl(t)
-	payload, err := json.Marshal(routes)
+	hello := helloPayload{Routes: routes}
+	if len(email) > 0 {
+		hello.Email = emailcfg.Normalize(email[0])
+	}
+	payload, err := json.Marshal(hello)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeHello, Payload: payload}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAgentReceivesEmailConfigFromHello(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := startFakeTunnelServer(t, "testtoken")
+	defer server.close()
+
+	connectedCh := make(chan struct{}, 1)
+	emailCh := make(chan emailcfg.Config, 1)
+	go func() {
+		_ = RunWithHooks(ctx, Config{
+			Server:     server.serverAddr(),
+			Token:      "testtoken",
+			DisableTLS: true,
+		}, &Hooks{
+			OnConnected: func() {
+				select {
+				case connectedCh <- struct{}{}:
+				default:
+				}
+			},
+			OnEmailConfig: func(cfg emailcfg.Config) {
+				select {
+				case emailCh <- cfg:
+				default:
+				}
+			},
+		})
+	}()
+
+	server.sendHello(t, map[string]RemoteRoute{}, emailcfg.Config{
+		Enabled:        true,
+		Domain:         "example.com",
+		MailHost:       "mail.example.com",
+		SubmissionAddr: "127.0.0.1:587",
+		IMAPAddr:       "127.0.0.1:993",
+		Accounts: []emailcfg.Account{{
+			Username:    "admin",
+			PasswordSet: true,
+			Enabled:     true,
+		}},
+	})
+
+	waitForSignal(t, connectedCh, 5*time.Second, "agent never processed HELLO")
+
+	select {
+	case cfg := <-emailCh:
+		if !cfg.Enabled {
+			t.Fatal("Email.Enabled = false, want true")
+		}
+		if cfg.EffectiveMailHost() != "mail.example.com" {
+			t.Fatalf("EffectiveMailHost() = %q, want mail.example.com", cfg.EffectiveMailHost())
+		}
+		if len(cfg.Accounts) != 1 || cfg.Accounts[0].Username != "admin" {
+			t.Fatalf("Accounts = %#v, want one admin account", cfg.Accounts)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for email config hook")
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+
+	"hostit/shared/emailcfg"
 )
 
 type RemoteRoute struct {
@@ -31,6 +33,7 @@ type Config struct {
 	Token        string
 	DisableTLS   bool
 	TLSPinSHA256 string
+	Email        emailcfg.Config         `json:"-"`
 	Routes       map[string]RemoteRoute `json:"-"`
 }
 

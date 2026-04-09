@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"hostit/shared/emailcfg"
 )
 
 type ConfigValidationError struct {
@@ -198,11 +200,13 @@ type ServerConfig struct {
 	PairTimeout          time.Duration
 	DashboardInterval    time.Duration `json:",omitempty"`
 	EncryptionAlgorithm  string        `json:",omitempty"`
+	Email                emailcfg.Config `json:"email,omitempty"`
 	Routes               []RouteConfig
 }
 
 func (c *ServerConfig) Validate() error {
 	var errs []string
+	c.Email = emailcfg.Normalize(c.Email)
 
 	if strings.TrimSpace(c.Token) == "" {
 		errs = append(errs, "token is required")
@@ -277,6 +281,18 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.DashboardInterval > 10*time.Minute {
 		errs = append(errs, "dashboard_interval must be at most 10m")
+	}
+
+	if err := c.Email.Validate(); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if base := normalizeHostname(c.DomainBase); base != "" {
+		if domain := normalizeHostname(c.Email.Domain); domain != "" && !hostnameWithinBase(domain, base) {
+			errs = append(errs, fmt.Sprintf("email domain %q must match base domain %q", c.Email.Domain, c.DomainBase))
+		}
+		if host := normalizeHostname(c.Email.EffectiveMailHost()); host != "" && !hostnameWithinBase(host, base) {
+			errs = append(errs, fmt.Sprintf("email mail host %q must match base domain %q", c.Email.EffectiveMailHost(), c.DomainBase))
+		}
 	}
 
 	routeNames := make(map[string]bool)

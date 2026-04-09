@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"hostit/client/internal/agent"
+	"hostit/client/internal/mail"
 	"hostit/shared/configio"
+	"hostit/shared/emailcfg"
 	"hostit/shared/module"
 	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
@@ -98,6 +100,24 @@ func main() {
 	}
 
 	ctrl := newAgentController(ctx, cfg)
+	absCfg := configPath
+	if p, err := filepath.Abs(configPath); err == nil {
+		absCfg = p
+	}
+	mailSvc, err := mail.NewService(filepath.Join(filepath.Dir(absCfg), "mail"))
+	if err != nil {
+		log.Printf("mail service init failed: %v", err)
+	} else {
+		if err := mailSvc.Start(ctx); err != nil {
+			log.Printf("mail service start failed: %v", err)
+		}
+		defer mailSvc.Close()
+		ctrl.onEmailConfig = func(cfg emailcfg.Config) {
+			if err := mailSvc.ApplyConfig(cfg); err != nil {
+				log.Printf("mail config apply failed: %v", err)
+			}
+		}
+	}
 	if autostart {
 		log.Printf("=== Auto-starting agent ===")
 		log.Printf("Server: %s", cfg.Server)
@@ -126,7 +146,7 @@ func main() {
 				}
 			}
 			log.Printf("agent web: http://%s", display)
-			if err := serveAgentDashboard(ctx, webAddr, configPath, ctrl); err != nil {
+			if err := serveAgentDashboard(ctx, webAddr, configPath, ctrl, mailSvc); err != nil {
 				log.Printf("agent web error: %v", err)
 			}
 		}()
@@ -144,9 +164,11 @@ type agentController struct {
 	connected bool
 	lastErr   string
 	routes    []agent.RemoteRoute
+	emailCfg  emailcfg.Config
 	cancel    context.CancelFunc
 	done      chan struct{}
 	runID     uint64
+	onEmailConfig func(emailcfg.Config)
 }
 
 func newAgentController(root context.Context, cfg agent.Config) *agentController {
@@ -210,6 +232,19 @@ func (a *agentController) Start() {
 			}
 			a.routes = append([]agent.RemoteRoute(nil), routes...)
 			a.mu.Unlock()
+		},
+		OnEmailConfig: func(cfg emailcfg.Config) {
+			a.mu.Lock()
+			if a.runID != rid {
+				a.mu.Unlock()
+				return
+			}
+			a.emailCfg = cfg
+			onEmailConfig := a.onEmailConfig
+			a.mu.Unlock()
+			if onEmailConfig != nil {
+				onEmailConfig(cfg)
+			}
 		},
 		OnDisconnected: func(err error) {
 			a.mu.Lock()
@@ -275,7 +310,7 @@ func (a *agentController) Stop() {
 	}
 }
 
-func serveAgentDashboard(ctx context.Context, addr string, configPath string, ctrl *agentController) error {
+func serveAgentDashboard(ctx context.Context, addr string, configPath string, ctrl *agentController, mailSvc *mail.Service) error {
 	tplHome := template.Must(template.New("home").Parse(agentHomeHTML))
 	tplControls := template.Must(template.New("controls").Parse(agentControlsHTML))
 
@@ -286,7 +321,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	updStatePath := filepath.Join(filepath.Dir(absCfg), "update_state_client.json")
 	moduleDir := module.DetectModuleDir(absCfg)
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentClient, "client.zip", moduleDir, updStatePath)
-	upd.PreservePaths = []string{absCfg}
+	upd.PreservePaths = []string{absCfg, filepath.Join(filepath.Dir(absCfg), "mail")}
 	upd.Restart = func() error {
 		log.Printf("=== Update complete, restarting agent ===")
 		ctrl.Stop()
@@ -381,6 +416,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"nowUnix":    time.Now().Unix(),
 			"routes":     outRoutes,
 			"routeCount": len(outRoutes),
+		}
+		if mailSvc != nil {
+			resp["email"] = mailSvc.Status()
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -580,6 +618,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"Msg":        getMsg(),
 			"RoutesView": makeRouteViews(routes),
 		}
+		if mailSvc != nil {
+			data["EmailStatus"] = mailSvc.Status()
+		}
 		_ = tplHome.Execute(w, data)
 	})
 
@@ -599,6 +640,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"Version":    version.Current,
 			"Msg":        getMsg(),
 			"RoutesView": makeRouteViews(routes),
+		}
+		if mailSvc != nil {
+			data["EmailStatus"] = mailSvc.Status()
 		}
 		_ = tplControls.Execute(w, data)
 	})
@@ -744,6 +788,9 @@ const agentHomeHTML = `<!doctype html>
 		.routeRow .rProto.tcp{background:var(--accentDim);color:var(--accent)}
 		.routeRow .rProto.udp{background:rgba(163,113,247,.14);color:var(--purple)}
 		.routeRow .rAddrs{font-size:12px;color:var(--textMuted)}
+		.dkimBox{margin-top:8px;padding:10px;border-radius:10px;background:var(--bg2);border:1px solid var(--border)}
+		.dkimTop{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+		.dkimText{width:100%;min-height:108px;max-width:100%;resize:vertical;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-family:var(--mono);font-size:11px;line-height:1.45;overflow:auto;white-space:pre-wrap;word-break:break-word}
 		.updatePopup{position:fixed;right:16px;bottom:16px;max-width:460px;width:calc(100% - 32px);z-index:1000;display:none;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
 		.updatePopup pre{font-family:var(--mono);font-size:11px;white-space:pre-wrap;margin:8px 0 0;padding:10px;border-radius:8px;background:var(--bg);border:1px solid var(--border);max-height:180px;overflow:auto}
 	</style>
@@ -779,6 +826,10 @@ const agentHomeHTML = `<!doctype html>
 			<div class="sCard">
 				<div class="label">Server</div>
 				<div class="val" style="font-size:12px"><code id="serverVal">{{.Cfg.Server}}</code></div>
+			</div>
+			<div class="sCard">
+				<div class="label">Email</div>
+				<div class="val"><span id="emailPill" class="pill {{with .EmailStatus}}{{if .Running}}ok{{else if .Enabled}}warn{{else}}bad{{end}}{{else}}bad{{end}}">{{with .EmailStatus}}{{if .Running}}Running{{else if .Enabled}}Configured{{else}}Disabled{{end}}{{else}}Disabled{{end}}</span></div>
 			</div>
 		</div>
 
@@ -827,6 +878,12 @@ const agentHomeHTML = `<!doctype html>
 				</div>
 				{{end}}
 			</div>
+		</div>
+
+		<div class="secHead"><h2>Email</h2></div>
+		<div class="card">
+			<div id="emailInfo" class="muted">{{with .EmailStatus}}{{if .Enabled}}Mail host <code>{{.MailHost}}</code> · TLS {{if .TLSReady}}{{.TLSCertSource}}{{else}}unavailable{{end}} · DKIM {{if .DKIMReady}}{{.DKIMSelector}}{{else}}unavailable{{end}} · SMTP <code>{{.SubmissionAddr}}</code> · IMAP <code>{{.IMAPAddr}}</code> · Max {{.MaxMessageBytes}} bytes / {{.MaxRecipients}} recipients per email · Storage unlimited · Accounts {{.AccountCount}} · Messages {{.MessageCount}}{{else}}Email is not enabled on the server.{{end}}{{else}}Email service unavailable.{{end}}</div>
+			<div id="emailDNS" class="muted" style="margin-top:10px">{{with .EmailStatus}}{{if .DKIMReady}}<div>DKIM DNS name <code>{{.DKIMDNSName}}</code></div><div class="dkimBox"><div class="dkimTop"><span class="muted">TXT value</span><button type="button" class="btn sm" id="copyDkimBtn">Copy</button></div><textarea id="dkimTxtValue" class="dkimText" readonly>{{.DKIMTXTValue}}</textarea></div>{{else if .Enabled}}DKIM record will appear here after the mail service starts.{{end}}{{end}}</div>
 		</div>
 	</div>
 
@@ -904,7 +961,31 @@ const agentHomeHTML = `<!doctype html>
 		var svcPill=document.getElementById('svcPill');
 		var ctlPill=document.getElementById('ctlPill');
 		var tokenPill=document.getElementById('tokenPill');
+		var emailPill=document.getElementById('emailPill');
 		var serverVal=document.getElementById('serverVal');
+		var emailInfo=document.getElementById('emailInfo');
+		var emailDNS=document.getElementById('emailDNS');
+		function bindDKIMCopy(){
+			var btn=document.getElementById('copyDkimBtn');
+			var field=document.getElementById('dkimTxtValue');
+			if(!btn||!field)return;
+			btn.onclick=async function(){
+				try{
+					field.select();
+					field.setSelectionRange(0, field.value.length);
+					if(navigator.clipboard&&navigator.clipboard.writeText){
+						await navigator.clipboard.writeText(field.value);
+					}else{
+						document.execCommand('copy');
+					}
+					btn.textContent='Copied';
+					setTimeout(function(){btn.textContent='Copy';},1500);
+				}catch(_){
+					btn.textContent='Copy failed';
+					setTimeout(function(){btn.textContent='Copy';},1500);
+				}
+			};
+		}
 		var liveText=document.getElementById('liveText');
 		var errRow=document.getElementById('errRow');
 		var errText=document.getElementById('errText');
@@ -943,12 +1024,28 @@ const agentHomeHTML = `<!doctype html>
 				setPill(svcPill,!!j.running,j.running?'Running':'Stopped');
 				setPill(ctlPill,!!j.connected,j.connected?'Connected':'Disconnected');
 				setPill(tokenPill,!!j.tokenSet,j.tokenSet?'Set':'Missing');
+				if(emailPill){
+					var em=j.email||{};
+					var txt=em.running?'Running':(em.enabled?'Configured':'Disabled');
+					emailPill.classList.remove('ok','bad','warn');
+					emailPill.classList.add(em.running?'ok':(em.enabled?'warn':'bad'));
+					emailPill.textContent=txt;
+				}
 				if(serverVal)serverVal.textContent=esc(j.server);
+				if(emailInfo){
+					var ems=j.email||{};
+					if(ems.enabled){emailInfo.innerHTML='Mail host <code>'+esc(ems.mailHost)+'</code> · TLS '+esc(ems.tlsReady?(ems.tlsCertSource||'ready'):'unavailable')+' · DKIM '+esc(ems.dkimReady?(ems.dkimSelector||'ready'):'unavailable')+' · SMTP <code>'+esc(ems.submissionAddr)+'</code> · IMAP <code>'+esc(ems.imapAddr)+'</code> · Max '+esc(ems.maxMessageBytes)+' bytes / '+esc(ems.maxRecipients)+' recipients per email · Storage unlimited · Accounts '+esc(ems.accountCount)+' · Messages '+esc(ems.messageCount);}else{emailInfo.textContent='Email is not enabled on the server.';}
+				}
+				if(emailDNS){
+					var emd=j.email||{};
+					if(emd.dkimReady){emailDNS.innerHTML='<div>DKIM DNS name <code>'+esc(emd.dkimDNSName)+'</code></div><div class="dkimBox"><div class="dkimTop"><span class="muted">TXT value</span><button type="button" class="btn sm" id="copyDkimBtn">Copy</button></div><textarea id="dkimTxtValue" class="dkimText" readonly></textarea></div>';var field=document.getElementById('dkimTxtValue');if(field)field.value=esc(emd.dkimTXTValue);bindDKIMCopy();}else if(emd.enabled){emailDNS.textContent='DKIM record will appear here after the mail service starts.';}else{emailDNS.textContent='';}
+				}
 				if(errRow&&errText){if(j.lastErr){errRow.style.display='';errText.textContent=esc(j.lastErr);}else{errRow.style.display='none';}}
 				renderRoutes(j.routes);
 				if(liveText)liveText.textContent='Updated '+new Date().toLocaleTimeString();
 			}catch(e){if(liveText)liveText.textContent='Offline';}
 		}
+		bindDKIMCopy();
 		pollOnce();setInterval(pollOnce,2000);
 	})();
 	</script>

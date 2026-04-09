@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"hostit/shared/emailcfg"
 	"hostit/shared/crypto"
 	"hostit/shared/logging"
 	"hostit/shared/netutil"
@@ -23,9 +24,15 @@ import (
 
 type Hooks struct {
 	OnConnected    func()
+	OnEmailConfig  func(cfg emailcfg.Config)
 	OnRoutes       func(routes []RemoteRoute)
 	OnDisconnected func(err error)
 	OnError        func(err error)
+}
+
+type helloPayload struct {
+	Routes map[string]RemoteRoute `json:"routes"`
+	Email  emailcfg.Config        `json:"email,omitempty"`
 }
 
 func RunWithHooks(ctx context.Context, cfg Config, hooks *Hooks) error {
@@ -233,6 +240,12 @@ func (a *Agent) Stop() {
 	a.wg.Wait()
 }
 
+func (a *Agent) EmailConfig() emailcfg.Config {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return emailcfg.Normalize(a.cfg.Email)
+}
+
 func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 	helloSeen := false
 	for {
@@ -268,8 +281,15 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 		}
 
 		if pkt.Type == protocol.TypeHello {
-			var routes map[string]RemoteRoute
-			if err := json.Unmarshal(pkt.Payload, &routes); err != nil {
+			var (
+				routes map[string]RemoteRoute
+				email  emailcfg.Config
+			)
+			var hello helloPayload
+			if err := json.Unmarshal(pkt.Payload, &hello); err == nil && hello.Routes != nil {
+				routes = hello.Routes
+				email = emailcfg.Normalize(hello.Email)
+			} else if err := json.Unmarshal(pkt.Payload, &routes); err != nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to parse HELLO routes: %v", err)
 				continue
 			}
@@ -292,6 +312,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 			}
 			a.mu.Lock()
 			a.cfg.Routes = routes
+			a.cfg.Email = email
 			a.routeCacheGen++
 			a.mu.Unlock()
 			logging.Global().Infof(logging.CatSystem, "Received %d routes from server", len(routes))
@@ -308,6 +329,9 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					routeList = append(routeList, r)
 				}
 				a.hooks.OnRoutes(routeList)
+			}
+			if a.hooks != nil && a.hooks.OnEmailConfig != nil {
+				a.hooks.OnEmailConfig(email)
 			}
 			continue
 		}

@@ -3,6 +3,8 @@ package tunnel
 import (
 	"fmt"
 	"strings"
+
+	"hostit/shared/emailcfg"
 )
 
 func normalizeRoutes(cfg *ServerConfig) {
@@ -47,4 +49,5 @@ func normalizeRoutes(cfg *ServerConfig) {
 	cfg.DomainHTTPSAddr = strings.TrimSpace(cfg.DomainHTTPSAddr)
 	cfg.DomainBase = normalizeHostname(cfg.DomainBase)
 	cfg.DomainACMEEmail = strings.TrimSpace(cfg.DomainACMEEmail)
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 }
