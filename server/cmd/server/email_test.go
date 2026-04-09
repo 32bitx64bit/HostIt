@@ -27,9 +27,12 @@ func TestParseServerEmailForm_PreservesExistingHashAndHashesNewPassword(t *testi
 	form.Set("email_dkim_selector", "mail")
 	form.Set("email_dkim_key_path", "/var/lib/hostit/mail/dkim.pem")
 	form.Set("email_submission_addr", "127.0.0.1:1587")
-	form.Set("email_imap_addr", "127.0.0.1:1993")
+	form.Set("email_submission_tls_addr", "127.0.0.1:1465")
+	form.Set("email_imap_addr", "127.0.0.1:1143")
+	form.Set("email_imap_tls_addr", "127.0.0.1:1993")
 	form.Set("email_max_message_mb", "50")
 	form.Set("email_max_recipients", "250")
+	form.Set("email_storage_limit", "1GB")
 	form.Set("email_account_count", "2")
 	form.Set("email_account_0_username", "admin")
 	form.Set("email_account_0_enabled", "1")
@@ -66,6 +69,9 @@ func TestParseServerEmailForm_PreservesExistingHashAndHashesNewPassword(t *testi
 	if !cfg.AutoTLS || cfg.ACMEEmail != "admin@example.com" || cfg.ACMEHTTPAddr != ":80" {
 		t.Fatalf("ACME config = %+v, want automatic TLS values", cfg)
 	}
+	if cfg.SubmissionTLSAddr != "127.0.0.1:1465" || cfg.IMAPTLSAddr != "127.0.0.1:1993" {
+		t.Fatalf("implicit TLS binds = %q / %q, want 127.0.0.1:1465 and 127.0.0.1:1993", cfg.SubmissionTLSAddr, cfg.IMAPTLSAddr)
+	}
 	if cfg.DKIMSelector != "mail" || cfg.DKIMKeyPath != "/var/lib/hostit/mail/dkim.pem" {
 		t.Fatalf("DKIM config = %q / %q, want configured values", cfg.DKIMSelector, cfg.DKIMKeyPath)
 	}
@@ -74,6 +80,9 @@ func TestParseServerEmailForm_PreservesExistingHashAndHashesNewPassword(t *testi
 	}
 	if cfg.MaxRecipients != 250 {
 		t.Fatalf("MaxRecipients = %d, want 250", cfg.MaxRecipients)
+	}
+	if cfg.StorageLimitBytes != 1<<30 {
+		t.Fatalf("StorageLimitBytes = %d, want %d", cfg.StorageLimitBytes, 1<<30)
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(cfg.Accounts[1].PasswordHash), []byte("Password123")); err != nil {
 		t.Fatalf("new password hash does not verify: %v", err)

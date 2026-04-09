@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"hostit/shared/emailcfg"
 	"hostit/shared/crypto"
+	"hostit/shared/emailcfg"
 	"hostit/shared/logging"
 	"hostit/shared/netutil"
 	"hostit/shared/protocol"
@@ -55,13 +55,15 @@ type Server struct {
 	domainHTTPServer  *http.Server
 	domainHTTPSServer *http.Server
 	domainCerts       *domainCertManager
+	domains           *domainManager
 	domainProxyCache  sync.Map
 
 	pendingTCP map[string]chan net.Conn
 
 	clientIDCounter uint64
 
-	pongCh chan []byte
+	pongCh       chan []byte
+	emailProbeCh chan []byte
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -115,12 +117,28 @@ type ServerStatus struct {
 	AgentConnected bool
 }
 
+type EmailRuntimeStatus struct {
+	PublicInboundListening bool
+	PublicInboundAddr      string
+}
+
 func (s *Server) Status() ServerStatus {
 	s.mu.RLock()
 	connected := s.agentTCP != nil
 	s.mu.RUnlock()
 
 	return ServerStatus{AgentConnected: connected}
+}
+
+func (s *Server) EmailStatus() EmailRuntimeStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st := EmailRuntimeStatus{}
+	if ln := s.publicTCP[internalEmailInboundRouteName]; ln != nil {
+		st.PublicInboundListening = true
+		st.PublicInboundAddr = ln.Addr().String()
+	}
+	return st
 }
 
 type AgentNettestRequest struct {
@@ -165,7 +183,7 @@ func (s *Server) updateRouteCache() {
 	defer s.mu.RUnlock()
 
 	newCache := make(map[string]routeConfig)
-	for _, rt := range s.cfg.Routes {
+	for _, rt := range effectiveRoutes(s.cfg) {
 		newCache[rt.Name] = routeConfig{
 			enabled:     rt.IsEnabled(),
 			isEncrypted: rt.IsEncrypted(),
@@ -174,9 +192,35 @@ func (s *Server) updateRouteCache() {
 	s.routeCache.Store(newCache)
 }
 
+func (s *Server) getRouteConfig(name string) (routeConfig, bool) {
+	cache, _ := s.routeCache.Load().(map[string]routeConfig)
+	rc, ok := cache[name]
+	return rc, ok
+}
+
+func (s *Server) dialMailOutboundTCP(conn net.Conn, target string) {
+	remoteAddr, err := net.ResolveTCPAddr("tcp", strings.TrimSpace(target))
+	if err != nil || remoteAddr == nil {
+		logging.Global().Errorf(logging.CatTCP, "mail outbound dial resolve failed for %q: %v", target, err)
+		conn.Close()
+		return
+	}
+	serverConn, err := (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).Dial("tcp", remoteAddr.String())
+	if err != nil {
+		logging.Global().Errorf(logging.CatTCP, "mail outbound dial failed for %s: %v", remoteAddr.String(), err)
+		conn.Close()
+		return
+	}
+	netutil.SetTCPKeepAlive(serverConn, 15*time.Second)
+	_ = conn.SetDeadline(time.Time{})
+	logging.Global().Infof(logging.CatTCP, "Mail outbound relay connected target=%s", remoteAddr.String())
+	go relay.Proxy(serverConn, conn)
+}
+
 func buildHelloRoutes(cfg ServerConfig) map[string]helloRoute {
-	routes := make(map[string]helloRoute, len(cfg.Routes))
-	for _, rt := range cfg.Routes {
+	effective := effectiveRoutes(cfg)
+	routes := make(map[string]helloRoute, len(effective))
+	for _, rt := range effective {
 		routes[rt.Name] = helloRoute{
 			Name:       rt.Name,
 			Proto:      rt.Proto,
@@ -248,6 +292,20 @@ func unixOrZero(t time.Time) int64 {
 	return t.Unix()
 }
 
+func writeMailRouteUnavailable(conn net.Conn, routeName string) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	switch routeName {
+	case internalEmailSubmissionRouteName, internalEmailInboundRouteName:
+		_, _ = io.WriteString(conn, "421 4.3.0 HostIt mail backend unavailable\r\n")
+	case internalEmailIMAPRouteName:
+		_, _ = io.WriteString(conn, "* BYE HostIt mail backend unavailable\r\n")
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+}
+
 func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 	s.mu.Lock()
 	for i, rt := range s.cfg.Routes {
@@ -286,14 +344,8 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 }
 
 func (s *Server) GetRouteEnabled(name string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, rt := range s.cfg.Routes {
-		if rt.Name == name {
-			return rt.IsEnabled()
-		}
-	}
-	return false
+	rc, ok := s.getRouteConfig(name)
+	return ok && rc.enabled
 }
 
 func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (AgentNettestResult, error) {
@@ -483,6 +535,61 @@ bwWaitLoop:
 	return res, nil
 }
 
+func (s *Server) RunAgentEmailProbe(ctx context.Context, req protocol.EmailProbeRequest) (protocol.EmailProbeResult, error) {
+	s.mu.Lock()
+	agent := s.agentTCP
+	if agent == nil {
+		s.mu.Unlock()
+		return protocol.EmailProbeResult{}, fmt.Errorf("agent not connected")
+	}
+	remoteAddr := agent.RemoteAddr().String()
+	if s.emailProbeCh != nil {
+		s.mu.Unlock()
+		return protocol.EmailProbeResult{}, fmt.Errorf("email probe already in progress")
+	}
+	probeCh := make(chan []byte, 1)
+	s.emailProbeCh = probeCh
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.emailProbeCh = nil
+		s.mu.Unlock()
+	}()
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return protocol.EmailProbeResult{}, err
+	}
+	pkt := &protocol.Packet{Type: protocol.TypeEmailProbeRequest, Payload: payload}
+
+	s.sessionsMu.Lock()
+	if session, ok := s.sessions[remoteAddr]; ok {
+		session.writeMu.Lock()
+		agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		err = protocol.WritePacket(agent, pkt)
+		session.writeMu.Unlock()
+		s.sessionsMu.Unlock()
+		if err != nil {
+			return protocol.EmailProbeResult{}, err
+		}
+	} else {
+		s.sessionsMu.Unlock()
+		return protocol.EmailProbeResult{}, fmt.Errorf("agent session unavailable")
+	}
+
+	select {
+	case <-ctx.Done():
+		return protocol.EmailProbeResult{}, ctx.Err()
+	case payload := <-probeCh:
+		var res protocol.EmailProbeResult
+		if err := json.Unmarshal(payload, &res); err != nil {
+			return protocol.EmailProbeResult{}, err
+		}
+		return res, nil
+	}
+}
+
 func (s *Server) Run(ctx context.Context) error {
 	if err := s.Start(ctx); err != nil {
 		return err
@@ -503,7 +610,8 @@ func NewServer(cfg ServerConfig) *Server {
 		dash:        newDashState(),
 		sessions:    make(map[string]*agentSession),
 	}
-	for _, rt := range cfg.Routes {
+	s.domains = newDomainManager(s)
+	for _, rt := range effectiveRoutes(cfg) {
 		if rt.IsEncrypted() {
 			key, err := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
 			if err != nil {
@@ -572,7 +680,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go s.acceptAgentUDP()
 
-	for _, rt := range s.cfg.Routes {
+	for _, rt := range effectiveRoutes(s.cfg) {
 		if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == "tcp" || rt.Proto == "both") {
 			ln, err := net.Listen("tcp", rt.PublicAddr)
 			if err != nil {
@@ -825,6 +933,17 @@ func (s *Server) acceptControl(ln net.Listener) {
 						}
 					}
 				}
+				if pkt.Type == protocol.TypeEmailProbeResult {
+					s.mu.RLock()
+					ch := s.emailProbeCh
+					s.mu.RUnlock()
+					if ch != nil {
+						select {
+						case ch <- pkt.Payload:
+						default:
+						}
+					}
+				}
 			}
 
 			s.mu.Lock()
@@ -888,16 +1007,14 @@ func (s *Server) acceptData(ln net.Listener) {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 		routeName := string(routeBytes)
-
-		s.mu.RLock()
-		var isEncrypted bool
-		for _, rt := range s.cfg.Routes {
-			if rt.Name == routeName {
-				isEncrypted = rt.IsEncrypted()
-				break
-			}
+		if routeName == protocol.RouteMailOutboundTCP {
+			target := string(clientBytes)
+			s.dialMailOutboundTCP(conn, target)
+			continue
 		}
-		s.mu.RUnlock()
+
+		rc, _ := s.getRouteConfig(routeName)
+		isEncrypted := rc.isEncrypted
 
 		if isEncrypted {
 			key := s.derivedKeys[routeName]
@@ -950,16 +1067,15 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 
 		s.mu.RLock()
 		agent := s.agentTCP
-		enabled := false
-		for _, rt := range s.cfg.Routes {
-			if rt.Name == routeName {
-				enabled = rt.IsEnabled()
-				break
-			}
-		}
 		s.mu.RUnlock()
+		rc, ok := s.getRouteConfig(routeName)
+		enabled := ok && rc.enabled
 
 		if agent == nil || !enabled {
+			if routeName == internalEmailSubmissionRouteName || routeName == internalEmailInboundRouteName || routeName == internalEmailIMAPRouteName {
+				logging.Global().Warnf(logging.CatTCP, "mail public connection rejected route=%s agentConnected=%v enabled=%v", routeName, agent != nil, enabled)
+				writeMailRouteUnavailable(conn, routeName)
+			}
 			conn.Close()
 			continue
 		}
@@ -981,8 +1097,10 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			session.writeMu.Lock()
 			agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := protocol.WritePacket(agent, reqPkt); err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to request agent connect route=%s client=%s: %v", routeName, clientID, err)
 				session.writeMu.Unlock()
 				s.sessionsMu.Unlock()
+				writeMailRouteUnavailable(conn, routeName)
 				conn.Close()
 				s.mu.Lock()
 				delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
@@ -992,6 +1110,8 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			session.writeMu.Unlock()
 		} else {
 			s.sessionsMu.Unlock()
+			logging.Global().Warnf(logging.CatTCP, "agent session unavailable for route=%s client=%s", routeName, clientID)
+			writeMailRouteUnavailable(conn, routeName)
 			conn.Close()
 			s.mu.Lock()
 			delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
@@ -1005,8 +1125,11 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			select {
 			case agentConn := <-ch:
 				if agentConn == nil {
+					logging.Global().Warnf(logging.CatTCP, "agent pairing aborted route=%s client=%s", routeName, clientID)
+					writeMailRouteUnavailable(c, routeName)
 					return
 				}
+				logging.Global().Infof(logging.CatTCP, "paired public TCP route=%s client=%s", routeName, clientID)
 				s.dash.addConn(time.Now())
 				s.dash.incActive(routeName)
 				defer s.dash.decActive(routeName)
@@ -1017,9 +1140,11 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				relay.Proxy(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes})
 
 			case <-time.After(s.cfg.PairTimeout):
+				logging.Global().Warnf(logging.CatTCP, "pair timeout route=%s client=%s", routeName, clientID)
 				s.mu.Lock()
 				delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
 				s.mu.Unlock()
+				writeMailRouteUnavailable(c, routeName)
 				select {
 				case lateConn := <-ch:
 					if lateConn != nil {

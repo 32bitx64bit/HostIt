@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"hostit/shared/emailcfg"
 	"hostit/shared/crypto"
+	"hostit/shared/emailcfg"
 	"hostit/shared/protocol"
 )
 
@@ -417,6 +417,65 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 	}
 	if hello.Email.EffectiveMailHost() != "mail.example.com" {
 		t.Fatalf("HELLO Email.EffectiveMailHost() = %q, want %q", hello.Email.EffectiveMailHost(), "mail.example.com")
+	}
+}
+
+func TestMailOutboundRelayOverDataConn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	echoLn, echoAddr := startEcho(t)
+	defer echoLn.Close()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Token: "testtoken", PairTimeout: 3 * time.Second, DisableTLS: true})
+	go func() { _ = srv.Run(ctx) }()
+
+	var dataConn net.Conn
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var err error
+		dataConn, err = net.Dial("tcp", dataAddr)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	defer dataConn.Close()
+	if err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
+		t.Fatal(err)
+	}
+	routeBytes := []byte(protocol.RouteMailOutboundTCP)
+	targetBytes := []byte(echoAddr)
+	header := make([]byte, 0, 2+len(routeBytes)+len(targetBytes))
+	header = append(header, byte(len(routeBytes)))
+	header = append(header, routeBytes...)
+	header = append(header, byte(len(targetBytes)))
+	header = append(header, targetBytes...)
+	if _, err := dataConn.Write(header); err != nil {
+		t.Fatal(err)
+	}
+	_ = dataConn.SetDeadline(time.Now().Add(5 * time.Second))
+	msg := []byte("hello\n")
+	if _, err := dataConn.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(dataConn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != string(msg) {
+		t.Fatalf("expected %q got %q", string(msg), string(buf))
 	}
 }
 

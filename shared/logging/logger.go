@@ -75,6 +75,7 @@ const (
 	CatDashboard  Category = "dashboard"
 	CatHealth     Category = "health"
 	CatEncryption Category = "encryption"
+	CatEmail      Category = "email"
 )
 
 type Entry struct {

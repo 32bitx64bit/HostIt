@@ -30,6 +30,7 @@ import (
 	"hostit/shared/emailcfg"
 	"hostit/shared/logging"
 	"hostit/shared/module"
+	"hostit/shared/protocol"
 	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
 	"hostit/shared/version"
@@ -69,6 +70,7 @@ func main() {
 
 	// Initialize centralized logging
 	serverlog.Init()
+	log.SetOutput(io.MultiWriter(os.Stderr, serverlog.NewUILogWriter("stdio", serverlog.UILogs)))
 	slog := serverlog.Log
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -290,6 +292,26 @@ func (r *serverRunner) RunAgentNettest(ctx context.Context, req tunnel.AgentNett
 		return tunnel.AgentNettestResult{}, fmt.Errorf("server not running")
 	}
 	return srv.RunAgentNettest(ctx, req)
+}
+
+func (r *serverRunner) RunAgentEmailProbe(ctx context.Context, req protocol.EmailProbeRequest) (protocol.EmailProbeResult, error) {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return protocol.EmailProbeResult{}, fmt.Errorf("server not running")
+	}
+	return srv.RunAgentEmailProbe(ctx, req)
+}
+
+func (r *serverRunner) EmailStatus() tunnel.EmailRuntimeStatus {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return tunnel.EmailRuntimeStatus{}
+	}
+	return srv.EmailStatus()
 }
 
 // SetRouteEnabled toggles a route's enabled state at runtime.
@@ -1081,16 +1103,17 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				})
 			}
 			data := map[string]any{
-				"Cfg":          cfg,
-				"Status":       st,
-				"ConfigPath":   configPath,
-				"Msg":          getMsg(),
-				"Err":          err,
-				"CSRF":         csrf,
-				"Version":      version.Current,
-				"EmailAccounts": accounts,
-				"EmailCount":   len(accounts),
+				"Cfg":               cfg,
+				"Status":            st,
+				"ConfigPath":        configPath,
+				"Msg":               getMsg(),
+				"Err":               err,
+				"CSRF":              csrf,
+				"Version":           version.Current,
+				"EmailAccounts":     accounts,
+				"EmailCount":        len(accounts),
 				"EmailMaxMessageMB": cfg.Email.MaxMessageBytes / (1 << 20),
+				"EmailStorageLimit": emailcfg.FormatByteSize(cfg.Email.StorageLimitBytes),
 			}
 			_ = tplEmail.Execute(w, data)
 		})))
@@ -1117,21 +1140,45 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				dkimName = dkimSelector + "._domainkey." + emailDomain
 			}
 			data := map[string]any{
-				"Cfg":         cfg,
-				"Status":      st,
-				"ConfigPath":  configPath,
-				"Msg":         getMsg(),
-				"Err":         err,
-				"CSRF":        csrf,
-				"Version":     version.Current,
-				"EmailDomain": emailDomain,
-				"MailHost":    mailHost,
+				"Cfg":          cfg,
+				"Status":       st,
+				"ConfigPath":   configPath,
+				"Msg":          getMsg(),
+				"Err":          err,
+				"CSRF":         csrf,
+				"Version":      version.Current,
+				"EmailDomain":  emailDomain,
+				"MailHost":     mailHost,
 				"DKIMSelector": dkimSelector,
-				"DKIMDNSName": dkimName,
-				"SPFValue":    spfValue,
-				"DMARCValue":  dmarcValue,
+				"DKIMDNSName":  dkimName,
+				"SPFValue":     spfValue,
+				"DMARCValue":   dmarcValue,
 			}
 			_ = tplEmailSetup.Execute(w, data)
+		})))
+
+		mux.HandleFunc("/api/email/check", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			cfg, _, err := runner.Get()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			report := runEmailCheckReportWithLive(r.Context(), cfg.Email, runner)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(report)
 		})))
 
 		mux.HandleFunc("/domain-manager-info", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1180,6 +1227,33 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"DomainRenewBefore": domainRenewBefore.String(),
 			}
 			_ = tplControls.Execute(w, data)
+		})))
+
+		mux.HandleFunc("/api/logs", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			level := strings.TrimSpace(r.URL.Query().Get("level"))
+			limit := 300
+			if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+				if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+					limit = n
+				}
+			}
+			stats := map[string]int{"all": 0, "warning": 0, "error": 0}
+			entries := []serverlog.UILogEntry{}
+			if serverlog.UILogs != nil {
+				stats = serverlog.UILogs.Stats()
+				entries = serverlog.UILogs.Entries(level, limit)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"level":   level,
+				"limit":   limit,
+				"stats":   stats,
+				"entries": entries,
+			})
 		})))
 
 		mux.HandleFunc("/api/udp/payload", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1731,23 +1805,36 @@ func parseServerEmailForm(r *http.Request, existing emailcfg.Config) (emailcfg.C
 	}
 
 	cfg := emailcfg.Config{
-		Enabled:         strings.TrimSpace(r.Form.Get("email_enabled")) != "",
-		Domain:          strings.TrimSpace(r.Form.Get("email_domain")),
-		MailHost:        strings.TrimSpace(r.Form.Get("email_mail_host")),
-		AutoTLS:         strings.TrimSpace(r.Form.Get("email_auto_tls")) != "",
-		ACMEEmail:       strings.TrimSpace(r.Form.Get("email_acme_email")),
-		ACMEHTTPAddr:    strings.TrimSpace(r.Form.Get("email_acme_http_addr")),
-		TLSCertPath:     strings.TrimSpace(r.Form.Get("email_tls_cert_path")),
-		TLSKeyPath:      strings.TrimSpace(r.Form.Get("email_tls_key_path")),
-		DKIMSelector:    strings.TrimSpace(r.Form.Get("email_dkim_selector")),
-		DKIMKeyPath:     strings.TrimSpace(r.Form.Get("email_dkim_key_path")),
-		SubmissionAddr:  strings.TrimSpace(r.Form.Get("email_submission_addr")),
-		IMAPAddr:        strings.TrimSpace(r.Form.Get("email_imap_addr")),
-		InboundSMTP:     strings.TrimSpace(r.Form.Get("email_inbound_smtp")) != "",
-		InboundSMTPAddr: strings.TrimSpace(r.Form.Get("email_inbound_smtp_addr")),
-		MaxMessageBytes: parseInt64Default(strings.TrimSpace(r.Form.Get("email_max_message_mb")), 25) * (1 << 20),
-		MaxRecipients:   parseIntDefault(strings.TrimSpace(r.Form.Get("email_max_recipients")), 100),
-		Accounts:        make([]emailcfg.Account, 0, count),
+		Enabled:           strings.TrimSpace(r.Form.Get("email_enabled")) != "",
+		Domain:            strings.TrimSpace(r.Form.Get("email_domain")),
+		MailHost:          strings.TrimSpace(r.Form.Get("email_mail_host")),
+		AutoTLS:           strings.TrimSpace(r.Form.Get("email_auto_tls")) != "",
+		ACMEEmail:         strings.TrimSpace(r.Form.Get("email_acme_email")),
+		ACMEHTTPAddr:      strings.TrimSpace(r.Form.Get("email_acme_http_addr")),
+		TLSCertPath:       strings.TrimSpace(r.Form.Get("email_tls_cert_path")),
+		TLSKeyPath:        strings.TrimSpace(r.Form.Get("email_tls_key_path")),
+		DKIMSelector:      strings.TrimSpace(r.Form.Get("email_dkim_selector")),
+		DKIMKeyPath:       strings.TrimSpace(r.Form.Get("email_dkim_key_path")),
+		SubmissionAddr:    strings.TrimSpace(r.Form.Get("email_submission_addr")),
+		SubmissionTLSAddr: strings.TrimSpace(r.Form.Get("email_submission_tls_addr")),
+		IMAPAddr:          strings.TrimSpace(r.Form.Get("email_imap_addr")),
+		IMAPTLSAddr:       strings.TrimSpace(r.Form.Get("email_imap_tls_addr")),
+		InboundSMTP:       strings.TrimSpace(r.Form.Get("email_inbound_smtp")) != "",
+		InboundSMTPAddr:   strings.TrimSpace(r.Form.Get("email_inbound_smtp_addr")),
+		MaxMessageBytes:   parseInt64Default(strings.TrimSpace(r.Form.Get("email_max_message_mb")), 25) * (1 << 20),
+		MaxRecipients:     parseIntDefault(strings.TrimSpace(r.Form.Get("email_max_recipients")), 100),
+		Accounts:          make([]emailcfg.Account, 0, count),
+	}
+	if strings.TrimSpace(r.Form.Get("email_storage_unlimited")) == "" {
+		rawStorageLimit := strings.TrimSpace(r.Form.Get("email_storage_limit"))
+		if rawStorageLimit == "" {
+			return emailcfg.Config{}, fmt.Errorf("email storage limit is required when unlimited storage is turned off")
+		}
+		limit, err := emailcfg.ParseByteSize(rawStorageLimit)
+		if err != nil {
+			return emailcfg.Config{}, fmt.Errorf("invalid email storage limit: %w", err)
+		}
+		cfg.StorageLimitBytes = limit
 	}
 
 	for i := 0; i < count; i++ {
@@ -2914,34 +3001,46 @@ const serverEmailHTML = `<!doctype html>
 				</div>
 				<div>
 					<label>Submission Bind</label>
-					<div class="help">Local authenticated SMTP submission listener for your own users and apps to send mail out. This is for sending, not for internet mail delivery into your domain. STARTTLS is advertised and plaintext auth is blocked.</div>
+					<div class="help">Local authenticated SMTP submission listener on the agent for your own users and apps to send mail out. Default is <code>127.0.0.1:1587</code> so it works without root. The public internet-facing submission port stays <code>587</code> on the server side. STARTTLS is advertised and plaintext auth is blocked.</div>
 					<input name="email_submission_addr" value="{{.Cfg.Email.SubmissionAddr}}" placeholder="127.0.0.1:1587" />
 				</div>
 				<div>
+					<label>Submission TLS Bind</label>
+					<div class="help">Implicit TLS SMTP submission listener on the agent for apps that expect SSL/TLS immediately on connect. Default is <code>127.0.0.1:1465</code> so it does not require privileged local binds. The public internet-facing SMTPS port stays <code>465</code> on the server side.</div>
+					<input name="email_submission_tls_addr" value="{{.Cfg.Email.SubmissionTLSAddr}}" placeholder="127.0.0.1:1465" />
+				</div>
+				<div>
 					<label>IMAP Bind</label>
-					<div class="help">Local IMAP listener for webmail and mail clients. STARTTLS is required before login.</div>
-					<input name="email_imap_addr" value="{{.Cfg.Email.IMAPAddr}}" placeholder="127.0.0.1:1993" />
+					<div class="help">Local IMAP listener on the agent for webmail and mail clients. Default is <code>127.0.0.1:1143</code> so it works without root. The public internet-facing IMAP port stays <code>143</code> on the server side. STARTTLS is required before login.</div>
+					<input name="email_imap_addr" value="{{.Cfg.Email.IMAPAddr}}" placeholder="127.0.0.1:1143" />
+				</div>
+				<div>
+					<label>IMAPS Bind</label>
+					<div class="help">Implicit TLS IMAP listener on the agent for apps that expect SSL/TLS immediately on connect. Default is <code>127.0.0.1:1993</code> so it does not require privileged local binds. The public internet-facing IMAPS port stays <code>993</code> on the server side.</div>
+					<input name="email_imap_tls_addr" value="{{.Cfg.Email.IMAPTLSAddr}}" placeholder="127.0.0.1:1993" />
 				</div>
 				<div>
 					<label>Inbound SMTP</label>
 					<div class="help">Accept direct inbound SMTP delivery from the internet for your mailbox domain. Turn this on if you want to receive mail from Gmail, Outlook, and other servers. This does <b>not</b> control whether your own users can send mail; that is handled by Submission above.</div>
 					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" name="email_inbound_smtp" value="1" {{if .Cfg.Email.InboundSMTP}}checked{{end}} /><span>Enable local inbound SMTP listener</span></label>
 					<div style="margin-top:8px"><input name="email_inbound_smtp_addr" value="{{.Cfg.Email.InboundSMTPAddr}}" placeholder="127.0.0.1:1025" /></div>
+					<div class="help">Default is <code>127.0.0.1:1025</code> on the agent so it works without root. The public internet-facing SMTP port stays <code>25</code> on the server side. Only bind low local ports like 25, 143, 465, 587, and 993 if the agent really has <code>CAP_NET_BIND_SERVICE</code> or is running as root.</div>
 				</div>
 				<div>
 					<label>Max Message Size (MB)</label>
-					<div class="help">Reject oversized messages early. Default 25 MB.</div>
+					<div class="help">Reject oversized messages early. Enter a whole number of megabytes, for example <code>25</code> or <code>50</code>. Default 25 MB.</div>
 					<input name="email_max_message_mb" value="{{if .EmailMaxMessageMB}}{{.EmailMaxMessageMB}}{{else}}25{{end}}" placeholder="25" />
 				</div>
 				<div>
 					<label>Max Recipients Per Email</label>
-					<div class="help">Per-email recipient cap for submission and inbound SMTP. This is not a mailbox storage limit. Default 100.</div>
+					<div class="help">Per-email recipient cap for submission and inbound SMTP. Enter a whole number such as <code>100</code> or <code>250</code>. This is not a mailbox storage limit.</div>
 					<input name="email_max_recipients" value="{{if .Cfg.Email.MaxRecipients}}{{.Cfg.Email.MaxRecipients}}{{else}}100{{end}}" placeholder="100" />
 				</div>
 				<div>
 					<label>Storage</label>
-					<div class="help">Stored mail is currently unlimited except for available disk space. There is no arbitrary message-count cap.</div>
-					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" checked disabled /><span>Unlimited mail storage</span></label>
+					<div class="help">When unlimited storage is turned off, enter a whole number plus an optional unit such as <code>500MB</code>, <code>1GB</code>, <code>5Tb</code>, or a raw byte count like <code>1048576</code>. Accepted units: <code>B</code>, <code>KB</code>, <code>MB</code>, <code>GB</code>, <code>TB</code>.</div>
+					<label style="font-weight:400;display:flex;gap:8px;align-items:center;margin-top:8px"><input id="email_storage_unlimited" type="checkbox" name="email_storage_unlimited" value="1" {{if not .Cfg.Email.StorageLimitBytes}}checked{{end}} /><span>Unlimited mail storage</span></label>
+					<div style="margin-top:8px"><input id="email_storage_limit" name="email_storage_limit" value="{{.EmailStorageLimit}}" placeholder="1GB" {{if not .Cfg.Email.StorageLimitBytes}}disabled{{end}} /></div>
 				</div>
 			</div>
 
@@ -2997,9 +3096,11 @@ const serverEmailHTML = `<!doctype html>
 	<script>
 	(function(){
 		var btn=document.getElementById('addEmailAccount'),wrap=document.getElementById('emailAccounts'),cnt=document.getElementById('email_account_count'),tpl=document.getElementById('emailAccountTemplate');
-		if(!btn||!wrap||!cnt||!tpl)return;
-		wrap.addEventListener('click',function(e){var t=e.target;if(!t||!t.matches||!t.matches('[data-remove-email-account]'))return;e.preventDefault();var c=t.closest('[data-email-account]');if(!c)return;var d=c.querySelector('[data-email-account-delete]');if(d)d.value='1';c.style.display='none';});
-		btn.addEventListener('click',function(){var i=parseInt(cnt.value||'0',10);var html=tpl.innerHTML.split('IDX').join(String(i));var w=document.createElement('div');w.innerHTML=html;wrap.appendChild(w.firstElementChild);cnt.value=String(i+1);});
+		var storageUnlimited=document.getElementById('email_storage_unlimited'),storageLimit=document.getElementById('email_storage_limit');
+		function syncStorageLimit(){if(!storageUnlimited||!storageLimit)return;storageLimit.disabled=!!storageUnlimited.checked;}
+		if(wrap){wrap.addEventListener('click',function(e){var t=e.target;if(!t||!t.matches||!t.matches('[data-remove-email-account]'))return;e.preventDefault();var c=t.closest('[data-email-account]');if(!c)return;var d=c.querySelector('[data-email-account-delete]');if(d)d.value='1';c.style.display='none';});}
+		if(btn&&wrap&&cnt&&tpl){btn.addEventListener('click',function(){var i=parseInt(cnt.value||'0',10);var html=tpl.innerHTML.split('IDX').join(String(i));var w=document.createElement('div');w.innerHTML=html;wrap.appendChild(w.firstElementChild);cnt.value=String(i+1);});}
+		if(storageUnlimited){storageUnlimited.addEventListener('change',syncStorageLimit);syncStorageLimit();}
 	})();
 	</script>
 </body>
@@ -3046,6 +3147,20 @@ const serverControlsHTML = `<!doctype html>
 		.muted{color:var(--textMuted)}
 		.flash{padding:10px 14px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--greenDim);border:1px solid var(--greenBorder);color:var(--green)}
 		pre{font-family:var(--mono);font-size:11px;white-space:pre-wrap;margin:8px 0 0;padding:10px;border-radius:8px;background:var(--bg);border:1px solid var(--border);max-height:200px;overflow:auto}
+		.select{font-family:var(--font);font-size:13px;padding:7px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text)}
+		.logCard{margin-top:24px}
+		.logToolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-bottom:10px}
+		.logToolbarLeft{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.logList{display:grid;gap:8px;max-height:520px;overflow:auto}
+		.logEmpty{padding:18px;border:1px dashed var(--border);border-radius:var(--radius);text-align:center;color:var(--textMuted)}
+		.logRow{display:grid;grid-template-columns:150px 72px 120px minmax(0,1fr);gap:10px;align-items:start;padding:10px;border-radius:10px;background:var(--bg);border:1px solid var(--border)}
+		.logTime,.logLevel,.logSource,.logMessage{font-family:var(--mono);font-size:12px;min-width:0;overflow-wrap:anywhere}
+		.logLevel{font-weight:700}
+		.logLevel.info{color:var(--accent)}
+		.logLevel.warn{color:#d29922}
+		.logLevel.error{color:var(--red)}
+		.logLevel.debug,.logLevel.trace{color:var(--textMuted)}
+		@media(max-width:860px){.logRow{grid-template-columns:1fr}}
 	</style>
 </head>
 <body>
@@ -3140,11 +3255,65 @@ const serverControlsHTML = `<!doctype html>
 				</div>
 			</div>
 		</div>
+
+		<div class="secHead"><h2>Logs</h2></div>
+		<div class="card logCard">
+			<div class="logToolbar">
+				<div class="logToolbarLeft">
+					<label class="muted" for="logLevel">Log level</label>
+					<select id="logLevel" class="select">
+						<option value="all">All</option>
+						<option value="warning">Warnings</option>
+						<option value="error">Errors</option>
+					</select>
+					<button class="btn sm" id="refreshLogsBtn">Refresh</button>
+				</div>
+				<div id="logStats" class="muted">—</div>
+			</div>
+			<div id="logState" class="muted" style="margin-bottom:10px">Loading logs…</div>
+			<div id="logList" class="logList"><div class="logEmpty">No logs yet.</div></div>
+		</div>
 	</div>
 
 	<script>
 	var csrf = {{printf "%q" .CSRF}};
 	function body(){var b=new URLSearchParams();b.set('csrf',csrf);return b;}
+	function esc(v){return String(v||'').replace(/[&<>"']/g,function(ch){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];});}
+	function fmtUnix(ts){if(!ts)return '—'; try{return new Date(ts*1000).toLocaleString();}catch(e){return String(ts);}}
+	function logClass(level){level=String(level||'').toLowerCase(); if(level==='warn')return 'warn'; if(level==='error'||level==='fatal')return 'error'; if(level==='debug')return 'debug'; if(level==='trace')return 'trace'; return 'info';}
+	function renderLogs(payload){
+		var list=document.getElementById('logList');
+		var stats=document.getElementById('logStats');
+		if(!list)return;
+		var entries=(payload&&payload.entries)||[];
+		var st=(payload&&payload.stats)||{};
+		if(stats)stats.textContent='All '+(st.all||0)+' · Warnings '+(st.warning||0)+' · Errors '+(st.error||0);
+		if(!entries.length){list.innerHTML='<div class="logEmpty">No matching logs.</div>';return;}
+		list.innerHTML=entries.map(function(entry){
+			var level=String(entry.level||'INFO').toUpperCase();
+			return '<div class="logRow">'
+				+'<div class="logTime">'+esc(fmtUnix(entry.timeUnix))+'</div>'
+				+'<div class="logLevel '+esc(logClass(level))+'">'+esc(level)+'</div>'
+				+'<div class="logSource">'+esc(entry.source||'server')+'</div>'
+				+'<div class="logMessage">'+esc(entry.message||'')+'</div>'
+				+'</div>';
+		}).join('');
+	}
+	async function refreshLogs(){
+		var levelSel=document.getElementById('logLevel');
+		var state=document.getElementById('logState');
+		var level=levelSel?levelSel.value:'all';
+		if(state)state.textContent='Loading logs…';
+		try{
+			var r=await fetch('/api/logs?level='+encodeURIComponent(level)+'&limit=300',{cache:'no-store',credentials:'include'});
+			if(!r.ok){throw new Error(await r.text()||('http '+r.status));}
+			var payload=await r.json();
+			renderLogs(payload);
+			if(state)state.textContent='Showing '+(((payload&&payload.entries)||[]).length)+' log entries.';
+		}catch(e){
+			if(state)state.textContent='Failed to load logs: '+(e&&e.message?e.message:'unknown');
+		}
+	}
 	function setUpd(st){
 		if(!st)return;
 		document.getElementById('availableVersion').textContent=st.latestVersion||st.availableVersion||'—';
@@ -3198,6 +3367,8 @@ const serverControlsHTML = `<!doctype html>
 	document.getElementById('applyLocalBtn').onclick=applyLocalUpd;
 	document.getElementById('svcRestartBtn').onclick=function(){sysAction('/api/systemd/restart','Restarting…');};
 	document.getElementById('svcStopBtn').onclick=function(){sysAction('/api/systemd/stop','Stopping…');};
+	document.getElementById('refreshLogsBtn').onclick=refreshLogs;
+	document.getElementById('logLevel').onchange=refreshLogs;
 	document.getElementById('procRestart').onclick=async function(){
 		await fetch('/api/process/restart',{method:'POST',body:body(),credentials:'include'});
 		setTimeout(function(){location.reload();},1000);
@@ -3206,7 +3377,7 @@ const serverControlsHTML = `<!doctype html>
 		await fetch('/api/process/exit',{method:'POST',body:body(),credentials:'include'});
 		setTimeout(function(){location.reload();},1000);
 	};
-	refreshUpd();refreshSys();
+	refreshUpd();refreshSys();refreshLogs();setInterval(refreshLogs,2500);
 	</script>
 </body>
 </html>`
@@ -3224,18 +3395,34 @@ const serverEmailSetupHTML = `<!doctype html>
 		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
 		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 		code,pre{font-family:var(--mono)}
-		code{font-size:.84em;background:var(--surface);padding:2px 6px;border-radius:4px}
-		pre{white-space:pre-wrap;word-break:break-word;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 0}
+		code{font-size:.84em;background:var(--surface);padding:2px 6px;border-radius:4px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+		pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 0;max-width:100%}
 		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 50px}
 		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
 		.topbar h1{font-size:18px;font-weight:700;margin:0}
 		.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
 		.nav{display:flex;gap:4px}
 		.nav a{font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);text-decoration:none}.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
-		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;margin-bottom:14px}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;margin-bottom:14px;min-width:0;overflow:hidden}
 		.secHead{margin:0 0 10px}.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
-		.kv{display:grid;grid-template-columns:180px 1fr;gap:8px 12px}.muted{color:var(--textMuted)}
+		.kv{display:grid;grid-template-columns:180px minmax(0,1fr);gap:8px 12px}.muted{color:var(--textMuted)}
 		.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid var(--yellowBorder);color:var(--yellow);background:var(--yellowDim)}
+		.btn{font-size:13px;padding:8px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer}
+		.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.btn[disabled]{opacity:.6;cursor:not-allowed}
+		.checkSummary{margin-top:12px;font-size:13px}
+		.checkList{display:grid;gap:10px;margin-top:12px;min-width:0}
+		.checkItem{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--bg2);min-width:0;overflow:hidden}
+		.checkTop{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+		.checkTop > div{min-width:0;flex:1 1 280px}
+		.checkName{font-weight:600}
+		.checkStatus{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--border)}
+		.checkStatus.ok{color:var(--green);border-color:var(--greenBorder);background:var(--greenDim)}
+		.checkStatus.warn{color:var(--yellow);border-color:var(--yellowBorder);background:var(--yellowDim)}
+		.checkStatus.fail{color:#f85149;border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.12)}
+		.checkFix,.checkDetails{margin-top:8px;font-size:13px}
+		.checkFix,.checkDetails,.checkSummary,.checkItem li{overflow-wrap:anywhere;word-break:break-word}
+		.checkDetails ul{margin:6px 0 0 18px;padding-right:4px}
 		@media(max-width:760px){.kv{grid-template-columns:1fr}}
 	</style>
 </head>
@@ -3323,7 +3510,64 @@ const serverEmailSetupHTML = `<!doctype html>
 			<div class="secHead" style="margin-top:10px"><h2>Why DKIM is shown on the agent</h2></div>
 			<p class="muted">This stack keeps the DKIM private key on the agent by default. That means the server UI can tell you the DNS record name, but the exact public TXT value is generated locally and displayed in the agent dashboard once the mail service starts.</p>
 		</div>
+
+		<div class="card">
+			<div class="secHead"><h2>Run DNS + mail checks</h2></div>
+			<p class="muted">This only runs when you click the button. It checks the current DNS records and the public ports this setup needs.</p>
+			<button type="button" id="runEmailChecks" class="btn primary">Run checks now</button>
+			<div id="emailCheckStatus" class="muted" style="margin-top:10px">Idle</div>
+			<div id="emailCheckSummary" class="checkSummary"></div>
+			<div id="emailCheckResults" class="checkList"></div>
+		</div>
 	</div>
+	<script>
+	(function(){
+		var csrf = {{printf "%q" .CSRF}};
+		function $(id){ return document.getElementById(id); }
+		function escapeHtml(v){ return String(v || '').replace(/[&<>"']/g, function(ch){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch]; }); }
+		function statusLabel(status){ if(status==='ok') return 'Pass'; if(status==='warn') return 'Needs attention'; return 'Failed'; }
+		function renderChecks(report){
+			var summary = $('emailCheckSummary');
+			var list = $('emailCheckResults');
+			summary.textContent = report && report.summary ? report.summary : '';
+			if(!report || !Array.isArray(report.checks) || report.checks.length===0){
+				list.innerHTML = '<div class="muted">No results.</div>';
+				return;
+			}
+			list.innerHTML = report.checks.map(function(ch){
+				var details = '';
+				if(Array.isArray(ch.details) && ch.details.length){
+					details = '<div class="checkDetails"><div class="muted">Found</div><ul>' + ch.details.map(function(item){ return '<li><code>'+escapeHtml(item)+'</code></li>'; }).join('') + '</ul></div>';
+				}
+				var fix = ch.fix ? '<div class="checkFix"><div class="muted">Fix</div><div>'+escapeHtml(ch.fix)+'</div></div>' : '';
+				return '<div class="checkItem">'
+					+ '<div class="checkTop"><div><div class="checkName">'+escapeHtml(ch.name)+'</div><div>'+escapeHtml(ch.summary || '')+'</div></div>'
+					+ '<span class="checkStatus '+escapeHtml(ch.status)+'">'+escapeHtml(statusLabel(ch.status))+'</span></div>'
+					+ details + fix
+					+ '</div>';
+			}).join('');
+		}
+		async function runChecks(){
+			$('runEmailChecks').disabled = true;
+			$('emailCheckStatus').textContent = 'Running checks...';
+			var form = new URLSearchParams();
+			form.set('csrf', csrf);
+			try {
+				var resp = await fetch('/api/email/check', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: form.toString()});
+				if(!resp.ok){
+					throw new Error((await resp.text()) || ('http '+resp.status));
+				}
+				var report = await resp.json();
+				renderChecks(report);
+				$('emailCheckStatus').textContent = 'Checks finished.';
+			} catch(err){
+				$('emailCheckStatus').textContent = 'Check failed: ' + (err && err.message ? err.message : 'unknown');
+			}
+			$('runEmailChecks').disabled = false;
+		}
+		$('runEmailChecks').addEventListener('click', runChecks);
+	})();
+	</script>
 </body>
 </html>`
 

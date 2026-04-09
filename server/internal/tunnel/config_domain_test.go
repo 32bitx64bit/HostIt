@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"hostit/shared/emailcfg"
 )
 
 func TestServerConfigValidate_AllowsManagedDomainRoute(t *testing.T) {
@@ -103,5 +105,38 @@ func TestServerConfigValidate_RejectsDomainWithPort(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "must not include ports") {
 		t.Fatalf("Validate() error = %v, want invalid domain failure", err)
+	}
+}
+
+func TestServerConfigValidate_RejectsMailHostConflictWithManagedRoute(t *testing.T) {
+	domainEnabled := true
+	cfg := ServerConfig{
+		ControlAddr:          ":7000",
+		DataAddr:             ":7001",
+		Token:                "test-token",
+		DisableTLS:           true,
+		DomainManagerEnabled: true,
+		DomainHTTPAddr:       ":80",
+		DomainHTTPSAddr:      ":443",
+		DomainBase:           "example.com",
+		Email: emailcfg.Config{
+			Enabled:   true,
+			Domain:    "example.com",
+			MailHost:  "app.example.com",
+			AutoTLS:   true,
+			ACMEEmail: "admin@example.com",
+		},
+		Routes: []RouteConfig{{
+			Name:          "web",
+			Proto:         "tcp",
+			LocalAddr:     "127.0.0.1:3234",
+			Domain:        "app.example.com",
+			DomainEnabled: &domainEnabled,
+		}},
+	}
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "email mail host") || !strings.Contains(err.Error(), "conflicts with managed route domain") {
+		t.Fatalf("Validate() error = %v, want mail-host conflict failure", err)
 	}
 }

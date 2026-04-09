@@ -8,13 +8,17 @@ import (
 )
 
 const (
-	TypeRegister byte = 1
-	TypeData     byte = 2
-	TypePing     byte = 3
-	TypePong     byte = 4
-	TypeHello    byte = 5
-	TypeConnect  byte = 6
+	TypeRegister          byte = 1
+	TypeData              byte = 2
+	TypePing              byte = 3
+	TypePong              byte = 4
+	TypeHello             byte = 5
+	TypeConnect           byte = 6
+	TypeEmailProbeRequest byte = 7
+	TypeEmailProbeResult  byte = 8
 )
+
+const RouteMailOutboundTCP = "hostit_mail_outbound"
 
 var (
 	ErrInvalidPacket = errors.New("invalid packet")

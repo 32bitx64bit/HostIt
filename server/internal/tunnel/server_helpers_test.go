@@ -13,10 +13,12 @@ func TestBuildHelloPayloadIncludesRoutesAndEmailConfig(t *testing.T) {
 	cfg := ServerConfig{
 		EncryptionAlgorithm: "aes-256",
 		Email: emailcfg.Config{
-			Enabled:  true,
-			Domain:   "example.com",
-			MailHost: "mail.example.com",
-			Accounts: []emailcfg.Account{{Username: "admin", PasswordSet: true, Enabled: true}},
+			Enabled:         true,
+			Domain:          "example.com",
+			MailHost:        "mail.example.com",
+			InboundSMTP:     true,
+			InboundSMTPAddr: "0.0.0.0:25",
+			Accounts:        []emailcfg.Account{{Username: "admin", PasswordSet: true, Enabled: true}},
 		},
 		Routes: []RouteConfig{{
 			Name:       "web",
@@ -49,6 +51,23 @@ func TestBuildHelloPayloadIncludesRoutesAndEmailConfig(t *testing.T) {
 	}
 	if len(payload.Email.Accounts) != 1 || payload.Email.Accounts[0].Username != "admin" {
 		t.Fatalf("Email accounts = %#v, want one admin account", payload.Email.Accounts)
+	}
+	mailRT, ok := payload.Routes[internalEmailInboundRouteName]
+	if !ok {
+		t.Fatalf("buildHelloPayload() missing synthesized mail route: %#v", payload.Routes)
+	}
+	if mailRT.PublicAddr != emailInboundPublicAddr {
+		t.Fatalf("mail route PublicAddr = %q, want %q", mailRT.PublicAddr, emailInboundPublicAddr)
+	}
+	if mailRT.LocalAddr != "127.0.0.1:25" {
+		t.Fatalf("mail route LocalAddr = %q, want %q", mailRT.LocalAddr, "127.0.0.1:25")
+	}
+	submissionRT, ok := payload.Routes[internalEmailSubmissionRouteName]
+	if !ok {
+		t.Fatalf("buildHelloPayload() missing synthesized submission route: %#v", payload.Routes)
+	}
+	if submissionRT.PublicAddr != ":587" || submissionRT.LocalAddr != "127.0.0.1:1587" {
+		t.Fatalf("submission route = %#v, want public :587 local 127.0.0.1:1587", submissionRT)
 	}
 }
 
@@ -98,5 +117,27 @@ func TestServerDashboardIncludesRuntimeStats(t *testing.T) {
 	}
 	if snap.Runtime.LastAgentDisconnectUnix != 200 {
 		t.Fatalf("LastAgentDisconnectUnix = %d, want 200", snap.Runtime.LastAgentDisconnectUnix)
+	}
+}
+
+func TestGetRouteEnabled_UsesEffectiveRoutes(t *testing.T) {
+	t.Parallel()
+
+	srv := NewServer(ServerConfig{
+		ControlAddr: ":7000",
+		DataAddr:    ":7001",
+		Token:       "testtoken",
+		DisableTLS:  true,
+		Email: emailcfg.Config{
+			Enabled:         true,
+			Domain:          "example.com",
+			MailHost:        "mail.example.com",
+			InboundSMTP:     true,
+			InboundSMTPAddr: "0.0.0.0:25",
+		},
+	})
+
+	if !srv.GetRouteEnabled(internalEmailInboundRouteName) {
+		t.Fatalf("GetRouteEnabled(%q) = false, want true", internalEmailInboundRouteName)
 	}
 }

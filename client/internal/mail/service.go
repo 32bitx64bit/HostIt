@@ -10,9 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	stdmail "net/mail"
 	"net"
 	"net/http"
+	stdmail "net/mail"
 	stdsmtp "net/smtp"
 	"os"
 	"path/filepath"
@@ -30,57 +30,73 @@ import (
 	_ "modernc.org/sqlite"
 
 	"hostit/shared/emailcfg"
+	"hostit/shared/logging"
+	"hostit/shared/protocol"
 )
 
+const outboundSMTPAttemptTimeout = 45 * time.Second
+
 type Status struct {
-	Enabled         bool      `json:"enabled"`
-	Running         bool      `json:"running"`
-	Domain          string    `json:"domain,omitempty"`
-	MailHost        string    `json:"mailHost,omitempty"`
-	TLSReady        bool      `json:"tlsReady"`
-	TLSCertSource   string    `json:"tlsCertSource,omitempty"`
-	DKIMReady       bool      `json:"dkimReady"`
-	DKIMSelector    string    `json:"dkimSelector,omitempty"`
-	DKIMDNSName     string    `json:"dkimDNSName,omitempty"`
-	DKIMTXTValue    string    `json:"dkimTXTValue,omitempty"`
-	DKIMKeySource   string    `json:"dkimKeySource,omitempty"`
-	SubmissionAddr  string    `json:"submissionAddr,omitempty"`
-	IMAPAddr        string    `json:"imapAddr,omitempty"`
-	InboundSMTPAddr string    `json:"inboundSMTPAddr,omitempty"`
-	InboundSMTP     bool      `json:"inboundSMTP"`
-	MaxMessageBytes int64     `json:"maxMessageBytes,omitempty"`
-	MaxRecipients   int       `json:"maxRecipients,omitempty"`
-	AccountCount    int       `json:"accountCount"`
-	MessageCount    int       `json:"messageCount"`
-	LastError       string    `json:"lastError,omitempty"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	Enabled           bool      `json:"enabled"`
+	Running           bool      `json:"running"`
+	Domain            string    `json:"domain,omitempty"`
+	MailHost          string    `json:"mailHost,omitempty"`
+	TLSReady          bool      `json:"tlsReady"`
+	TLSCertSource     string    `json:"tlsCertSource,omitempty"`
+	DKIMReady         bool      `json:"dkimReady"`
+	DKIMSelector      string    `json:"dkimSelector,omitempty"`
+	DKIMDNSName       string    `json:"dkimDNSName,omitempty"`
+	DKIMTXTValue      string    `json:"dkimTXTValue,omitempty"`
+	DKIMKeySource     string    `json:"dkimKeySource,omitempty"`
+	SubmissionAddr    string    `json:"submissionAddr,omitempty"`
+	SubmissionTLSAddr string    `json:"submissionTlsAddr,omitempty"`
+	IMAPAddr          string    `json:"imapAddr,omitempty"`
+	IMAPTLSAddr       string    `json:"imapTlsAddr,omitempty"`
+	InboundSMTPAddr   string    `json:"inboundSMTPAddr,omitempty"`
+	InboundSMTP       bool      `json:"inboundSMTP"`
+	MaxMessageBytes   int64     `json:"maxMessageBytes,omitempty"`
+	MaxRecipients     int       `json:"maxRecipients,omitempty"`
+	StorageLimitBytes int64     `json:"storageLimitBytes,omitempty"`
+	StorageUsedBytes  int64     `json:"storageUsedBytes,omitempty"`
+	StorageUnlimited  bool      `json:"storageUnlimited"`
+	StorageLimitText  string    `json:"storageLimitText,omitempty"`
+	StorageUsedText   string    `json:"storageUsedText,omitempty"`
+	AccountCount      int       `json:"accountCount"`
+	MessageCount      int       `json:"messageCount"`
+	LastError         string    `json:"lastError,omitempty"`
+	UpdatedAt         time.Time `json:"updatedAt"`
 }
 
 type Service struct {
 	dataDir string
 	db      *sql.DB
 
-	mu      sync.RWMutex
-	cfg     emailcfg.Config
-	status  Status
-	started bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	tlsCfg          *tls.Config
-	tlsSrc          string
-	acmeHTTPServer  *http.Server
-	acmeHTTPLn      net.Listener
-	dkimSigner      crypto.Signer
-	dkimDNSName     string
-	dkimTXTValue    string
-	dkimKeySource   string
+	mu             sync.RWMutex
+	cfg            emailcfg.Config
+	status         Status
+	started        bool
+	ctx            context.Context
+	cancel         context.CancelFunc
+	outboundDialer func(context.Context, string) (net.Conn, error)
+	tlsCfg         *tls.Config
+	tlsSrc         string
+	acmeHTTPServer *http.Server
+	acmeHTTPLn     net.Listener
+	dkimSigner     crypto.Signer
+	dkimDNSName    string
+	dkimTXTValue   string
+	dkimKeySource  string
 
-	submissionServer *smtp.Server
-	submissionLn     net.Listener
-	inboundServer    *smtp.Server
-	inboundLn        net.Listener
-	imapServer       *imapserver.Server
-	imapLn           net.Listener
+	submissionServer    *smtp.Server
+	submissionLn        net.Listener
+	submissionTLSServer *smtp.Server
+	submissionTLSLn     net.Listener
+	inboundServer       *smtp.Server
+	inboundLn           net.Listener
+	imapServer          *imapserver.Server
+	imapLn              net.Listener
+	imapTLSServer       *imapserver.Server
+	imapTLSLn           net.Listener
 }
 
 type accountRecord struct {
@@ -187,6 +203,70 @@ func (s *Service) Config() emailcfg.Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cfg
+}
+
+func (s *Service) SetOutboundDialer(dialer func(context.Context, string) (net.Conn, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.outboundDialer = dialer
+}
+
+func (s *Service) RunProbe(ctx context.Context, req protocol.EmailProbeRequest) (protocol.EmailProbeResult, error) {
+	result := protocol.EmailProbeResult{}
+
+	s.mu.RLock()
+	cfg := s.cfg
+	listeners := []struct {
+		code string
+		name string
+		ln   net.Listener
+		need bool
+	}{
+		{code: "submission", name: "Submission SMTP", ln: s.submissionLn, need: cfg.Enabled},
+		{code: "submission_tls", name: "Submission SMTPS", ln: s.submissionTLSLn, need: cfg.Enabled},
+		{code: "imap", name: "IMAP", ln: s.imapLn, need: cfg.Enabled},
+		{code: "imap_tls", name: "IMAPS", ln: s.imapTLSLn, need: cfg.Enabled},
+		{code: "inbound", name: "Inbound SMTP", ln: s.inboundLn, need: cfg.Enabled && cfg.InboundSMTP},
+	}
+	s.mu.RUnlock()
+
+	for _, item := range listeners {
+		st := protocol.EmailListenerStatus{Code: item.code, Name: item.name}
+		if item.ln != nil {
+			st.Listening = true
+			st.Addr = item.ln.Addr().String()
+		} else if item.need {
+			st.Details = "listener is not running"
+		} else {
+			st.Details = "not enabled"
+		}
+		result.ListenerChecks = append(result.ListenerChecks, st)
+	}
+
+	if strings.TrimSpace(req.InboundProbeID) != "" && strings.TrimSpace(req.Username) != "" {
+		ok, summary, err := s.waitForProbeMessage(ctx, req.Username, req.InboundProbeID, probeTimeout(req.TimeoutSeconds))
+		result.InboundReady = ok
+		result.InboundSummary = summary
+		if err != nil {
+			result.Error = err.Error()
+		}
+	}
+
+	if strings.TrimSpace(req.OutboundTarget) != "" && strings.TrimSpace(req.Address) != "" && strings.TrimSpace(req.OutboundRcpt) != "" {
+		raw := buildProbeMessage(req.Address, req.OutboundRcpt, req.OutboundProbeID)
+		err := s.sendOutboundSMTPToTarget(ctx, req.OutboundTarget, req.Address, []string{req.OutboundRcpt}, raw)
+		result.OutboundReady = err == nil
+		if err != nil {
+			result.OutboundSummary = err.Error()
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
+		} else {
+			result.OutboundSummary = "outbound probe accepted by relay target"
+		}
+	}
+
+	return result, nil
 }
 
 func (s *Service) migrate(ctx context.Context) error {
@@ -303,28 +383,36 @@ func (s *Service) reconcileAccountsLocked(cfg emailcfg.Config) error {
 func (s *Service) refreshStatusLocked(lastErr string) {
 	accountCount, _ := s.countAccountsLocked()
 	messageCount, _ := s.countMessagesLocked()
+	storageUsed, _ := s.storageUsageLocked()
 	s.status = Status{
-		Enabled:         s.cfg.Enabled,
-		Running:         s.started && s.cfg.Enabled,
-		Domain:          s.cfg.Domain,
-		MailHost:        s.cfg.EffectiveMailHost(),
-		TLSReady:        s.tlsCfg != nil,
-		TLSCertSource:   s.tlsSrc,
-		DKIMReady:       s.dkimSigner != nil,
-		DKIMSelector:    s.cfg.DKIMSelector,
-		DKIMDNSName:     s.dkimDNSName,
-		DKIMTXTValue:    s.dkimTXTValue,
-		DKIMKeySource:   s.dkimKeySource,
-		SubmissionAddr:  s.cfg.SubmissionAddr,
-		IMAPAddr:        s.cfg.IMAPAddr,
-		InboundSMTPAddr: s.cfg.InboundSMTPAddr,
-		InboundSMTP:     s.cfg.InboundSMTP,
-		MaxMessageBytes: s.cfg.MaxMessageBytes,
-		MaxRecipients:   s.cfg.MaxRecipients,
-		AccountCount:    accountCount,
-		MessageCount:    messageCount,
-		LastError:       lastErr,
-		UpdatedAt:       time.Now(),
+		Enabled:           s.cfg.Enabled,
+		Running:           s.started && s.cfg.Enabled,
+		Domain:            s.cfg.Domain,
+		MailHost:          s.cfg.EffectiveMailHost(),
+		TLSReady:          s.tlsCfg != nil,
+		TLSCertSource:     s.tlsSrc,
+		DKIMReady:         s.dkimSigner != nil,
+		DKIMSelector:      s.cfg.DKIMSelector,
+		DKIMDNSName:       s.dkimDNSName,
+		DKIMTXTValue:      s.dkimTXTValue,
+		DKIMKeySource:     s.dkimKeySource,
+		SubmissionAddr:    s.cfg.SubmissionAddr,
+		SubmissionTLSAddr: s.cfg.SubmissionTLSAddr,
+		IMAPAddr:          s.cfg.IMAPAddr,
+		IMAPTLSAddr:       s.cfg.IMAPTLSAddr,
+		InboundSMTPAddr:   s.cfg.InboundSMTPAddr,
+		InboundSMTP:       s.cfg.InboundSMTP,
+		MaxMessageBytes:   s.cfg.MaxMessageBytes,
+		MaxRecipients:     s.cfg.MaxRecipients,
+		StorageLimitBytes: s.cfg.StorageLimitBytes,
+		StorageUsedBytes:  storageUsed,
+		StorageUnlimited:  s.cfg.StorageLimitBytes <= 0,
+		StorageLimitText:  emailcfg.HumanByteSize(s.cfg.StorageLimitBytes),
+		StorageUsedText:   emailcfg.HumanByteSize(storageUsed),
+		AccountCount:      accountCount,
+		MessageCount:      messageCount,
+		LastError:         lastErr,
+		UpdatedAt:         time.Now(),
 	}
 }
 
@@ -338,6 +426,18 @@ func (s *Service) countMessagesLocked() (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n)
 	return n, err
+}
+
+func (s *Service) storageUsageLocked() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(LENGTH(raw)), 0) FROM messages`).Scan(&n)
+	return n, err
+}
+
+func (s *Service) storageUsage() (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.storageUsageLocked()
 }
 
 func (s *Service) restartServersLocked(lastErr string) error {
@@ -359,10 +459,6 @@ func (s *Service) restartServersLocked(lastErr string) error {
 	}
 	s.tlsCfg = tlsSetup.Config
 	s.tlsSrc = tlsSetup.Source
-	if err := s.startACMEHTTPChallengeLocked(tlsSetup); err != nil {
-		s.refreshStatusLocked(err.Error())
-		return err
-	}
 	dkimSigner, dkimDNSName, dkimTXTValue, dkimKeySource, err := ensureDKIMSigner(s.dataDir, s.cfg)
 	if err != nil {
 		s.refreshStatusLocked(err.Error())
@@ -372,7 +468,16 @@ func (s *Service) restartServersLocked(lastErr string) error {
 	s.dkimDNSName = dkimDNSName
 	s.dkimTXTValue = dkimTXTValue
 	s.dkimKeySource = dkimKeySource
+	startupWarning := strings.TrimSpace(lastErr)
+	if err := s.startACMEHTTPChallengeLocked(tlsSetup); err != nil {
+		startupWarning = combineMailStartupWarnings(startupWarning, fmt.Sprintf("ACME HTTP challenge listener unavailable: %v", err))
+	}
 	if err := s.startSubmissionLocked(); err != nil {
+		s.refreshStatusLocked(err.Error())
+		return err
+	}
+	if err := s.startSubmissionTLSLocked(); err != nil {
+		s.closeListenersLocked()
 		s.refreshStatusLocked(err.Error())
 		return err
 	}
@@ -388,8 +493,50 @@ func (s *Service) restartServersLocked(lastErr string) error {
 		s.refreshStatusLocked(err.Error())
 		return err
 	}
-	s.refreshStatusLocked(lastErr)
+	if err := s.startIMAPTLSLocked(); err != nil {
+		s.closeListenersLocked()
+		s.refreshStatusLocked(err.Error())
+		return err
+	}
+	if tlsSetup != nil && tlsSetup.Warmup != nil {
+		go s.warmAutoTLSCertificate(tlsSetup)
+	}
+	s.refreshStatusLocked(startupWarning)
 	return nil
+}
+
+func (s *Service) warmAutoTLSCertificate(setup *mailTLSSetup) {
+	if setup == nil || setup.Warmup == nil {
+		return
+	}
+	ctx := context.Background()
+	if s.ctx != nil {
+		ctx = s.ctx
+	}
+	warmCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	if err := setup.Warmup(warmCtx); err != nil {
+		logging.Global().Warnf(logging.CatEncryption, "mail automatic TLS warmup failed: %v", err)
+		return
+	}
+	logging.Global().Infof(logging.CatEncryption, "mail automatic TLS certificate is ready")
+}
+
+func combineMailStartupWarnings(parts ...string) string {
+	filtered := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, ok := seen[part]; ok {
+			continue
+		}
+		seen[part] = struct{}{}
+		filtered = append(filtered, part)
+	}
+	return strings.Join(filtered, "; ")
 }
 
 func (s *Service) startACMEHTTPChallengeLocked(setup *mailTLSSetup) error {
@@ -420,6 +567,14 @@ func (s *Service) closeListenersLocked() {
 		_ = s.submissionLn.Close()
 		s.submissionLn = nil
 	}
+	if s.submissionTLSServer != nil {
+		_ = s.submissionTLSServer.Close()
+		s.submissionTLSServer = nil
+	}
+	if s.submissionTLSLn != nil {
+		_ = s.submissionTLSLn.Close()
+		s.submissionTLSLn = nil
+	}
 	if s.inboundServer != nil {
 		_ = s.inboundServer.Close()
 		s.inboundServer = nil
@@ -435,6 +590,14 @@ func (s *Service) closeListenersLocked() {
 	if s.imapLn != nil {
 		_ = s.imapLn.Close()
 		s.imapLn = nil
+	}
+	if s.imapTLSServer != nil {
+		_ = s.imapTLSServer.Close()
+		s.imapTLSServer = nil
+	}
+	if s.imapTLSLn != nil {
+		_ = s.imapTLSLn.Close()
+		s.imapTLSLn = nil
 	}
 	if s.acmeHTTPServer != nil {
 		_ = s.acmeHTTPServer.Close()
@@ -464,6 +627,27 @@ func (s *Service) startSubmissionLocked() error {
 	go func() { _ = srv.Serve(ln) }()
 	s.submissionLn = ln
 	s.submissionServer = srv
+	return nil
+}
+
+func (s *Service) startSubmissionTLSLocked() error {
+	ln, err := net.Listen("tcp", s.cfg.SubmissionTLSAddr)
+	if err != nil {
+		return err
+	}
+	backend := &smtpBackend{svc: s, submission: true}
+	srv := smtp.NewServer(backend)
+	srv.Addr = s.cfg.SubmissionTLSAddr
+	srv.Domain = s.cfg.EffectiveMailHost()
+	srv.AllowInsecureAuth = false
+	srv.MaxMessageBytes = s.cfg.MaxMessageBytes
+	srv.MaxRecipients = s.cfg.MaxRecipients
+	srv.ReadTimeout = 30 * time.Second
+	srv.WriteTimeout = 30 * time.Second
+	secureLn := tls.NewListener(ln, s.tlsCfg)
+	go func() { _ = srv.Serve(secureLn) }()
+	s.submissionTLSLn = ln
+	s.submissionTLSServer = srv
 	return nil
 }
 
@@ -510,6 +694,28 @@ func (s *Service) startIMAPLocked() error {
 	return nil
 }
 
+func (s *Service) startIMAPTLSLocked() error {
+	ln, err := net.Listen("tcp", s.cfg.IMAPTLSAddr)
+	if err != nil {
+		return err
+	}
+	srv := imapserver.New(&imapserver.Options{
+		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return &imapSession{svc: s}, nil, nil
+		},
+		Caps: imap.CapSet{
+			imap.CapIMAP4rev1: {},
+			imap.CapIMAP4rev2: {},
+		},
+		InsecureAuth: false,
+	})
+	secureLn := tls.NewListener(ln, s.tlsCfg)
+	go func() { _ = srv.Serve(secureLn) }()
+	s.imapTLSLn = ln
+	s.imapTLSServer = srv
+	return nil
+}
+
 func (s *Service) authenticate(username, password string) (*accountRecord, error) {
 	username = strings.TrimSpace(strings.ToLower(username))
 	var rec accountRecord
@@ -528,7 +734,7 @@ func (s *Service) authenticate(username, password string) (*accountRecord, error
 			}
 			return &rec, nil
 		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
 	}
@@ -568,8 +774,33 @@ func (s *Service) listMessages(username string) ([]storedMessage, error) {
 
 func (s *Service) storeMessage(username, mailbox string, flags []string, raw []byte) error {
 	flagsJSON, _ := json.Marshal(flags)
-	_, err := s.db.Exec(`INSERT INTO messages(username, mailbox, internal_date, flags_json, raw, created_at) VALUES(?, ?, ?, ?, ?, ?)`, username, mailbox, time.Now().Unix(), string(flagsJSON), raw, time.Now().Unix())
-	return err
+	s.mu.RLock()
+	limit := s.cfg.StorageLimitBytes
+	s.mu.RUnlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if limit > 0 {
+		var used int64
+		if err := tx.QueryRow(`SELECT COALESCE(SUM(LENGTH(raw)), 0) FROM messages`).Scan(&used); err != nil {
+			return err
+		}
+		if used+int64(len(raw)) > limit {
+			return fmt.Errorf("mail storage limit exceeded")
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO messages(username, mailbox, internal_date, flags_json, raw, created_at) VALUES(?, ?, ?, ?, ?, ?)`, username, mailbox, time.Now().Unix(), string(flagsJSON), raw, time.Now().Unix()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.refreshStatusLocked("")
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *Service) deliverLocal(address, mailbox string, raw []byte) error {
@@ -597,24 +828,150 @@ func (s *Service) classifyRecipients(rcpts []string) (local []string, external [
 	return local, external
 }
 
-func sendOutboundSMTP(from string, rcpts []string, raw []byte) error {
+func (s *Service) dialOutboundSMTP(ctx context.Context, addr string) (net.Conn, error) {
+	s.mu.RLock()
+	dialer := s.outboundDialer
+	s.mu.RUnlock()
+	if dialer != nil {
+		return dialer(ctx, addr)
+	}
+	return (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).DialContext(ctx, "tcp", addr)
+}
+
+func (s *Service) sendOutboundSMTPToTarget(ctx context.Context, target, from string, rcpts []string, raw []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, outboundSMTPAttemptTimeout)
+	defer cancel()
+
+	conn, err := s.dialOutboundSMTP(ctx, strings.TrimSpace(target))
+	if err != nil {
+		return err
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(target))
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "localhost"
+	}
+	return deliverOutboundSMTP(ctx, conn, host, "", from, rcpts, raw)
+}
+
+func closeConnOnContextDone(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+	}
+}
+
+func smtpContextErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
+func deliverOutboundSMTP(ctx context.Context, conn net.Conn, host, heloHost, from string, rcpts []string, raw []byte) (err error) {
+	stopCancelWatch := closeConnOnContextDone(ctx, conn)
+	defer stopCancelWatch()
+	if deadline, ok := ctx.Deadline(); ok {
+		if setErr := conn.SetDeadline(deadline); setErr != nil {
+			_ = conn.Close()
+			return setErr
+		}
+		defer conn.SetDeadline(time.Time{})
+	}
+
+	client, err := stdsmtp.NewClient(conn, host)
+	if err != nil {
+		_ = conn.Close()
+		return smtpContextErr(ctx, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = client.Close()
+			return
+		}
+		_ = client.Quit()
+	}()
+
+	// Announce ourselves with the configured mail hostname so remote
+	// servers see a proper FQDN instead of the default "localhost".
+	if heloHost != "" {
+		if err = client.Hello(heloHost); err != nil {
+			return smtpContextErr(ctx, err)
+		}
+	}
+
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		if err = client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
+			return smtpContextErr(ctx, err)
+		}
+	}
+	if err = client.Mail(from); err != nil {
+		return smtpContextErr(ctx, err)
+	}
+	for _, rcpt := range rcpts {
+		if err = client.Rcpt(rcpt); err != nil {
+			return smtpContextErr(ctx, err)
+		}
+	}
+	wc, err := client.Data()
+	if err != nil {
+		return smtpContextErr(ctx, err)
+	}
+	if _, err = wc.Write(raw); err != nil {
+		_ = wc.Close()
+		return smtpContextErr(ctx, err)
+	}
+	return smtpContextErr(ctx, wc.Close())
+}
+
+func (s *Service) sendOutboundSMTP(ctx context.Context, from string, rcpts []string, raw []byte) error {
+	s.mu.RLock()
+	heloHost := s.cfg.EffectiveMailHost()
+	s.mu.RUnlock()
+
 	for _, rcpt := range rcpts {
 		parts := strings.Split(strings.TrimSpace(rcpt), "@")
 		if len(parts) != 2 {
 			return fmt.Errorf("invalid recipient %q", rcpt)
 		}
-		mxRecords, err := net.LookupMX(parts[1])
-		if err != nil || len(mxRecords) == 0 {
-			return fmt.Errorf("mx lookup failed for %s: %w", parts[1], err)
+		domain := parts[1]
+		mxRecords, err := net.LookupMX(domain)
+		if err != nil {
+			return fmt.Errorf("mx lookup failed for %s: %w", domain, err)
+		}
+		if len(mxRecords) == 0 {
+			mxRecords = []*net.MX{{Host: domain + ".", Pref: 0}}
 		}
 		sort.Slice(mxRecords, func(i, j int) bool { return mxRecords[i].Pref < mxRecords[j].Pref })
 		var sendErr error
 		for _, mx := range mxRecords {
 			host := strings.TrimSuffix(mx.Host, ".")
-			sendErr = stdsmtp.SendMail(net.JoinHostPort(host, "25"), nil, from, []string{rcpt}, raw)
+			logging.Global().Infof(logging.CatEmail, "outbound SMTP: from=%s rcpt=%s mx=%s", from, rcpt, host)
+			attemptCtx, cancel := context.WithTimeout(ctx, outboundSMTPAttemptTimeout)
+			conn, err := s.dialOutboundSMTP(attemptCtx, net.JoinHostPort(host, "25"))
+			if err != nil {
+				cancel()
+				logging.Global().Warnf(logging.CatEmail, "outbound SMTP dial failed: rcpt=%s mx=%s err=%v", rcpt, host, err)
+				sendErr = err
+				continue
+			}
+			sendErr = deliverOutboundSMTP(attemptCtx, conn, host, heloHost, from, []string{rcpt}, raw)
+			cancel()
 			if sendErr == nil {
+				logging.Global().Infof(logging.CatEmail, "outbound SMTP delivered: rcpt=%s mx=%s", rcpt, host)
 				break
 			}
+			logging.Global().Warnf(logging.CatEmail, "outbound SMTP delivery failed: rcpt=%s mx=%s err=%v", rcpt, host, sendErr)
 		}
 		if sendErr != nil {
 			return sendErr
@@ -633,12 +990,12 @@ func (b *smtpBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 type smtpSession struct {
-	svc          *Service
-	submission   bool
+	svc           *Service
+	submission    bool
 	authenticated bool
-	authAddress  string
-	from         string
-	rcpts        []string
+	authAddress   string
+	from          string
+	rcpts         []string
 }
 
 func (s *smtpSession) AuthMechanisms() []string {
@@ -701,6 +1058,13 @@ func (s *smtpSession) Data(r io.Reader) error {
 		s.from = s.authAddress
 	}
 	local, external := s.svc.classifyRecipients(s.rcpts)
+	storageCopies := len(local)
+	if s.authenticated && s.authAddress != "" {
+		storageCopies++
+	}
+	if err := s.svc.ensureStorageCapacity(storageCopies, len(raw)); err != nil {
+		return err
+	}
 	for _, rcpt := range local {
 		if err := s.svc.deliverLocal(rcpt, "INBOX", raw); err != nil {
 			return err
@@ -714,7 +1078,7 @@ func (s *smtpSession) Data(r io.Reader) error {
 		if err != nil {
 			return err
 		}
-		if err := sendOutboundSMTP(s.from, external, signedRaw); err != nil {
+		if err := s.svc.sendOutboundSMTP(context.Background(), s.from, external, signedRaw); err != nil {
 			return err
 		}
 	}
@@ -722,6 +1086,27 @@ func (s *smtpSession) Data(r io.Reader) error {
 		if err := s.svc.deliverLocal(s.authAddress, "Sent", raw); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (s *Service) ensureStorageCapacity(copies int, rawSize int) error {
+	if copies <= 0 || rawSize <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	limit := s.cfg.StorageLimitBytes
+	s.mu.RUnlock()
+	if limit <= 0 {
+		return nil
+	}
+	used, err := s.storageUsage()
+	if err != nil {
+		return err
+	}
+	needed := int64(copies) * int64(rawSize)
+	if used+needed > limit {
+		return fmt.Errorf("mail storage limit exceeded")
 	}
 	return nil
 }
@@ -797,4 +1182,60 @@ func ParseMessageSummary(raw []byte) (from string, subject string, err error) {
 		return "", "", err
 	}
 	return msg.Header.Get("From"), msg.Header.Get("Subject"), nil
+}
+
+func buildProbeMessage(from, to, probeID string) []byte {
+	if strings.TrimSpace(probeID) == "" {
+		probeID = fmt.Sprintf("probe-%d", time.Now().UnixNano())
+	}
+	body := "HostIt email architecture probe\r\n"
+	return []byte(strings.Join([]string{
+		"From: " + from,
+		"To: " + to,
+		"Subject: HostIt email probe",
+		"Message-ID: <" + probeID + "@hostit.local>",
+		"X-HostIt-Probe: " + probeID,
+		"",
+		body,
+	}, "\r\n"))
+}
+
+func probeTimeout(timeoutSeconds int) time.Duration {
+	if timeoutSeconds <= 0 {
+		return 8 * time.Second
+	}
+	return time.Duration(timeoutSeconds) * time.Second
+}
+
+func (s *Service) waitForProbeMessage(ctx context.Context, username, probeID string, timeout time.Duration) (bool, string, error) {
+	if strings.TrimSpace(username) == "" || strings.TrimSpace(probeID) == "" {
+		return false, "probe input missing", nil
+	}
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	want := strings.TrimSpace(probeID)
+	for {
+		msgs, err := s.listMessages(username)
+		if err != nil {
+			return false, "failed to read mailbox", err
+		}
+		for _, msg := range msgs {
+			parsed, err := stdmail.ReadMessage(bytes.NewReader(msg.Raw))
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(parsed.Header.Get("X-HostIt-Probe")) == want {
+				return true, "probe message received in " + msg.Mailbox, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return false, "probe message was not received", nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, "probe cancelled", ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }

@@ -30,11 +30,21 @@ type mailTLSSetup struct {
 	Source          string
 	ACMEHTTPAddr    string
 	ACMEHTTPHandler http.Handler
+	Warmup          func(context.Context) error
 }
 
 func ensureMailTLSConfig(dataDir string, cfg emailcfg.Config) (*mailTLSSetup, error) {
 	if cfg.AutoTLS {
 		host := strings.TrimSpace(cfg.EffectiveMailHost())
+		fallbackCertFile := filepath.Join(dataDir, "tls", "mail-local.crt")
+		fallbackKeyFile := filepath.Join(dataDir, "tls", "mail-local.key")
+		if _, err := ensureMailSelfSigned(fallbackCertFile, fallbackKeyFile, host); err != nil {
+			return nil, err
+		}
+		fallbackPair, err := tls.LoadX509KeyPair(fallbackCertFile, fallbackKeyFile)
+		if err != nil {
+			return nil, err
+		}
 		mgr := &autocert.Manager{
 			Prompt: autocert.AcceptTOS,
 			Cache:  autocert.DirCache(filepath.Join(dataDir, "tls", "acme")),
@@ -48,11 +58,30 @@ func ensureMailTLSConfig(dataDir string, cfg emailcfg.Config) (*mailTLSSetup, er
 		}
 		tlsCfg := mgr.TLSConfig()
 		tlsCfg.MinVersion = tls.VersionTLS12
+		getACMECert := tlsCfg.GetCertificate
+		tlsCfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if shouldUseLocalMailTLSFallback(hello) {
+				return &fallbackPair, nil
+			}
+			hello = effectiveMailClientHello(hello, host)
+			if getACMECert == nil {
+				return &fallbackPair, nil
+			}
+			cert, err := getACMECert(hello)
+			if err != nil && isLoopbackMailClient(hello) {
+				return &fallbackPair, nil
+			}
+			return cert, err
+		}
 		return &mailTLSSetup{
 			Config:          tlsCfg,
 			Source:          "lets-encrypt",
 			ACMEHTTPAddr:    cfg.ACMEHTTPAddr,
 			ACMEHTTPHandler: mgr.HTTPHandler(http.NotFoundHandler()),
+			Warmup: func(ctx context.Context) error {
+				_, err := mgr.GetCertificate(&tls.ClientHelloInfo{ServerName: host})
+				return err
+			},
 		}, nil
 	}
 
@@ -86,6 +115,52 @@ func ensureMailTLSConfig(dataDir string, cfg emailcfg.Config) (*mailTLSSetup, er
 func normalizeMailHostname(host string) string {
 	host = strings.TrimSpace(strings.ToLower(host))
 	return strings.TrimSuffix(host, ".")
+}
+
+func shouldUseLocalMailTLSFallback(hello *tls.ClientHelloInfo) bool {
+	if hello == nil {
+		return true
+	}
+	if !isLoopbackMailClient(hello) {
+		return false
+	}
+	switch normalizeMailHostname(hello.ServerName) {
+	case "", "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+func effectiveMailClientHello(hello *tls.ClientHelloInfo, host string) *tls.ClientHelloInfo {
+	host = normalizeMailHostname(host)
+	if hello == nil {
+		if host == "" {
+			return nil
+		}
+		return &tls.ClientHelloInfo{ServerName: host}
+	}
+	if normalizeMailHostname(hello.ServerName) != "" || host == "" {
+		return hello
+	}
+	clone := *hello
+	clone.ServerName = host
+	return &clone
+}
+
+func isLoopbackMailClient(hello *tls.ClientHelloInfo) bool {
+	if hello == nil || hello.Conn == nil {
+		return false
+	}
+	addr := hello.Conn.RemoteAddr()
+	if addr == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func ensureMailSelfSigned(certFile, keyFile, host string) (string, error) {

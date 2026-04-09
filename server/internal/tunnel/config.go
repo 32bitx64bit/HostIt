@@ -8,6 +8,7 @@ import (
 	"unicode"
 
 	"hostit/shared/emailcfg"
+	"hostit/shared/protocol"
 )
 
 type ConfigValidationError struct {
@@ -116,7 +117,7 @@ func validateRouteName(name string) error {
 		}
 	}
 	switch strings.ToLower(name) {
-	case "_system", "system", "default", "all", "any":
+	case "_system", "system", "default", "all", "any", internalEmailInboundRouteName, internalEmailSubmissionRouteName, internalEmailSubmissionTLSRouteName, internalEmailIMAPRouteName, internalEmailIMAPTLSRouteName, internalEmailACMEHTTPRouteName, protocol.RouteMailOutboundTCP:
 		return fmt.Errorf("route name %q is reserved", name)
 	}
 	return nil
@@ -198,8 +199,8 @@ type ServerConfig struct {
 	DomainCertDir        string        `json:",omitempty"`
 	DomainRenewBefore    time.Duration `json:",omitempty"`
 	PairTimeout          time.Duration
-	DashboardInterval    time.Duration `json:",omitempty"`
-	EncryptionAlgorithm  string        `json:",omitempty"`
+	DashboardInterval    time.Duration   `json:",omitempty"`
+	EncryptionAlgorithm  string          `json:",omitempty"`
 	Email                emailcfg.Config `json:"email,omitempty"`
 	Routes               []RouteConfig
 }
@@ -326,6 +327,28 @@ func (c *ServerConfig) Validate() error {
 				errs = append(errs, fmt.Sprintf("duplicate route domain %q used by %q and %q", host, prev, c.Routes[i].Name))
 			} else {
 				routeDomains[host] = c.Routes[i].Name
+			}
+		}
+	}
+
+	if c.DomainManagerEnabled && c.Email.Enabled && c.Email.AutoTLS {
+		mailHost := normalizeHostname(c.Email.EffectiveMailHost())
+		if prev, ok := routeDomains[mailHost]; ok {
+			errs = append(errs, fmt.Sprintf("email mail host %q conflicts with managed route domain used by %q", c.Email.EffectiveMailHost(), prev))
+		}
+	}
+
+	for _, internalRoute := range emailSynthRoutes(*c) {
+		for _, rt := range c.Routes {
+			if !rt.IsEnabled() {
+				continue
+			}
+			proto := strings.ToLower(strings.TrimSpace(rt.Proto))
+			if proto != "tcp" && proto != "both" {
+				continue
+			}
+			if publicTCPAddrsConflict(rt.PublicAddr, internalRoute.PublicAddr) {
+				errs = append(errs, fmt.Sprintf("synthesized email route %q uses public TCP %s, which conflicts with route %q on %s", internalRoute.Name, internalRoute.PublicAddr, rt.Name, rt.PublicAddr))
 			}
 		}
 	}

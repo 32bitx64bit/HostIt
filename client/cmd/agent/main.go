@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"html/template"
 	"io"
 	"log"
@@ -12,23 +13,33 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"hostit/client/internal/agent"
+	"hostit/client/internal/agentlog"
 	"hostit/client/internal/mail"
 	"hostit/shared/configio"
 	"hostit/shared/emailcfg"
 	"hostit/shared/module"
+	"hostit/shared/protocol"
 	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
 	"hostit/shared/version"
 )
 
 var shutdownTimeout = 5 * time.Second
+
+const (
+	agentSystemdServiceName = "hostit-agent.service"
+	agentSystemdUnitPath    = "/etc/systemd/system/hostit-agent.service"
+	agentSystemdEnvPath     = "/etc/hostit/agent.env"
+)
 
 func init() {
 	if v := os.Getenv("HOSTIT_SHUTDOWN_TIMEOUT"); v != "" {
@@ -38,7 +49,109 @@ func init() {
 	}
 }
 
+func agentSystemdIdentityLines(moduleDir string) string {
+	info, err := os.Stat(moduleDir)
+	if err != nil {
+		return ""
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+	usr, err := user.LookupId(fmt.Sprintf("%d", stat.Uid))
+	if err != nil || strings.TrimSpace(usr.Username) == "" {
+		return ""
+	}
+	grp, err := user.LookupGroupId(fmt.Sprintf("%d", stat.Gid))
+	if err != nil || strings.TrimSpace(grp.Name) == "" {
+		return fmt.Sprintf("User=%s\n", usr.Username)
+	}
+	return fmt.Sprintf("User=%s\nGroup=%s\n", usr.Username, grp.Name)
+}
+
+func agentSystemdUnitContent(moduleDir string) string {
+	moduleDir = strings.TrimSpace(moduleDir)
+	identity := agentSystemdIdentityLines(moduleDir)
+	return fmt.Sprintf(`[Unit]
+Description=HostIt Tunnel Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+%sWorkingDirectory=%s
+EnvironmentFile=-%s
+
+ExecStartPre=/bin/sh -c "test -x ./bin/tunnel-agent || (echo Missing ./bin/tunnel-agent. Run ./build.sh once as your user. >&2; exit 1)"
+ExecStart=/bin/sh %s/client.sh
+
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+`, identity, moduleDir, agentSystemdEnvPath, moduleDir)
+}
+
+func ensureAgentSystemdEnvFile() error {
+	if _, err := os.Stat(agentSystemdEnvPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(agentSystemdEnvPath), 0o755); err != nil {
+		return err
+	}
+	content := strings.Join([]string{
+		"# Optional overrides for client/client.sh",
+		"# WEB=127.0.0.1:7003",
+		"# CONFIG=agent.json",
+		"# SERVER=",
+		"# TOKEN=",
+		"",
+	}, "\n")
+	return os.WriteFile(agentSystemdEnvPath, []byte(content), 0o644)
+}
+
+func syncInstalledAgentSystemdUnit(moduleDir string) error {
+	if strings.TrimSpace(moduleDir) == "" {
+		return fmt.Errorf("module dir is required")
+	}
+	if err := ensureAgentSystemdEnvFile(); err != nil {
+		return err
+	}
+	want := agentSystemdUnitContent(moduleDir)
+	have, err := os.ReadFile(agentSystemdUnitPath)
+	if err == nil && string(have) == want {
+		return nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.WriteFile(agentSystemdUnitPath, []byte(want), 0o644); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "daemon-reload")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("systemctl daemon-reload failed: %s", msg)
+	}
+	return nil
+}
+
 func main() {
+	agentlog.Init()
+	log.SetOutput(io.MultiWriter(os.Stderr, agentlog.NewUILogWriter("stdio", agentlog.UILogs)))
+
 	var serverHost string
 	var token string
 	var webAddr string
@@ -111,11 +224,21 @@ func main() {
 		if err := mailSvc.Start(ctx); err != nil {
 			log.Printf("mail service start failed: %v", err)
 		}
+		mailSvc.SetOutboundDialer(func(callCtx context.Context, remoteAddr string) (net.Conn, error) {
+			cfg, _, connected, _, _ := ctrl.Get()
+			if !connected {
+				return nil, fmt.Errorf("agent is not connected to the server")
+			}
+			return agent.DialMailOutboundTCP(callCtx, cfg, remoteAddr)
+		})
 		defer mailSvc.Close()
 		ctrl.onEmailConfig = func(cfg emailcfg.Config) {
 			if err := mailSvc.ApplyConfig(cfg); err != nil {
 				log.Printf("mail config apply failed: %v", err)
 			}
+		}
+		ctrl.onEmailProbe = func(callCtx context.Context, req protocol.EmailProbeRequest) (protocol.EmailProbeResult, error) {
+			return mailSvc.RunProbe(callCtx, req)
 		}
 	}
 	if autostart {
@@ -158,17 +281,18 @@ func main() {
 type agentController struct {
 	root context.Context
 
-	mu        sync.Mutex
-	cfg       agent.Config
-	running   bool
-	connected bool
-	lastErr   string
-	routes    []agent.RemoteRoute
-	emailCfg  emailcfg.Config
-	cancel    context.CancelFunc
-	done      chan struct{}
-	runID     uint64
+	mu            sync.Mutex
+	cfg           agent.Config
+	running       bool
+	connected     bool
+	lastErr       string
+	routes        []agent.RemoteRoute
+	emailCfg      emailcfg.Config
+	cancel        context.CancelFunc
+	done          chan struct{}
+	runID         uint64
 	onEmailConfig func(emailcfg.Config)
+	onEmailProbe  func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
 }
 
 func newAgentController(root context.Context, cfg agent.Config) *agentController {
@@ -245,6 +369,19 @@ func (a *agentController) Start() {
 			if onEmailConfig != nil {
 				onEmailConfig(cfg)
 			}
+		},
+		OnEmailProbe: func(callCtx context.Context, req protocol.EmailProbeRequest) (protocol.EmailProbeResult, error) {
+			a.mu.Lock()
+			if a.runID != rid {
+				a.mu.Unlock()
+				return protocol.EmailProbeResult{}, fmt.Errorf("stale agent run")
+			}
+			onEmailProbe := a.onEmailProbe
+			a.mu.Unlock()
+			if onEmailProbe == nil {
+				return protocol.EmailProbeResult{}, fmt.Errorf("email probe handler not configured")
+			}
+			return onEmailProbe(callCtx, req)
 		},
 		OnDisconnected: func(err error) {
 			a.mu.Lock()
@@ -335,9 +472,13 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		if systemdutil.RunningUnderSystemd() {
 			log.Printf("Running under systemd - restarting service")
 			if systemdutil.SystemctlAvailable() {
+				if err := syncInstalledAgentSystemdUnit(moduleDir); err != nil {
+					log.Printf("Failed to refresh installed systemd unit: %v", err)
+					return err
+				}
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
-				cmd := exec.CommandContext(ctx2, "systemctl", "restart", "--no-block", "hostit-agent.service")
+				cmd := exec.CommandContext(ctx2, "systemctl", "restart", "--no-block", agentSystemdServiceName)
 				out, err := cmd.CombinedOutput()
 				if err == nil {
 					log.Printf("Systemd restart command sent successfully")
@@ -424,6 +565,33 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
+	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		level := strings.TrimSpace(r.URL.Query().Get("level"))
+		limit := 300
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		stats := map[string]int{"all": 0, "warning": 0, "error": 0}
+		entries := []agentlog.UILogEntry{}
+		if agentlog.UILogs != nil {
+			stats = agentlog.UILogs.Stats()
+			entries = agentlog.UILogs.Entries(level, limit)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"level":   level,
+			"limit":   limit,
+			"stats":   stats,
+			"entries": entries,
+		})
+	})
+
 	mux.HandleFunc("/api/update/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -448,7 +616,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		st := systemdutil.Status(r.Context(), "hostit-agent.service")
+		st := systemdutil.Status(r.Context(), agentSystemdServiceName)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(st)
 	})
@@ -457,7 +625,11 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := systemdutil.Action(r.Context(), "restart", "hostit-agent.service"); err != nil {
+		if err := syncInstalledAgentSystemdUnit(moduleDir); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := systemdutil.Action(r.Context(), "restart", agentSystemdServiceName); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -468,7 +640,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := systemdutil.Action(r.Context(), "stop", "hostit-agent.service"); err != nil {
+		if err := systemdutil.Action(r.Context(), "stop", agentSystemdServiceName); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -882,7 +1054,7 @@ const agentHomeHTML = `<!doctype html>
 
 		<div class="secHead"><h2>Email</h2></div>
 		<div class="card">
-			<div id="emailInfo" class="muted">{{with .EmailStatus}}{{if .Enabled}}Mail host <code>{{.MailHost}}</code> · TLS {{if .TLSReady}}{{.TLSCertSource}}{{else}}unavailable{{end}} · DKIM {{if .DKIMReady}}{{.DKIMSelector}}{{else}}unavailable{{end}} · SMTP <code>{{.SubmissionAddr}}</code> · IMAP <code>{{.IMAPAddr}}</code> · Max {{.MaxMessageBytes}} bytes / {{.MaxRecipients}} recipients per email · Storage unlimited · Accounts {{.AccountCount}} · Messages {{.MessageCount}}{{else}}Email is not enabled on the server.{{end}}{{else}}Email service unavailable.{{end}}</div>
+			<div id="emailInfo" class="muted">{{with .EmailStatus}}{{if .Enabled}}Mail host <code>{{.MailHost}}</code> · TLS {{if .TLSReady}}{{.TLSCertSource}}{{else}}unavailable{{end}} · DKIM {{if .DKIMReady}}{{.DKIMSelector}}{{else}}unavailable{{end}} · SMTP <code>{{.SubmissionAddr}}</code> / SMTPS <code>{{.SubmissionTLSAddr}}</code> · IMAP <code>{{.IMAPAddr}}</code> / IMAPS <code>{{.IMAPTLSAddr}}</code> · Max {{.MaxMessageBytes}} bytes / {{.MaxRecipients}} recipients per email · Storage {{.StorageUsedText}}{{if .StorageUnlimited}} / unlimited{{else}} / {{.StorageLimitText}}{{end}} · Accounts {{.AccountCount}} · Messages {{.MessageCount}}{{else}}Email is not enabled on the server.{{end}}{{else}}Email service unavailable.{{end}}</div>
 			<div id="emailDNS" class="muted" style="margin-top:10px">{{with .EmailStatus}}{{if .DKIMReady}}<div>DKIM DNS name <code>{{.DKIMDNSName}}</code></div><div class="dkimBox"><div class="dkimTop"><span class="muted">TXT value</span><button type="button" class="btn sm" id="copyDkimBtn">Copy</button></div><textarea id="dkimTxtValue" class="dkimText" readonly>{{.DKIMTXTValue}}</textarea></div>{{else if .Enabled}}DKIM record will appear here after the mail service starts.{{end}}{{end}}</div>
 		</div>
 	</div>
@@ -1034,7 +1206,7 @@ const agentHomeHTML = `<!doctype html>
 				if(serverVal)serverVal.textContent=esc(j.server);
 				if(emailInfo){
 					var ems=j.email||{};
-					if(ems.enabled){emailInfo.innerHTML='Mail host <code>'+esc(ems.mailHost)+'</code> · TLS '+esc(ems.tlsReady?(ems.tlsCertSource||'ready'):'unavailable')+' · DKIM '+esc(ems.dkimReady?(ems.dkimSelector||'ready'):'unavailable')+' · SMTP <code>'+esc(ems.submissionAddr)+'</code> · IMAP <code>'+esc(ems.imapAddr)+'</code> · Max '+esc(ems.maxMessageBytes)+' bytes / '+esc(ems.maxRecipients)+' recipients per email · Storage unlimited · Accounts '+esc(ems.accountCount)+' · Messages '+esc(ems.messageCount);}else{emailInfo.textContent='Email is not enabled on the server.';}
+					if(ems.enabled){var storageText=(ems.storageUsedText||'0B')+' / '+(ems.storageUnlimited?'unlimited':(ems.storageLimitText||'0B'));emailInfo.innerHTML='Mail host <code>'+esc(ems.mailHost)+'</code> · TLS '+esc(ems.tlsReady?(ems.tlsCertSource||'ready'):'unavailable')+' · DKIM '+esc(ems.dkimReady?(ems.dkimSelector||'ready'):'unavailable')+' · SMTP <code>'+esc(ems.submissionAddr)+'</code> / SMTPS <code>'+esc(ems.submissionTlsAddr)+'</code> · IMAP <code>'+esc(ems.imapAddr)+'</code> / IMAPS <code>'+esc(ems.imapTlsAddr)+'</code> · Max '+esc(ems.maxMessageBytes)+' bytes / '+esc(ems.maxRecipients)+' recipients per email · Storage '+esc(storageText)+' · Accounts '+esc(ems.accountCount)+' · Messages '+esc(ems.messageCount);}else{emailInfo.textContent='Email is not enabled on the server.';}
 				}
 				if(emailDNS){
 					var emd=j.email||{};
@@ -1088,11 +1260,25 @@ const agentControlsHTML = `<!doctype html>
 		.btn[disabled]{opacity:.4;cursor:not-allowed}
 		.btn.sm{font-size:12px;padding:5px 10px}
 		.btn.warn{background:var(--redDim);border-color:var(--redBorder);color:var(--red)}
+		.select{font-family:var(--font);font-size:13px;padding:7px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text)}
 		.row{margin-bottom:8px}
 		.muted{color:var(--textMuted)}
 		.flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 		.flash{padding:10px 14px;border-radius:var(--radius);font-size:13px;margin-bottom:16px;background:var(--greenDim);border:1px solid var(--greenBorder);color:var(--green)}
 		pre{font-family:var(--mono);font-size:11px;white-space:pre-wrap;margin:8px 0 0;padding:10px;border-radius:8px;background:var(--bg);border:1px solid var(--border);max-height:200px;overflow:auto}
+		.logCard{margin-top:24px}
+		.logToolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-bottom:10px}
+		.logToolbarLeft{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.logList{display:grid;gap:8px;max-height:520px;overflow:auto}
+		.logEmpty{padding:18px;border:1px dashed var(--border);border-radius:var(--radius);text-align:center;color:var(--textMuted)}
+		.logRow{display:grid;grid-template-columns:150px 72px 120px minmax(0,1fr);gap:10px;align-items:start;padding:10px;border-radius:10px;background:var(--bg);border:1px solid var(--border)}
+		.logTime,.logLevel,.logSource,.logMessage{font-family:var(--mono);font-size:12px;min-width:0;overflow-wrap:anywhere}
+		.logLevel{font-weight:700}
+		.logLevel.info{color:var(--accent)}
+		.logLevel.warn{color:#d29922}
+		.logLevel.error{color:var(--red)}
+		.logLevel.debug,.logLevel.trace{color:var(--textMuted)}
+		@media(max-width:860px){.logRow{grid-template-columns:1fr}}
 	</style>
 </head>
 <body>
@@ -1157,9 +1343,63 @@ const agentControlsHTML = `<!doctype html>
 				</div>
 			</div>
 		</div>
+
+		<div class="secHead"><h2>Logs</h2></div>
+		<div class="card logCard">
+			<div class="logToolbar">
+				<div class="logToolbarLeft">
+					<label class="muted" for="logLevel">Log level</label>
+					<select id="logLevel" class="select">
+						<option value="all">All</option>
+						<option value="warning">Warnings</option>
+						<option value="error">Errors</option>
+					</select>
+					<button class="btn sm" id="refreshLogsBtn">Refresh</button>
+				</div>
+				<div id="logStats" class="muted">—</div>
+			</div>
+			<div id="logState" class="muted" style="margin-bottom:10px">Loading logs…</div>
+			<div id="logList" class="logList"><div class="logEmpty">No logs yet.</div></div>
+		</div>
 	</div>
 
 	<script>
+	function esc(v){return String(v||'').replace(/[&<>"']/g,function(ch){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];});}
+	function fmtUnix(ts){if(!ts)return '—'; try{return new Date(ts*1000).toLocaleString();}catch(e){return String(ts);}}
+	function logClass(level){level=String(level||'').toLowerCase(); if(level==='warn')return 'warn'; if(level==='error'||level==='fatal')return 'error'; if(level==='debug')return 'debug'; if(level==='trace')return 'trace'; return 'info';}
+	function renderLogs(payload){
+		var list=document.getElementById('logList');
+		var stats=document.getElementById('logStats');
+		if(!list)return;
+		var entries=(payload&&payload.entries)||[];
+		var st=(payload&&payload.stats)||{};
+		if(stats)stats.textContent='All '+(st.all||0)+' · Warnings '+(st.warning||0)+' · Errors '+(st.error||0);
+		if(!entries.length){list.innerHTML='<div class="logEmpty">No matching logs.</div>';return;}
+		list.innerHTML=entries.map(function(entry){
+			var level=String(entry.level||'INFO').toUpperCase();
+			return '<div class="logRow">'
+				+'<div class="logTime">'+esc(fmtUnix(entry.timeUnix))+'</div>'
+				+'<div class="logLevel '+esc(logClass(level))+'">'+esc(level)+'</div>'
+				+'<div class="logSource">'+esc(entry.source||'agent')+'</div>'
+				+'<div class="logMessage">'+esc(entry.message||'')+'</div>'
+				+'</div>';
+		}).join('');
+	}
+	async function refreshLogs(){
+		var levelSel=document.getElementById('logLevel');
+		var state=document.getElementById('logState');
+		var level=levelSel?levelSel.value:'all';
+		if(state)state.textContent='Loading logs…';
+		try{
+			var r=await fetch('/api/logs?level='+encodeURIComponent(level)+'&limit=300',{cache:'no-store'});
+			if(!r.ok){throw new Error(await r.text()||('http '+r.status));}
+			var payload=await r.json();
+			renderLogs(payload);
+			if(state)state.textContent='Showing '+(((payload&&payload.entries)||[]).length)+' log entries.';
+		}catch(e){
+			if(state)state.textContent='Failed to load logs: '+(e&&e.message?e.message:'unknown');
+		}
+	}
 	function setUpd(st){
 		if(!st)return;
 		document.getElementById('availableVersion').textContent=st.availableVersion||'—';
@@ -1212,6 +1452,8 @@ const agentControlsHTML = `<!doctype html>
 	document.getElementById('applyLocalBtn').onclick=applyLocalUpd;
 	document.getElementById('svcRestartBtn').onclick=function(){sysAction('/api/systemd/restart','Restarting…');};
 	document.getElementById('svcStopBtn').onclick=function(){sysAction('/api/systemd/stop','Stopping…');};
+	document.getElementById('refreshLogsBtn').onclick=refreshLogs;
+	document.getElementById('logLevel').onchange=refreshLogs;
 	document.getElementById('procRestart').onclick=async function(){
 		await fetch('/api/process/restart',{method:'POST'});
 		setTimeout(function(){location.reload();},1000);
@@ -1220,7 +1462,7 @@ const agentControlsHTML = `<!doctype html>
 		await fetch('/api/process/exit',{method:'POST'});
 		setTimeout(function(){location.reload();},1000);
 	};
-	refreshUpd();refreshSys();
+	refreshUpd();refreshSys();refreshLogs();setInterval(refreshLogs,2500);
 	</script>
 </body>
 </html>`

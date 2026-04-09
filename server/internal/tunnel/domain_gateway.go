@@ -131,11 +131,64 @@ func (m *domainCertManager) ensureFresh(host string) error {
 		return nil
 	}
 	if m.autocert != nil {
+		// Check the ACME cache before calling GetCertificate.
+		// autocert.GetCertificate will attempt an ACME renewal when the
+		// cached cert is within its internal renewal window (~30 days),
+		// which can hit Let's Encrypt rate limits if a valid cert is
+		// already on disk.  We only proceed when the cached cert is
+		// actually missing or close to expiry according to our own
+		// renewBefore threshold.
+		if !m.acmeCertNeedsRenew(host) {
+			return nil
+		}
 		_, err := m.autocert.GetCertificate(&tls.ClientHelloInfo{ServerName: host})
 		return err
 	}
 	_, err := m.selfSignedCertificate(host)
 	return err
+}
+
+// acmeCertNeedsRenew reads the cert from the ACME cache directly and
+// returns true only when the cert is missing, unparseable, or expires
+// within m.renewBefore.
+func (m *domainCertManager) acmeCertNeedsRenew(host string) bool {
+	if m.autocert == nil || m.autocert.Cache == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	certData, err := m.autocert.Cache.Get(ctx, host)
+	if err != nil {
+		// Cache miss — cert hasn't been issued yet.
+		return true
+	}
+	// The autocert cache entry contains a PEM bundle (private key + cert chain).
+	// Walk PEM blocks looking for the leaf certificate.
+	rest := certData
+	for {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		if blk.Type != "CERTIFICATE" {
+			continue
+		}
+		leaf, err := x509.ParseCertificate(blk.Bytes)
+		if err != nil {
+			return true
+		}
+		if time.Until(leaf.NotAfter) <= m.renewBefore {
+			logging.Global().Infof(logging.CatEncryption,
+				"cached ACME cert for %s expires in %s (threshold %s); will renew",
+				host, time.Until(leaf.NotAfter).Round(time.Minute), m.renewBefore)
+			return true
+		}
+		// Cert is still valid and not close to expiry.
+		return false
+	}
+	// No CERTIFICATE block found — treat as missing.
+	return true
 }
 
 func (m *domainCertManager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -144,7 +197,14 @@ func (m *domainCertManager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Cer
 	}
 	host := normalizeHostname(hello.ServerName)
 	if host == "" {
-		return nil, fmt.Errorf("managed domain requires SNI server name")
+		host = m.defaultManagedHost()
+		if host == "" {
+			return nil, fmt.Errorf("managed domain requires SNI server name")
+		}
+		clone := *hello
+		clone.ServerName = host
+		hello = &clone
+		logging.Global().Warnf(logging.CatEncryption, "managed domain client missing SNI; using fallback host=%s", host)
 	}
 	if !m.server.isManagedDomain(host) {
 		return nil, fmt.Errorf("managed domain not configured: %s", host)
@@ -157,6 +217,13 @@ func (m *domainCertManager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Cer
 		logging.Global().Errorf(logging.CatEncryption, "automatic certificate fetch failed for %s: %v", host, err)
 	}
 	return m.selfSignedCertificate(host)
+}
+
+func (m *domainCertManager) defaultManagedHost() string {
+	if m == nil || m.server == nil || m.server.domains == nil {
+		return ""
+	}
+	return m.server.domains.defaultHTTPSHost()
 }
 
 func (m *domainCertManager) selfSignedCertificate(host string) (*tls.Certificate, error) {
@@ -204,31 +271,32 @@ func certNeedsRenew(certFile string, renewBefore time.Duration) (bool, error) {
 }
 
 func (s *Server) isManagedDomain(host string) bool {
-	_, ok := s.managedRoute(host)
+	if s == nil || s.domains == nil {
+		return false
+	}
+	_, ok := s.domains.lookupHTTPS(host)
 	return ok
 }
 
 func (s *Server) managedDomains() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]string, 0, len(s.cfg.Routes))
-	for _, rt := range s.cfg.Routes {
-		if rt.IsEnabled() && rt.IsDomainEnabled() {
-			host := normalizeHostname(rt.Domain)
-			if host != "" {
-				out = append(out, host)
-			}
-		}
+	if s == nil || s.domains == nil {
+		return nil
 	}
-	return out
+	return s.domains.httpsHosts()
 }
 
 func (s *Server) managedRoute(host string) (RouteConfig, bool) {
-	host = normalizeHostname(host)
+	if s == nil || s.domains == nil {
+		return RouteConfig{}, false
+	}
+	entry, ok := s.domains.lookupHTTPS(host)
+	if !ok {
+		return RouteConfig{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, rt := range s.cfg.Routes {
-		if rt.IsEnabled() && rt.IsDomainEnabled() && normalizeHostname(rt.Domain) == host {
+		if rt.IsEnabled() && strings.TrimSpace(rt.Name) == entry.HTTPSRouteName {
 			return rt, true
 		}
 	}
@@ -258,7 +326,11 @@ func (s *Server) domainHTTPSAuthority(host string) string {
 func (s *Server) domainRedirectHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := normalizeRequestHost(r.Host)
-		if _, ok := s.managedRoute(host); !ok {
+		if s == nil || s.domains == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if _, ok := s.domains.lookupHTTPS(host); !ok {
 			logging.Global().Warnf(logging.CatDashboard, "managed domain redirect miss host=%s raw_host=%s", host, r.Host)
 			http.NotFound(w, r)
 			return
@@ -268,16 +340,40 @@ func (s *Server) domainRedirectHandler() http.Handler {
 	})
 }
 
+func (s *Server) emailACMEProxyHandler(fallback http.Handler) http.Handler {
+	if fallback == nil {
+		fallback = http.NotFoundHandler()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := normalizeRequestHost(r.Host)
+		if !strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") || s == nil || s.domains == nil {
+			fallback.ServeHTTP(w, r)
+			return
+		}
+		entry, ok := s.domains.lookup(host)
+		if !ok || entry.HTTPChallengeRoute == "" {
+			fallback.ServeHTTP(w, r)
+			return
+		}
+		proxy := s.domainProxy(entry.HTTPChallengeRoute, host)
+		proxy.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) domainProxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := normalizeRequestHost(r.Host)
-		rt, ok := s.managedRoute(host)
+		if s == nil || s.domains == nil {
+			http.NotFound(w, r)
+			return
+		}
+		entry, ok := s.domains.lookupHTTPS(host)
 		if !ok {
 			logging.Global().Warnf(logging.CatDashboard, "managed domain proxy miss host=%s raw_host=%s", host, r.Host)
 			http.NotFound(w, r)
 			return
 		}
-		proxy := s.domainProxy(rt.Name, host)
+		proxy := s.domainProxy(entry.HTTPSRouteName, host)
 		proxy.ServeHTTP(w, r)
 	})
 }
@@ -352,7 +448,18 @@ func (s *Server) startDomainGateway() error {
 	}
 	s.domainHTTPSLn = httpsLn
 
+	// Pre-load a default self-signed certificate so the TLS config always
+	// has something to serve when clients connect without SNI.
+	var defaultCerts []tls.Certificate
+	if defaultHost := s.domains.defaultHTTPSHost(); defaultHost != "" {
+		if cert, err := s.domainCerts.selfSignedCertificate(defaultHost); err == nil {
+			defaultCerts = []tls.Certificate{*cert}
+			logging.Global().Infof(logging.CatEncryption, "pre-loaded default TLS certificate for %s", defaultHost)
+		}
+	}
+
 	tlsConfig := &tls.Config{
+		Certificates:   defaultCerts,
 		MinVersion:     tls.VersionTLS12,
 		GetCertificate: s.domainCerts.GetCertificate,
 		NextProtos:     []string{"h2", "http/1.1"},
@@ -380,7 +487,7 @@ func (s *Server) startDomainGateway() error {
 		}
 		s.domainHTTPLn = httpLn
 		s.domainHTTPServer = &http.Server{
-			Handler:           s.domainCerts.HTTPHandler(s.domainRedirectHandler()),
+			Handler:           s.emailACMEProxyHandler(s.domainCerts.HTTPHandler(s.domainRedirectHandler())),
 			ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout:       30 * time.Second,
 		}
@@ -406,14 +513,9 @@ func (s *Server) startDomainGateway() error {
 func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, error) {
 	s.mu.RLock()
 	agent := s.agentTCP
-	enabled := false
-	for _, rt := range s.cfg.Routes {
-		if rt.Name == routeName {
-			enabled = rt.IsEnabled()
-			break
-		}
-	}
 	s.mu.RUnlock()
+	rc, ok := s.getRouteConfig(routeName)
+	enabled := ok && rc.enabled
 	if !enabled {
 		return nil, fmt.Errorf("route %s is disabled", routeName)
 	}

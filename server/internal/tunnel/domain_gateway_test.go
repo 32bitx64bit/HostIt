@@ -2,9 +2,16 @@ package tunnel
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +20,49 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"hostit/shared/emailcfg"
+
+	"golang.org/x/crypto/acme/autocert"
 )
+
+// memCache is a trivial in-memory autocert.Cache for testing.
+type memCache struct {
+	data map[string][]byte
+}
+
+func (c *memCache) Get(_ context.Context, key string) ([]byte, error) {
+	v, ok := c.data[key]
+	if !ok {
+		return nil, autocert.ErrCacheMiss
+	}
+	return v, nil
+}
+func (c *memCache) Put(_ context.Context, key string, data []byte) error {
+	c.data[key] = data
+	return nil
+}
+func (c *memCache) Delete(_ context.Context, key string) error {
+	delete(c.data, key)
+	return nil
+}
+
+func selfSignedPEM(host string, notAfter time.Time) []byte {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: host},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     notAfter,
+		DNSNames:     []string{host},
+	}
+	certDER, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	var buf []byte
+	buf = append(buf, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})...)
+	buf = append(buf, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})...)
+	return buf
+}
 
 func freeTCPAddr(t *testing.T) string {
 	t.Helper()
@@ -116,6 +165,156 @@ func TestManagedDomainHTTPSProxy(t *testing.T) {
 	}
 	if !strings.Contains(got, "path=/hello") {
 		t.Fatalf("response %q missing forwarded path", got)
+	}
+}
+
+func TestManagedDomainCertificateFallsBackWithoutSNIForSingleDomain(t *testing.T) {
+	domainEnabled := true
+	srv := NewServer(ServerConfig{
+		DomainManagerEnabled: true,
+		DomainHTTPSAddr:      freeTCPAddr(t),
+		DomainCertDir:        t.TempDir(),
+		Routes: []RouteConfig{{
+			Name:          "web",
+			Proto:         "tcp",
+			Domain:        "app.example.test",
+			DomainEnabled: &domainEnabled,
+		}},
+	})
+	mgr := newDomainCertManager(srv)
+	cert, err := mgr.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("GetCertificate(no SNI) error = %v", err)
+	}
+	if cert == nil {
+		t.Fatal("GetCertificate(no SNI) returned nil cert")
+	}
+	if cert.Leaf == nil {
+		t.Fatal("GetCertificate(no SNI) returned cert without parsed leaf")
+	}
+	if got := cert.Leaf.Subject.CommonName; got != "app.example.test" {
+		t.Fatalf("cert common name = %q, want app.example.test", got)
+	}
+}
+
+func TestManagedDomainCertificateWithoutSNIUsesFirstSortedDomain(t *testing.T) {
+	domainEnabled := true
+	srv := NewServer(ServerConfig{
+		DomainManagerEnabled: true,
+		DomainHTTPSAddr:      freeTCPAddr(t),
+		DomainCertDir:        t.TempDir(),
+		Routes: []RouteConfig{
+			{Name: "web-1", Proto: "tcp", Domain: "app1.example.test", DomainEnabled: &domainEnabled},
+			{Name: "web-2", Proto: "tcp", Domain: "app2.example.test", DomainEnabled: &domainEnabled},
+		},
+	})
+	mgr := newDomainCertManager(srv)
+	cert, err := mgr.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("GetCertificate(no SNI) error = %v, want nil", err)
+	}
+	if cert == nil {
+		t.Fatal("GetCertificate(no SNI) returned nil cert")
+	}
+	if cert.Leaf == nil {
+		t.Fatal("GetCertificate(no SNI) returned cert without parsed leaf")
+	}
+	if got := cert.Leaf.Subject.CommonName; got != "app1.example.test" {
+		t.Fatalf("cert common name = %q, want app1.example.test (first sorted domain)", got)
+	}
+}
+
+func TestAcmeCertNeedsRenew_SkipsWhenCertIsValid(t *testing.T) {
+	cache := &memCache{data: map[string][]byte{
+		"app.example.test": selfSignedPEM("app.example.test", time.Now().Add(60*24*time.Hour)),
+	}}
+	mgr := &domainCertManager{
+		renewBefore: 7 * 24 * time.Hour,
+		autocert: &autocert.Manager{
+			Cache: cache,
+		},
+	}
+	if mgr.acmeCertNeedsRenew("app.example.test") {
+		t.Fatal("acmeCertNeedsRenew = true for cert valid 60 days, want false")
+	}
+}
+
+func TestAcmeCertNeedsRenew_RenewsWhenCertExpiringSoon(t *testing.T) {
+	cache := &memCache{data: map[string][]byte{
+		"app.example.test": selfSignedPEM("app.example.test", time.Now().Add(3*24*time.Hour)),
+	}}
+	mgr := &domainCertManager{
+		renewBefore: 7 * 24 * time.Hour,
+		autocert: &autocert.Manager{
+			Cache: cache,
+		},
+	}
+	if !mgr.acmeCertNeedsRenew("app.example.test") {
+		t.Fatal("acmeCertNeedsRenew = false for cert expiring in 3 days (threshold 7), want true")
+	}
+}
+
+func TestAcmeCertNeedsRenew_RenewsWhenCacheMiss(t *testing.T) {
+	cache := &memCache{data: map[string][]byte{}}
+	mgr := &domainCertManager{
+		renewBefore: 7 * 24 * time.Hour,
+		autocert: &autocert.Manager{
+			Cache: cache,
+		},
+	}
+	if !mgr.acmeCertNeedsRenew("app.example.test") {
+		t.Fatal("acmeCertNeedsRenew = false for missing cert, want true")
+	}
+}
+
+func TestManagedDomainEnsureFreshSkipsValidACMECert(t *testing.T) {
+	cache := &memCache{data: map[string][]byte{
+		"app.example.test": selfSignedPEM("app.example.test", time.Now().Add(60*24*time.Hour)),
+	}}
+	domainEnabled := true
+	srv := NewServer(ServerConfig{
+		DomainManagerEnabled: true,
+		DomainHTTPSAddr:      freeTCPAddr(t),
+		DomainCertDir:        t.TempDir(),
+		DomainAutoTLS:        true,
+		DomainACMEEmail:      "admin@example.test",
+		DomainHTTPAddr:       freeTCPAddr(t),
+		DomainBase:           "example.test",
+		Routes: []RouteConfig{{
+			Name:          "web",
+			Proto:         "tcp",
+			Domain:        "app.example.test",
+			DomainEnabled: &domainEnabled,
+		}},
+	})
+	mgr := newDomainCertManager(srv)
+	mgr.autocert.Cache = cache
+
+	if err := mgr.ensureFresh("app.example.test"); err != nil {
+		t.Fatalf("ensureFresh() = %v, want nil (should skip renewal for valid cached cert)", err)
+	}
+}
+
+func TestManagedDomainSnapshotIncludesEmailACMEHost(t *testing.T) {
+	snap := buildManagedDomainSnapshot(ServerConfig{
+		DomainManagerEnabled: true,
+		Email: emailcfg.Config{
+			Enabled:   true,
+			Domain:    "example.test",
+			MailHost:  "mail.example.test",
+			AutoTLS:   true,
+			ACMEEmail: "admin@example.test",
+		},
+	})
+	entry, ok := snap.entries["mail.example.test"]
+	if !ok {
+		t.Fatal("managed domain snapshot missing email mail host")
+	}
+	if entry.HTTPChallengeRoute != internalEmailACMEHTTPRouteName {
+		t.Fatalf("HTTPChallengeRoute = %q, want %q", entry.HTTPChallengeRoute, internalEmailACMEHTTPRouteName)
+	}
+	if entry.HTTPSRouteName != "" {
+		t.Fatalf("HTTPSRouteName = %q, want empty for email ACME host", entry.HTTPSRouteName)
 	}
 }
 

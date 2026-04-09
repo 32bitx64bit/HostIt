@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"hostit/shared/emailcfg"
 	"hostit/shared/crypto"
+	"hostit/shared/emailcfg"
 	"hostit/shared/logging"
 	"hostit/shared/netutil"
 	"hostit/shared/protocol"
@@ -25,6 +25,7 @@ import (
 type Hooks struct {
 	OnConnected    func()
 	OnEmailConfig  func(cfg emailcfg.Config)
+	OnEmailProbe   func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
 	OnRoutes       func(routes []RemoteRoute)
 	OnDisconnected func(err error)
 	OnError        func(err error)
@@ -280,6 +281,39 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 			continue
 		}
 
+		if pkt.Type == protocol.TypeEmailProbeRequest {
+			var req protocol.EmailProbeRequest
+			if err := json.Unmarshal(pkt.Payload, &req); err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to parse email probe request: %v", err)
+				continue
+			}
+			go func(req protocol.EmailProbeRequest) {
+				res := protocol.EmailProbeResult{}
+				if a.hooks == nil || a.hooks.OnEmailProbe == nil {
+					res.Error = "email probe handler not configured"
+				} else {
+					probeRes, err := a.hooks.OnEmailProbe(ctx, req)
+					res = probeRes
+					if err != nil && res.Error == "" {
+						res.Error = err.Error()
+					}
+				}
+				payload, err := json.Marshal(res)
+				if err != nil {
+					logging.Global().Errorf(logging.CatTCP, "failed to marshal email probe result: %v", err)
+					return
+				}
+				a.controlWriteMu.Lock()
+				defer a.controlWriteMu.Unlock()
+				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeEmailProbeResult, Payload: payload}); err != nil {
+					logging.Global().Errorf(logging.CatTCP, "failed to send email probe result: %v", err)
+				}
+				conn.SetWriteDeadline(time.Time{})
+			}(req)
+			continue
+		}
+
 		if pkt.Type == protocol.TypeHello {
 			var (
 				routes map[string]RemoteRoute
@@ -447,6 +481,57 @@ func dialLocalTCP(localAddr string) (net.Conn, error) {
 	}
 
 	return nil, lastErr
+}
+
+func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (net.Conn, error) {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	resolved, err := net.ResolveTCPAddr("tcp", remoteAddr)
+	if err != nil || resolved == nil {
+		return nil, fmt.Errorf("resolve outbound SMTP target %q: %w", remoteAddr, err)
+	}
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
+	var dataConn net.Conn
+	if cfg.DisableTLS {
+		dataConn, err = dialer.DialContext(ctx, "tcp", cfg.DataAddr())
+	} else {
+		tlsConfig := &tls.Config{InsecureSkipVerify: true}
+		dataConn, err = tls.DialWithDialer(dialer, "tcp", cfg.DataAddr(), tlsConfig)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("dial data server %s: %w", cfg.DataAddr(), err)
+	}
+	netutil.SetTCPKeepAlive(dataConn, 15*time.Second)
+
+	if err := dataConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		dataConn.Close()
+		return nil, err
+	}
+	if err := crypto.AuthenticateClient(dataConn, cfg.Token); err != nil {
+		dataConn.Close()
+		return nil, fmt.Errorf("data auth failed: %w", err)
+	}
+
+	routeBytes := []byte(protocol.RouteMailOutboundTCP)
+	targetBytes := []byte(resolved.String())
+	if len(targetBytes) > 255 {
+		dataConn.Close()
+		return nil, fmt.Errorf("outbound SMTP target %q is too long", resolved.String())
+	}
+	buf := make([]byte, 0, 1+len(routeBytes)+1+len(targetBytes))
+	buf = append(buf, byte(len(routeBytes)))
+	buf = append(buf, routeBytes...)
+	buf = append(buf, byte(len(targetBytes)))
+	buf = append(buf, targetBytes...)
+	if _, err := dataConn.Write(buf); err != nil {
+		dataConn.Close()
+		return nil, fmt.Errorf("write outbound SMTP target: %w", err)
+	}
+	if err := dataConn.SetDeadline(time.Time{}); err != nil {
+		dataConn.Close()
+		return nil, err
+	}
+	return dataConn, nil
 }
 
 type agentUDPSession struct {

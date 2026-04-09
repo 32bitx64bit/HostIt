@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"hostit/shared/emailcfg"
 	sharedcrypto "hostit/shared/crypto"
+	"hostit/shared/emailcfg"
 	"hostit/shared/protocol"
 )
 
@@ -180,7 +180,7 @@ func TestAgentReceivesEmailConfigFromHello(t *testing.T) {
 		Domain:         "example.com",
 		MailHost:       "mail.example.com",
 		SubmissionAddr: "127.0.0.1:587",
-		IMAPAddr:       "127.0.0.1:993",
+		IMAPAddr:       "127.0.0.1:143",
 		Accounts: []emailcfg.Account{{
 			Username:    "admin",
 			PasswordSet: true,
@@ -498,5 +498,56 @@ func TestAgentTCPConnectRetriesLocalDial(t *testing.T) {
 	}
 	if got := string(buf); got != "ack:hello" {
 		t.Fatalf("TCP response = %q, want %q", got, "ack:hello")
+	}
+}
+
+func TestDialMailOutboundTCPUsesReservedRelayRoute(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := startFakeTunnelServer(t, "testtoken")
+	defer server.close()
+
+	connCh := make(chan net.Conn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := DialMailOutboundTCP(ctx, Config{
+			Server:     server.serverAddr(),
+			Token:      "testtoken",
+			DisableTLS: true,
+		}, "127.0.0.1:25")
+		if err != nil {
+			errCh <- err
+			return
+		}
+		connCh <- conn
+	}()
+
+	dataConn, routeName, clientID := server.acceptDataConn(t)
+	if routeName != protocol.RouteMailOutboundTCP {
+		t.Fatalf("route = %q, want %q", routeName, protocol.RouteMailOutboundTCP)
+	}
+	if clientID != "127.0.0.1:25" {
+		t.Fatalf("clientID = %q, want %q", clientID, "127.0.0.1:25")
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case conn := <-connCh:
+		defer conn.Close()
+		defer dataConn.Close()
+		if _, err := dataConn.Write([]byte("220 test\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, len("220 test\r\n"))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(buf); got != "220 test\r\n" {
+			t.Fatalf("banner = %q, want %q", got, "220 test\\r\\n")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for outbound relay dial")
 	}
 }

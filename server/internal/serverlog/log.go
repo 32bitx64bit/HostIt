@@ -10,6 +10,7 @@ var (
 	Log *logging.Logger
 
 	Dashboard *logging.DashboardHook
+	UILogs    *UILogBuffer
 )
 
 func Init() {
@@ -26,7 +27,9 @@ func Init() {
 	Log.SetLevelFromEnv()
 
 	Dashboard = logging.NewDashboardHook(500, logging.LevelInfo)
+	UILogs = NewUILogBuffer(2000)
 	Log.AddHook(Dashboard.Hook())
+	Log.AddHook(AddStructuredEntry)
 
 	logging.SetGlobal(Log)
 }

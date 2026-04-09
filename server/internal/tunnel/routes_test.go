@@ -1,6 +1,11 @@
 package tunnel
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"hostit/shared/emailcfg"
+)
 
 func TestNormalizeRoutes_GeneratesUniqueNamesForBlank(t *testing.T) {
 	cfg := ServerConfig{Routes: []RouteConfig{
@@ -39,4 +44,69 @@ func TestNormalizeRoutes_DedupesExplicitDuplicateNames(t *testing.T) {
 			t.Fatalf("route%d name=%q, want %q (all=%v)", i, got[i], want[i], got)
 		}
 	}
+}
+
+func TestServerConfigValidate_RejectsInboundSMTPPort25Conflict(t *testing.T) {
+	t.Parallel()
+
+	cfg := ServerConfig{
+		ControlAddr: ":7000",
+		DataAddr:    ":7001",
+		Token:       "testtoken",
+		DisableTLS:  true,
+		Email: emailcfg.Config{
+			Enabled:         true,
+			Domain:          "example.com",
+			MailHost:        "mail.example.com",
+			InboundSMTP:     true,
+			InboundSMTPAddr: "0.0.0.0:25",
+		},
+		Routes: []RouteConfig{{Name: "app", Proto: "tcp", PublicAddr: ":25"}},
+	}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want conflict on public TCP 25")
+	}
+	if got := err.Error(); got == "" || !containsAll(got, "conflicts", "route \"app\"") {
+		t.Fatalf("Validate() error = %q, want inbound SMTP conflict", got)
+	}
+}
+
+func TestServerConfigValidate_RejectsSubmissionPort587Conflict(t *testing.T) {
+	t.Parallel()
+
+	cfg := ServerConfig{
+		ControlAddr: ":7000",
+		DataAddr:    ":7001",
+		Token:       "testtoken",
+		DisableTLS:  true,
+		Email: emailcfg.Config{
+			Enabled:           true,
+			Domain:            "example.com",
+			MailHost:          "mail.example.com",
+			SubmissionAddr:    "127.0.0.1:1587",
+			SubmissionTLSAddr: "127.0.0.1:1465",
+			IMAPAddr:          "127.0.0.1:1143",
+			IMAPTLSAddr:       "127.0.0.1:1993",
+		},
+		Routes: []RouteConfig{{Name: "app", Proto: "tcp", PublicAddr: ":587"}},
+	}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want conflict on public TCP 587")
+	}
+	if got := err.Error(); got == "" || !containsAll(got, "hostit_mail_submission", "route \"app\"") {
+		t.Fatalf("Validate() error = %q, want synthesized submission conflict", got)
+	}
+}
+
+func containsAll(s string, parts ...string) bool {
+	for _, part := range parts {
+		if !strings.Contains(s, part) {
+			return false
+		}
+	}
+	return true
 }
