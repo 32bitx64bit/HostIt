@@ -863,6 +863,158 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	mux.HandleFunc("/save", saveHandler)
 	mux.HandleFunc("/config/save", saveHandler)
 
+	// ── Mail viewer API ─────────────────────────────────────────────
+	tplMail := template.Must(template.New("mail").Parse(agentMailHTML))
+
+	mux.HandleFunc("/api/mail/accounts", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if mailSvc == nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]mail.WebAccount{})
+			return
+		}
+		accts, err := mailSvc.ListAccounts()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if accts == nil {
+			accts = []mail.WebAccount{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(accts)
+	})
+
+	mux.HandleFunc("/api/mail/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if mailSvc == nil {
+			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var req struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		addr, err := mailSvc.Authenticate(req.Username, req.Password)
+		if err != nil {
+			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"username": req.Username, "address": addr})
+	})
+
+	mux.HandleFunc("/api/mail/inbox", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if mailSvc == nil {
+			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var req struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
+			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			return
+		}
+		msgs, err := mailSvc.ListInbox(req.Username)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if msgs == nil {
+			msgs = []mail.WebMessage{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(msgs)
+	})
+
+	mux.HandleFunc("/api/mail/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if mailSvc == nil {
+			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var req struct {
+			Username  string `json:"username"`
+			Password  string `json:"password"`
+			MessageID int64  `json:"messageId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
+			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			return
+		}
+		msg, err := mailSvc.GetMessage(req.Username, req.MessageID)
+		if err != nil {
+			http.Error(w, "message not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(msg)
+	})
+
+	mux.HandleFunc("/api/mail/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if mailSvc == nil {
+			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var req struct {
+			Username  string `json:"username"`
+			Password  string `json:"password"`
+			MessageID int64  `json:"messageId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
+			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			return
+		}
+		if err := mailSvc.DeleteMessage(req.Username, req.MessageID); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("/mail", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = tplMail.Execute(w, nil)
+	})
+
 	h := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		<-ctx.Done()
@@ -977,6 +1129,7 @@ const agentHomeHTML = `<!doctype html>
 			<div class="nav">
 				<a class="active" href="/">Home</a>
 				<a href="/controls">Controls</a>
+				<a href="/mail">Mail</a>
 			</div>
 		</div>
 
@@ -1291,6 +1444,7 @@ const agentControlsHTML = `<!doctype html>
 			<div class="nav">
 				<a href="/">Home</a>
 				<a class="active" href="/controls">Controls</a>
+				<a href="/mail">Mail</a>
 			</div>
 		</div>
 
@@ -1463,6 +1617,299 @@ const agentControlsHTML = `<!doctype html>
 		setTimeout(function(){location.reload();},1000);
 	};
 	refreshUpd();refreshSys();refreshLogs();setInterval(refreshLogs,2500);
+	</script>
+</body>
+</html>`
+
+const agentMailHTML = `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Tunnel Agent – Mail</title>
+	<style>
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--orange:#d29922;--orangeDim:rgba(210,153,34,.12);--orangeBorder:rgba(210,153,34,.4);--purple:#a371f7;--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--redDim:rgba(248,81,73,.08);--orangeDim:rgba(210,153,34,.08);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 60px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0}
+		.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}
+		.nav a{font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);transition:all .15s;text-decoration:none}
+		.nav a:hover{background:var(--surfaceHover);border-color:var(--borderHover);text-decoration:none}
+		.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;transition:border-color .15s}
+		.secHead{margin:20px 0 10px}
+		.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		label{font-size:12px;font-weight:600;display:block;margin:0 0 4px;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		select,input[type="password"]{width:100%;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:var(--font);font-size:14px;transition:border-color .15s}
+		select:focus,input:focus{outline:none;border-color:var(--accent)}
+		.btn{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;transition:all .15s}
+		.btn:hover{background:var(--surfaceHover);border-color:var(--borderHover)}
+		.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.btn.warn{background:var(--redDim);border-color:var(--redBorder);color:var(--red)}
+		.btn.sm{font-size:12px;padding:5px 10px}
+		.flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.muted{color:var(--textMuted)}
+		.errBox{font-size:12px;padding:8px 10px;margin-top:8px;border-radius:8px;background:var(--redDim);border:1px solid var(--redBorder);color:var(--red);word-break:break-all}
+
+		/* login form */
+		.loginForm{max-width:380px}
+		.loginForm .field{margin-bottom:12px}
+
+		/* inbox table */
+		table.inbox{width:100%;border-collapse:collapse;font-size:13px}
+		table.inbox th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted);padding:6px 8px;border-bottom:1px solid var(--border)}
+		table.inbox td{padding:8px;border-bottom:1px solid var(--border);vertical-align:top}
+		table.inbox tr{cursor:pointer;transition:background .12s}
+		table.inbox tbody tr:hover{background:var(--surfaceHover)}
+		table.inbox .from{font-weight:500;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+		table.inbox .subj{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+		table.inbox .date{white-space:nowrap;font-size:12px;color:var(--textMuted)}
+
+		/* message view */
+		.msgView{display:none}
+		.msgMeta{font-size:13px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+		.msgMeta span{display:block;margin-bottom:2px}
+		.msgMeta .lbl{font-weight:600;color:var(--textMuted);display:inline;margin-right:6px;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+		.msgBody{font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;max-height:600px;overflow:auto}
+		.msgActions{margin-top:12px;display:flex;gap:8px}
+
+		.noMail{text-align:center;padding:40px 20px;color:var(--textMuted);font-size:14px}
+		.hidden{display:none}
+	</style>
+</head>
+<body>
+	<div class="wrap">
+		<div class="topbar">
+			<div>
+				<h1>Tunnel Agent</h1>
+				<div class="subtitle">Email Viewer</div>
+			</div>
+			<div class="nav">
+				<a href="/">Home</a>
+				<a href="/controls">Controls</a>
+				<a class="active" href="/mail">Mail</a>
+			</div>
+		</div>
+
+		<!-- Login -->
+		<div id="loginSection">
+			<div class="secHead"><h2>Sign In</h2></div>
+			<div class="card loginForm">
+				<div class="field">
+					<label for="acctSelect">Account</label>
+					<select id="acctSelect"><option value="">Loading…</option></select>
+				</div>
+				<div class="field">
+					<label for="passInput">Password</label>
+					<input type="password" id="passInput" placeholder="Enter password" />
+				</div>
+				<div class="flex" style="margin-top:14px">
+					<button class="btn primary" id="loginBtn">Sign In</button>
+				</div>
+				<div id="loginErr" class="errBox hidden"></div>
+			</div>
+		</div>
+
+		<!-- Inbox -->
+		<div id="inboxSection" class="hidden">
+			<div class="secHead" style="display:flex;align-items:center;justify-content:space-between">
+				<h2 id="inboxTitle">Inbox</h2>
+				<div class="flex">
+					<button class="btn sm" id="refreshBtn">Refresh</button>
+					<button class="btn sm" id="logoutBtn">Sign Out</button>
+				</div>
+			</div>
+			<div class="card" style="padding:0;overflow:auto">
+				<table class="inbox">
+					<thead><tr><th>From</th><th>Subject</th><th>Date</th></tr></thead>
+					<tbody id="inboxBody"></tbody>
+				</table>
+				<div id="noMessages" class="noMail hidden">No messages</div>
+			</div>
+		</div>
+
+		<!-- Message view -->
+		<div id="msgSection" class="hidden">
+			<div class="secHead" style="display:flex;align-items:center;justify-content:space-between">
+				<h2>Message</h2>
+				<button class="btn sm" id="backBtn">&larr; Back to Inbox</button>
+			</div>
+			<div class="card">
+				<div class="msgMeta">
+					<span><span class="lbl">From</span><span id="msgFrom"></span></span>
+					<span><span class="lbl">To</span><span id="msgTo"></span></span>
+					<span><span class="lbl">Subject</span><span id="msgSubject"></span></span>
+					<span><span class="lbl">Date</span><span id="msgDate"></span></span>
+				</div>
+				<div class="msgBody" id="msgBody"></div>
+				<div class="msgActions">
+					<button class="btn warn sm" id="deleteBtn">Delete</button>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<script>
+	(function(){
+		var creds = null; // {username, password}
+		var currentAddress = '';
+
+		var loginSection  = document.getElementById('loginSection');
+		var inboxSection  = document.getElementById('inboxSection');
+		var msgSection    = document.getElementById('msgSection');
+		var acctSelect    = document.getElementById('acctSelect');
+		var passInput     = document.getElementById('passInput');
+		var loginBtn      = document.getElementById('loginBtn');
+		var loginErr      = document.getElementById('loginErr');
+		var inboxTitle    = document.getElementById('inboxTitle');
+		var inboxBody     = document.getElementById('inboxBody');
+		var noMessages    = document.getElementById('noMessages');
+		var refreshBtn    = document.getElementById('refreshBtn');
+		var logoutBtn     = document.getElementById('logoutBtn');
+		var backBtn       = document.getElementById('backBtn');
+		var deleteBtn     = document.getElementById('deleteBtn');
+
+		function show(el){el.classList.remove('hidden')}
+		function hide(el){el.classList.add('hidden')}
+
+		function escHtml(s){
+			var d=document.createElement('div');d.textContent=s;return d.innerHTML;
+		}
+
+		// Load accounts
+		fetch('/api/mail/accounts').then(function(r){return r.json()}).then(function(accts){
+			acctSelect.innerHTML='';
+			if(!accts||accts.length===0){
+				acctSelect.innerHTML='<option value="">No accounts</option>';
+				return;
+			}
+			for(var i=0;i<accts.length;i++){
+				var o=document.createElement('option');
+				o.value=accts[i].username;
+				o.textContent=accts[i].address+' ('+accts[i].username+')';
+				acctSelect.appendChild(o);
+			}
+		}).catch(function(){
+			acctSelect.innerHTML='<option value="">Error loading accounts</option>';
+		});
+
+		loginBtn.onclick=function(){
+			var u=acctSelect.value, p=passInput.value;
+			if(!u){showErr('Select an account');return;}
+			if(!p){showErr('Enter a password');return;}
+			hide(loginErr);
+			fetch('/api/mail/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})})
+			.then(function(r){
+				if(!r.ok) throw new Error('Invalid credentials');
+				return r.json();
+			})
+			.then(function(data){
+				creds={username:u,password:p};
+				currentAddress=data.address||u;
+				hide(loginSection);
+				show(inboxSection);
+				inboxTitle.textContent='Inbox – '+currentAddress;
+				loadInbox();
+			})
+			.catch(function(e){showErr(e.message)});
+		};
+
+		passInput.addEventListener('keydown',function(e){if(e.key==='Enter')loginBtn.click()});
+
+		function showErr(msg){
+			loginErr.textContent=msg;
+			show(loginErr);
+		}
+
+		function loadInbox(){
+			inboxBody.innerHTML='<tr><td colspan="3" style="text-align:center;padding:20px;color:var(--textMuted)">Loading…</td></tr>';
+			hide(noMessages);
+			fetch('/api/mail/inbox',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(creds)})
+			.then(function(r){
+				if(!r.ok) throw new Error('Failed to load inbox');
+				return r.json();
+			})
+			.then(function(msgs){
+				inboxBody.innerHTML='';
+				if(!msgs||msgs.length===0){
+					show(noMessages);
+					return;
+				}
+				hide(noMessages);
+				for(var i=0;i<msgs.length;i++){
+					(function(msg){
+						var tr=document.createElement('tr');
+						tr.innerHTML='<td class="from">'+escHtml(msg.from)+'</td>'
+							+'<td class="subj">'+escHtml(msg.subject||'(no subject)')+'</td>'
+							+'<td class="date">'+escHtml(msg.date)+'</td>';
+						tr.onclick=function(){openMessage(msg.id)};
+						inboxBody.appendChild(tr);
+					})(msgs[i]);
+				}
+			})
+			.catch(function(e){
+				inboxBody.innerHTML='<tr><td colspan="3" class="errBox">'+escHtml(e.message)+'</td></tr>';
+			});
+		}
+
+		function openMessage(id){
+			hide(inboxSection);
+			show(msgSection);
+			document.getElementById('msgFrom').textContent='Loading…';
+			document.getElementById('msgTo').textContent='';
+			document.getElementById('msgSubject').textContent='';
+			document.getElementById('msgDate').textContent='';
+			document.getElementById('msgBody').textContent='';
+
+			fetch('/api/mail/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:creds.username,password:creds.password,messageId:id})})
+			.then(function(r){
+				if(!r.ok) throw new Error('Failed to load message');
+				return r.json();
+			})
+			.then(function(msg){
+				document.getElementById('msgFrom').textContent=msg.from;
+				document.getElementById('msgTo').textContent=msg.to;
+				document.getElementById('msgSubject').textContent=msg.subject||'(no subject)';
+				document.getElementById('msgDate').textContent=msg.date;
+				document.getElementById('msgBody').textContent=msg.body;
+				deleteBtn.onclick=function(){
+					if(!confirm('Delete this message?')) return;
+					fetch('/api/mail/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:creds.username,password:creds.password,messageId:id})})
+					.then(function(r){
+						if(!r.ok) throw new Error('Delete failed');
+						hide(msgSection);
+						show(inboxSection);
+						loadInbox();
+					})
+					.catch(function(e){alert(e.message)});
+				};
+			})
+			.catch(function(e){
+				document.getElementById('msgBody').textContent='Error: '+e.message;
+			});
+		}
+
+		refreshBtn.onclick=loadInbox;
+
+		logoutBtn.onclick=function(){
+			creds=null;
+			currentAddress='';
+			passInput.value='';
+			hide(inboxSection);
+			hide(msgSection);
+			show(loginSection);
+		};
+
+		backBtn.onclick=function(){
+			hide(msgSection);
+			show(inboxSection);
+		};
+	})();
 	</script>
 </body>
 </html>`

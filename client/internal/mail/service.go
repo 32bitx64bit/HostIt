@@ -205,6 +205,135 @@ func (s *Service) Config() emailcfg.Config {
 	return s.cfg
 }
 
+// WebAccount is a minimal account view for the web email viewer.
+type WebAccount struct {
+	Username string `json:"username"`
+	Address  string `json:"address"`
+}
+
+// WebMessage is a message summary for the web email viewer.
+type WebMessage struct {
+	ID      int64     `json:"id"`
+	Mailbox string    `json:"mailbox"`
+	Date    time.Time `json:"date"`
+	From    string    `json:"from"`
+	To      string    `json:"to"`
+	Subject string    `json:"subject"`
+	Flags   []string  `json:"flags,omitempty"`
+	Size    int       `json:"size"`
+}
+
+// WebMessageFull is a full message for the web email viewer.
+type WebMessageFull struct {
+	WebMessage
+	Body string `json:"body"`
+}
+
+// ListAccounts returns all enabled email accounts.
+func (s *Service) ListAccounts() ([]WebAccount, error) {
+	rows, err := s.db.Query(`SELECT username, address FROM accounts WHERE enabled = 1 ORDER BY username`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WebAccount
+	for rows.Next() {
+		var a WebAccount
+		if err := rows.Scan(&a.Username, &a.Address); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// Authenticate validates username/password and returns the account address.
+func (s *Service) Authenticate(username, password string) (string, error) {
+	rec, err := s.authenticate(username, password)
+	if err != nil {
+		return "", err
+	}
+	return rec.Address, nil
+}
+
+// ListInbox returns message summaries for the given username.
+func (s *Service) ListInbox(username string) ([]WebMessage, error) {
+	msgs, err := s.listMessages(username)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WebMessage, 0, len(msgs))
+	for _, m := range msgs {
+		wm := WebMessage{
+			ID:      m.ID,
+			Mailbox: m.Mailbox,
+			Date:    m.InternalDate,
+			Flags:   m.Flags,
+			Size:    len(m.Raw),
+		}
+		if parsed, err := stdmail.ReadMessage(bytes.NewReader(m.Raw)); err == nil {
+			wm.From = parsed.Header.Get("From")
+			wm.To = parsed.Header.Get("To")
+			wm.Subject = parsed.Header.Get("Subject")
+		}
+		out = append(out, wm)
+	}
+	// Reverse so newest first.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
+// GetMessage returns a single full message by ID, only if it belongs to the given username.
+func (s *Service) GetMessage(username string, messageID int64) (*WebMessageFull, error) {
+	var m storedMessage
+	var internal int64
+	var flagsRaw string
+	err := s.db.QueryRow(`SELECT id, username, mailbox, internal_date, flags_json, raw FROM messages WHERE id = ? AND username = ?`, messageID, username).Scan(&m.ID, &m.Username, &m.Mailbox, &internal, &flagsRaw, &m.Raw)
+	if err != nil {
+		return nil, err
+	}
+	m.InternalDate = time.Unix(internal, 0)
+	_ = json.Unmarshal([]byte(flagsRaw), &m.Flags)
+
+	wm := WebMessageFull{
+		WebMessage: WebMessage{
+			ID:      m.ID,
+			Mailbox: m.Mailbox,
+			Date:    m.InternalDate,
+			Flags:   m.Flags,
+			Size:    len(m.Raw),
+		},
+	}
+	if parsed, err := stdmail.ReadMessage(bytes.NewReader(m.Raw)); err == nil {
+		wm.From = parsed.Header.Get("From")
+		wm.To = parsed.Header.Get("To")
+		wm.Subject = parsed.Header.Get("Subject")
+		body, _ := io.ReadAll(parsed.Body)
+		wm.Body = string(body)
+	} else {
+		wm.Body = string(m.Raw)
+	}
+	return &wm, nil
+}
+
+// DeleteMessage deletes a single message by ID, only if it belongs to the given username.
+func (s *Service) DeleteMessage(username string, messageID int64) error {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE id = ? AND username = ?`, messageID, username)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("message not found")
+	}
+	s.mu.Lock()
+	s.refreshStatusLocked("")
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *Service) SetOutboundDialer(dialer func(context.Context, string) (net.Conn, error)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
