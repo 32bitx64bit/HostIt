@@ -292,6 +292,18 @@ func unixOrZero(t time.Time) int64 {
 	return t.Unix()
 }
 
+func isEmailRoute(name string) bool {
+	switch name {
+	case internalEmailInboundRouteName,
+		internalEmailSubmissionRouteName,
+		internalEmailSubmissionTLSRouteName,
+		internalEmailIMAPRouteName,
+		internalEmailIMAPTLSRouteName:
+		return true
+	}
+	return false
+}
+
 func writeMailRouteUnavailable(conn net.Conn, routeName string) {
 	if conn == nil {
 		return
@@ -302,6 +314,10 @@ func writeMailRouteUnavailable(conn net.Conn, routeName string) {
 		_, _ = io.WriteString(conn, "421 4.3.0 HostIt mail backend unavailable\r\n")
 	case internalEmailIMAPRouteName:
 		_, _ = io.WriteString(conn, "* BYE HostIt mail backend unavailable\r\n")
+	case internalEmailSubmissionTLSRouteName, internalEmailIMAPTLSRouteName:
+		// Implicit TLS – close silently; writing plaintext to a client
+		// that expects TLS would cause "first record does not look like
+		// a TLS handshake".
 	}
 	_ = conn.SetWriteDeadline(time.Time{})
 }
@@ -1072,7 +1088,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		enabled := ok && rc.enabled
 
 		if agent == nil || !enabled {
-			if routeName == internalEmailSubmissionRouteName || routeName == internalEmailInboundRouteName || routeName == internalEmailIMAPRouteName {
+			if isEmailRoute(routeName) {
 				logging.Global().Warnf(logging.CatTCP, "mail public connection rejected route=%s agentConnected=%v enabled=%v", routeName, agent != nil, enabled)
 				writeMailRouteUnavailable(conn, routeName)
 			}

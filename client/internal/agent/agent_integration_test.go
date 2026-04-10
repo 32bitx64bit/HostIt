@@ -2,10 +2,18 @@ package agent
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"sync"
 	"testing"
@@ -549,5 +557,139 @@ func TestDialMailOutboundTCPUsesReservedRelayRoute(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for outbound relay dial")
+	}
+}
+
+// selfSignedTLSConfig generates a self-signed TLS certificate and returns a
+// *tls.Config suitable for tests.
+func selfSignedTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{pair}}
+}
+
+// TestAgentTCPConnectImplicitTLS verifies that a TLS handshake succeeds
+// when the remote client's bytes flow through the tunnel relay to a local
+// tls.NewListener (implicit TLS, as used on ports 465/993).
+func TestAgentTCPConnectImplicitTLS(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tlsCfg := selfSignedTLSConfig(t)
+
+	// Start a local TLS echo server simulating the mail service's implicit TLS
+	// listener. tls.NewListener wraps a raw TCP listener exactly like
+	// startSubmissionTLSLocked / startIMAPTLSLocked do.
+	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawLn.Close()
+	tlsLn := tls.NewListener(rawLn, tlsCfg)
+	go func() {
+		for {
+			conn, err := tlsLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 256)
+				n, err := c.Read(buf)
+				if err != nil {
+					return
+				}
+				_, _ = c.Write(append([]byte("echo:"), buf[:n]...))
+			}(conn)
+		}
+	}()
+
+	server := startFakeTunnelServer(t, "testtoken")
+	defer server.close()
+
+	connectedCh := make(chan struct{}, 1)
+	go func() {
+		_ = RunWithHooks(ctx, Config{
+			Server:     server.serverAddr(),
+			Token:      "testtoken",
+			DisableTLS: true,
+		}, &Hooks{OnConnected: func() {
+			select {
+			case connectedCh <- struct{}{}:
+			default:
+			}
+		}})
+	}()
+
+	server.sendHello(t, map[string]RemoteRoute{
+		"tls_echo": {
+			Name:       "tls_echo",
+			Proto:      "tcp",
+			PublicAddr: ":465",
+			LocalAddr:  rawLn.Addr().String(),
+		},
+	})
+	waitForSignal(t, connectedCh, 5*time.Second, "agent never processed HELLO")
+
+	// Ask the agent to connect to the tls_echo route.
+	server.sendConnect(t, "tls_echo", "client-tls-1")
+	dataConn, routeName, clientID := server.acceptDataConn(t)
+	defer dataConn.Close()
+	if routeName != "tls_echo" || clientID != "client-tls-1" {
+		t.Fatalf("unexpected metadata route=%q client=%q", routeName, clientID)
+	}
+
+	// The data connection is now relayed by the agent to the local TLS
+	// listener.  Perform a TLS handshake through it, exactly as a remote
+	// email client would through the public port → tunnel → agent chain.
+	if err := dataConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	clientTLS := tls.Client(dataConn, &tls.Config{InsecureSkipVerify: true})
+	if err := clientTLS.Handshake(); err != nil {
+		t.Fatalf("TLS handshake through relay failed: %v", err)
+	}
+
+	if _, err := clientTLS.Write([]byte("ping")); err != nil {
+		t.Fatalf("write through TLS relay failed: %v", err)
+	}
+	buf := make([]byte, 256)
+	n, err := clientTLS.Read(buf)
+	if err != nil {
+		t.Fatalf("read through TLS relay failed: %v", err)
+	}
+	if got := string(buf[:n]); got != "echo:ping" {
+		t.Fatalf("TLS echo response = %q, want %q", got, "echo:ping")
 	}
 }

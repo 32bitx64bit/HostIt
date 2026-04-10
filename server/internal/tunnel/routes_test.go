@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"net"
 	"strings"
 	"testing"
 
@@ -109,4 +110,51 @@ func containsAll(s string, parts ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestIsEmailRoute(t *testing.T) {
+	emailRoutes := []string{
+		internalEmailInboundRouteName,
+		internalEmailSubmissionRouteName,
+		internalEmailSubmissionTLSRouteName,
+		internalEmailIMAPRouteName,
+		internalEmailIMAPTLSRouteName,
+	}
+	for _, name := range emailRoutes {
+		if !isEmailRoute(name) {
+			t.Errorf("isEmailRoute(%q) = false, want true", name)
+		}
+	}
+	if isEmailRoute("game") {
+		t.Errorf("isEmailRoute(%q) = true, want false", "game")
+	}
+	if isEmailRoute("") {
+		t.Errorf("isEmailRoute(%q) = true, want false", "")
+	}
+}
+
+func TestWriteMailRouteUnavailable_NoPlaintextOnTLSRoutes(t *testing.T) {
+	// Verify that writeMailRouteUnavailable does NOT write plaintext data
+	// on implicit-TLS routes.  Sending plaintext to a client that expects
+	// TLS causes "first record does not look like a TLS handshake".
+	for _, name := range []string{internalEmailSubmissionTLSRouteName, internalEmailIMAPTLSRouteName} {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+
+		done := make(chan struct{})
+		go func() {
+			writeMailRouteUnavailable(server, name)
+			server.Close()
+			close(done)
+		}()
+
+		buf := make([]byte, 256)
+		n, _ := client.Read(buf)
+		<-done
+
+		if n > 0 {
+			t.Errorf("writeMailRouteUnavailable(%q) wrote %d bytes (%q), want 0", name, n, buf[:n])
+		}
+	}
 }
