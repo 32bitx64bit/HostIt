@@ -198,6 +198,29 @@ func (s *Server) getRouteConfig(name string) (routeConfig, bool) {
 	return rc, ok
 }
 
+// isAllowedOutboundSMTPTarget validates that the resolved address is a
+// permitted SMTP destination: standard SMTP ports only and no loopback,
+// private, or link-local addresses.
+func isAllowedOutboundSMTPTarget(addr *net.TCPAddr) bool {
+	switch addr.Port {
+	case 25, 465, 587:
+		// allowed SMTP ports
+	default:
+		return false
+	}
+
+	ip := addr.IP
+	if ip == nil {
+		return false
+	}
+
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return false
+	}
+
+	return true
+}
+
 func (s *Server) dialMailOutboundTCP(conn net.Conn, target string) {
 	remoteAddr, err := net.ResolveTCPAddr("tcp", strings.TrimSpace(target))
 	if err != nil || remoteAddr == nil {
@@ -205,6 +228,13 @@ func (s *Server) dialMailOutboundTCP(conn net.Conn, target string) {
 		conn.Close()
 		return
 	}
+
+	if !isAllowedOutboundSMTPTarget(remoteAddr) {
+		logging.Global().Errorf(logging.CatTCP, "mail outbound dial REJECTED: target=%s resolved=%s (invalid port or private/loopback IP)", target, remoteAddr.String())
+		conn.Close()
+		return
+	}
+
 	serverConn, err := (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).Dial("tcp", remoteAddr.String())
 	if err != nil {
 		logging.Global().Errorf(logging.CatTCP, "mail outbound dial failed for %s: %v", remoteAddr.String(), err)
@@ -410,8 +440,8 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		s.sessionsMu.Lock()
 		if session, ok := s.sessions[remoteAddr]; ok {
 			session.writeMu.Lock()
-			agent.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			err := protocol.WritePacket(agent, pkt)
+			session.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			err := protocol.WritePacket(session.conn, pkt)
 			session.writeMu.Unlock()
 			s.sessionsMu.Unlock()
 
@@ -483,7 +513,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		s.sessionsMu.Lock()
 		if session, ok := s.sessions[remoteAddr]; ok {
 			session.writeMu.Lock()
-			agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			session.writeMu.Unlock()
 		}
 		s.sessionsMu.Unlock()
@@ -498,7 +528,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 			s.sessionsMu.Lock()
 			if session, ok := s.sessions[remoteAddr]; ok {
 				session.writeMu.Lock()
-				if err := protocol.WritePacket(agent, pkt); err != nil {
+				if err := protocol.WritePacket(session.conn, pkt); err != nil {
 					session.writeMu.Unlock()
 					s.sessionsMu.Unlock()
 					break
@@ -582,8 +612,8 @@ func (s *Server) RunAgentEmailProbe(ctx context.Context, req protocol.EmailProbe
 	s.sessionsMu.Lock()
 	if session, ok := s.sessions[remoteAddr]; ok {
 		session.writeMu.Lock()
-		agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		err = protocol.WritePacket(agent, pkt)
+		session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		err = protocol.WritePacket(session.conn, pkt)
 		session.writeMu.Unlock()
 		s.sessionsMu.Unlock()
 		if err != nil {
@@ -771,6 +801,37 @@ func (s *Server) acceptControl(ln net.Listener) {
 	defer s.wg.Done()
 	defer ln.Close()
 
+	// Rate limiter for failed auth attempts per IP
+	type ipFailRecord struct {
+		count int
+		first time.Time
+	}
+	var failMu sync.Mutex
+	failsByIP := make(map[string]*ipFailRecord)
+	const maxFailures = 10
+	const failWindow = 60 * time.Second
+
+	// Background cleanup of stale entries
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				failMu.Lock()
+				for ip, rec := range failsByIP {
+					if now.Sub(rec.first) > failWindow {
+						delete(failsByIP, ip)
+					}
+				}
+				failMu.Unlock()
+			}
+		}
+	}()
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -782,12 +843,42 @@ func (s *Server) acceptControl(ln net.Listener) {
 		}
 		netutil.SetTCPKeepAlive(conn, 15*time.Second)
 
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
-		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "control auth failed from %s: %v", conn.RemoteAddr(), err)
+		// Check per-IP rate limit before doing crypto work
+		remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		failMu.Lock()
+		rec := failsByIP[remoteIP]
+		if rec != nil && time.Since(rec.first) > failWindow {
+			// Window expired, reset
+			delete(failsByIP, remoteIP)
+			rec = nil
+		}
+		if rec != nil && rec.count >= maxFailures {
+			failMu.Unlock()
+			logging.Global().Errorf(logging.CatTCP, "control auth rate limited for %s (%d failures in window)", remoteIP, rec.count)
 			conn.Close()
 			continue
 		}
+		failMu.Unlock()
+
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "control auth failed from %s: %v", conn.RemoteAddr(), err)
+			// Record failure for rate limiting
+			failMu.Lock()
+			if failsByIP[remoteIP] == nil {
+				failsByIP[remoteIP] = &ipFailRecord{count: 1, first: time.Now()}
+			} else {
+				failsByIP[remoteIP].count++
+			}
+			failMu.Unlock()
+			time.Sleep(100 * time.Millisecond) // Throttle brute-force attempts
+			conn.Close()
+			continue
+		}
+		// Auth succeeded — clear any failure record for this IP
+		failMu.Lock()
+		delete(failsByIP, remoteIP)
+		failMu.Unlock()
 		conn.SetDeadline(time.Time{})
 
 		remoteAddr := conn.RemoteAddr().String()
@@ -1083,6 +1174,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 
 		s.mu.RLock()
 		agent := s.agentTCP
+		epoch := s.agentEpoch
 		s.mu.RUnlock()
 		rc, ok := s.getRouteConfig(routeName)
 		enabled := ok && rc.enabled
@@ -1100,6 +1192,17 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 
 		ch := make(chan net.Conn, 1)
 		s.mu.Lock()
+		if s.agentEpoch != epoch {
+			// Agent reconnected between capturing it and adding this
+			// pending entry. The abort already ran so this entry would
+			// be orphaned — reject immediately instead of hanging for
+			// PairTimeout.
+			s.mu.Unlock()
+			logging.Global().Warnf(logging.CatTCP, "agent epoch changed, rejecting stale public TCP route=%s client=%s", routeName, clientID)
+			writeMailRouteUnavailable(conn, routeName)
+			conn.Close()
+			continue
+		}
 		s.pendingTCP[makePendingTCPKey(routeName, clientID)] = ch
 		s.mu.Unlock()
 
@@ -1111,8 +1214,8 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		s.sessionsMu.Lock()
 		if session, ok := s.sessions[remoteAddr]; ok {
 			session.writeMu.Lock()
-			agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := protocol.WritePacket(agent, reqPkt); err != nil {
+			session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := protocol.WritePacket(session.conn, reqPkt); err != nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to request agent connect route=%s client=%s: %v", routeName, clientID, err)
 				session.writeMu.Unlock()
 				s.sessionsMu.Unlock()
@@ -1208,7 +1311,9 @@ func (s *Server) acceptAgentUDP() {
 	decryptBuf := make([]byte, 65536)
 	var pkt protocol.Packet
 
-	addrCache := sync.Map{}
+	addrCacheMu := sync.Mutex{}
+	addrCache := make(map[string]*net.UDPAddr)
+	const addrCacheLimit = 50000
 
 	for {
 		select {
@@ -1278,17 +1383,23 @@ func (s *Server) acceptAgentUDP() {
 				payload = decrypted
 			}
 
-			clientAddrVal, ok := addrCache.Load(clientID)
+			addrCacheMu.Lock()
+			clientAddr, ok := addrCache[clientID]
+			addrCacheMu.Unlock()
 			if !ok {
-				clientAddr, err := net.ResolveUDPAddr("udp", clientID)
+				var err error
+				clientAddr, err = net.ResolveUDPAddr("udp", clientID)
 				if err != nil {
 					continue
 				}
-				clientAddrVal = clientAddr
-				addrCache.Store(clientID, clientAddrVal)
+				addrCacheMu.Lock()
+				if len(addrCache) >= addrCacheLimit {
+					addrCache = make(map[string]*net.UDPAddr)
+				}
+				addrCache[clientID] = clientAddr
+				addrCacheMu.Unlock()
 			}
-			clientAddr, ok := clientAddrVal.(*net.UDPAddr)
-			if !ok || clientAddr == nil {
+			if clientAddr == nil {
 				continue
 			}
 

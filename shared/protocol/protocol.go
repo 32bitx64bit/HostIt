@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"unsafe"
 )
 
 const (
@@ -93,6 +92,10 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 	clientLen := int(header[2])
 	payloadLen := int(binary.BigEndian.Uint16(header[3:5]))
 
+	if payloadLen > MaxPayloadSize {
+		return nil, ErrPayloadTooBig
+	}
+
 	if routeLen > 0 {
 		routeBytes := make([]byte, routeLen)
 		if _, err := io.ReadFull(r, routeBytes); err != nil {
@@ -176,7 +179,7 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	if len(data) < i+routeLen+1 {
 		return ErrInvalidPacket
 	}
-	p.Route = unsafe.String(unsafe.SliceData(data[i:i+routeLen]), routeLen)
+	p.Route = string(data[i : i+routeLen])
 	i += routeLen
 
 	clientLen := int(data[i])
@@ -185,7 +188,7 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	if len(data) < i+clientLen {
 		return ErrInvalidPacket
 	}
-	p.Client = unsafe.String(unsafe.SliceData(data[i:i+clientLen]), clientLen)
+	p.Client = string(data[i : i+clientLen])
 	i += clientLen
 
 	p.Payload = data[i:]

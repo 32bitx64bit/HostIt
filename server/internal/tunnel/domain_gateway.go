@@ -513,6 +513,7 @@ func (s *Server) startDomainGateway() error {
 func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, error) {
 	s.mu.RLock()
 	agent := s.agentTCP
+	epoch := s.agentEpoch
 	s.mu.RUnlock()
 	rc, ok := s.getRouteConfig(routeName)
 	enabled := ok && rc.enabled
@@ -529,6 +530,10 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 	ch := make(chan net.Conn, 1)
 
 	s.mu.Lock()
+	if s.agentEpoch != epoch {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("agent reconnected, retry")
+	}
 	s.pendingTCP[pendingKey] = ch
 	s.mu.Unlock()
 	cleanup := func() {
@@ -546,8 +551,8 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 		return nil, fmt.Errorf("agent session not available")
 	}
 	session.writeMu.Lock()
-	agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	err := protocol.WritePacket(agent, reqPkt)
+	session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err := protocol.WritePacket(session.conn, reqPkt)
 	session.writeMu.Unlock()
 	s.sessionsMu.Unlock()
 	if err != nil {

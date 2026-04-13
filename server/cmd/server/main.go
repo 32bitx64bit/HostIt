@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -180,6 +182,13 @@ func main() {
 	))
 
 	if webAddr != "" {
+		// Warn if dashboard is bound to a non-loopback address without cookie-secure
+		if !cookieSecure {
+			host, _, _ := net.SplitHostPort(webAddr)
+			if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+				slog.Warn(logging.CatDashboard, "WARNING: Dashboard is bound to a public address without cookie-secure. This is insecure for production use.", serverlog.F("addr", webAddr))
+			}
+		}
 		go func() {
 			store, err := auth.Open(authDBPath)
 			if err != nil {
@@ -1696,7 +1705,7 @@ func serverUpdaterPreservePaths(absCfg string, absAuthDB string, runner *serverR
 }
 
 func genToken() string {
-	var b [16]byte
+	var b [32]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
@@ -4081,6 +4090,25 @@ func clientIP(r *http.Request) string {
 // Rate limiter for auth session lookups (prevents session brute-forcing)
 var authSessionLimiter = newIPRateLimiter(60, 1*time.Minute) // 60 requests per minute per IP
 
+// csrfSecret is a random 32-byte key generated at startup, used to HMAC-sign
+// CSRF nonces so that an attacker who can inject cookies cannot forge a
+// matching form token (signed double-submit cookie pattern).
+var csrfSecret [32]byte
+
+func init() {
+	if _, err := io.ReadFull(rand.Reader, csrfSecret[:]); err != nil {
+		panic("failed to generate CSRF secret: " + err.Error())
+	}
+}
+
+// computeCSRFToken computes HMAC-SHA256(csrfSecret, nonce) and returns it
+// as a hex string. The nonce is the random value stored in the cookie.
+func computeCSRFToken(nonce string) string {
+	mac := hmac.New(sha256.New, csrfSecret[:])
+	mac.Write([]byte(nonce))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func requireAuth(store *auth.Store, cookieSecure bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Rate limit session validation attempts
@@ -4118,20 +4146,23 @@ func requireAuth(store *auth.Store, cookieSecure bool, next http.HandlerFunc) ht
 }
 
 func ensureCSRF(w http.ResponseWriter, r *http.Request, secure bool) string {
+	// Read existing nonce from the cookie; if present, reuse it.
 	if c, err := r.Cookie("csrf"); err == nil && c.Value != "" {
-		return c.Value
+		return computeCSRFToken(c.Value)
 	}
-	tok := genToken()
+	// Generate a fresh random nonce and set it as the cookie value.
+	nonce := genToken()
 	http.SetCookie(w, &http.Cookie{
 		Name:     "csrf",
-		Value:    tok,
+		Value:    nonce,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		Secure:   secure,
 		MaxAge:   60 * 60 * 24 * 7,
 	})
-	return tok
+	// Return the HMAC of the nonce for embedding in forms.
+	return computeCSRFToken(nonce)
 }
 
 func checkCSRF(r *http.Request) bool {
@@ -4148,10 +4179,13 @@ func checkCSRF(r *http.Request) bool {
 		}
 	}
 	c, err := r.Cookie("csrf")
-	if err != nil {
+	if err != nil || c.Value == "" {
 		return false
 	}
-	return formTok != "" && c.Value != "" && subtleEq(formTok, c.Value)
+	// Recompute the expected HMAC from the cookie nonce and compare
+	// against the form-submitted token using constant-time comparison.
+	expected := computeCSRFToken(c.Value)
+	return formTok != "" && subtleEq(formTok, expected)
 }
 
 func subtleEq(a, b string) bool {

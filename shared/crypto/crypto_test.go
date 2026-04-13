@@ -263,25 +263,55 @@ func TestCryptoConnWriteHandlesShortWrites(t *testing.T) {
 		t.Fatalf("aes.NewCipher: %v", err)
 	}
 
-	iv := bytes.Repeat([]byte{0x42}, block.BlockSize())
-	underlying := &shortWriteConn{w: &bytes.Buffer{}, maxWrite: 7}
-	conn := &cryptoConn{
-		Conn:   underlying,
-		block:  block,
-		writer: cipher.NewCTR(block, iv),
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("cipher.NewGCM: %v", err)
 	}
 
-	payload := bytes.Repeat([]byte("abcdef0123456789"), 128)
+	var seed [gcmNonceSize]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+
+	underlying := &shortWriteConn{w: &bytes.Buffer{}, maxWrite: 7}
+	conn := &cryptoConn{
+		Conn:      underlying,
+		gcm:       gcm,
+		writeSeed: seed,
+	}
+
+	payload := bytes.Repeat([]byte("abcdef0123456789"), 128) // 2048 bytes
 	if n, err := conn.Write(payload); err != nil {
 		t.Fatalf("Write error: %v", err)
 	} else if n != len(payload) {
 		t.Fatalf("expected %d bytes written, got %d", len(payload), n)
 	}
 
-	expected := make([]byte, len(payload))
-	cipher.NewCTR(block, iv).XORKeyStream(expected, payload)
-	if got := underlying.w.Bytes(); !bytes.Equal(got, expected) {
-		t.Fatalf("ciphertext mismatch: wrote %d bytes, expected %d", len(got), len(expected))
+	// Verify by reading back frames and decrypting
+	raw := underlying.w.Bytes()
+	offset := 0
+	var decrypted []byte
+	for offset < len(raw) {
+		if offset+frameLenSize > len(raw) {
+			t.Fatalf("truncated frame header at offset %d", offset)
+		}
+		frameLen := int(raw[offset])<<8 | int(raw[offset+1])
+		offset += frameLenSize
+		if offset+frameLen > len(raw) {
+			t.Fatalf("truncated frame body at offset %d", offset)
+		}
+		nonce := raw[offset : offset+gcmNonceSize]
+		ciphertext := raw[offset+gcmNonceSize : offset+frameLen]
+		plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+		if err != nil {
+			t.Fatalf("GCM decrypt failed at offset %d: %v", offset, err)
+		}
+		decrypted = append(decrypted, plain...)
+		offset += frameLen
+	}
+
+	if !bytes.Equal(decrypted, payload) {
+		t.Fatal("decrypted data doesn't match original payload")
 	}
 }
 

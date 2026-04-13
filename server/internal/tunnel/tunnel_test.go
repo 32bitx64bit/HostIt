@@ -420,7 +420,10 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 	}
 }
 
-func TestMailOutboundRelayOverDataConn(t *testing.T) {
+func TestMailOutboundRelayRejectsLoopbackTarget(t *testing.T) {
+	// The security fix rejects loopback/private IPs and non-SMTP ports.
+	// This test verifies that a loopback echo target is properly rejected
+	// (server closes the data connection).
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -465,17 +468,41 @@ func TestMailOutboundRelayOverDataConn(t *testing.T) {
 	if _, err := dataConn.Write(header); err != nil {
 		t.Fatal(err)
 	}
+	// The server should reject the loopback target and close the connection.
 	_ = dataConn.SetDeadline(time.Now().Add(5 * time.Second))
-	msg := []byte("hello\n")
-	if _, err := dataConn.Write(msg); err != nil {
-		t.Fatal(err)
+	buf := make([]byte, 64)
+	_, err := dataConn.Read(buf)
+	if err == nil {
+		t.Fatal("expected server to close connection for loopback/non-SMTP target, but read succeeded")
 	}
-	buf := make([]byte, len(msg))
-	if _, err := io.ReadFull(dataConn, buf); err != nil {
-		t.Fatal(err)
+}
+
+func TestIsAllowedOutboundSMTPTarget(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    *net.TCPAddr
+		allowed bool
+	}{
+		{"loopback IPv4 port 25", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 25}, false},
+		{"loopback IPv6 port 25", &net.TCPAddr{IP: net.IPv6loopback, Port: 25}, false},
+		{"private 10.x port 25", &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 25}, false},
+		{"private 192.168 port 587", &net.TCPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 587}, false},
+		{"public port 25", &net.TCPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 25}, true},
+		{"public port 465", &net.TCPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 465}, true},
+		{"public port 587", &net.TCPAddr{IP: net.IPv4(8, 8, 4, 4), Port: 587}, true},
+		{"public port 80 (non-SMTP)", &net.TCPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 80}, false},
+		{"public port 8025 (non-SMTP)", &net.TCPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 8025}, false},
+		{"nil IP", &net.TCPAddr{IP: nil, Port: 25}, false},
+		{"unspecified IPv4", &net.TCPAddr{IP: net.IPv4zero, Port: 25}, false},
+		{"link-local IPv4", &net.TCPAddr{IP: net.IPv4(169, 254, 1, 1), Port: 25}, false},
 	}
-	if string(buf) != string(msg) {
-		t.Fatalf("expected %q got %q", string(msg), string(buf))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isAllowedOutboundSMTPTarget(tt.addr)
+			if got != tt.allowed {
+				t.Errorf("isAllowedOutboundSMTPTarget(%v) = %v, want %v", tt.addr, got, tt.allowed)
+			}
+		})
 	}
 }
 

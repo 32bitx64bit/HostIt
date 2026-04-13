@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"os"
@@ -30,6 +31,10 @@ func EnsureSelfSigned(certFile, keyFile string) (fingerprintHex string, err erro
 		der, err := readFirstCertDER(certFile)
 		if err != nil {
 			return "", err
+		}
+		if selfSignedNeedsRenew(der) {
+			log.Println("tlsutil: auto-rotating tunnel self-signed cert (expires within 30 days)")
+			return RegenerateSelfSigned(certFile, keyFile)
 		}
 		sum := sha256.Sum256(der)
 		return hex.EncodeToString(sum[:]), nil
@@ -58,6 +63,10 @@ func EnsureSelfSignedDashboard(certFile, keyFile string) (fingerprintHex string,
 		if err != nil {
 			return "", err
 		}
+		if selfSignedNeedsRenew(der) {
+			log.Println("tlsutil: auto-rotating dashboard self-signed cert (expires within 30 days)")
+			return RegenerateSelfSignedDashboard(certFile, keyFile)
+		}
 		sum := sha256.Sum256(der)
 		return hex.EncodeToString(sum[:]), nil
 	}
@@ -84,6 +93,10 @@ func EnsureSelfSignedHost(certFile, keyFile string, host string) (fingerprintHex
 		der, err := readFirstCertDER(certFile)
 		if err != nil {
 			return "", err
+		}
+		if selfSignedNeedsRenew(der) {
+			log.Println("tlsutil: auto-rotating host self-signed cert (expires within 30 days)")
+			return RegenerateSelfSignedHost(certFile, keyFile, host)
 		}
 		sum := sha256.Sum256(der)
 		return hex.EncodeToString(sum[:]), nil
@@ -180,6 +193,16 @@ func writeSelfSignedWithSANs(certFile, keyFile string, commonName string, dnsNam
 func fileExists(path string) bool {
 	st, err := os.Stat(path)
 	return err == nil && !st.IsDir()
+}
+
+const renewWindow = 30 * 24 * time.Hour
+
+func selfSignedNeedsRenew(der []byte) bool {
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return true // can't parse → regenerate
+	}
+	return time.Until(cert.NotAfter) <= renewWindow
 }
 
 func readFirstCertDER(certFile string) ([]byte, error) {

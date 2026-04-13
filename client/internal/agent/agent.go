@@ -58,10 +58,58 @@ type Agent struct {
 	wg     sync.WaitGroup
 }
 
+// connTracker keeps track of all TCP relay connections for the current
+// control session so they can be forcibly closed when the session ends.
+type connTracker struct {
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (ct *connTracker) add(c net.Conn) {
+	ct.mu.Lock()
+	ct.conns = append(ct.conns, c)
+	ct.mu.Unlock()
+}
+
+func (ct *connTracker) closeAll() {
+	ct.mu.Lock()
+	conns := ct.conns
+	ct.conns = nil
+	ct.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
 func NewAgent(cfg Config) *Agent {
 	return &Agent{
 		cfg: cfg,
 	}
+}
+
+// tlsConfigWithPin returns a TLS config that performs certificate pinning
+// when a SHA-256 pin is configured. InsecureSkipVerify is always true
+// because the server may use self-signed certificates; the pin check
+// in VerifyPeerCertificate provides the actual trust anchor.
+func tlsConfigWithPin(pin string) *tls.Config {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+	if pin != "" {
+		expectedPin := pin
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no certificates provided by server")
+			}
+			hash := sha256.Sum256(rawCerts[0])
+			hashHex := hex.EncodeToString(hash[:])
+			if !strings.EqualFold(hashHex, expectedPin) {
+				return fmt.Errorf("certificate pinning failed: expected %s, got %s", expectedPin, hashHex)
+			}
+			return nil
+		}
+	}
+	return tlsConfig
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -97,27 +145,7 @@ func (a *Agent) connectAndRun() error {
 	if a.cfg.DisableTLS {
 		conn, err = controlDialer.Dial("tcp", a.cfg.ControlAddr())
 	} else {
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: true,
-		}
-
-		if a.cfg.TLSPinSHA256 != "" {
-			tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-				if len(rawCerts) == 0 {
-					return fmt.Errorf("no certificates provided by server")
-				}
-
-				hash := sha256.Sum256(rawCerts[0])
-				hashHex := hex.EncodeToString(hash[:])
-
-				if !strings.EqualFold(hashHex, a.cfg.TLSPinSHA256) {
-					return fmt.Errorf("certificate pinning failed: expected %s, got %s", a.cfg.TLSPinSHA256, hashHex)
-				}
-				return nil
-			}
-		}
-
-		conn, err = tls.DialWithDialer(controlDialer, "tcp", a.cfg.ControlAddr(), tlsConfig)
+		conn, err = tls.DialWithDialer(controlDialer, "tcp", a.cfg.ControlAddr(), tlsConfigWithPin(a.cfg.TLSPinSHA256))
 	}
 	if err != nil {
 		return fmt.Errorf("control dial failed: %w", err)
@@ -198,6 +226,12 @@ func (a *Agent) connectAndRun() error {
 		a.udpDataConn.Close()
 	}()
 
+	tracker := &connTracker{}
+	go func() {
+		<-connCtx.Done()
+		tracker.closeAll()
+	}()
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
@@ -205,7 +239,7 @@ func (a *Agent) connectAndRun() error {
 	go func() {
 		defer wg.Done()
 		defer connCancel()
-		if err := a.handleControl(connCtx, conn); err != nil {
+		if err := a.handleControl(connCtx, conn, tracker); err != nil {
 			errCh <- err
 		}
 	}()
@@ -247,7 +281,7 @@ func (a *Agent) EmailConfig() emailcfg.Config {
 	return emailcfg.Normalize(a.cfg.Email)
 }
 
-func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
+func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connTracker) error {
 	helloSeen := false
 	for {
 		select {
@@ -391,8 +425,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 				if a.cfg.DisableTLS {
 					dataConn, err = dataDialer.Dial("tcp", a.cfg.DataAddr())
 				} else {
-					tlsConfig := &tls.Config{InsecureSkipVerify: true}
-					dataConn, err = tls.DialWithDialer(dataDialer, "tcp", a.cfg.DataAddr(), tlsConfig)
+					dataConn, err = tls.DialWithDialer(dataDialer, "tcp", a.cfg.DataAddr(), tlsConfigWithPin(a.cfg.TLSPinSHA256))
 				}
 				if err != nil {
 					logging.Global().Errorf(logging.CatTCP, "failed to dial data server %s: %v", a.cfg.DataAddr(), err)
@@ -453,6 +486,8 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn) error {
 					}
 				}
 
+				tracker.add(dataConn)
+				tracker.add(localConn)
 				relay.Proxy(localConn, dataConn)
 			}(routeName, clientID, rt)
 		}
@@ -495,8 +530,7 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 	if cfg.DisableTLS {
 		dataConn, err = dialer.DialContext(ctx, "tcp", cfg.DataAddr())
 	} else {
-		tlsConfig := &tls.Config{InsecureSkipVerify: true}
-		dataConn, err = tls.DialWithDialer(dialer, "tcp", cfg.DataAddr(), tlsConfig)
+		dataConn, err = tls.DialWithDialer(dialer, "tcp", cfg.DataAddr(), tlsConfigWithPin(cfg.TLSPinSHA256))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("dial data server %s: %w", cfg.DataAddr(), err)

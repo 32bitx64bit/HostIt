@@ -41,11 +41,15 @@ const (
 )
 
 func DeriveKey(token string, alg string) ([]byte, error) {
+	// Derive salt from token to prevent rainbow table attacks across deployments.
+	saltHash := sha256.Sum256([]byte("hostit-key-salt:" + token))
+	salt := saltHash[:]
+
 	switch strings.ToLower(alg) {
 	case AlgAES128:
-		return pbkdf2.Key([]byte(token), []byte("hostit-salt"), 4096, 16, sha256.New), nil
+		return pbkdf2.Key([]byte(token), salt, 100_000, 16, sha256.New), nil
 	case AlgAES256:
-		return pbkdf2.Key([]byte(token), []byte("hostit-salt"), 4096, 32, sha256.New), nil
+		return pbkdf2.Key([]byte(token), salt, 100_000, 32, sha256.New), nil
 	case AlgNone, "":
 		return nil, nil
 	default:
@@ -119,6 +123,14 @@ func DecryptUDP(aesgcm cipher.AEAD, dst, ciphertext []byte) ([]byte, error) {
 	return aesgcm.Open(dst, nonce, ciphertext, nil)
 }
 
+const (
+	gcmNonceSize     = 12
+	maxPlaintextSize = 32 * 1024
+	frameLenSize     = 2
+	maxFrameBodySize = gcmNonceSize + maxPlaintextSize + 16 // nonce + ciphertext + GCM tag
+	maxFrameSize     = frameLenSize + maxFrameBodySize
+)
+
 func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
 	if len(key) == 0 {
 		return conn, nil
@@ -127,32 +139,44 @@ func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	writeIV := make([]byte, block.BlockSize())
-	if _, err := io.ReadFull(rand.Reader, writeIV); err != nil {
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
 		return nil, err
 	}
 
-	if _, err := writeAll(conn, writeIV); err != nil {
-		return nil, fmt.Errorf("IV write failed: %w", err)
+	var writeSeed [gcmNonceSize]byte
+	if _, err := io.ReadFull(rand.Reader, writeSeed[:]); err != nil {
+		return nil, err
+	}
+	if _, err := writeAll(conn, writeSeed[:]); err != nil {
+		return nil, fmt.Errorf("nonce seed write failed: %w", err)
 	}
 
-	streamWriter := cipher.NewCTR(block, writeIV)
-
 	return &cryptoConn{
-		Conn:   conn,
-		block:  block,
-		writer: streamWriter,
+		Conn:      conn,
+		gcm:       gcm,
+		writeSeed: writeSeed,
 	}, nil
 }
 
 type cryptoConn struct {
 	net.Conn
-	block    cipher.Block
-	reader   cipher.Stream
-	writer   cipher.Stream
-	readOnce sync.Once
-	readErr  error
+	gcm        cipher.AEAD
+	writeSeed  [gcmNonceSize]byte
+	writeNonce uint64
+	readSeed   [gcmNonceSize]byte
+	readBuf    []byte
+	readOnce   sync.Once
+	readErr    error
+}
+
+func buildNonce(seed *[gcmNonceSize]byte, counter uint64) [gcmNonceSize]byte {
+	var nonce [gcmNonceSize]byte
+	copy(nonce[:], seed[:])
+	for i := 0; i < 8; i++ {
+		nonce[i] ^= byte(counter >> (i * 8))
+	}
+	return nonce
 }
 
 func (c *cryptoConn) CloseRead() error {
@@ -189,29 +213,60 @@ func (c *cryptoConn) NetConn() net.Conn {
 	return c.Conn
 }
 
-func (c *cryptoConn) Read(b []byte) (n int, err error) {
+func (c *cryptoConn) Read(b []byte) (int, error) {
 	c.readOnce.Do(func() {
-		iv := make([]byte, c.block.BlockSize())
-		if _, err := io.ReadFull(c.Conn, iv); err != nil {
-			c.readErr = fmt.Errorf("IV read failed: %w", err)
-			return
+		if _, err := io.ReadFull(c.Conn, c.readSeed[:]); err != nil {
+			c.readErr = fmt.Errorf("nonce seed read failed: %w", err)
 		}
-		c.reader = cipher.NewCTR(c.block, iv)
 	})
 	if c.readErr != nil {
 		return 0, c.readErr
 	}
 
-	n, err = c.Conn.Read(b)
-	if n > 0 {
-		c.reader.XORKeyStream(b[:n], b[:n])
+	if len(c.readBuf) > 0 {
+		n := copy(b, c.readBuf)
+		c.readBuf = c.readBuf[n:]
+		if len(c.readBuf) == 0 {
+			c.readBuf = nil
+		}
+		return n, nil
 	}
-	return n, err
+
+	var header [frameLenSize]byte
+	if _, err := io.ReadFull(c.Conn, header[:]); err != nil {
+		return 0, err
+	}
+	frameLen := int(header[0])<<8 | int(header[1])
+	if frameLen < gcmNonceSize+c.gcm.Overhead() {
+		return 0, errors.New("encrypted frame too short")
+	}
+	if frameLen > maxFrameBodySize {
+		return 0, errors.New("encrypted frame too large")
+	}
+
+	frame := make([]byte, frameLen)
+	if _, err := io.ReadFull(c.Conn, frame); err != nil {
+		return 0, err
+	}
+
+	nonce := frame[:gcmNonceSize]
+	ciphertext := frame[gcmNonceSize:]
+
+	plaintext, err := c.gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return 0, fmt.Errorf("GCM decrypt failed: %w", err)
+	}
+
+	n := copy(b, plaintext)
+	if n < len(plaintext) {
+		c.readBuf = plaintext[n:]
+	}
+	return n, nil
 }
 
 var writeBufPool = sync.Pool{
 	New: func() interface{} {
-		var b [32 * 1024]byte
+		var b [maxFrameSize]byte
 		return &b
 	},
 }
@@ -219,37 +274,30 @@ var writeBufPool = sync.Pool{
 func (c *cryptoConn) Write(b []byte) (n int, err error) {
 	for len(b) > 0 {
 		chunk := len(b)
-		switch {
-		case chunk <= 4096:
-			var buf [4096]byte
-			c.writer.XORKeyStream(buf[:chunk], b[:chunk])
-			wn, werr := writeAll(c.Conn, buf[:chunk])
-			n += wn
-			if werr != nil {
-				return n, werr
-			}
-		case chunk <= 32*1024:
-			bufPtr := writeBufPool.Get().(*[32 * 1024]byte)
-			buf := bufPtr[:]
-			c.writer.XORKeyStream(buf[:chunk], b[:chunk])
-			wn, werr := writeAll(c.Conn, buf[:chunk])
-			writeBufPool.Put(bufPtr)
-			n += wn
-			if werr != nil {
-				return n, werr
-			}
-		default:
-			chunk = 32 * 1024
-			bufPtr := writeBufPool.Get().(*[32 * 1024]byte)
-			buf := bufPtr[:]
-			c.writer.XORKeyStream(buf[:chunk], b[:chunk])
-			wn, werr := writeAll(c.Conn, buf[:chunk])
-			writeBufPool.Put(bufPtr)
-			n += wn
-			if werr != nil {
-				return n, werr
-			}
+		if chunk > maxPlaintextSize {
+			chunk = maxPlaintextSize
 		}
+
+		nonce := buildNonce(&c.writeSeed, c.writeNonce)
+		c.writeNonce++
+
+		bufPtr := writeBufPool.Get().(*[maxFrameSize]byte)
+		buf := bufPtr[:]
+
+		frameBodyLen := gcmNonceSize + chunk + c.gcm.Overhead()
+		buf[0] = byte(frameBodyLen >> 8)
+		buf[1] = byte(frameBodyLen)
+		copy(buf[frameLenSize:], nonce[:])
+		c.gcm.Seal(buf[frameLenSize+gcmNonceSize:frameLenSize+gcmNonceSize], nonce[:], b[:chunk], nil)
+
+		totalLen := frameLenSize + frameBodyLen
+		_, werr := writeAll(c.Conn, buf[:totalLen])
+		writeBufPool.Put(bufPtr)
+
+		if werr != nil {
+			return n, werr
+		}
+		n += chunk
 		b = b[chunk:]
 	}
 	return n, nil
