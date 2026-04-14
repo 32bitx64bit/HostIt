@@ -33,6 +33,78 @@ type agentSession struct {
 	writeMu     sync.Mutex
 }
 
+type pendingTCPEntry struct {
+	mu       sync.Mutex
+	conn     net.Conn
+	ready    chan struct{}
+	done     chan struct{}
+	readyOnce sync.Once
+	doneOnce  sync.Once
+}
+
+func newPendingTCPEntry() *pendingTCPEntry {
+	return &pendingTCPEntry{
+		ready: make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+}
+
+func (p *pendingTCPEntry) cancel() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	conn := p.conn
+	p.conn = nil
+	p.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+	p.doneOnce.Do(func() {
+		close(p.done)
+	})
+}
+
+func (p *pendingTCPEntry) deliver(conn net.Conn) {
+	if p == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-p.done:
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return
+	default:
+	}
+	if p.conn != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return
+	}
+	p.conn = conn
+	p.readyOnce.Do(func() {
+		close(p.ready)
+	})
+	}
+
+func (p *pendingTCPEntry) take() net.Conn {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	conn := p.conn
+	p.conn = nil
+	return conn
+}
+
 type Server struct {
 	cfg ServerConfig
 
@@ -58,7 +130,7 @@ type Server struct {
 	domains           *domainManager
 	domainProxyCache  sync.Map
 
-	pendingTCP map[string]chan net.Conn
+	pendingTCP map[string]*pendingTCPEntry
 
 	clientIDCounter uint64
 
@@ -85,12 +157,9 @@ func makePendingTCPKey(routeName, clientID string) string {
 }
 
 func (s *Server) abortPendingTCPLocked() {
-	for clientID, ch := range s.pendingTCP {
+	for clientID, entry := range s.pendingTCP {
 		delete(s.pendingTCP, clientID)
-		select {
-		case ch <- nil:
-		default:
-		}
+		entry.cancel()
 	}
 }
 
@@ -652,7 +721,7 @@ func NewServer(cfg ServerConfig) *Server {
 		udpCiphers:  make(map[string]cipher.AEAD),
 		publicTCP:   make(map[string]net.Listener),
 		publicUDP:   make(map[string]*net.UDPConn),
-		pendingTCP:  make(map[string]chan net.Conn),
+		pendingTCP:  make(map[string]*pendingTCPEntry),
 		dash:        newDashState(),
 		sessions:    make(map[string]*agentSession),
 	}
@@ -1139,7 +1208,7 @@ func (s *Server) acceptData(ln net.Listener) {
 		}
 
 		s.mu.Lock()
-		ch, ok := s.pendingTCP[makePendingTCPKey(routeName, clientID)]
+		entry, ok := s.pendingTCP[makePendingTCPKey(routeName, clientID)]
 		if ok {
 			delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
 			conn.SetReadDeadline(time.Time{})
@@ -1147,7 +1216,7 @@ func (s *Server) acceptData(ln net.Listener) {
 		s.mu.Unlock()
 
 		if ok {
-			ch <- conn
+			entry.deliver(conn)
 		} else {
 			conn.Close()
 		}
@@ -1190,7 +1259,8 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 
 		remoteAddr := agent.RemoteAddr().String()
 
-		ch := make(chan net.Conn, 1)
+		entry := newPendingTCPEntry()
+		pendingKey := makePendingTCPKey(routeName, clientID)
 		s.mu.Lock()
 		if s.agentEpoch != epoch {
 			// Agent reconnected between capturing it and adding this
@@ -1203,7 +1273,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			conn.Close()
 			continue
 		}
-		s.pendingTCP[makePendingTCPKey(routeName, clientID)] = ch
+		s.pendingTCP[pendingKey] = entry
 		s.mu.Unlock()
 
 		reqPkt := &protocol.Packet{
@@ -1222,8 +1292,9 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				writeMailRouteUnavailable(conn, routeName)
 				conn.Close()
 				s.mu.Lock()
-				delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
+				delete(s.pendingTCP, pendingKey)
 				s.mu.Unlock()
+				entry.cancel()
 				continue
 			}
 			session.writeMu.Unlock()
@@ -1233,18 +1304,26 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			writeMailRouteUnavailable(conn, routeName)
 			conn.Close()
 			s.mu.Lock()
-			delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
+			delete(s.pendingTCP, pendingKey)
 			s.mu.Unlock()
+			entry.cancel()
 			continue
 		}
 		s.sessionsMu.Unlock()
 
 		go func(c net.Conn, clientID string) {
 			defer c.Close()
+			timer := time.NewTimer(s.cfg.PairTimeout)
+			defer timer.Stop()
 			select {
-			case agentConn := <-ch:
-				if agentConn == nil {
+			case <-entry.done:
 					logging.Global().Warnf(logging.CatTCP, "agent pairing aborted route=%s client=%s", routeName, clientID)
+					writeMailRouteUnavailable(c, routeName)
+					return
+			case <-entry.ready:
+				agentConn := entry.take()
+				if agentConn == nil {
+					logging.Global().Warnf(logging.CatTCP, "agent pairing missing backend route=%s client=%s", routeName, clientID)
 					writeMailRouteUnavailable(c, routeName)
 					return
 				}
@@ -1258,19 +1337,13 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				}
 				relay.Proxy(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes})
 
-			case <-time.After(s.cfg.PairTimeout):
+			case <-timer.C:
 				logging.Global().Warnf(logging.CatTCP, "pair timeout route=%s client=%s", routeName, clientID)
 				s.mu.Lock()
-				delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
+				delete(s.pendingTCP, pendingKey)
 				s.mu.Unlock()
+				entry.cancel()
 				writeMailRouteUnavailable(c, routeName)
-				select {
-				case lateConn := <-ch:
-					if lateConn != nil {
-						lateConn.Close()
-					}
-				default:
-				}
 			}
 		}(conn, clientID)
 	}

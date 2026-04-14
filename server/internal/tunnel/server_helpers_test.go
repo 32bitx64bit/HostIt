@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"net"
 	"testing"
 	"time"
 
@@ -85,7 +84,7 @@ func TestServerDashboardIncludesRuntimeStats(t *testing.T) {
 	})
 
 	srv.mu.Lock()
-	srv.pendingTCP[makePendingTCPKey("web", "client-1")] = make(chan net.Conn)
+	srv.pendingTCP[makePendingTCPKey("web", "client-1")] = newPendingTCPEntry()
 	srv.lastAgentConnectAt = time.Unix(100, 0)
 	srv.lastAgentDisconnectAt = time.Unix(200, 0)
 	srv.mu.Unlock()

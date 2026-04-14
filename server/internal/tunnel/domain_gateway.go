@@ -527,19 +527,20 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 	remoteAddr := agent.RemoteAddr().String()
 	clientID := s.nextClientID()
 	pendingKey := makePendingTCPKey(routeName, clientID)
-	ch := make(chan net.Conn, 1)
+	entry := newPendingTCPEntry()
 
 	s.mu.Lock()
 	if s.agentEpoch != epoch {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("agent reconnected, retry")
 	}
-	s.pendingTCP[pendingKey] = ch
+	s.pendingTCP[pendingKey] = entry
 	s.mu.Unlock()
 	cleanup := func() {
 		s.mu.Lock()
 		delete(s.pendingTCP, pendingKey)
 		s.mu.Unlock()
+		entry.cancel()
 	}
 
 	reqPkt := &protocol.Packet{Type: protocol.TypeConnect, Route: routeName, Client: clientID}
@@ -568,15 +569,12 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 		return nil, ctx.Err()
 	case <-timer.C:
 		cleanup()
-		select {
-		case lateConn := <-ch:
-			if lateConn != nil {
-				_ = lateConn.Close()
-			}
-		default:
-		}
 		return nil, fmt.Errorf("timeout waiting for route %s backend", routeName)
-	case agentConn := <-ch:
+	case <-entry.done:
+			cleanup()
+			return nil, fmt.Errorf("route %s backend unavailable", routeName)
+	case <-entry.ready:
+		agentConn := entry.take()
 		if agentConn == nil {
 			cleanup()
 			return nil, fmt.Errorf("route %s backend unavailable", routeName)

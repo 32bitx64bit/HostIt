@@ -342,6 +342,71 @@ func TestPendingTCPKeyIncludesRoute(t *testing.T) {
 	}
 }
 
+type closeTrackingConn struct {
+	mu     sync.Mutex
+	closed bool
+	closedCh chan struct{}
+}
+
+func newCloseTrackingConn() *closeTrackingConn {
+	return &closeTrackingConn{closedCh: make(chan struct{})}
+}
+
+func (c *closeTrackingConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *closeTrackingConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (c *closeTrackingConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (c *closeTrackingConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (c *closeTrackingConn) SetDeadline(time.Time) error      { return nil }
+func (c *closeTrackingConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *closeTrackingConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *closeTrackingConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	close(c.closedCh)
+	return nil
+}
+
+type dummyAddr string
+
+func (d dummyAddr) Network() string { return "tcp" }
+func (d dummyAddr) String() string  { return string(d) }
+
+func TestPendingTCPEntryClosesLateDeliveredConnOnCancel(t *testing.T) {
+	entry := newPendingTCPEntry()
+	lateConn := newCloseTrackingConn()
+	entry.deliver(lateConn)
+
+	entry.cancel()
+
+	select {
+	case <-lateConn.closedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late-delivered conn was not closed")
+	}
+}
+
+func TestPendingTCPEntryAllowsEarlyDeliveryBeforeWaiter(t *testing.T) {
+	entry := newPendingTCPEntry()
+	earlyConn := newCloseTrackingConn()
+	entry.deliver(earlyConn)
+
+	select {
+	case <-entry.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ready was not signaled for early delivery")
+	}
+
+	got := entry.take()
+	if got != earlyConn {
+		t.Fatalf("take() = %v, want %v", got, earlyConn)
+	}
+}
+
 func TestHelloIncludesLocalAddr(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
