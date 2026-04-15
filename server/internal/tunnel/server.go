@@ -34,10 +34,10 @@ type agentSession struct {
 }
 
 type pendingTCPEntry struct {
-	mu       sync.Mutex
-	conn     net.Conn
-	ready    chan struct{}
-	done     chan struct{}
+	mu        sync.Mutex
+	conn      net.Conn
+	ready     chan struct{}
+	done      chan struct{}
 	readyOnce sync.Once
 	doneOnce  sync.Once
 }
@@ -92,7 +92,7 @@ func (p *pendingTCPEntry) deliver(conn net.Conn) {
 	p.readyOnce.Do(func() {
 		close(p.ready)
 	})
-	}
+}
 
 func (p *pendingTCPEntry) take() net.Conn {
 	if p == nil {
@@ -1317,9 +1317,9 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			defer timer.Stop()
 			select {
 			case <-entry.done:
-					logging.Global().Warnf(logging.CatTCP, "agent pairing aborted route=%s client=%s", routeName, clientID)
-					writeMailRouteUnavailable(c, routeName)
-					return
+				logging.Global().Warnf(logging.CatTCP, "agent pairing aborted route=%s client=%s", routeName, clientID)
+				writeMailRouteUnavailable(c, routeName)
+				return
 			case <-entry.ready:
 				agentConn := entry.take()
 				if agentConn == nil {

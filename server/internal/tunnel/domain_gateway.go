@@ -571,8 +571,8 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 		cleanup()
 		return nil, fmt.Errorf("timeout waiting for route %s backend", routeName)
 	case <-entry.done:
-			cleanup()
-			return nil, fmt.Errorf("route %s backend unavailable", routeName)
+		cleanup()
+		return nil, fmt.Errorf("route %s backend unavailable", routeName)
 	case <-entry.ready:
 		agentConn := entry.take()
 		if agentConn == nil {

@@ -343,8 +343,8 @@ func TestPendingTCPKeyIncludesRoute(t *testing.T) {
 }
 
 type closeTrackingConn struct {
-	mu     sync.Mutex
-	closed bool
+	mu       sync.Mutex
+	closed   bool
 	closedCh chan struct{}
 }
 

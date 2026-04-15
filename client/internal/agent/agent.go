@@ -61,12 +61,18 @@ type Agent struct {
 // connTracker keeps track of all TCP relay connections for the current
 // control session so they can be forcibly closed when the session ends.
 type connTracker struct {
-	mu    sync.Mutex
-	conns []net.Conn
+	mu     sync.Mutex
+	conns  []net.Conn
+	closed bool
 }
 
 func (ct *connTracker) add(c net.Conn) {
 	ct.mu.Lock()
+	if ct.closed {
+		ct.mu.Unlock()
+		_ = c.Close()
+		return
+	}
 	ct.conns = append(ct.conns, c)
 	ct.mu.Unlock()
 }
@@ -75,6 +81,7 @@ func (ct *connTracker) closeAll() {
 	ct.mu.Lock()
 	conns := ct.conns
 	ct.conns = nil
+	ct.closed = true
 	ct.mu.Unlock()
 	for _, c := range conns {
 		_ = c.Close()
@@ -151,7 +158,9 @@ func (a *Agent) connectAndRun() error {
 		return fmt.Errorf("control dial failed: %w", err)
 	}
 	netutil.SetTCPKeepAlive(conn, 15*time.Second)
+	a.mu.Lock()
 	a.controlConn = conn
+	a.mu.Unlock()
 	defer conn.Close()
 
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -171,19 +180,22 @@ func (a *Agent) connectAndRun() error {
 		return fmt.Errorf("resolve local udp addr failed: %w", err)
 	}
 
-	a.udpDataConn, err = net.ListenUDP("udp", localAddr)
+	udpConn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
 		return fmt.Errorf("udp data listen failed: %w", err)
 	}
-	a.udpDataConn.SetReadBuffer(8 * 1024 * 1024)
-	a.udpDataConn.SetWriteBuffer(8 * 1024 * 1024)
-	defer a.udpDataConn.Close()
+	a.mu.Lock()
+	a.udpDataConn = udpConn
+	a.mu.Unlock()
+	udpConn.SetReadBuffer(8 * 1024 * 1024)
+	udpConn.SetWriteBuffer(8 * 1024 * 1024)
+	defer udpConn.Close()
 
 	pkt := &protocol.Packet{
 		Type: protocol.TypeRegister,
 	}
 	data, _ := protocol.MarshalUDP(pkt, nil)
-	a.udpDataConn.WriteToUDP(data, a.serverUDP)
+	udpConn.WriteToUDP(data, a.serverUDP)
 
 	logging.Global().Infof(logging.CatSystem, "Agent started on control=%s data=%s", a.cfg.ControlAddr(), a.cfg.DataAddr())
 
@@ -198,7 +210,7 @@ func (a *Agent) connectAndRun() error {
 			case <-connCtx.Done():
 				return
 			case <-ticker.C:
-				a.udpDataConn.WriteToUDP(data, a.serverUDP)
+				udpConn.WriteToUDP(data, a.serverUDP)
 			}
 		}
 	}()
@@ -223,7 +235,7 @@ func (a *Agent) connectAndRun() error {
 	go func() {
 		<-connCtx.Done()
 		conn.Close()
-		a.udpDataConn.Close()
+		udpConn.Close()
 	}()
 
 	tracker := &connTracker{}
@@ -232,24 +244,36 @@ func (a *Agent) connectAndRun() error {
 		tracker.closeAll()
 	}()
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
+	var (
+		errCh = make(chan error, 2)
+		wg    sync.WaitGroup
+	)
 
 	wg.Add(1)
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done()
 		defer wg.Done()
 		defer connCancel()
 		if err := a.handleControl(connCtx, conn, tracker); err != nil {
-			errCh <- err
+			select {
+			case errCh <- err:
+			default:
+			}
 		}
 	}()
 
 	wg.Add(1)
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done()
 		defer wg.Done()
 		defer connCancel()
-		if err := a.handleUDPData(connCtx); err != nil {
-			errCh <- err
+		if err := a.handleUDPData(connCtx, udpConn); err != nil {
+			select {
+			case errCh <- err:
+			default:
+			}
 		}
 	}()
 
@@ -266,12 +290,16 @@ func (a *Agent) connectAndRun() error {
 
 func (a *Agent) Stop() {
 	a.cancel()
+	a.mu.Lock()
 	if a.controlConn != nil {
 		a.controlConn.Close()
+		a.controlConn = nil
 	}
 	if a.udpDataConn != nil {
 		a.udpDataConn.Close()
+		a.udpDataConn = nil
 	}
+	a.mu.Unlock()
 	a.wg.Wait()
 }
 
@@ -417,7 +445,16 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				continue
 			}
 
-			go func(routeName, clientID string, rt RemoteRoute) {
+			a.wg.Add(1)
+			go func(ctx context.Context, routeName, clientID string, rt RemoteRoute) {
+				defer a.wg.Done()
+
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				var dataConn net.Conn
 				var err error
 				dialTimeout := 10 * time.Second
@@ -457,6 +494,13 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				}
 				dataConn.SetDeadline(time.Time{})
 
+				select {
+				case <-ctx.Done():
+					dataConn.Close()
+					return
+				default:
+				}
+
 				localAddr := rt.EffectiveLocalAddr()
 				localConn, err := dialLocalTCP(localAddr)
 				if err != nil {
@@ -489,7 +533,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				tracker.add(dataConn)
 				tracker.add(localConn)
 				relay.Proxy(localConn, dataConn)
-			}(routeName, clientID, rt)
+			}(ctx, routeName, clientID, rt)
 		}
 	}
 }
@@ -573,7 +617,7 @@ type agentUDPSession struct {
 	lastSeen time.Time
 }
 
-func (a *Agent) handleUDPData(ctx context.Context) error {
+func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	buf := make([]byte, 65536)
 	decryptBuf := make([]byte, 65536)
 	var pkt protocol.Packet
@@ -655,7 +699,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 
 		refreshRouteCacheIfNeeded()
 
-		n, _, err := a.udpDataConn.ReadFromUDPAddrPort(buf)
+		n, _, err := udpConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -797,7 +841,7 @@ func (a *Agent) handleUDPData(ctx context.Context) error {
 							continue
 						}
 
-						a.udpDataConn.WriteToUDP(data, a.serverUDP)
+						udpConn.WriteToUDP(data, a.serverUDP)
 					}
 				}(key, localConn, rc.isEncrypted, rc.udpCipher)
 			}
