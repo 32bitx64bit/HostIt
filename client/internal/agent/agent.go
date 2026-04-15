@@ -122,6 +122,9 @@ func tlsConfigWithPin(pin string) *tls.Config {
 func (a *Agent) Run(ctx context.Context) error {
 	a.ctx, a.cancel = context.WithCancel(ctx)
 
+	backoff := 250 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+
 	for {
 		select {
 		case <-a.ctx.Done():
@@ -140,7 +143,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		select {
 		case <-a.ctx.Done():
 			return nil
-		case <-time.After(2 * time.Second):
+		case <-time.After(backoff):
+		}
+
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
 	}
 }
@@ -225,7 +235,11 @@ func (a *Agent) connectAndRun() error {
 			case <-ticker.C:
 				a.controlWriteMu.Lock()
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypePing})
+				if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypePing}); err != nil {
+					a.controlWriteMu.Unlock()
+					conn.Close()
+					return
+				}
 				conn.SetWriteDeadline(time.Time{})
 				a.controlWriteMu.Unlock()
 			}
@@ -318,7 +332,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		pkt, err := protocol.ReadPacket(conn)
 		if err != nil {
 			if ctx.Err() != nil {

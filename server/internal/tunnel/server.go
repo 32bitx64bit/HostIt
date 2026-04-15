@@ -1045,7 +1045,11 @@ func (s *Server) acceptControl(ln net.Listener) {
 						if isAgent {
 							session.writeMu.Lock()
 							c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-							protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing})
+							if err := protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing}); err != nil {
+								session.writeMu.Unlock()
+								c.Close()
+								return
+							}
 							session.writeMu.Unlock()
 						}
 					}
@@ -1065,7 +1069,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 						s.mu.RUnlock()
 						if isAgent {
 							lastPongTime := time.Unix(0, lastPong.Load().(int64))
-							if time.Since(lastPongTime) > 60*time.Second {
+							if time.Since(lastPongTime) > 35*time.Second {
 								logging.Global().Errorf(logging.CatTCP, "agent health check timeout, closing connection")
 								c.Close()
 								return
@@ -1082,7 +1086,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 				default:
 				}
 
-				c.SetReadDeadline(time.Now().Add(45 * time.Second))
+				c.SetReadDeadline(time.Now().Add(30 * time.Second))
 				pkt, err := protocol.ReadPacket(c)
 				if err != nil {
 					break
