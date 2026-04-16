@@ -427,29 +427,27 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 		if rt.Name == name {
 			val := enabled
 			s.cfg.Routes[i].Enabled = &val
+			cfg := s.cfg
+			agent := s.agentTCP
 			s.mu.Unlock()
 
 			s.updateRouteCache()
 
-			s.mu.Lock()
-			if s.agentTCP != nil {
-				helloPkt, err := s.buildHelloPacket()
+			if agent != nil {
+				payload, err := json.Marshal(buildHelloPayload(cfg))
 				if err != nil {
-					s.mu.Unlock()
 					return false
 				}
-				remoteAddr := s.agentTCP.RemoteAddr().String()
-				s.mu.Unlock()
+				helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: payload}
+				remoteAddr := agent.RemoteAddr().String()
 				s.sessionsMu.Lock()
 				if session, ok := s.sessions[remoteAddr]; ok {
 					session.writeMu.Lock()
-					s.agentTCP.SetWriteDeadline(time.Now().Add(5 * time.Second))
-					protocol.WritePacket(s.agentTCP, helloPkt)
+					agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					protocol.WritePacket(agent, helloPkt)
 					session.writeMu.Unlock()
 				}
 				s.sessionsMu.Unlock()
-			} else {
-				s.mu.Unlock()
 			}
 			return true
 		}
