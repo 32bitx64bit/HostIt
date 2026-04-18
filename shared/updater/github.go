@@ -11,6 +11,8 @@ import (
 	"hostit/shared/version"
 )
 
+var defaultHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 type githubRelease struct {
 	TagName    string        `json:"tag_name"`
 	HTMLURL    string        `json:"html_url"`
@@ -33,8 +35,7 @@ func fetchLatestStableRelease(ctx context.Context, repo string) (githubRelease, 
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "hostit-updater")
 
-	cl := &http.Client{Timeout: 10 * time.Second}
-	res, err := cl.Do(req)
+	res, err := defaultHTTPClient.Do(req)
 	if err != nil {
 		return githubRelease{}, err
 	}

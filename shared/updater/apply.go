@@ -53,51 +53,7 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 		return err
 	}
 
-	srcRoot, err := pickSourceRoot(extractDir, opts.ExpectedFolder)
-	if err != nil {
-		return err
-	}
-
-	sharedDest := strings.TrimSpace(opts.SharedDestDir)
-	if sharedDest != "" {
-		if p, err := filepath.Abs(sharedDest); err == nil {
-			sharedDest = p
-		}
-		sharedSrc, err := pickSharedRoot(extractDir)
-		if err != nil {
-			_, _ = fmt.Fprintf(logw, "Shared source not found in zip (continuing): %v\n", err)
-		} else {
-			_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDest)
-			if err := syncDir(sharedSrc, sharedDest, nil, nil, logw); err != nil {
-				return err
-			}
-		}
-	}
-
-	_, _ = fmt.Fprintf(logw, "Extracted source: %s\n", srcRoot)
-	_, _ = fmt.Fprintf(logw, "Applying into: %s\n", moduleDir)
-
-	preserve := make([]string, 0, len(opts.PreservePaths))
-	for _, p := range opts.PreservePaths {
-		if strings.TrimSpace(p) != "" {
-			preserve = append(preserve, p)
-		}
-	}
-
-	var extraSkip []string
-	if srcRoot == extractDir && sharedDest != "" {
-		extraSkip = append(extraSkip, "shared")
-	}
-
-	if err := syncDir(srcRoot, moduleDir, preserve, extraSkip, logw); err != nil {
-		return err
-	}
-
-	if err := runBuild(ctx, moduleDir, logw); err != nil {
-		return err
-	}
-
-	return nil
+	return applyZipUpdate(ctx, extractDir, moduleDir, opts, logw)
 }
 
 func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, logw io.Writer) error {
@@ -135,6 +91,10 @@ func ApplyZipFileUpdate(ctx context.Context, zipPath string, opts ApplyOptions, 
 		return err
 	}
 
+	return applyZipUpdate(ctx, extractDir, moduleDir, opts, logw)
+}
+
+func applyZipUpdate(ctx context.Context, extractDir string, moduleDir string, opts ApplyOptions, logw io.Writer) error {
 	srcRoot, err := pickSourceRoot(extractDir, opts.ExpectedFolder)
 	if err != nil {
 		return err
@@ -216,14 +176,7 @@ func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir st
 		return err
 	}
 
-	sharedSrc, err := pickSharedRoot(extractDir)
-	if err != nil {
-		return err
-	}
-
-	_, _ = fmt.Fprintf(logw, "Extracted shared: %s\n", sharedSrc)
-	_, _ = fmt.Fprintf(logw, "Applying shared into: %s\n", sharedDestDir)
-	return syncDir(sharedSrc, sharedDestDir, nil, nil, logw)
+	return applySharedZipUpdate(extractDir, sharedDestDir, logw)
 }
 
 func ApplySharedZipFileUpdate(zipPath string, sharedDestDir string, logw io.Writer) error {
@@ -264,6 +217,10 @@ func ApplySharedZipFileUpdate(zipPath string, sharedDestDir string, logw io.Writ
 		return err
 	}
 
+	return applySharedZipUpdate(extractDir, sharedDestDir, logw)
+}
+
+func applySharedZipUpdate(extractDir string, sharedDestDir string, logw io.Writer) error {
 	sharedSrc, err := pickSharedRoot(extractDir)
 	if err != nil {
 		return err
@@ -323,7 +280,7 @@ func downloadToFile(ctx context.Context, url string, dst string, logw io.Writer)
 		return err
 	}
 	req.Header.Set("User-Agent", "hostit-updater")
-	cl := &http.Client{Timeout: 0}
+	cl := &http.Client{Timeout: 30 * time.Minute}
 	res, err := cl.Do(req)
 	if err != nil {
 		return err
@@ -337,7 +294,7 @@ func downloadToFile(ctx context.Context, url string, dst string, logw io.Writer)
 		return err
 	}
 	defer f.Close()
-	if _, err := io.Copy(f, res.Body); err != nil {
+	if err := copyWithContext(ctx, f, res.Body); err != nil {
 		return err
 	}
 	fi, err := f.Stat()
@@ -345,6 +302,34 @@ func downloadToFile(ctx context.Context, url string, dst string, logw io.Writer)
 		_, _ = fmt.Fprintf(logw, "Downloaded %d bytes\n", fi.Size())
 	}
 	return nil
+}
+
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) error {
+	buf := make([]byte, 32*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+type zipFileEntry struct {
+	file *zip.File
+	path string
 }
 
 func unzip(zipPath string, dstDir string) error {
@@ -357,12 +342,8 @@ func unzip(zipPath string, dstDir string) error {
 		return err
 	}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(r.File))
-	sem := make(chan struct{}, 10) // limit concurrency
-
+	var files []zipFileEntry
 	for _, f := range r.File {
-		f := f
 		name := f.Name
 		if strings.Contains(name, "..") {
 			continue
@@ -380,19 +361,27 @@ func unzip(zipPath string, dstDir string) error {
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			return err
 		}
+		files = append(files, zipFileEntry{file: f, path: p})
+	}
 
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(files))
+	sem := make(chan struct{}, 10)
+
+	for _, entry := range files {
+		entry := entry
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			rc, err := f.Open()
+			rc, err := entry.file.Open()
 			if err != nil {
 				errCh <- err
 				return
 			}
 			defer rc.Close()
-			out, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+			out, err := os.OpenFile(entry.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, entry.file.Mode())
 			if err != nil {
 				errCh <- err
 				return
@@ -456,6 +445,22 @@ func pickSourceRoot(extractDir string, expectedFolder string) (string, error) {
 	return "", errors.New("could not locate build.sh in extracted zip")
 }
 
+func shouldSkipPath(rel string, skipPrefixes []string) bool {
+	parts := strings.Split(rel, string(os.PathSeparator))
+	if len(parts) == 0 {
+		return false
+	}
+	for _, sp := range skipPrefixes {
+		if parts[0] == sp {
+			return true
+		}
+	}
+	if strings.HasPrefix(parts[0], ".hostit-update-") {
+		return true
+	}
+	return false
+}
+
 func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkipPrefixes []string, logw io.Writer) error {
 	preserveFiles := make(map[string]struct{})
 	preserveDirs := make([]string, 0)
@@ -491,22 +496,11 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 			return nil
 		}
 		rel = filepath.Clean(rel)
-		parts := strings.Split(rel, string(os.PathSeparator))
-		if len(parts) > 0 {
-			for _, sp := range skipPrefixes {
-				if parts[0] == sp {
-					if d.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
-				}
+		if shouldSkipPath(rel, skipPrefixes) {
+			if d.IsDir() {
+				return filepath.SkipDir
 			}
-			if strings.HasPrefix(parts[0], ".hostit-update-") {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
+			return nil
 		}
 		srcRelPaths[rel] = struct{}{}
 		return nil
@@ -537,22 +531,11 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 			return nil
 		}
 		rel = filepath.Clean(rel)
-		parts := strings.Split(rel, string(os.PathSeparator))
-		if len(parts) > 0 {
-			for _, sp := range skipPrefixes {
-				if parts[0] == sp {
-					if d.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
-				}
+		if shouldSkipPath(rel, skipPrefixes) {
+			if d.IsDir() {
+				return filepath.SkipDir
 			}
-			if strings.HasPrefix(parts[0], ".hostit-update-") {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
+			return nil
 		}
 
 		abs := filepath.Clean(path)
@@ -600,22 +583,11 @@ func syncDir(srcRoot string, dstRoot string, preserveAbsList []string, extraSkip
 			return nil
 		}
 		rel = filepath.Clean(rel)
-		parts := strings.Split(rel, string(os.PathSeparator))
-		if len(parts) > 0 {
-			for _, sp := range skipPrefixes {
-				if parts[0] == sp {
-					if d.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
-				}
+		if shouldSkipPath(rel, skipPrefixes) {
+			if d.IsDir() {
+				return filepath.SkipDir
 			}
-			if strings.HasPrefix(parts[0], ".hostit-update-") {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
+			return nil
 		}
 
 		dstPath := filepath.Join(dstRoot, rel)

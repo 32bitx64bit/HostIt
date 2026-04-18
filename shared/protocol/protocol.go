@@ -171,6 +171,9 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	}
 
 	p.Type = data[0]
+	if p.Type < TypeRegister || p.Type > TypeEmailProbeResult {
+		return ErrInvalidPacket
+	}
 
 	i := 1
 	routeLen := int(data[i])

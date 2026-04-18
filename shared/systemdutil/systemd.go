@@ -34,7 +34,22 @@ func SystemctlAvailable() bool {
 	return err == nil
 }
 
+var allowedActions = map[string]bool{
+	"start":      true,
+	"stop":       true,
+	"restart":    true,
+	"reload":     true,
+	"status":     true,
+	"enable":     true,
+	"disable":    true,
+	"is-active":  true,
+	"is-enabled": true,
+}
+
 func Action(ctx context.Context, action string, service string) error {
+	if !allowedActions[action] {
+		return fmt.Errorf("unsupported systemctl action: %s", action)
+	}
 	if !SystemctlAvailable() {
 		return fmt.Errorf("systemctl not found")
 	}

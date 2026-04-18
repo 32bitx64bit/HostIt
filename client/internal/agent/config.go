@@ -74,7 +74,7 @@ func (c Config) ControlAddr() string {
 func (c Config) DataAddr() string {
 	host, port := splitHostPortOrDefault(c.Server, "7000")
 	pi, err := strconv.Atoi(port)
-	if err != nil {
+	if err != nil || pi+1 <= 0 || pi+1 > 65535 {
 		return net.JoinHostPort(host, "7001")
 	}
 	return net.JoinHostPort(host, strconv.Itoa(pi+1))

@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -187,7 +188,13 @@ func IsUniqueConstraint(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "UNIQUE constraint failed")
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		code := sqliteErr.Code()
+		return code == sqlite3.SQLITE_CONSTRAINT_UNIQUE || code == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") || (strings.Contains(msg, "constraint failed") && strings.Contains(strings.ToUpper(msg), "UNIQUE"))
 }
 
 var ErrBadInput = fmt.Errorf("bad input")

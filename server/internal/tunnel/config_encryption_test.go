@@ -3,6 +3,8 @@ package tunnel
 import (
 	"strings"
 	"testing"
+
+	"hostit/shared/emailcfg"
 )
 
 func TestServerConfigValidate_RequiresEncryptionAlgorithmForEncryptedRoutes(t *testing.T) {
@@ -20,6 +22,7 @@ func TestServerConfigValidate_RequiresEncryptionAlgorithmForEncryptedRoutes(t *t
 		}},
 	}
 
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "encryption_algorithm is required") {
 		t.Fatalf("Validate() error = %v, want encryption algorithm validation failure", err)

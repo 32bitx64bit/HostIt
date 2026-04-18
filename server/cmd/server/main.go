@@ -106,7 +106,11 @@ func main() {
 	}
 
 	if strings.TrimSpace(cfg.Token) == "" {
-		cfg.Token = genToken()
+		tok, err := genToken()
+		if err != nil {
+			log.Fatal(err)
+		}
+		cfg.Token = tok
 		_ = configio.Save(configPath, cfg)
 		slog.Info(logging.CatSystem, "generated new server token (was empty)")
 	}
@@ -367,6 +371,7 @@ const (
 )
 
 func serveServerDashboard(ctx context.Context, addr string, configPath string, authDBPath string, runner *serverRunner, store *auth.Store, cookieSecure bool, sessionTTL time.Duration, shutdownTimeout time.Duration) error {
+	sessionMaxAge = int(sessionTTL.Seconds())
 	tplStats := template.Must(template.New("stats").Parse(serverStatsHTML))
 	tplConfig := template.Must(template.New("config").Parse(serverConfigHTML))
 	tplEmail := template.Must(template.New("email").Parse(serverEmailHTML))
@@ -447,6 +452,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 			render := func(errMsg string, username string, errUser bool, errPass bool, errConfirm bool) {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				_ = tplSetup.Execute(w, map[string]any{
@@ -535,6 +543,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 
 			switch r.Method {
 			case http.MethodGet:
@@ -610,6 +621,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 			cfg, st, err := runner.Get()
 			routes := cfg.Routes
 			data := map[string]any{
@@ -633,6 +647,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 			cfg, st, err := runner.Get()
 			data := map[string]any{
 				"Cfg":      cfg,
@@ -708,6 +725,10 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
+			if !nettestDownloadLimiter.Allow(clientIP(r)) {
+				http.Error(w, "too many requests", http.StatusTooManyRequests)
+				return
+			}
 			sz := 8 * 1024 * 1024
 			if raw := strings.TrimSpace(r.URL.Query().Get("bytes")); raw != "" {
 				if n, err := strconv.Atoi(raw); err == nil {
@@ -717,8 +738,8 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			if sz < 1024 {
 				sz = 1024
 			}
-			if sz > 64*1024*1024 {
-				sz = 64 * 1024 * 1024
+			if sz > 16*1024*1024 {
+				sz = 16 * 1024 * 1024
 			}
 			buf := make([]byte, 32*1024)
 			_, _ = rand.Read(buf)
@@ -1037,7 +1058,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			w.WriteHeader(http.StatusAccepted)
 			go func() {
 				time.Sleep(250 * time.Millisecond)
-				_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+				os.Exit(0)
 			}()
 		})))
 
@@ -1048,6 +1069,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 			cfg, st, err := runner.Get()
 			routes := cfg.Routes
 			type routeView struct {
@@ -1095,6 +1119,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 			cfg, st, err := runner.Get()
 			type emailAccountView struct {
 				Username    string
@@ -1133,6 +1160,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 			cfg, st, err := runner.Get()
 			emailDomain := cfg.Email.Domain
 			mailHost := cfg.Email.EffectiveMailHost()
@@ -1196,6 +1226,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 			cfg, st, err := runner.Get()
 			data := map[string]any{
 				"Cfg":        cfg,
@@ -1215,6 +1248,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
 			cfg, st, err := runner.Get()
 			dashInterval := cfg.DashboardInterval
 			if dashInterval <= 0 {
@@ -1263,14 +1299,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"stats":   stats,
 				"entries": entries,
 			})
-		})))
-
-		mux.HandleFunc("/api/udp/payload", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		})))
-
-		mux.HandleFunc("/api/udp/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		})))
 
 		mux.HandleFunc("/config/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
@@ -1324,7 +1352,12 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			cfg.DomainACMEEmail = strings.TrimSpace(r.Form.Get("domain_acme_email"))
 			cfg.EncryptionAlgorithm = r.Form.Get("encryption_algorithm")
 			if cfg.Token == "" {
-				cfg.Token = genToken()
+				tok, err := genToken()
+				if err != nil {
+					http.Error(w, "token generation failed", http.StatusInternalServerError)
+					return
+				}
+				cfg.Token = tok
 				addMsg("Token was empty; generated a new token")
 			}
 			cfg.Routes = parseServerRoutesForm(r)
@@ -1400,6 +1433,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				addMsg("Dashboard HTTPS enabled (self-signed); cert sha256=" + fp)
 			}
 
+			cfg.Email = emailcfg.Normalize(cfg.Email)
 			if err := cfg.Validate(); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -1450,7 +1484,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			cfg.Email = emailCfg
+			cfg.Email = emailcfg.Normalize(emailCfg)
 			if err := cfg.Validate(); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -1537,10 +1571,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/controls", http.StatusSeeOther)
 		})))
 
-		mux.HandleFunc("/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/config", http.StatusSeeOther)
-		})))
-
 		mux.HandleFunc("/gen-token", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1556,7 +1586,12 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			cfg, _, _ := runner.Get()
-			cfg.Token = genToken()
+			tok, err := genToken()
+			if err != nil {
+				http.Error(w, "token generation failed", http.StatusInternalServerError)
+				return
+			}
+			cfg.Token = tok
 			if err := configio.Save(configPath, cfg); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -1569,6 +1604,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		return mux
 	}
 
+nextLoop:
 	for {
 		cfg, _, _ := runner.Get()
 		useTLS := cfg.WebHTTPS
@@ -1632,7 +1668,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				select {
 				case <-restartCh:
 				default:
-					goto next
+					continue nextLoop
 				}
 			}
 		case err := <-errCh:
@@ -1641,9 +1677,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			return err
 		}
-
-	next:
-		continue
 	}
 }
 
@@ -1704,10 +1737,12 @@ func serverUpdaterPreservePaths(absCfg string, absAuthDB string, runner *serverR
 	return paths
 }
 
-func genToken() string {
+func genToken() (string, error) {
 	var b [32]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("genToken: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func writeUploadedZipTemp(r *http.Request, fieldName string, pattern string) (string, bool, error) {
@@ -1735,10 +1770,6 @@ func writeUploadedZipTemp(r *http.Request, fieldName string, pattern string) (st
 		return "", false, err
 	}
 	return name, true, nil
-}
-
-func effectiveServerRoutes(cfg tunnel.ServerConfig) []tunnel.RouteConfig {
-	return cfg.Routes
 }
 
 func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
@@ -4087,8 +4118,13 @@ func clientIP(r *http.Request) string {
 	return strings.TrimSpace(r.RemoteAddr)
 }
 
-// Rate limiter for auth session lookups (prevents session brute-forcing)
-var authSessionLimiter = newIPRateLimiter(60, 1*time.Minute) // 60 requests per minute per IP
+// Rate limiter for invalid auth session lookups. This preserves brute-force
+// protection without throttling normal authenticated dashboard polling.
+var invalidSessionLimiter = newIPRateLimiter(60, 1*time.Minute)
+
+var nettestDownloadLimiter = newIPRateLimiter(4, 1*time.Minute)
+
+var sessionMaxAge int
 
 // csrfSecret is a random 32-byte key generated at startup, used to HMAC-sign
 // CSRF nonces so that an attacker who can inject cookies cannot forge a
@@ -4111,12 +4147,6 @@ func computeCSRFToken(nonce string) string {
 
 func requireAuth(store *auth.Store, cookieSecure bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Rate limit session validation attempts
-		if !authSessionLimiter.Allow(clientIP(r)) {
-			http.Error(w, "too many requests", http.StatusTooManyRequests)
-			return
-		}
-
 		hasUsers, err := store.HasAnyUsers(r.Context())
 		if err != nil {
 			http.Error(w, "auth db error", http.StatusInternalServerError)
@@ -4137,6 +4167,10 @@ func requireAuth(store *auth.Store, cookieSecure bool, next http.HandlerFunc) ht
 			return
 		}
 		if !ok {
+			if !invalidSessionLimiter.Allow(clientIP(r)) {
+				http.Error(w, "too many requests", http.StatusTooManyRequests)
+				return
+			}
 			clearSessionCookie(w, cookieSecure)
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
@@ -4151,7 +4185,15 @@ func ensureCSRF(w http.ResponseWriter, r *http.Request, secure bool) string {
 		return computeCSRFToken(c.Value)
 	}
 	// Generate a fresh random nonce and set it as the cookie value.
-	nonce := genToken()
+	nonce, err := genToken()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return ""
+	}
+	if nonce == "" {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return ""
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "csrf",
 		Value:    nonce,
@@ -4159,9 +4201,8 @@ func ensureCSRF(w http.ResponseWriter, r *http.Request, secure bool) string {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		Secure:   secure,
-		MaxAge:   60 * 60 * 24 * 7,
+		MaxAge:   sessionMaxAge,
 	})
-	// Return the HMAC of the nonce for embedding in forms.
 	return computeCSRFToken(nonce)
 }
 
@@ -4207,7 +4248,7 @@ func setSessionCookie(w http.ResponseWriter, sid string, secure bool) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		Secure:   secure,
-		MaxAge:   60 * 60 * 24 * 7,
+		MaxAge:   sessionMaxAge,
 	})
 }
 

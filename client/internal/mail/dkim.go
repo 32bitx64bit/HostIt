@@ -18,6 +18,7 @@ import (
 	"github.com/emersion/go-msgauth/dkim"
 
 	"hostit/shared/emailcfg"
+	"hostit/shared/logging"
 )
 
 func ensureDKIMSigner(dataDir string, cfg emailcfg.Config) (crypto.Signer, string, string, string, error) {
@@ -73,9 +74,12 @@ func loadDKIMKey(path string) (crypto.Signer, error) {
 	if err != nil {
 		return nil, err
 	}
-	blk, _ := pem.Decode(b)
+	blk, rest := pem.Decode(b)
 	if blk == nil {
 		return nil, fmt.Errorf("%s: no private key PEM block", path)
+	}
+	if len(bytes.TrimSpace(rest)) > 0 {
+		logging.Global().Warnf(logging.CatEmail, "%s: extra PEM blocks after first key are ignored", path)
 	}
 	switch blk.Type {
 	case "RSA PRIVATE KEY":

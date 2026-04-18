@@ -307,13 +307,13 @@ func (l *Logger) formatText(entry Entry) string {
 			if k == "category" {
 				continue
 			}
-			b.WriteString(fmt.Sprintf(" %s=%v", k, v))
+			b.WriteString(fmt.Sprintf(" %s=%v", k, sanitizeValue(v)))
 		}
 	}
 
 	if entry.ErrorStr != "" {
 		b.WriteString(" error=\"")
-		b.WriteString(entry.ErrorStr)
+		b.WriteString(sanitizeString(entry.ErrorStr))
 		b.WriteString("\"")
 	}
 
@@ -390,6 +390,20 @@ func (l *Logger) Errorf(cat Category, format string, args ...any) {
 		return
 	}
 	l.Error(cat, fmt.Sprintf(format, args...))
+}
+
+func sanitizeString(s string) string {
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	return s
+}
+
+func sanitizeValue(v any) any {
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	return sanitizeString(s)
 }
 
 func mergeFields(fields []map[string]any) map[string]any {

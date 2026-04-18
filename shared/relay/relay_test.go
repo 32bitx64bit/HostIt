@@ -7,6 +7,37 @@ import (
 	"time"
 )
 
+func TestProxyWithIdleTimeout(t *testing.T) {
+	a, b := net.Pipe()
+
+	idleTimeout := 100 * time.Millisecond
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ProxyWithIdleTimeout(a, b, idleTimeout)
+	}()
+
+	_ = a.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = b.SetDeadline(time.Now().Add(2 * time.Second))
+
+	if _, err := a.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(b, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("unexpected data: %q", string(buf))
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProxyWithIdleTimeout did not close connections after idle timeout")
+	}
+}
+
 func TestProxyPropagatesHalfClose(t *testing.T) {
 	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

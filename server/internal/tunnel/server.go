@@ -134,6 +134,9 @@ type Server struct {
 
 	clientIDCounter uint64
 
+	maxConnsPerRoute int
+	connSemaphores   sync.Map
+
 	pongCh       chan []byte
 	emailProbeCh chan []byte
 
@@ -147,6 +150,9 @@ type Server struct {
 
 	sessionsMu sync.Mutex
 	sessions   map[string]*agentSession
+
+	probeOutboundMu      sync.Mutex
+	probeOutboundTargets map[string]time.Time
 
 	lastAgentConnectAt    time.Time
 	lastAgentDisconnectAt time.Time
@@ -298,7 +304,7 @@ func (s *Server) dialMailOutboundTCP(conn net.Conn, target string) {
 		return
 	}
 
-	if !isAllowedOutboundSMTPTarget(remoteAddr) {
+	if !isAllowedOutboundSMTPTarget(remoteAddr) && !s.isAllowedProbeOutboundTarget(remoteAddr.String()) {
 		logging.Global().Errorf(logging.CatTCP, "mail outbound dial REJECTED: target=%s resolved=%s (invalid port or private/loopback IP)", target, remoteAddr.String())
 		conn.Close()
 		return
@@ -313,7 +319,57 @@ func (s *Server) dialMailOutboundTCP(conn net.Conn, target string) {
 	netutil.SetTCPKeepAlive(serverConn, 15*time.Second)
 	_ = conn.SetDeadline(time.Time{})
 	logging.Global().Infof(logging.CatTCP, "Mail outbound relay connected target=%s", remoteAddr.String())
-	go relay.Proxy(serverConn, conn)
+	go relay.ProxyWithIdleTimeout(serverConn, conn, 2*time.Minute)
+}
+
+func (s *Server) allowProbeOutboundTarget(target string, ttl time.Duration) (string, error) {
+	remoteAddr, err := net.ResolveTCPAddr("tcp", strings.TrimSpace(target))
+	if err != nil || remoteAddr == nil {
+		return "", fmt.Errorf("resolve probe outbound target %q: %w", target, err)
+	}
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	key := remoteAddr.String()
+	now := time.Now()
+
+	s.probeOutboundMu.Lock()
+	defer s.probeOutboundMu.Unlock()
+	if s.probeOutboundTargets == nil {
+		s.probeOutboundTargets = make(map[string]time.Time)
+	}
+	for existing, expiry := range s.probeOutboundTargets {
+		if !expiry.After(now) {
+			delete(s.probeOutboundTargets, existing)
+		}
+	}
+	s.probeOutboundTargets[key] = now.Add(ttl)
+	return key, nil
+}
+
+func (s *Server) revokeProbeOutboundTarget(target string) {
+	if strings.TrimSpace(target) == "" {
+		return
+	}
+	s.probeOutboundMu.Lock()
+	delete(s.probeOutboundTargets, target)
+	s.probeOutboundMu.Unlock()
+}
+
+func (s *Server) isAllowedProbeOutboundTarget(target string) bool {
+	now := time.Now()
+	s.probeOutboundMu.Lock()
+	defer s.probeOutboundMu.Unlock()
+	if len(s.probeOutboundTargets) == 0 {
+		return false
+	}
+	for existing, expiry := range s.probeOutboundTargets {
+		if !expiry.After(now) {
+			delete(s.probeOutboundTargets, existing)
+		}
+	}
+	expiresAt, ok := s.probeOutboundTargets[target]
+	return ok && expiresAt.After(now)
 }
 
 func buildHelloRoutes(cfg ServerConfig) map[string]helloRoute {
@@ -670,6 +726,14 @@ func (s *Server) RunAgentEmailProbe(ctx context.Context, req protocol.EmailProbe
 		s.mu.Unlock()
 	}()
 
+	if strings.TrimSpace(req.OutboundTarget) != "" {
+		allowedTarget, err := s.allowProbeOutboundTarget(req.OutboundTarget, time.Minute)
+		if err != nil {
+			return protocol.EmailProbeResult{}, err
+		}
+		defer s.revokeProbeOutboundTarget(allowedTarget)
+	}
+
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return protocol.EmailProbeResult{}, err
@@ -712,16 +776,20 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
+const defaultMaxConnsPerRoute = 4096
+
 func NewServer(cfg ServerConfig) *Server {
 	s := &Server{
-		cfg:         cfg,
-		derivedKeys: make(map[string][]byte),
-		udpCiphers:  make(map[string]cipher.AEAD),
-		publicTCP:   make(map[string]net.Listener),
-		publicUDP:   make(map[string]*net.UDPConn),
-		pendingTCP:  make(map[string]*pendingTCPEntry),
-		dash:        newDashState(),
-		sessions:    make(map[string]*agentSession),
+		cfg:              cfg,
+		derivedKeys:      make(map[string][]byte),
+		udpCiphers:       make(map[string]cipher.AEAD),
+		publicTCP:        make(map[string]net.Listener),
+		publicUDP:        make(map[string]*net.UDPConn),
+		pendingTCP:       make(map[string]*pendingTCPEntry),
+		dash:             newDashState(),
+		sessions:         make(map[string]*agentSession),
+		probeOutboundTargets: make(map[string]time.Time),
+		maxConnsPerRoute: defaultMaxConnsPerRoute,
 	}
 	s.domains = newDomainManager(s)
 	for _, rt := range effectiveRoutes(cfg) {
@@ -843,10 +911,14 @@ func (s *Server) Stop() {
 		s.udpDataConn.Close()
 	}
 	if s.domainHTTPServer != nil {
-		_ = s.domainHTTPServer.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = s.domainHTTPServer.Shutdown(ctx)
+		cancel()
 	}
 	if s.domainHTTPSServer != nil {
-		_ = s.domainHTTPSServer.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = s.domainHTTPSServer.Shutdown(ctx)
+		cancel()
 	}
 	if s.domainHTTPLn != nil {
 		s.domainHTTPLn.Close()
@@ -1239,6 +1311,21 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			continue
 		}
 
+		semVal, _ := s.connSemaphores.LoadOrStore(routeName, make(chan struct{}, s.maxConnsPerRoute))
+		sem, ok := semVal.(chan struct{})
+		if !ok {
+			logging.Global().Errorf(logging.CatTCP, "invalid semaphore type for route=%s, rejecting", routeName)
+			conn.Close()
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+		default:
+			logging.Global().Warnf(logging.CatTCP, "connection limit reached for route=%s, rejecting", routeName)
+			conn.Close()
+			continue
+		}
+
 		netutil.SetTCPKeepAlive(conn, 15*time.Second)
 		clientID := s.nextClientID()
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
@@ -1251,6 +1338,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		enabled := ok && rc.enabled
 
 		if agent == nil || !enabled {
+			<-sem
 			if isEmailRoute(routeName) {
 				logging.Global().Warnf(logging.CatTCP, "mail public connection rejected route=%s agentConnected=%v enabled=%v", routeName, agent != nil, enabled)
 				writeMailRouteUnavailable(conn, routeName)
@@ -1270,6 +1358,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			// be orphaned — reject immediately instead of hanging for
 			// PairTimeout.
 			s.mu.Unlock()
+			<-sem
 			logging.Global().Warnf(logging.CatTCP, "agent epoch changed, rejecting stale public TCP route=%s client=%s", routeName, clientID)
 			writeMailRouteUnavailable(conn, routeName)
 			conn.Close()
@@ -1291,6 +1380,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				logging.Global().Errorf(logging.CatTCP, "failed to request agent connect route=%s client=%s: %v", routeName, clientID, err)
 				session.writeMu.Unlock()
 				s.sessionsMu.Unlock()
+				<-sem
 				writeMailRouteUnavailable(conn, routeName)
 				conn.Close()
 				s.mu.Lock()
@@ -1302,6 +1392,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			session.writeMu.Unlock()
 		} else {
 			s.sessionsMu.Unlock()
+			<-sem
 			logging.Global().Warnf(logging.CatTCP, "agent session unavailable for route=%s client=%s", routeName, clientID)
 			writeMailRouteUnavailable(conn, routeName)
 			conn.Close()
@@ -1313,8 +1404,9 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		}
 		s.sessionsMu.Unlock()
 
-		go func(c net.Conn, clientID string) {
+		go func(c net.Conn, clientID string, sem chan struct{}) {
 			defer c.Close()
+			defer func() { <-sem }()
 			timer := time.NewTimer(s.cfg.PairTimeout)
 			defer timer.Stop()
 			select {
@@ -1337,7 +1429,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				countBytes := func(n int) {
 					s.dash.addBytes(time.Now(), int64(n))
 				}
-				relay.Proxy(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes})
+				relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, 5*time.Minute)
 
 			case <-timer.C:
 				logging.Global().Warnf(logging.CatTCP, "pair timeout route=%s client=%s", routeName, clientID)
@@ -1347,7 +1439,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				entry.cancel()
 				writeMailRouteUnavailable(c, routeName)
 			}
-		}(conn, clientID)
+		}(conn, clientID, sem)
 	}
 }
 
@@ -1469,7 +1561,13 @@ func (s *Server) acceptAgentUDP() {
 				}
 				addrCacheMu.Lock()
 				if len(addrCache) >= addrCacheLimit {
-					addrCache = make(map[string]*net.UDPAddr)
+					target := int(float64(addrCacheLimit) * 0.75)
+					for k := range addrCache {
+						if len(addrCache) <= target {
+							break
+						}
+						delete(addrCache, k)
+					}
 				}
 				addrCache[clientID] = clientAddr
 				addrCacheMu.Unlock()

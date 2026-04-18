@@ -27,8 +27,9 @@ type Manager struct {
 	Restart       func() error
 	CheckEvery    time.Duration
 
-	mu sync.Mutex
-	st persistedState
+	mu          sync.Mutex
+	jobStarting bool
+	st          persistedState
 }
 
 func NewManager(repo string, component Component, assetName string, moduleDir string, storePath string) *Manager {
@@ -147,8 +148,9 @@ func (m *Manager) SkipAvailableVersion() error {
 }
 
 func (m *Manager) Apply(ctx context.Context) (bool, error) {
+	_ = ctx
 	m.mu.Lock()
-	if m.st.Job.State == JobRunning {
+	if m.st.Job.State == JobRunning || m.jobStarting {
 		m.mu.Unlock()
 		return false, nil
 	}
@@ -162,22 +164,30 @@ func (m *Manager) Apply(ctx context.Context) (bool, error) {
 		m.mu.Unlock()
 		return false, errors.New("already up to date")
 	}
+	m.jobStarting = true
 	assetURL := ""
 	m.mu.Unlock()
 
-	ctx2, cancel := context.WithTimeout(ctx, 12*time.Second)
+	ctx2, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	rel, err := fetchLatestStableRelease(ctx2, m.Repo)
 	if err != nil {
+		m.mu.Lock()
+		m.jobStarting = false
+		m.mu.Unlock()
 		return false, err
 	}
 	assetURL = findAssetURL(rel, m.AssetName)
 	if strings.TrimSpace(assetURL) == "" {
+		m.mu.Lock()
+		m.jobStarting = false
+		m.mu.Unlock()
 		return false, fmt.Errorf("missing asset %q on release", m.AssetName)
 	}
 
 	m.mu.Lock()
 	m.st.Job = JobStatus{State: JobRunning, TargetVersion: availStr, StartedAtUnix: m.Now().Unix()}
+	m.jobStarting = false
 	_ = m.Store.Save(m.st)
 	m.mu.Unlock()
 
@@ -188,19 +198,26 @@ func (m *Manager) Apply(ctx context.Context) (bool, error) {
 func (m *Manager) ApplyLocal(ctx context.Context, componentZipPath string, sharedZipPath string) (bool, error) {
 	_ = ctx
 	m.mu.Lock()
-	if m.st.Job.State == JobRunning {
+	if m.st.Job.State == JobRunning || m.jobStarting {
 		m.mu.Unlock()
 		return false, nil
 	}
+	m.jobStarting = true
 	m.mu.Unlock()
 
 	componentZipPath = strings.TrimSpace(componentZipPath)
 	if componentZipPath == "" {
+		m.mu.Lock()
+		m.jobStarting = false
+		m.mu.Unlock()
 		return false, errors.New("missing component zip")
 	}
 
 	compStaged, err := copyZipToTemp(componentZipPath, "hostit-local-component-*")
 	if err != nil {
+		m.mu.Lock()
+		m.jobStarting = false
+		m.mu.Unlock()
 		return false, err
 	}
 
@@ -209,16 +226,20 @@ func (m *Manager) ApplyLocal(ctx context.Context, componentZipPath string, share
 		sharedStaged, err = copyZipToTemp(sharedZipPath, "hostit-local-shared-*")
 		if err != nil {
 			_ = os.Remove(compStaged)
+			m.mu.Lock()
+			m.jobStarting = false
+			m.mu.Unlock()
 			return false, err
 		}
 	}
 
 	m.mu.Lock()
 	m.st.Job = JobStatus{State: JobRunning, TargetVersion: "local", StartedAtUnix: m.Now().Unix()}
+	m.jobStarting = false
 	_ = m.Store.Save(m.st)
 	m.mu.Unlock()
 
-	go m.runApplyLocal(compStaged, sharedStaged)
+	go m.runApplyLocal(context.Background(), compStaged, sharedStaged)
 	return true, nil
 }
 
@@ -270,48 +291,13 @@ func (m *Manager) runApply(targetVersion string, assetURL string) {
 		ModuleDir:      m.ModuleDir,
 		ExpectedFolder: expectedFolder,
 		PreservePaths:  preserve,
-		SharedDestDir:  siblingSharedDir(m.ModuleDir),
+		SharedDestDir:  sharedDest,
 	}, logw)
 
-	now := m.Now().Unix()
-	m.mu.Lock()
-	if err != nil {
-		m.st.Job.State = JobFailed
-		m.st.Job.EndedAtUnix = now
-		m.st.Job.LastError = err.Error()
-		m.st.Job.Log = logw.String()
-		_ = m.Store.Save(m.st)
-		m.mu.Unlock()
-		return
-	}
-	m.st.Job.State = JobSuccess
-	m.st.Job.EndedAtUnix = now
-	m.st.Job.Log = logw.String()
-	m.st.Job.LastError = ""
-	m.st.RemindUntilUnix = 0
-	m.st.SkipVersion = ""
-	_ = m.Store.Save(m.st)
-	restart := m.Restart
-	m.mu.Unlock()
-
-	if restart != nil {
-		m.mu.Lock()
-		m.st.Job.Restarting = true
-		_ = m.Store.Save(m.st)
-		m.mu.Unlock()
-		if err := restart(); err != nil {
-			m.mu.Lock()
-			m.st.Job.State = JobFailed
-			m.st.Job.LastError = "restart failed: " + err.Error()
-			m.st.Job.Log = m.st.Job.Log + "\nRestart failed: " + err.Error() + "\n"
-			m.st.Job.EndedAtUnix = m.Now().Unix()
-			_ = m.Store.Save(m.st)
-			m.mu.Unlock()
-		}
-	}
+	m.finishApply(logw, err)
 }
 
-func (m *Manager) runApplyLocal(componentZipPath string, sharedZipPath string) {
+func (m *Manager) runApplyLocal(ctx context.Context, componentZipPath string, sharedZipPath string) {
 	defer os.Remove(componentZipPath)
 	if strings.TrimSpace(sharedZipPath) != "" {
 		defer os.Remove(sharedZipPath)
@@ -319,7 +305,6 @@ func (m *Manager) runApplyLocal(componentZipPath string, sharedZipPath string) {
 
 	logw := newJobLogWriter(m, 1<<20, 500*time.Millisecond)
 
-	ctx := context.Background()
 	sharedDest := siblingSharedDir(m.ModuleDir)
 	if strings.TrimSpace(sharedZipPath) != "" && strings.TrimSpace(sharedDest) != "" {
 		_, _ = fmt.Fprintf(logw, "Applying local shared.zip update...\n")
@@ -347,9 +332,13 @@ func (m *Manager) runApplyLocal(componentZipPath string, sharedZipPath string) {
 		ModuleDir:      m.ModuleDir,
 		ExpectedFolder: expectedFolder,
 		PreservePaths:  preserve,
-		SharedDestDir:  siblingSharedDir(m.ModuleDir),
+		SharedDestDir:  sharedDest,
 	}, logw)
 
+	m.finishApply(logw, err)
+}
+
+func (m *Manager) finishApply(logw *jobLogWriter, err error) {
 	now := m.Now().Unix()
 	m.mu.Lock()
 	if err != nil {

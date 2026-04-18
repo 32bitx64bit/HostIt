@@ -78,6 +78,7 @@ type Service struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	outboundDialer func(context.Context, string) (net.Conn, error)
+	mxLookup       func(string) ([]*net.MX, error)
 	tlsCfg         *tls.Config
 	tlsSrc         string
 	acmeHTTPServer *http.Server
@@ -97,6 +98,8 @@ type Service struct {
 	imapLn              net.Listener
 	imapTLSServer       *imapserver.Server
 	imapTLSLn           net.Listener
+
+	imapMessages map[string][]storedMessage
 }
 
 type accountRecord struct {
@@ -122,7 +125,9 @@ func NewService(dataDir string) (*Service, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", filepath.Join(dataDir, "mail.db"))
+	dbPath := filepath.Join(dataDir, "mail.db")
+	dbExisted := fileExists(dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +137,9 @@ func NewService(dataDir string) (*Service, error) {
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if !dbExisted {
+		_ = os.Chmod(dbPath, 0o600)
 	}
 	cfg, _ := s.loadConfig(context.Background())
 	s.cfg = cfg
@@ -278,10 +286,12 @@ func (s *Service) ListInbox(username string) ([]WebMessage, error) {
 		}
 		out = append(out, wm)
 	}
-	// Reverse so newest first.
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Date.Equal(out[j].Date) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].Date.After(out[j].Date)
+	})
 	return out, nil
 }
 
@@ -329,6 +339,7 @@ func (s *Service) DeleteMessage(username string, messageID int64) error {
 		return fmt.Errorf("message not found")
 	}
 	s.mu.Lock()
+	delete(s.imapMessages, username)
 	s.refreshStatusLocked("")
 	s.mu.Unlock()
 	return nil
@@ -499,6 +510,7 @@ func (s *Service) reconcileAccountsLocked(cfg emailcfg.Config) error {
 		}
 	}
 	for _, username := range stale {
+		logging.Global().Warnf(logging.CatEmail, "deleting account and messages for removed user %q", username)
 		if _, err := tx.Exec(`DELETE FROM messages WHERE username = ?`, username); err != nil {
 			return err
 		}
@@ -506,6 +518,7 @@ func (s *Service) reconcileAccountsLocked(cfg emailcfg.Config) error {
 			return err
 		}
 	}
+	s.imapMessages = nil
 	return tx.Commit()
 }
 
@@ -679,7 +692,10 @@ func (s *Service) startACMEHTTPChallengeLocked(setup *mailTLSSetup) error {
 	httpSrv := &http.Server{
 		Addr:              setup.ACMEHTTPAddr,
 		Handler:           setup.ACMEHTTPHandler,
-		ReadHeaderTimeout: 15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 	go func() { _ = httpSrv.Serve(ln) }()
 	s.acmeHTTPLn = ln
@@ -688,125 +704,112 @@ func (s *Service) startACMEHTTPChallengeLocked(setup *mailTLSSetup) error {
 }
 
 func (s *Service) closeListenersLocked() {
+	var closers []io.Closer
 	if s.submissionServer != nil {
-		_ = s.submissionServer.Close()
-		s.submissionServer = nil
+		closers = append(closers, s.submissionServer)
 	}
-	if s.submissionLn != nil {
-		_ = s.submissionLn.Close()
-		s.submissionLn = nil
-	}
+	closers = append(closers, s.submissionLn)
 	if s.submissionTLSServer != nil {
-		_ = s.submissionTLSServer.Close()
-		s.submissionTLSServer = nil
+		closers = append(closers, s.submissionTLSServer)
 	}
-	if s.submissionTLSLn != nil {
-		_ = s.submissionTLSLn.Close()
-		s.submissionTLSLn = nil
-	}
+	closers = append(closers, s.submissionTLSLn)
 	if s.inboundServer != nil {
-		_ = s.inboundServer.Close()
-		s.inboundServer = nil
+		closers = append(closers, s.inboundServer)
 	}
-	if s.inboundLn != nil {
-		_ = s.inboundLn.Close()
-		s.inboundLn = nil
-	}
+	closers = append(closers, s.inboundLn)
 	if s.imapServer != nil {
-		_ = s.imapServer.Close()
-		s.imapServer = nil
+		closers = append(closers, s.imapServer)
 	}
-	if s.imapLn != nil {
-		_ = s.imapLn.Close()
-		s.imapLn = nil
-	}
+	closers = append(closers, s.imapLn)
 	if s.imapTLSServer != nil {
-		_ = s.imapTLSServer.Close()
-		s.imapTLSServer = nil
+		closers = append(closers, s.imapTLSServer)
 	}
-	if s.imapTLSLn != nil {
-		_ = s.imapTLSLn.Close()
-		s.imapTLSLn = nil
+	closers = append(closers, s.imapTLSLn)
+	closers = append(closers, s.acmeHTTPLn)
+	for _, c := range closers {
+		if c != nil {
+			_ = c.Close()
+		}
 	}
 	if s.acmeHTTPServer != nil {
-		_ = s.acmeHTTPServer.Close()
-		s.acmeHTTPServer = nil
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = s.acmeHTTPServer.Shutdown(ctx)
+		cancel()
 	}
-	if s.acmeHTTPLn != nil {
-		_ = s.acmeHTTPLn.Close()
-		s.acmeHTTPLn = nil
-	}
+	s.submissionServer = nil
+	s.submissionLn = nil
+	s.submissionTLSServer = nil
+	s.submissionTLSLn = nil
+	s.inboundServer = nil
+	s.inboundLn = nil
+	s.imapServer = nil
+	s.imapLn = nil
+	s.imapTLSServer = nil
+	s.imapTLSLn = nil
+	s.acmeHTTPServer = nil
+	s.acmeHTTPLn = nil
 }
 
-func (s *Service) startSubmissionLocked() error {
-	ln, err := net.Listen("tcp", s.cfg.SubmissionAddr)
+func (s *Service) startSMTPServer(addr string, implicitTLS bool, submission bool) (net.Listener, *smtp.Server, error) {
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	backend := &smtpBackend{svc: s, submission: true}
+	backend := &smtpBackend{svc: s, submission: submission}
 	srv := smtp.NewServer(backend)
-	srv.Addr = s.cfg.SubmissionAddr
+	srv.Addr = addr
 	srv.Domain = s.cfg.EffectiveMailHost()
 	srv.AllowInsecureAuth = false
-	srv.TLSConfig = s.tlsCfg
 	srv.MaxMessageBytes = s.cfg.MaxMessageBytes
 	srv.MaxRecipients = s.cfg.MaxRecipients
 	srv.ReadTimeout = 30 * time.Second
 	srv.WriteTimeout = 30 * time.Second
-	go func() { _ = srv.Serve(ln) }()
+	var serveLn net.Listener = ln
+	if implicitTLS {
+		serveLn = tls.NewListener(ln, s.tlsCfg)
+	} else {
+		srv.TLSConfig = s.tlsCfg
+	}
+	go func() { _ = srv.Serve(serveLn) }()
+	return ln, srv, nil
+}
+
+func (s *Service) startSubmissionLocked() error {
+	ln, srv, err := s.startSMTPServer(s.cfg.SubmissionAddr, false, true)
+	if err != nil {
+		return err
+	}
 	s.submissionLn = ln
 	s.submissionServer = srv
 	return nil
 }
 
 func (s *Service) startSubmissionTLSLocked() error {
-	ln, err := net.Listen("tcp", s.cfg.SubmissionTLSAddr)
+	ln, srv, err := s.startSMTPServer(s.cfg.SubmissionTLSAddr, true, true)
 	if err != nil {
 		return err
 	}
-	backend := &smtpBackend{svc: s, submission: true}
-	srv := smtp.NewServer(backend)
-	srv.Addr = s.cfg.SubmissionTLSAddr
-	srv.Domain = s.cfg.EffectiveMailHost()
-	srv.AllowInsecureAuth = false
-	srv.MaxMessageBytes = s.cfg.MaxMessageBytes
-	srv.MaxRecipients = s.cfg.MaxRecipients
-	srv.ReadTimeout = 30 * time.Second
-	srv.WriteTimeout = 30 * time.Second
-	secureLn := tls.NewListener(ln, s.tlsCfg)
-	go func() { _ = srv.Serve(secureLn) }()
 	s.submissionTLSLn = ln
 	s.submissionTLSServer = srv
 	return nil
 }
 
 func (s *Service) startInboundLocked() error {
-	ln, err := net.Listen("tcp", s.cfg.InboundSMTPAddr)
+	ln, srv, err := s.startSMTPServer(s.cfg.InboundSMTPAddr, false, false)
 	if err != nil {
 		return err
 	}
-	backend := &smtpBackend{svc: s, submission: false}
-	srv := smtp.NewServer(backend)
-	srv.Addr = s.cfg.InboundSMTPAddr
-	srv.Domain = s.cfg.EffectiveMailHost()
-	srv.AllowInsecureAuth = false
-	srv.TLSConfig = s.tlsCfg
-	srv.MaxMessageBytes = s.cfg.MaxMessageBytes
-	srv.MaxRecipients = s.cfg.MaxRecipients
-	srv.ReadTimeout = 30 * time.Second
-	srv.WriteTimeout = 30 * time.Second
-	go func() { _ = srv.Serve(ln) }()
 	s.inboundLn = ln
 	s.inboundServer = srv
 	return nil
 }
 
-func (s *Service) startIMAPLocked() error {
-	ln, err := net.Listen("tcp", s.cfg.IMAPAddr)
+func (s *Service) startIMAPServer(addr string, implicitTLS bool) (net.Listener, *imapserver.Server, error) {
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	srv := imapserver.New(&imapserver.Options{
+	opts := &imapserver.Options{
 		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return &imapSession{svc: s}, nil, nil
 		},
@@ -815,31 +818,33 @@ func (s *Service) startIMAPLocked() error {
 			imap.CapIMAP4rev2: {},
 		},
 		InsecureAuth: false,
-		TLSConfig:    s.tlsCfg,
-	})
-	go func() { _ = srv.Serve(ln) }()
+	}
+	var serveLn net.Listener = ln
+	if implicitTLS {
+		serveLn = tls.NewListener(ln, s.tlsCfg)
+	} else {
+		opts.TLSConfig = s.tlsCfg
+	}
+	srv := imapserver.New(opts)
+	go func() { _ = srv.Serve(serveLn) }()
+	return ln, srv, nil
+}
+
+func (s *Service) startIMAPLocked() error {
+	ln, srv, err := s.startIMAPServer(s.cfg.IMAPAddr, false)
+	if err != nil {
+		return err
+	}
 	s.imapLn = ln
 	s.imapServer = srv
 	return nil
 }
 
 func (s *Service) startIMAPTLSLocked() error {
-	ln, err := net.Listen("tcp", s.cfg.IMAPTLSAddr)
+	ln, srv, err := s.startIMAPServer(s.cfg.IMAPTLSAddr, true)
 	if err != nil {
 		return err
 	}
-	srv := imapserver.New(&imapserver.Options{
-		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return &imapSession{svc: s}, nil, nil
-		},
-		Caps: imap.CapSet{
-			imap.CapIMAP4rev1: {},
-			imap.CapIMAP4rev2: {},
-		},
-		InsecureAuth: false,
-	})
-	secureLn := tls.NewListener(ln, s.tlsCfg)
-	go func() { _ = srv.Serve(secureLn) }()
 	s.imapTLSLn = ln
 	s.imapTLSServer = srv
 	return nil
@@ -927,6 +932,7 @@ func (s *Service) storeMessage(username, mailbox string, flags []string, raw []b
 		return err
 	}
 	s.mu.Lock()
+	delete(s.imapMessages, username)
 	s.refreshStatusLocked("")
 	s.mu.Unlock()
 	return nil
@@ -947,7 +953,12 @@ func (s *Service) classifyRecipients(rcpts []string) (local []string, external [
 		if rcpt == "" {
 			continue
 		}
-		parts := strings.Split(rcpt, "@")
+		addr, err := stdmail.ParseAddress(rcpt)
+		if err != nil {
+			external = append(external, rcpt)
+			continue
+		}
+		parts := strings.Split(addr.Address, "@")
 		if len(parts) == 2 && parts[1] == domain {
 			local = append(local, rcpt)
 		} else {
@@ -1074,7 +1085,11 @@ func (s *Service) sendOutboundSMTP(ctx context.Context, from string, rcpts []str
 			return fmt.Errorf("invalid recipient %q", rcpt)
 		}
 		domain := parts[1]
-		mxRecords, err := net.LookupMX(domain)
+		mxLookup := s.mxLookup
+		if mxLookup == nil {
+			mxLookup = net.LookupMX
+		}
+		mxRecords, err := mxLookup(domain)
 		if err != nil {
 			return fmt.Errorf("mx lookup failed for %s: %w", domain, err)
 		}
@@ -1086,7 +1101,13 @@ func (s *Service) sendOutboundSMTP(ctx context.Context, from string, rcpts []str
 		for _, mx := range mxRecords {
 			host := strings.TrimSuffix(mx.Host, ".")
 			logging.Global().Infof(logging.CatEmail, "outbound SMTP: from=%s rcpt=%s mx=%s", from, rcpt, host)
-			attemptCtx, cancel := context.WithTimeout(ctx, outboundSMTPAttemptTimeout)
+			perMXTimeout := outboundSMTPAttemptTimeout
+			if deadline, ok := ctx.Deadline(); ok {
+				if remaining := time.Until(deadline); remaining < perMXTimeout {
+					perMXTimeout = remaining
+				}
+			}
+			attemptCtx, cancel := context.WithTimeout(ctx, perMXTimeout)
 			conn, err := s.dialOutboundSMTP(attemptCtx, net.JoinHostPort(host, "25"))
 			if err != nil {
 				cancel()
@@ -1139,14 +1160,39 @@ func (s *smtpSession) Auth(mech string) (sasl.Server, error) {
 		return nil, fmt.Errorf("unsupported auth mechanism")
 	}
 	return sasl.NewPlainServer(func(identity, username, password string) error {
-		rec, err := s.svc.authenticate(username, password)
-		if err != nil {
-			return err
-		}
-		s.authenticated = true
-		s.authAddress = rec.Address
-		return nil
+		return s.authenticatePlain(identity, username, password)
 	}), nil
+}
+
+func (s *smtpSession) authenticatePlain(identity, username, password string) error {
+	identity = strings.TrimSpace(identity)
+	username = strings.TrimSpace(username)
+
+	candidates := make([]string, 0, 2)
+	if username != "" {
+		candidates = append(candidates, username)
+	}
+	if identity != "" && !strings.EqualFold(identity, username) {
+		candidates = append(candidates, identity)
+	}
+	if len(candidates) == 0 {
+		return fmt.Errorf("authentication failed")
+	}
+
+	var lastErr error
+	for _, candidate := range candidates {
+		rec, err := s.svc.authenticate(candidate, password)
+		if err == nil {
+			s.authenticated = true
+			s.authAddress = rec.Address
+			return nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("authentication failed")
 }
 
 func (s *smtpSession) Mail(from string, opts *smtp.MailOptions) error {
@@ -1187,13 +1233,6 @@ func (s *smtpSession) Data(r io.Reader) error {
 		s.from = s.authAddress
 	}
 	local, external := s.svc.classifyRecipients(s.rcpts)
-	storageCopies := len(local)
-	if s.authenticated && s.authAddress != "" {
-		storageCopies++
-	}
-	if err := s.svc.ensureStorageCapacity(storageCopies, len(raw)); err != nil {
-		return err
-	}
 	for _, rcpt := range local {
 		if err := s.svc.deliverLocal(rcpt, "INBOX", raw); err != nil {
 			return err
@@ -1203,11 +1242,13 @@ func (s *smtpSession) Data(r io.Reader) error {
 		if !s.submission || !s.authenticated {
 			return fmt.Errorf("relay denied")
 		}
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer sendCancel()
 		signedRaw, err := signOutboundMessage(raw, s.svc.cfg, s.svc.dkimSigner, s.authAddress)
 		if err != nil {
 			return err
 		}
-		if err := s.svc.sendOutboundSMTP(context.Background(), s.from, external, signedRaw); err != nil {
+		if err := s.svc.sendOutboundSMTP(sendCtx, s.from, external, signedRaw); err != nil {
 			return err
 		}
 	}
@@ -1215,27 +1256,6 @@ func (s *smtpSession) Data(r io.Reader) error {
 		if err := s.svc.deliverLocal(s.authAddress, "Sent", raw); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (s *Service) ensureStorageCapacity(copies int, rawSize int) error {
-	if copies <= 0 || rawSize <= 0 {
-		return nil
-	}
-	s.mu.RLock()
-	limit := s.cfg.StorageLimitBytes
-	s.mu.RUnlock()
-	if limit <= 0 {
-		return nil
-	}
-	used, err := s.storageUsage()
-	if err != nil {
-		return err
-	}
-	needed := int64(copies) * int64(rawSize)
-	if used+needed > limit {
-		return fmt.Errorf("mail storage limit exceeded")
 	}
 	return nil
 }
@@ -1281,9 +1301,23 @@ func (s *Service) buildIMAPUser(rec *accountRecord, password string) (*imapmemse
 		}
 		_ = user.Create(box, &imap.CreateOptions{})
 	}
-	msgs, err := s.listMessages(rec.Username)
-	if err != nil {
-		return nil, err
+	s.mu.RLock()
+	msgs := s.imapMessages[rec.Username]
+	s.mu.RUnlock()
+	if msgs == nil {
+		var err error
+		msgs, err = s.listMessages(rec.Username)
+		if err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		if s.imapMessages == nil {
+			s.imapMessages = make(map[string][]storedMessage)
+		}
+		if _, exists := s.imapMessages[rec.Username]; !exists {
+			s.imapMessages[rec.Username] = msgs
+		}
+		s.mu.Unlock()
 	}
 	for _, msg := range msgs {
 		flags := make([]imap.Flag, 0, len(msg.Flags))

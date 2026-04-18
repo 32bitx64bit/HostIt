@@ -207,7 +207,6 @@ type ServerConfig struct {
 
 func (c *ServerConfig) Validate() error {
 	var errs []string
-	c.Email = emailcfg.Normalize(c.Email)
 
 	if strings.TrimSpace(c.Token) == "" {
 		errs = append(errs, "token is required")

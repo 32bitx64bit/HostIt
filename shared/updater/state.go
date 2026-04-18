@@ -1,11 +1,9 @@
 package updater
 
 import (
-	"encoding/json"
-	"errors"
-	"os"
-	"path/filepath"
 	"sync"
+
+	"hostit/shared/configio"
 )
 
 type persistedState struct {
@@ -26,17 +24,7 @@ func (s *Store) Load() (persistedState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var st persistedState
-	b, err := os.ReadFile(s.Path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return st, nil
-		}
-		return st, err
-	}
-	if len(b) == 0 {
-		return st, nil
-	}
-	if err := json.Unmarshal(b, &st); err != nil {
+	if _, err := configio.Load(s.Path, &st); err != nil {
 		return persistedState{}, err
 	}
 	return st, nil
@@ -45,19 +33,5 @@ func (s *Store) Load() (persistedState, error) {
 func (s *Store) Save(st persistedState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.Path == "" {
-		return errors.New("empty store path")
-	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := s.Path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.Path)
+	return configio.Save(s.Path, st)
 }

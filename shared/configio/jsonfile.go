@@ -37,5 +37,6 @@ func Save(path string, v any) error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
+	defer os.Remove(tmp)
 	return os.Rename(tmp, path)
 }

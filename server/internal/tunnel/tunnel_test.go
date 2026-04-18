@@ -542,6 +542,70 @@ func TestMailOutboundRelayRejectsLoopbackTarget(t *testing.T) {
 	}
 }
 
+func TestMailOutboundRelayAllowsTemporarilyWhitelistedProbeTarget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	echoLn, echoAddr := startEcho(t)
+	defer echoLn.Close()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Token: "testtoken", PairTimeout: 3 * time.Second, DisableTLS: true})
+	allowedTarget, err := srv.allowProbeOutboundTarget(echoAddr, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.revokeProbeOutboundTarget(allowedTarget)
+	go func() { _ = srv.Run(ctx) }()
+
+	var dataConn net.Conn
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		dataConn, err = net.Dial("tcp", dataAddr)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	defer dataConn.Close()
+	if err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
+		t.Fatal(err)
+	}
+	routeBytes := []byte(protocol.RouteMailOutboundTCP)
+	targetBytes := []byte(echoAddr)
+	header := make([]byte, 0, 2+len(routeBytes)+len(targetBytes))
+	header = append(header, byte(len(routeBytes)))
+	header = append(header, routeBytes...)
+	header = append(header, byte(len(targetBytes)))
+	header = append(header, targetBytes...)
+	if _, err := dataConn.Write(header); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dataConn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(dataConn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("relay response = %q, want %q", string(buf), "ping")
+	}
+}
+
 func TestIsAllowedOutboundSMTPTarget(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -971,6 +1035,76 @@ func TestServerMultiConn_NoAgentRejectsQuickly(t *testing.T) {
 	_, rerr := c.Read(buf)
 	if rerr == nil {
 		return
+	}
+}
+
+func TestPublicTCPRejectWithoutAgentDoesNotLeakConnectionSlot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	echoLn, echoAddr := startEcho(t)
+	defer echoLn.Close()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	publicLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	publicAddr := publicLn.Addr().String()
+	publicLn.Close()
+
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}},
+		Token:       "testtoken",
+		PairTimeout: 500 * time.Millisecond,
+		DisableTLS:  true,
+	})
+	srv.maxConnsPerRoute = 1
+	go func() { _ = srv.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, err := net.Dial("tcp", publicAddr)
+		if err == nil {
+			_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+			_, _ = c.Write([]byte("probe"))
+			buf := make([]byte, 1)
+			_, _ = c.Read(buf)
+			_ = c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	go fakeAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
+	waitEchoReady(t, publicAddr)
+
+	c, err := net.Dial("tcp", publicAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+
+	msg := []byte("after-reject\n")
+	if _, err := c.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, len(msg))
+	if _, err := io.ReadFull(c, reply); err != nil {
+		t.Fatal(err)
+	}
+	if string(reply) != string(msg) {
+		t.Fatalf("expected %q got %q", string(msg), string(reply))
 	}
 }
 

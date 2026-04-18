@@ -31,6 +31,7 @@ func TestServerConfigValidate_AllowsManagedDomainRoute(t *testing.T) {
 		}},
 	}
 
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
@@ -55,6 +56,7 @@ func TestServerConfigValidate_RejectsRouteDomainOutsideBase(t *testing.T) {
 		}},
 	}
 
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "must match base domain") {
 		t.Fatalf("Validate() error = %v, want base-domain validation failure", err)
@@ -77,6 +79,7 @@ func TestServerConfigValidate_RejectsDuplicateRouteDomains(t *testing.T) {
 		},
 	}
 
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "duplicate route domain") {
 		t.Fatalf("Validate() error = %v, want duplicate domain failure", err)
@@ -102,6 +105,7 @@ func TestServerConfigValidate_RejectsDomainWithPort(t *testing.T) {
 		}},
 	}
 
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "must not include ports") {
 		t.Fatalf("Validate() error = %v, want invalid domain failure", err)
@@ -135,6 +139,7 @@ func TestServerConfigValidate_RejectsMailHostConflictWithManagedRoute(t *testing
 		}},
 	}
 
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "email mail host") || !strings.Contains(err.Error(), "conflicts with managed route domain") {
 		t.Fatalf("Validate() error = %v, want mail-host conflict failure", err)

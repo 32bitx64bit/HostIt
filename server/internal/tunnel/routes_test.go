@@ -65,6 +65,7 @@ func TestServerConfigValidate_RejectsInboundSMTPPort25Conflict(t *testing.T) {
 		Routes: []RouteConfig{{Name: "app", Proto: "tcp", PublicAddr: ":25"}},
 	}
 
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("Validate() error = nil, want conflict on public TCP 25")
@@ -94,6 +95,7 @@ func TestServerConfigValidate_RejectsSubmissionPort587Conflict(t *testing.T) {
 		Routes: []RouteConfig{{Name: "app", Proto: "tcp", PublicAddr: ":587"}},
 	}
 
+	cfg.Email = emailcfg.Normalize(cfg.Email)
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("Validate() error = nil, want conflict on public TCP 587")

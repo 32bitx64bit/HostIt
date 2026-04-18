@@ -182,18 +182,33 @@ func trimStdLogPrefix(s string) string {
 	return s
 }
 
+func containsLevelWord(s, level string) bool {
+	n := len(level)
+	for i := 0; i <= len(s)-n; i++ {
+		if s[i:i+n] != level {
+			continue
+		}
+		beforeOk := i == 0 || s[i-1] == ' ' || s[i-1] == '[' || s[i-1] == '(' || s[i-1] == '|' || s[i-1] == ':'
+		afterOk := i+n == len(s) || s[i+n] == ' ' || s[i+n] == ':' || s[i+n] == ']' || s[i+n] == ')' || s[i+n] == '|' || s[i+n] == ',' || s[i+n] == '.'
+		if beforeOk && afterOk {
+			return true
+		}
+	}
+	return false
+}
+
 func detectUILogLevel(s string) string {
 	upper := strings.ToUpper(strings.TrimSpace(s))
 	switch {
-	case strings.Contains(upper, "FATAL"):
+	case containsLevelWord(upper, "FATAL"):
 		return "FATAL"
-	case strings.Contains(upper, "ERROR") || strings.Contains(strings.ToLower(s), "error handling"):
+	case containsLevelWord(upper, "ERROR") || strings.Contains(strings.ToLower(s), "error handling"):
 		return "ERROR"
-	case strings.Contains(upper, "WARN") || strings.Contains(upper, "WARNING"):
+	case containsLevelWord(upper, "WARN") || containsLevelWord(upper, "WARNING"):
 		return "WARN"
-	case strings.Contains(upper, "DEBUG"):
+	case containsLevelWord(upper, "DEBUG"):
 		return "DEBUG"
-	case strings.Contains(upper, "TRACE"):
+	case containsLevelWord(upper, "TRACE"):
 		return "TRACE"
 	default:
 		return "INFO"

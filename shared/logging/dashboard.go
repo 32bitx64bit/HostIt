@@ -114,6 +114,16 @@ func (d *DashboardHook) allowRated(key string) bool {
 		}
 	}
 	d.rateKeys[key] = now
+
+	if len(d.rateKeys) > 1000 {
+		cutoff := now.Add(-d.rateMin * 10)
+		for k, t := range d.rateKeys {
+			if t.Before(cutoff) {
+				delete(d.rateKeys, k)
+			}
+		}
+	}
+
 	return true
 }
 

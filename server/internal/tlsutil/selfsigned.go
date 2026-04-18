@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-func EnsureSelfSigned(certFile, keyFile string) (fingerprintHex string, err error) {
+func ensureSelfSignedCert(certFile, keyFile, commonName string, dnsNames []string, ipAddrs []net.IP) (fingerprintHex string, err error) {
 	if certFile == "" || keyFile == "" {
 		return "", fmt.Errorf("certFile/keyFile required")
 	}
@@ -33,95 +33,53 @@ func EnsureSelfSigned(certFile, keyFile string) (fingerprintHex string, err erro
 			return "", err
 		}
 		if selfSignedNeedsRenew(der) {
-			log.Println("tlsutil: auto-rotating tunnel self-signed cert (expires within 30 days)")
-			return RegenerateSelfSigned(certFile, keyFile)
+			log.Printf("tlsutil: auto-rotating %s self-signed cert (expires within 30 days)", commonName)
+			return regenerateSelfSignedCert(certFile, keyFile, commonName, dnsNames, ipAddrs)
 		}
 		sum := sha256.Sum256(der)
 		return hex.EncodeToString(sum[:]), nil
 	}
 
-	return writeSelfSigned(certFile, keyFile, "hostit-tunnel")
+	return writeSelfSignedWithSANs(certFile, keyFile, commonName, dnsNames, ipAddrs)
+}
+
+func regenerateSelfSignedCert(certFile, keyFile, commonName string, dnsNames []string, ipAddrs []net.IP) (fingerprintHex string, err error) {
+	if certFile == "" || keyFile == "" {
+		return "", fmt.Errorf("certFile/keyFile required")
+	}
+	return writeSelfSignedWithSANs(certFile, keyFile, commonName, dnsNames, ipAddrs)
+}
+
+func EnsureSelfSigned(certFile, keyFile string) (fingerprintHex string, err error) {
+	return ensureSelfSignedCert(certFile, keyFile, "hostit-tunnel", []string{"localhost"}, []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback})
 }
 
 func RegenerateSelfSigned(certFile, keyFile string) (fingerprintHex string, err error) {
-	if certFile == "" || keyFile == "" {
-		return "", fmt.Errorf("certFile/keyFile required")
-	}
-	return writeSelfSigned(certFile, keyFile, "hostit-tunnel")
+	return regenerateSelfSignedCert(certFile, keyFile, "hostit-tunnel", []string{"localhost"}, []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback})
 }
 
 func EnsureSelfSignedDashboard(certFile, keyFile string) (fingerprintHex string, err error) {
-	if certFile == "" || keyFile == "" {
-		return "", fmt.Errorf("certFile/keyFile required")
-	}
-
-	certExists := fileExists(certFile)
-	keyExists := fileExists(keyFile)
-
-	if certExists && keyExists {
-		der, err := readFirstCertDER(certFile)
-		if err != nil {
-			return "", err
-		}
-		if selfSignedNeedsRenew(der) {
-			log.Println("tlsutil: auto-rotating dashboard self-signed cert (expires within 30 days)")
-			return RegenerateSelfSignedDashboard(certFile, keyFile)
-		}
-		sum := sha256.Sum256(der)
-		return hex.EncodeToString(sum[:]), nil
-	}
-
-	return writeSelfSigned(certFile, keyFile, "hostit-dashboard")
+	return ensureSelfSignedCert(certFile, keyFile, "hostit-dashboard", []string{"localhost"}, []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback})
 }
 
 func RegenerateSelfSignedDashboard(certFile, keyFile string) (fingerprintHex string, err error) {
-	if certFile == "" || keyFile == "" {
-		return "", fmt.Errorf("certFile/keyFile required")
-	}
-	return writeSelfSigned(certFile, keyFile, "hostit-dashboard")
+	return regenerateSelfSignedCert(certFile, keyFile, "hostit-dashboard", []string{"localhost"}, []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback})
 }
 
 func EnsureSelfSignedHost(certFile, keyFile string, host string) (fingerprintHex string, err error) {
-	if certFile == "" || keyFile == "" {
-		return "", fmt.Errorf("certFile/keyFile required")
-	}
-
-	certExists := fileExists(certFile)
-	keyExists := fileExists(keyFile)
-
-	if certExists && keyExists {
-		der, err := readFirstCertDER(certFile)
-		if err != nil {
-			return "", err
-		}
-		if selfSignedNeedsRenew(der) {
-			log.Println("tlsutil: auto-rotating host self-signed cert (expires within 30 days)")
-			return RegenerateSelfSignedHost(certFile, keyFile, host)
-		}
-		sum := sha256.Sum256(der)
-		return hex.EncodeToString(sum[:]), nil
-	}
-
-	return writeSelfSignedHost(certFile, keyFile, host)
-}
-
-func RegenerateSelfSignedHost(certFile, keyFile string, host string) (fingerprintHex string, err error) {
-	if certFile == "" || keyFile == "" {
-		return "", fmt.Errorf("certFile/keyFile required")
-	}
-	return writeSelfSignedHost(certFile, keyFile, host)
-}
-
-func writeSelfSigned(certFile, keyFile string, commonName string) (fingerprintHex string, err error) {
-	return writeSelfSignedWithSANs(certFile, keyFile, commonName, []string{"localhost"}, []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback})
-}
-
-func writeSelfSignedHost(certFile, keyFile string, host string) (fingerprintHex string, err error) {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return "", fmt.Errorf("host required")
 	}
-	return writeSelfSignedWithSANs(certFile, keyFile, host, []string{host}, nil)
+	return ensureSelfSignedCert(certFile, keyFile, host, []string{host}, nil)
+}
+
+func RegenerateSelfSignedHost(certFile, keyFile string, host string) (fingerprintHex string, err error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", fmt.Errorf("host required")
+	}
+	return regenerateSelfSignedCert(certFile, keyFile, host, []string{host}, nil)
 }
 
 func writeSelfSignedWithSANs(certFile, keyFile string, commonName string, dnsNames []string, ipAddrs []net.IP) (fingerprintHex string, err error) {

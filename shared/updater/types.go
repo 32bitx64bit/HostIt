@@ -1,7 +1,5 @@
 package updater
 
-import "time"
-
 type Component string
 
 const (
@@ -19,14 +17,13 @@ const (
 )
 
 type JobStatus struct {
-	State         JobState  `json:"state"`
-	TargetVersion string    `json:"targetVersion"`
-	StartedAtUnix int64     `json:"startedAtUnix"`
-	EndedAtUnix   int64     `json:"endedAtUnix"`
-	Log           string    `json:"log"`
-	LastError     string    `json:"lastError"`
-	Restarting    bool      `json:"restarting"`
-	UpdatedAt     time.Time `json:"-"`
+	State         JobState `json:"state"`
+	TargetVersion string   `json:"targetVersion"`
+	StartedAtUnix int64    `json:"startedAtUnix"`
+	EndedAtUnix   int64    `json:"endedAtUnix"`
+	Log           string   `json:"log"`
+	LastError     string   `json:"lastError"`
+	Restarting    bool     `json:"restarting"`
 }
 
 type Status struct {

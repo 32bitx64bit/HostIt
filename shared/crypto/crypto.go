@@ -93,8 +93,11 @@ func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 	}
 
 	val := atomic.AddUint64(&udpNonceCounter, 1)
-	for i := 0; i < 8 && i < nonceSize; i++ {
+	for i := 0; i < nonceSize; i++ {
 		dst[i] = byte(val >> (i * 8))
+	}
+	for i := 8; i < nonceSize; i++ {
+		dst[i] ^= byte(val >> ((i - 8) * 8))
 	}
 	return aesgcm.Seal(dst, dst[:nonceSize], plaintext, nil), nil
 }

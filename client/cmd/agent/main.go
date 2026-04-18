@@ -264,7 +264,7 @@ func main() {
 				log.Printf("WARNING: agent web UI is unauthenticated; binding to all interfaces")
 			} else if h, _, err := net.SplitHostPort(display); err == nil {
 				h = strings.TrimSpace(h)
-				if h == "" || h == "0.0.0.0" || h == "::" {
+				if h == "" || h == "0.0.0.0" || h == "::" || h == "[::]" || h == "0:0:0:0:0:0:0:0" {
 					log.Printf("WARNING: agent web UI is unauthenticated; binding to all interfaces")
 				}
 			}
@@ -447,6 +447,13 @@ func (a *agentController) Stop() {
 	}
 }
 
+func maskToken(s string) string {
+	if len(s) <= 4 {
+		return "****"
+	}
+	return "****" + s[len(s)-4:]
+}
+
 func serveAgentDashboard(ctx context.Context, addr string, configPath string, ctrl *agentController, mailSvc *mail.Service) error {
 	tplHome := template.Must(template.New("home").Parse(agentHomeHTML))
 	tplControls := template.Must(template.New("controls").Parse(agentControlsHTML))
@@ -498,10 +505,10 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	upd.Start(ctx)
 
 	type routeView struct {
-		Name        string
-		Proto       string
-		PublicAddr  string
-		LocalTarget string
+		Name        string `json:"name"`
+		Proto       string `json:"proto"`
+		PublicAddr  string `json:"publicAddr"`
+		LocalTarget string `json:"localTarget"`
 	}
 	makeRouteViews := func(routes []agent.RemoteRoute) []routeView {
 		out := make([]routeView, 0, len(routes))
@@ -529,7 +536,32 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		return msg
 	}
 
+	buildTemplateData := func(cfg agent.Config, running, connected bool, lastErr string, routes []agent.RemoteRoute) map[string]any {
+		data := map[string]any{
+			"Cfg":          cfg,
+			"Running":      running,
+			"Connected":    connected,
+			"HasToken":     strings.TrimSpace(cfg.Token) != "",
+			"TokenDisplay": maskToken(cfg.Token),
+			"LastErr":      lastErr,
+			"ConfigPath":   configPath,
+			"Version":      version.Current,
+			"Msg":          getMsg(),
+			"RoutesView":   makeRouteViews(routes),
+		}
+		if mailSvc != nil {
+			data["EmailStatus"] = mailSvc.Status()
+		}
+		return data
+	}
+
 	mux := http.NewServeMux()
+
+	writeJSON := func(w http.ResponseWriter, v any) {
+		if err := json.NewEncoder(w).Encode(v); err != nil {
+			log.Printf("json encode: %v", err)
+		}
+	}
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -537,16 +569,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		cfg, running, connected, lastErr, routes := ctrl.Get()
-		type routeView struct {
-			Name        string `json:"name"`
-			Proto       string `json:"proto"`
-			PublicAddr  string `json:"publicAddr"`
-			LocalTarget string `json:"localTarget"`
-		}
-		outRoutes := make([]routeView, 0, len(routes))
-		for _, rt := range routes {
-			outRoutes = append(outRoutes, routeView{Name: rt.Name, Proto: rt.Proto, PublicAddr: rt.PublicAddr, LocalTarget: rt.EffectiveLocalAddr()})
-		}
+		outRoutes := makeRouteViews(routes)
 		resp := map[string]any{
 			"running":    running,
 			"connected":  connected,
@@ -562,7 +585,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			resp["email"] = mailSvc.Status()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		writeJSON(w, resp)
 	})
 
 	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
@@ -584,7 +607,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			entries = agentlog.UILogs.Entries(level, limit)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, map[string]any{
 			"level":   level,
 			"limit":   limit,
 			"stats":   stats,
@@ -599,7 +622,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		upd.CheckIfDue(r.Context())
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(upd.Status())
+		writeJSON(w, upd.Status())
 	})
 	mux.HandleFunc("/api/update/check-now", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -608,7 +631,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		_ = upd.CheckNow(r.Context())
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(upd.Status())
+		writeJSON(w, upd.Status())
 	})
 
 	mux.HandleFunc("/api/systemd/status", func(w http.ResponseWriter, r *http.Request) {
@@ -618,7 +641,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		st := systemdutil.Status(r.Context(), agentSystemdServiceName)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(st)
+		writeJSON(w, st)
 	})
 	mux.HandleFunc("/api/systemd/restart", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -666,7 +689,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.WriteHeader(http.StatusAccepted)
 		go func() {
 			time.Sleep(250 * time.Millisecond)
-			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			os.Exit(0)
 		}()
 	})
 	mux.HandleFunc("/api/update/remind", func(w http.ResponseWriter, r *http.Request) {
@@ -779,21 +802,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		cfg, running, connected, lastErr, routes := ctrl.Get()
-		data := map[string]any{
-			"Cfg":        cfg,
-			"Running":    running,
-			"Connected":  connected,
-			"HasToken":   strings.TrimSpace(cfg.Token) != "",
-			"LastErr":    lastErr,
-			"ConfigPath": configPath,
-			"Version":    version.Current,
-			"Msg":        getMsg(),
-			"RoutesView": makeRouteViews(routes),
-		}
-		if mailSvc != nil {
-			data["EmailStatus"] = mailSvc.Status()
-		}
-		_ = tplHome.Execute(w, data)
+		_ = tplHome.Execute(w, buildTemplateData(cfg, running, connected, lastErr, routes))
 	})
 
 	mux.HandleFunc("/controls", func(w http.ResponseWriter, r *http.Request) {
@@ -802,21 +811,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		cfg, running, connected, lastErr, routes := ctrl.Get()
-		data := map[string]any{
-			"Cfg":        cfg,
-			"Running":    running,
-			"Connected":  connected,
-			"HasToken":   strings.TrimSpace(cfg.Token) != "",
-			"LastErr":    lastErr,
-			"ConfigPath": configPath,
-			"Version":    version.Current,
-			"Msg":        getMsg(),
-			"RoutesView": makeRouteViews(routes),
-		}
-		if mailSvc != nil {
-			data["EmailStatus"] = mailSvc.Status()
-		}
-		_ = tplControls.Execute(w, data)
+		_ = tplControls.Execute(w, buildTemplateData(cfg, running, connected, lastErr, routes))
 	})
 
 	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
@@ -835,7 +830,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		old, _, _, _, _ := ctrl.Get()
 		cfg := old
 		cfg.Server = strings.TrimSpace(r.Form.Get("server"))
-		cfg.Token = strings.TrimSpace(r.Form.Get("token"))
+		submittedToken := strings.TrimSpace(r.Form.Get("token"))
+		if strings.HasPrefix(submittedToken, "****") {
+			cfg.Token = old.Token
+		} else {
+			cfg.Token = submittedToken
+		}
 		cfg.TLSPinSHA256 = strings.TrimSpace(r.Form.Get("tls_pin_sha256"))
 		if cfg.Server == "" {
 			http.Error(w, "server is required", http.StatusBadRequest)
@@ -873,7 +873,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		if mailSvc == nil {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]mail.WebAccount{})
+			writeJSON(w, []mail.WebAccount{})
 			return
 		}
 		accts, err := mailSvc.ListAccounts()
@@ -885,7 +885,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			accts = []mail.WebAccount{}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(accts)
+		writeJSON(w, accts)
 	})
 
 	mux.HandleFunc("/api/mail/login", func(w http.ResponseWriter, r *http.Request) {
@@ -911,7 +911,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"username": req.Username, "address": addr})
+		writeJSON(w, map[string]string{"username": req.Username, "address": addr})
 	})
 
 	mux.HandleFunc("/api/mail/inbox", func(w http.ResponseWriter, r *http.Request) {
@@ -944,7 +944,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			msgs = []mail.WebMessage{}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(msgs)
+		writeJSON(w, msgs)
 	})
 
 	mux.HandleFunc("/api/mail/message", func(w http.ResponseWriter, r *http.Request) {
@@ -975,7 +975,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(msg)
+		writeJSON(w, msg)
 	})
 
 	mux.HandleFunc("/api/mail/delete", func(w http.ResponseWriter, r *http.Request) {
@@ -1015,7 +1015,14 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = tplMail.Execute(w, nil)
 	})
 
-	h := &http.Server{Addr: addr, Handler: mux}
+	h := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		ctx2, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -1177,7 +1184,7 @@ const agentHomeHTML = `<!doctype html>
 				<div>
 					<label>Token</label>
 					<div class="help">Required. Must match the server token.</div>
-					<input name="token" value="{{.Cfg.Token}}" />
+					<input type="password" id="tokenInput" name="token" value="{{.TokenDisplay}}" /><button type="button" class="btn sm" onclick="var i=document.getElementById('tokenInput');i.type=i.type==='password'?'text':'password';this.textContent=i.type==='password'?'Show':'Hide'">Show</button>
 				</div>
 				<div>
 					<label>TLS Pin (SHA256)</label>
@@ -1663,6 +1670,11 @@ const agentMailHTML = `<!doctype html>
 		/* inbox table */
 		table.inbox{width:100%;border-collapse:collapse;font-size:13px}
 		table.inbox th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted);padding:6px 8px;border-bottom:1px solid var(--border)}
+		table.inbox th.sortable{padding:0}
+		table.inbox th.sortable button{width:100%;display:flex;align-items:center;justify-content:flex-start;gap:6px;padding:6px 8px;border:0;background:transparent;color:inherit;font:inherit;text-transform:inherit;letter-spacing:inherit;cursor:pointer}
+		table.inbox th.sortable button:hover{color:var(--text)}
+		table.inbox th.sortable button:focus{outline:none;color:var(--text)}
+		.sortArrow{display:inline-block;min-width:1em;color:var(--accent);font-size:12px;line-height:1}
 		table.inbox td{padding:8px;border-bottom:1px solid var(--border);vertical-align:top}
 		table.inbox tr{cursor:pointer;transition:background .12s}
 		table.inbox tbody tr:hover{background:var(--surfaceHover)}
@@ -1726,7 +1738,7 @@ const agentMailHTML = `<!doctype html>
 			</div>
 			<div class="card" style="padding:0;overflow:auto">
 				<table class="inbox">
-					<thead><tr><th>From</th><th>Subject</th><th>Date</th></tr></thead>
+					<thead><tr><th>From</th><th>Subject</th><th class="sortable"><button type="button" id="dateSortBtn" aria-label="Sort emails by date">Date <span class="sortArrow" id="dateSortArrow">↓</span></button></th></tr></thead>
 					<tbody id="inboxBody"></tbody>
 				</table>
 				<div id="noMessages" class="noMail hidden">No messages</div>
@@ -1769,16 +1781,72 @@ const agentMailHTML = `<!doctype html>
 		var inboxTitle    = document.getElementById('inboxTitle');
 		var inboxBody     = document.getElementById('inboxBody');
 		var noMessages    = document.getElementById('noMessages');
+		var dateSortBtn   = document.getElementById('dateSortBtn');
+		var dateSortArrow = document.getElementById('dateSortArrow');
 		var refreshBtn    = document.getElementById('refreshBtn');
 		var logoutBtn     = document.getElementById('logoutBtn');
 		var backBtn       = document.getElementById('backBtn');
 		var deleteBtn     = document.getElementById('deleteBtn');
+		var currentMessages = [];
+		var sortDirection = 'desc';
 
 		function show(el){el.classList.remove('hidden')}
 		function hide(el){el.classList.add('hidden')}
 
 		function escHtml(s){
 			var d=document.createElement('div');d.textContent=s;return d.innerHTML;
+		}
+
+		function parseMsgTime(msg){
+			if(!msg||!msg.date)return 0;
+			var ts=Date.parse(msg.date);
+			return isNaN(ts)?0:ts;
+		}
+
+		function formatMsgDate(raw){
+			if(!raw)return '—';
+			var ts=Date.parse(raw);
+			if(isNaN(ts))return String(raw);
+			try{return new Date(ts).toLocaleString();}catch(_){return String(raw);}
+		}
+
+		function sortMessages(msgs){
+			var out=(msgs||[]).slice();
+			out.sort(function(a,b){
+				var diff=parseMsgTime(a)-parseMsgTime(b);
+				if(diff===0){
+					var aid=a&&typeof a.id==='number'?a.id:0;
+					var bid=b&&typeof b.id==='number'?b.id:0;
+					diff=aid-bid;
+				}
+				return sortDirection==='asc'?diff:-diff;
+			});
+			return out;
+		}
+
+		function renderSortArrow(){
+			if(dateSortArrow)dateSortArrow.textContent=sortDirection==='asc'?'↑':'↓';
+			if(dateSortBtn)dateSortBtn.title=sortDirection==='asc'?'Sorting oldest first':'Sorting newest first';
+		}
+
+		function renderInboxRows(msgs){
+			inboxBody.innerHTML='';
+			if(!msgs||msgs.length===0){
+				show(noMessages);
+				return;
+			}
+			hide(noMessages);
+			var sorted=sortMessages(msgs);
+			for(var i=0;i<sorted.length;i++){
+				(function(msg){
+					var tr=document.createElement('tr');
+					tr.innerHTML='<td class="from">'+escHtml(msg.from||'')+'</td>'
+						+'<td class="subj">'+escHtml(msg.subject||'(no subject)')+'</td>'
+						+'<td class="date">'+escHtml(formatMsgDate(msg.date))+'</td>';
+					tr.onclick=function(){openMessage(msg.id)};
+					inboxBody.appendChild(tr);
+				})(sorted[i]);
+			}
 		}
 
 		// Load accounts
@@ -1827,6 +1895,7 @@ const agentMailHTML = `<!doctype html>
 		}
 
 		function loadInbox(){
+			renderSortArrow();
 			inboxBody.innerHTML='<tr><td colspan="3" style="text-align:center;padding:20px;color:var(--textMuted)">Loading…</td></tr>';
 			hide(noMessages);
 			fetch('/api/mail/inbox',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(creds)})
@@ -1835,24 +1904,11 @@ const agentMailHTML = `<!doctype html>
 				return r.json();
 			})
 			.then(function(msgs){
-				inboxBody.innerHTML='';
-				if(!msgs||msgs.length===0){
-					show(noMessages);
-					return;
-				}
-				hide(noMessages);
-				for(var i=0;i<msgs.length;i++){
-					(function(msg){
-						var tr=document.createElement('tr');
-						tr.innerHTML='<td class="from">'+escHtml(msg.from)+'</td>'
-							+'<td class="subj">'+escHtml(msg.subject||'(no subject)')+'</td>'
-							+'<td class="date">'+escHtml(msg.date)+'</td>';
-						tr.onclick=function(){openMessage(msg.id)};
-						inboxBody.appendChild(tr);
-					})(msgs[i]);
-				}
+				currentMessages=Array.isArray(msgs)?msgs:[];
+				renderInboxRows(currentMessages);
 			})
 			.catch(function(e){
+				currentMessages=[];
 				inboxBody.innerHTML='<tr><td colspan="3" class="errBox">'+escHtml(e.message)+'</td></tr>';
 			});
 		}
@@ -1875,7 +1931,7 @@ const agentMailHTML = `<!doctype html>
 				document.getElementById('msgFrom').textContent=msg.from;
 				document.getElementById('msgTo').textContent=msg.to;
 				document.getElementById('msgSubject').textContent=msg.subject||'(no subject)';
-				document.getElementById('msgDate').textContent=msg.date;
+				document.getElementById('msgDate').textContent=formatMsgDate(msg.date);
 				document.getElementById('msgBody').textContent=msg.body;
 				deleteBtn.onclick=function(){
 					if(!confirm('Delete this message?')) return;
@@ -1895,10 +1951,18 @@ const agentMailHTML = `<!doctype html>
 		}
 
 		refreshBtn.onclick=loadInbox;
+		if(dateSortBtn){
+			dateSortBtn.onclick=function(){
+				sortDirection=sortDirection==='desc'?'asc':'desc';
+				renderSortArrow();
+				renderInboxRows(currentMessages);
+			};
+		}
 
 		logoutBtn.onclick=function(){
 			creds=null;
 			currentAddress='';
+			currentMessages=[];
 			passInput.value='';
 			hide(inboxSection);
 			hide(msgSection);
@@ -1909,6 +1973,8 @@ const agentMailHTML = `<!doctype html>
 			hide(msgSection);
 			show(inboxSection);
 		};
+
+		renderSortArrow();
 	})();
 	</script>
 </body>

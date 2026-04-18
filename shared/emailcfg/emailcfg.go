@@ -44,7 +44,6 @@ func Normalize(cfg Config) Config {
 	out := cfg
 	out.Domain = normalizeHostname(cfg.Domain)
 	out.MailHost = normalizeHostname(cfg.MailHost)
-	out.AutoTLS = cfg.AutoTLS
 	out.ACMEEmail = strings.TrimSpace(cfg.ACMEEmail)
 	out.ACMEHTTPAddr = strings.TrimSpace(cfg.ACMEHTTPAddr)
 	out.TLSCertPath = strings.TrimSpace(cfg.TLSCertPath)
@@ -356,20 +355,21 @@ func ParseByteSize(raw string) (int64, error) {
 	return value * multiplier, nil
 }
 
+var byteUnits = []struct {
+	suffix string
+	value  int64
+}{
+	{suffix: "TB", value: 1 << 40},
+	{suffix: "GB", value: 1 << 30},
+	{suffix: "MB", value: 1 << 20},
+	{suffix: "KB", value: 1 << 10},
+}
+
 func FormatByteSize(n int64) string {
 	if n <= 0 {
-		return ""
+		return "0B"
 	}
-	units := []struct {
-		suffix string
-		value  int64
-	}{
-		{suffix: "TB", value: 1 << 40},
-		{suffix: "GB", value: 1 << 30},
-		{suffix: "MB", value: 1 << 20},
-		{suffix: "KB", value: 1 << 10},
-	}
-	for _, unit := range units {
+	for _, unit := range byteUnits {
 		if n >= unit.value && n%unit.value == 0 {
 			return fmt.Sprintf("%d%s", n/unit.value, unit.suffix)
 		}
@@ -381,16 +381,7 @@ func HumanByteSize(n int64) string {
 	if n <= 0 {
 		return "0B"
 	}
-	units := []struct {
-		suffix string
-		value  int64
-	}{
-		{suffix: "TB", value: 1 << 40},
-		{suffix: "GB", value: 1 << 30},
-		{suffix: "MB", value: 1 << 20},
-		{suffix: "KB", value: 1 << 10},
-	}
-	for _, unit := range units {
+	for _, unit := range byteUnits {
 		if n >= unit.value {
 			whole := n / unit.value
 			remainder := n % unit.value

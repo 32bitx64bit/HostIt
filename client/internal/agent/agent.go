@@ -77,6 +77,19 @@ func (ct *connTracker) add(c net.Conn) {
 	ct.mu.Unlock()
 }
 
+func (ct *connTracker) remove(c net.Conn) {
+	ct.mu.Lock()
+	for i, conn := range ct.conns {
+		if conn == c {
+			ct.conns[i] = ct.conns[len(ct.conns)-1]
+			ct.conns[len(ct.conns)-1] = nil
+			ct.conns = ct.conns[:len(ct.conns)-1]
+			break
+		}
+	}
+	ct.mu.Unlock()
+}
+
 func (ct *connTracker) closeAll() {
 	ct.mu.Lock()
 	conns := ct.conns
@@ -95,28 +108,29 @@ func NewAgent(cfg Config) *Agent {
 }
 
 // tlsConfigWithPin returns a TLS config that performs certificate pinning
-// when a SHA-256 pin is configured. InsecureSkipVerify is always true
-// because the server may use self-signed certificates; the pin check
-// in VerifyPeerCertificate provides the actual trust anchor.
+// when a SHA-256 pin is configured. When no pin is configured, the agent
+// preserves the legacy behavior of accepting the server certificate as-is,
+// because many deployments use a self-signed cert generated for localhost.
 func tlsConfigWithPin(pin string) *tls.Config {
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-	}
 	if pin != "" {
 		expectedPin := pin
-		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("no certificates provided by server")
-			}
-			hash := sha256.Sum256(rawCerts[0])
-			hashHex := hex.EncodeToString(hash[:])
-			if !strings.EqualFold(hashHex, expectedPin) {
-				return fmt.Errorf("certificate pinning failed: expected %s, got %s", expectedPin, hashHex)
-			}
-			return nil
+		return &tls.Config{
+			InsecureSkipVerify: true,
+			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+				if len(rawCerts) == 0 {
+					return fmt.Errorf("no certificates provided by server")
+				}
+				hash := sha256.Sum256(rawCerts[0])
+				hashHex := hex.EncodeToString(hash[:])
+				if !strings.EqualFold(hashHex, expectedPin) {
+					return fmt.Errorf("certificate pinning failed: expected %s, got %s", expectedPin, hashHex)
+				}
+				return nil
+			},
 		}
 	}
-	return tlsConfig
+	logging.Global().Warnf(logging.CatEncryption, "TLS certificate pin is not set; skipping certificate verification for compatibility (set tls_pin_sha256 in config for pinning)")
+	return &tls.Config{InsecureSkipVerify: true}
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -204,7 +218,10 @@ func (a *Agent) connectAndRun() error {
 	pkt := &protocol.Packet{
 		Type: protocol.TypeRegister,
 	}
-	data, _ := protocol.MarshalUDP(pkt, nil)
+	data, err := protocol.MarshalUDP(pkt, nil)
+	if err != nil {
+		return fmt.Errorf("failed to marshal register packet: %w", err)
+	}
 	udpConn.WriteToUDP(data, a.serverUDP)
 
 	logging.Global().Infof(logging.CatSystem, "Agent started on control=%s data=%s", a.cfg.ControlAddr(), a.cfg.DataAddr())
@@ -546,7 +563,9 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 
 				tracker.add(dataConn)
 				tracker.add(localConn)
-				relay.Proxy(localConn, dataConn)
+				relay.ProxyWithIdleTimeout(localConn, dataConn, 5*time.Minute)
+				tracker.remove(dataConn)
+				tracker.remove(localConn)
 			}(ctx, routeName, clientID, rt)
 		}
 	}
@@ -771,10 +790,10 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 			sess, exists := sessions[key]
 			if exists {
 				sess.lastSeen = time.Now()
-			}
-			sessionsMu.Unlock()
+				sessionsMu.Unlock()
+			} else {
+				sessionsMu.Unlock()
 
-			if !exists {
 				localAddr, err := net.ResolveUDPAddr("udp", rc.localAddr)
 				if err != nil {
 					logging.Global().Errorf(logging.CatUDP, "failed to resolve local udp addr %s: %v", rc.localAddr, err)
@@ -789,75 +808,82 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 				localConn.SetReadBuffer(8 * 1024 * 1024)
 				localConn.SetWriteBuffer(8 * 1024 * 1024)
 
-				sess = &agentUDPSession{
+				newSess := &agentUDPSession{
 					conn:     localConn,
 					lastSeen: time.Now(),
 				}
 
 				sessionsMu.Lock()
-				sessions[key] = sess
-				sessionsMu.Unlock()
+				if existing, double := sessions[key]; double {
+					existing.lastSeen = time.Now()
+					localConn.Close()
+					sessionsMu.Unlock()
+				} else {
+					sessions[key] = newSess
+					sess = newSess
+					sessionsMu.Unlock()
 
-				go func(key sessionKey, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
-					defer func() {
-						c.Close()
-						sessionsMu.Lock()
-						delete(sessions, key)
-						sessionsMu.Unlock()
-					}()
+					go func(key sessionKey, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
+						defer func() {
+							c.Close()
+							sessionsMu.Lock()
+							delete(sessions, key)
+							sessionsMu.Unlock()
+						}()
 
-					respBuf := make([]byte, 65536)
-					marshalBuf := make([]byte, 65536)
-					encryptBuf := make([]byte, 65536)
-					var respPkt protocol.Packet
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						default:
-						}
+						respBuf := make([]byte, 65536)
+						marshalBuf := make([]byte, 65536)
+						encryptBuf := make([]byte, 65536)
+						var respPkt protocol.Packet
+						for {
+							select {
+							case <-ctx.Done():
+								return
+							default:
+							}
 
-						c.SetReadDeadline(time.Now().Add(2 * time.Minute))
-						rn, err := c.Read(respBuf)
-						if err != nil {
-							if ctx.Err() != nil {
+							c.SetReadDeadline(time.Now().Add(2 * time.Minute))
+							rn, err := c.Read(respBuf)
+							if err != nil {
+								if ctx.Err() != nil {
+									return
+								}
 								return
 							}
-							return
-						}
 
-						sessionsMu.Lock()
-						s, ok := sessions[key]
-						if ok {
-							s.lastSeen = time.Now()
-						}
-						sessionsMu.Unlock()
-
-						payload := respBuf[:rn]
-						if isEncrypted {
-							if udpCipher == nil {
-								continue
+							sessionsMu.Lock()
+							s, ok := sessions[key]
+							if ok {
+								s.lastSeen = time.Now()
 							}
-							encrypted, err := crypto.EncryptUDP(udpCipher, encryptBuf, payload)
+							sessionsMu.Unlock()
+
+							payload := respBuf[:rn]
+							if isEncrypted {
+								if udpCipher == nil {
+									continue
+								}
+								encrypted, err := crypto.EncryptUDP(udpCipher, encryptBuf, payload)
+								if err != nil {
+									continue
+								}
+								payload = encrypted
+							}
+
+							respPkt.Type = protocol.TypeData
+							respPkt.Route = key.route
+							respPkt.Client = key.client
+							respPkt.Payload = payload
+
+							data, err := protocol.MarshalUDP(&respPkt, marshalBuf)
 							if err != nil {
 								continue
 							}
-							payload = encrypted
+
+							udpConn.WriteToUDP(data, a.serverUDP)
 						}
-
-						respPkt.Type = protocol.TypeData
-						respPkt.Route = key.route
-						respPkt.Client = key.client
-						respPkt.Payload = payload
-
-						data, err := protocol.MarshalUDP(&respPkt, marshalBuf)
-						if err != nil {
-							continue
-						}
-
-						udpConn.WriteToUDP(data, a.serverUDP)
-					}
-				}(key, localConn, rc.isEncrypted, rc.udpCipher)
+					}(key, localConn, rc.isEncrypted, rc.udpCipher)
+				}
 			}
 
 			var sessConn *net.UDPConn

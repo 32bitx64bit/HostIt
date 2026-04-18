@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 type closeWriter interface {
@@ -15,7 +16,32 @@ type closeReader interface {
 	CloseRead() error
 }
 
+type idleTimeoutConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleTimeoutConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.Conn.SetDeadline(time.Now().Add(c.timeout))
+	}
+	return n, err
+}
+
+func (c *idleTimeoutConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.Conn.SetDeadline(time.Now().Add(c.timeout))
+	}
+	return n, err
+}
+
 func Proxy(a, b net.Conn) {
+	ProxyWithIdleTimeout(a, b, 0)
+}
+
+func ProxyWithIdleTimeout(a, b net.Conn, idleTimeout time.Duration) {
 	if a == nil || b == nil {
 		if a != nil {
 			_ = a.Close()
@@ -24,6 +50,14 @@ func Proxy(a, b net.Conn) {
 			_ = b.Close()
 		}
 		return
+	}
+
+	if idleTimeout > 0 {
+		now := time.Now()
+		a.SetDeadline(now.Add(idleTimeout))
+		b.SetDeadline(now.Add(idleTimeout))
+		a = &idleTimeoutConn{Conn: a, timeout: idleTimeout}
+		b = &idleTimeoutConn{Conn: b, timeout: idleTimeout}
 	}
 
 	var (

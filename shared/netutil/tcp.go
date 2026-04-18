@@ -18,7 +18,11 @@ func SetTCPKeepAlive(conn net.Conn, period time.Duration) {
 }
 
 func UnwrapTCPConn(conn net.Conn) *net.TCPConn {
-	if conn == nil {
+	return unwrapTCPConn(conn, 16)
+}
+
+func unwrapTCPConn(conn net.Conn, depth int) *net.TCPConn {
+	if conn == nil || depth <= 0 {
 		return nil
 	}
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
@@ -30,7 +34,7 @@ func UnwrapTCPConn(conn net.Conn) *net.TCPConn {
 		if next == nil || next == conn {
 			return nil
 		}
-		return UnwrapTCPConn(next)
+		return unwrapTCPConn(next, depth-1)
 	}
 	return nil
 }

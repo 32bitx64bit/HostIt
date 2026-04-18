@@ -57,6 +57,8 @@ func SetTrace(enabled bool) {
 	}
 	if enabled {
 		Log.SetLevel(logging.LevelTrace)
+	} else {
+		Log.SetLevel(logging.LevelInfo)
 	}
 }
 

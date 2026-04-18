@@ -172,8 +172,11 @@ func ensureMailSelfSigned(certFile, keyFile, host string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		sum := sha256.Sum256(der)
-		return hex.EncodeToString(sum[:]), nil
+		cert, parseErr := x509.ParseCertificate(der)
+		if parseErr == nil && time.Until(cert.NotAfter) > 30*24*time.Hour {
+			sum := sha256.Sum256(der)
+			return hex.EncodeToString(sum[:]), nil
+		}
 	}
 	return writeMailSelfSigned(certFile, keyFile, host)
 }
@@ -206,7 +209,7 @@ func writeMailSelfSigned(certFile, keyFile, host string) (string, error) {
 			Organization: []string{"hostit-mail"},
 		},
 		NotBefore:             now.Add(-1 * time.Hour),
-		NotAfter:              now.Add(365 * 24 * time.Hour),
+		NotAfter:              now.Add(730 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
