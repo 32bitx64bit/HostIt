@@ -3,6 +3,7 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -11,7 +12,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -47,9 +47,9 @@ func DeriveKey(token string, alg string) ([]byte, error) {
 
 	switch strings.ToLower(alg) {
 	case AlgAES128:
-		return pbkdf2.Key([]byte(token), salt, 100_000, 16, sha256.New), nil
+		return pbkdf2.Key([]byte(token), salt, 600_000, 16, sha256.New), nil
 	case AlgAES256:
-		return pbkdf2.Key([]byte(token), salt, 100_000, 32, sha256.New), nil
+		return pbkdf2.Key([]byte(token), salt, 600_000, 32, sha256.New), nil
 	case AlgNone, "":
 		return nil, nil
 	default:
@@ -68,16 +68,6 @@ func NewUDPCipher(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-var udpNonceCounter uint64
-
-func init() {
-	var b [8]byte
-	if _, err := io.ReadFull(rand.Reader, b[:]); err == nil {
-		udpNonceCounter = uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
-			uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
-	}
-}
-
 func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 	if aesgcm == nil {
 		dst = dst[:0]
@@ -92,12 +82,8 @@ func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 		dst = dst[:nonceSize]
 	}
 
-	val := atomic.AddUint64(&udpNonceCounter, 1)
-	for i := 0; i < nonceSize; i++ {
-		dst[i] = byte(val >> (i * 8))
-	}
-	for i := 8; i < nonceSize; i++ {
-		dst[i] ^= byte(val >> ((i - 8) * 8))
+	if _, err := io.ReadFull(rand.Reader, dst[:nonceSize]); err != nil {
+		return nil, fmt.Errorf("nonce generation failed: %w", err)
 	}
 	return aesgcm.Seal(dst, dst[:nonceSize], plaintext, nil), nil
 }
@@ -134,7 +120,16 @@ const (
 	maxFrameSize     = frameLenSize + maxFrameBodySize
 )
 
-func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
+func deriveSeed(key []byte, label string) [gcmNonceSize]byte {
+	var seed [gcmNonceSize]byte
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(label))
+	sum := mac.Sum(nil)
+	copy(seed[:], sum)
+	return seed
+}
+
+func WrapTCP(conn net.Conn, key []byte, isClient bool) (net.Conn, error) {
 	if len(key) == 0 {
 		return conn, nil
 	}
@@ -147,18 +142,18 @@ func WrapTCP(conn net.Conn, key []byte) (net.Conn, error) {
 		return nil, err
 	}
 
-	var writeSeed [gcmNonceSize]byte
-	if _, err := io.ReadFull(rand.Reader, writeSeed[:]); err != nil {
-		return nil, err
-	}
-	if _, err := writeAll(conn, writeSeed[:]); err != nil {
-		return nil, fmt.Errorf("nonce seed write failed: %w", err)
+	writeLabel := "hostit-server-to-client"
+	readLabel := "hostit-client-to-server"
+	if isClient {
+		writeLabel = "hostit-client-to-server"
+		readLabel = "hostit-server-to-client"
 	}
 
 	return &cryptoConn{
 		Conn:      conn,
 		gcm:       gcm,
-		writeSeed: writeSeed,
+		writeSeed: deriveSeed(key, writeLabel),
+		readSeed:  deriveSeed(key, readLabel),
 	}, nil
 }
 
@@ -169,8 +164,6 @@ type cryptoConn struct {
 	writeNonce uint64
 	readSeed   [gcmNonceSize]byte
 	readBuf    []byte
-	readOnce   sync.Once
-	readErr    error
 }
 
 func buildNonce(seed *[gcmNonceSize]byte, counter uint64) [gcmNonceSize]byte {
@@ -217,15 +210,6 @@ func (c *cryptoConn) NetConn() net.Conn {
 }
 
 func (c *cryptoConn) Read(b []byte) (int, error) {
-	c.readOnce.Do(func() {
-		if _, err := io.ReadFull(c.Conn, c.readSeed[:]); err != nil {
-			c.readErr = fmt.Errorf("nonce seed read failed: %w", err)
-		}
-	})
-	if c.readErr != nil {
-		return 0, c.readErr
-	}
-
 	if len(c.readBuf) > 0 {
 		n := copy(b, c.readBuf)
 		c.readBuf = c.readBuf[n:]

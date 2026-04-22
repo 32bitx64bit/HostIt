@@ -1088,6 +1088,10 @@ func TestPublicTCPRejectWithoutAgentDoesNotLeakConnectionSlot(t *testing.T) {
 	go fakeAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
 	waitEchoReady(t, publicAddr)
 
+	// Allow the server goroutine from waitEchoReady to release the
+	// maxConnsPerRoute=1 semaphore before the next dial.
+	time.Sleep(50 * time.Millisecond)
+
 	c, err := net.Dial("tcp", publicAddr)
 	if err != nil {
 		t.Fatal(err)

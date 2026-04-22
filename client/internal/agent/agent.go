@@ -23,12 +23,13 @@ import (
 )
 
 type Hooks struct {
-	OnConnected    func()
-	OnEmailConfig  func(cfg emailcfg.Config)
-	OnEmailProbe   func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
-	OnRoutes       func(routes []RemoteRoute)
-	OnDisconnected func(err error)
-	OnError        func(err error)
+	OnConnected        func()
+	OnEmailConfig      func(cfg emailcfg.Config)
+	OnEmailProbe       func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
+	OnRoutes           func(routes []RemoteRoute)
+	OnDisconnected     func(err error)
+	OnError            func(err error)
+	OnTLSPinDiscovered func(pin string)
 }
 
 type helloPayload struct {
@@ -109,10 +110,9 @@ func NewAgent(cfg Config) *Agent {
 
 // tlsConfigWithPin returns a TLS config that performs certificate pinning
 // when a SHA-256 pin is configured. When no pin is configured, the agent
-// preserves the legacy behavior of accepting the server certificate as-is,
-// because many deployments use a self-signed cert generated for localhost.
-func tlsConfigWithPin(pin string) *tls.Config {
-	if pin != "" {
+// requires InsecureTLS to be explicitly set, or it returns an error.
+func tlsConfigWithPin(cfg Config) (*tls.Config, error) {
+	if pin := strings.TrimSpace(cfg.TLSPinSHA256); pin != "" {
 		expectedPin := pin
 		return &tls.Config{
 			InsecureSkipVerify: true,
@@ -127,10 +127,13 @@ func tlsConfigWithPin(pin string) *tls.Config {
 				}
 				return nil
 			},
-		}
+		}, nil
 	}
-	logging.Global().Warnf(logging.CatEncryption, "TLS certificate pin is not set; skipping certificate verification for compatibility (set tls_pin_sha256 in config for pinning)")
-	return &tls.Config{InsecureSkipVerify: true}
+	if cfg.InsecureTLS {
+		logging.Global().Warnf(logging.CatEncryption, "TLS certificate verification is disabled (InsecureTLS=true). This is vulnerable to MITM attacks. Set tls_pin_sha256 for secure pinning.")
+		return &tls.Config{InsecureSkipVerify: true}, nil
+	}
+	return nil, fmt.Errorf("TLS is enabled but no certificate pin is configured. Set tls_pin_sha256 to the server certificate SHA-256 fingerprint, or set InsecureTLS=true to explicitly accept any certificate (not recommended)")
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -176,7 +179,32 @@ func (a *Agent) connectAndRun() error {
 	if a.cfg.DisableTLS {
 		conn, err = controlDialer.Dial("tcp", a.cfg.ControlAddr())
 	} else {
-		conn, err = tls.DialWithDialer(controlDialer, "tcp", a.cfg.ControlAddr(), tlsConfigWithPin(a.cfg.TLSPinSHA256))
+		var tlsCfg *tls.Config
+		if a.cfg.TLSPinSHA256 == "" && !a.cfg.InsecureTLS {
+			// Auto-pin mode: connect permissively to capture the server's certificate fingerprint
+			tlsCfg = &tls.Config{InsecureSkipVerify: true}
+		} else {
+			var tlsErr error
+			tlsCfg, tlsErr = tlsConfigWithPin(a.cfg)
+			if tlsErr != nil {
+				return fmt.Errorf("tls config failed: %w", tlsErr)
+			}
+		}
+		conn, err = tls.DialWithDialer(controlDialer, "tcp", a.cfg.ControlAddr(), tlsCfg)
+		if err == nil && a.cfg.TLSPinSHA256 == "" && !a.cfg.InsecureTLS {
+			if tlsConn, ok := conn.(*tls.Conn); ok {
+				state := tlsConn.ConnectionState()
+				if len(state.PeerCertificates) > 0 {
+					pin := sha256.Sum256(state.PeerCertificates[0].Raw)
+					pinHex := hex.EncodeToString(pin[:])
+					a.cfg.TLSPinSHA256 = pinHex
+					if a.hooks != nil && a.hooks.OnTLSPinDiscovered != nil {
+						a.hooks.OnTLSPinDiscovered(pinHex)
+					}
+					logging.Global().Infof(logging.CatEncryption, "Auto-pinned server TLS certificate SHA-256: %s", pinHex)
+				}
+			}
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("control dial failed: %w", err)
@@ -493,7 +521,12 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				if a.cfg.DisableTLS {
 					dataConn, err = dataDialer.Dial("tcp", a.cfg.DataAddr())
 				} else {
-					dataConn, err = tls.DialWithDialer(dataDialer, "tcp", a.cfg.DataAddr(), tlsConfigWithPin(a.cfg.TLSPinSHA256))
+					tlsCfg, tlsErr := tlsConfigWithPin(a.cfg)
+					if tlsErr != nil {
+						logging.Global().Errorf(logging.CatTCP, "tls config failed: %v", tlsErr)
+						return
+					}
+					dataConn, err = tls.DialWithDialer(dataDialer, "tcp", a.cfg.DataAddr(), tlsCfg)
 				}
 				if err != nil {
 					logging.Global().Errorf(logging.CatTCP, "failed to dial data server %s: %v", a.cfg.DataAddr(), err)
@@ -533,11 +566,19 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				}
 
 				localAddr := rt.EffectiveLocalAddr()
-				localConn, err := dialLocalTCP(localAddr)
+				localConn, err := dialLocalTCP(ctx, localAddr)
 				if err != nil {
 					logging.Global().Errorf(logging.CatTCP, "failed to dial local tcp %s: %v", localAddr, err)
 					dataConn.Close()
 					return
+				}
+
+				select {
+				case <-ctx.Done():
+					dataConn.Close()
+					localConn.Close()
+					return
+				default:
 				}
 
 				if tcpConn, ok := localConn.(*net.TCPConn); ok {
@@ -552,13 +593,21 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 						localConn.Close()
 						return
 					}
-					dataConn, err = crypto.WrapTCP(dataConn, rt.DerivedKey)
+					dataConn, err = crypto.WrapTCP(dataConn, rt.DerivedKey, true)
 					if err != nil {
 						logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
 						dataConn.Close()
 						localConn.Close()
 						return
 					}
+				}
+
+				select {
+				case <-ctx.Done():
+					dataConn.Close()
+					localConn.Close()
+					return
+				default:
 				}
 
 				tracker.add(dataConn)
@@ -571,7 +620,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 	}
 }
 
-func dialLocalTCP(localAddr string) (net.Conn, error) {
+func dialLocalTCP(ctx context.Context, localAddr string) (net.Conn, error) {
 	const (
 		maxAttempts = 5
 		dialTimeout = 2 * time.Second
@@ -580,6 +629,9 @@ func dialLocalTCP(localAddr string) (net.Conn, error) {
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 15 * time.Second}
 		conn, err := dialer.Dial("tcp", localAddr)
 		if err == nil {
@@ -588,7 +640,11 @@ func dialLocalTCP(localAddr string) (net.Conn, error) {
 		}
 		lastErr = err
 		if attempt < maxAttempts {
-			time.Sleep(retryDelay)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(retryDelay):
+			}
 		}
 	}
 
@@ -607,7 +663,28 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 	if cfg.DisableTLS {
 		dataConn, err = dialer.DialContext(ctx, "tcp", cfg.DataAddr())
 	} else {
-		dataConn, err = tls.DialWithDialer(dialer, "tcp", cfg.DataAddr(), tlsConfigWithPin(cfg.TLSPinSHA256))
+		var tlsCfg *tls.Config
+		if cfg.TLSPinSHA256 == "" && !cfg.InsecureTLS {
+			tlsCfg = &tls.Config{InsecureSkipVerify: true}
+		} else {
+			var tlsErr error
+			tlsCfg, tlsErr = tlsConfigWithPin(cfg)
+			if tlsErr != nil {
+				return nil, fmt.Errorf("tls config failed: %w", tlsErr)
+			}
+		}
+		dataConn, err = tls.DialWithDialer(dialer, "tcp", cfg.DataAddr(), tlsCfg)
+		if err == nil && cfg.TLSPinSHA256 == "" && !cfg.InsecureTLS {
+			if tlsConn, ok := dataConn.(*tls.Conn); ok {
+				state := tlsConn.ConnectionState()
+				if len(state.PeerCertificates) > 0 {
+					pin := sha256.Sum256(state.PeerCertificates[0].Raw)
+					pinHex := hex.EncodeToString(pin[:])
+					cfg.TLSPinSHA256 = pinHex
+					logging.Global().Infof(logging.CatEncryption, "Auto-pinned server TLS certificate SHA-256 (data): %s", pinHex)
+				}
+			}
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("dial data server %s: %w", cfg.DataAddr(), err)

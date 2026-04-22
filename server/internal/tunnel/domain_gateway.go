@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	managedProxyResponseHeaderTimeout = 0
+	managedProxyResponseHeaderTimeout = 30 * time.Second
 	managedProxyExpectContinueTimeout = 5 * time.Second
 )
 

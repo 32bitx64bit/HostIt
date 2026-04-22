@@ -289,7 +289,12 @@ func isAllowedOutboundSMTPTarget(addr *net.TCPAddr) bool {
 		return false
 	}
 
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return false
+	}
+
+	// Block CGNAT range (100.64.0.0/10)
+	if cgnat := ip.To4(); cgnat != nil && cgnat[0] == 100 && cgnat[1] >= 64 && cgnat[1] <= 127 {
 		return false
 	}
 
@@ -780,16 +785,16 @@ const defaultMaxConnsPerRoute = 4096
 
 func NewServer(cfg ServerConfig) *Server {
 	s := &Server{
-		cfg:              cfg,
-		derivedKeys:      make(map[string][]byte),
-		udpCiphers:       make(map[string]cipher.AEAD),
-		publicTCP:        make(map[string]net.Listener),
-		publicUDP:        make(map[string]*net.UDPConn),
-		pendingTCP:       make(map[string]*pendingTCPEntry),
-		dash:             newDashState(),
-		sessions:         make(map[string]*agentSession),
+		cfg:                  cfg,
+		derivedKeys:          make(map[string][]byte),
+		udpCiphers:           make(map[string]cipher.AEAD),
+		publicTCP:            make(map[string]net.Listener),
+		publicUDP:            make(map[string]*net.UDPConn),
+		pendingTCP:           make(map[string]*pendingTCPEntry),
+		dash:                 newDashState(),
+		sessions:             make(map[string]*agentSession),
 		probeOutboundTargets: make(map[string]time.Time),
-		maxConnsPerRoute: defaultMaxConnsPerRoute,
+		maxConnsPerRoute:     defaultMaxConnsPerRoute,
 	}
 	s.domains = newDomainManager(s)
 	for _, rt := range effectiveRoutes(cfg) {
@@ -829,7 +834,10 @@ func (s *Server) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to load TLS cert: %w", err)
 		}
-		tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
 		controlLn, err = tls.Listen("tcp", s.cfg.ControlAddr, tlsConfig)
 		if err != nil {
 			return fmt.Errorf("control tls listen failed: %w", err)
@@ -1149,11 +1157,18 @@ func (s *Server) acceptControl(ln net.Listener) {
 				}
 			}()
 
+			connStart := time.Now()
+			const maxControlConnLifetime = 24 * time.Hour
 			for {
 				select {
 				case <-sessionCtx.Done():
 					return
 				default:
+				}
+
+				if time.Since(connStart) > maxControlConnLifetime {
+					logging.Global().Warnf(logging.CatTCP, "control connection lifetime exceeded, closing")
+					break
 				}
 
 				c.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -1213,6 +1228,37 @@ func (s *Server) acceptData(ln net.Listener) {
 	defer s.wg.Done()
 	defer ln.Close()
 
+	// Rate limiter for failed auth attempts per IP
+	type ipFailRecord struct {
+		count int
+		first time.Time
+	}
+	var failMu sync.Mutex
+	failsByIP := make(map[string]*ipFailRecord)
+	const maxFailures = 10
+	const failWindow = 60 * time.Second
+
+	// Background cleanup of stale entries
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				failMu.Lock()
+				for ip, rec := range failsByIP {
+					if now.Sub(rec.first) > failWindow {
+						delete(failsByIP, ip)
+					}
+				}
+				failMu.Unlock()
+			}
+		}
+	}()
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -1224,13 +1270,37 @@ func (s *Server) acceptData(ln net.Listener) {
 		}
 		netutil.SetTCPKeepAlive(conn, 15*time.Second)
 
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
-		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "data auth failed from %s: %v", conn.RemoteAddr(), err)
+		// Check per-IP rate limit before doing crypto work
+		remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		failMu.Lock()
+		rec := failsByIP[remoteIP]
+		if rec != nil && time.Since(rec.first) > failWindow {
+			rec = nil
+			delete(failsByIP, remoteIP)
+		}
+		if rec != nil && rec.count >= maxFailures {
+			failMu.Unlock()
+			logging.Global().Warnf(logging.CatTCP, "data auth rate limit exceeded for %s", remoteIP)
 			conn.Close()
 			continue
 		}
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		failMu.Unlock()
+
+		handshakeDeadline := time.Now().Add(15 * time.Second)
+		conn.SetDeadline(handshakeDeadline)
+		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "data auth failed from %s: %v", conn.RemoteAddr(), err)
+			failMu.Lock()
+			if failsByIP[remoteIP] == nil {
+				failsByIP[remoteIP] = &ipFailRecord{count: 1, first: time.Now()}
+			} else {
+				failsByIP[remoteIP].count++
+			}
+			failMu.Unlock()
+			conn.Close()
+			continue
+		}
+		conn.SetReadDeadline(handshakeDeadline)
 
 		var routeLen byte
 		if err := binary.Read(conn, binary.BigEndian, &routeLen); err != nil {
@@ -1254,7 +1324,7 @@ func (s *Server) acceptData(ln net.Listener) {
 			continue
 		}
 		clientID := string(clientBytes)
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		conn.SetReadDeadline(handshakeDeadline)
 
 		routeName := string(routeBytes)
 		if routeName == protocol.RouteMailOutboundTCP {
@@ -1273,7 +1343,7 @@ func (s *Server) acceptData(ln net.Listener) {
 				conn.Close()
 				continue
 			}
-			conn, err = crypto.WrapTCP(conn, key)
+			conn, err = crypto.WrapTCP(conn, key, false)
 			if err != nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
 				conn.Close()
@@ -1432,6 +1502,22 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, 5*time.Minute)
 
 			case <-timer.C:
+				// Race: delivery may have arrived at the exact moment the timer
+				// fired. If a connection was already delivered, use it rather
+				// than discarding a valid pairing.
+				agentConn := entry.take()
+				if agentConn != nil {
+					logging.Global().Infof(logging.CatTCP, "paired public TCP route=%s client=%s (race recovery)", routeName, clientID)
+					s.dash.addConn(time.Now())
+					s.dash.incActive(routeName)
+					defer s.dash.decActive(routeName)
+
+					countBytes := func(n int) {
+						s.dash.addBytes(time.Now(), int64(n))
+					}
+					relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, 5*time.Minute)
+					return
+				}
 				logging.Global().Warnf(logging.CatTCP, "pair timeout route=%s client=%s", routeName, clientID)
 				s.mu.Lock()
 				delete(s.pendingTCP, pendingKey)

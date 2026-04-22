@@ -71,6 +71,10 @@ func agentSystemdIdentityLines(moduleDir string) string {
 
 func agentSystemdUnitContent(moduleDir string) string {
 	moduleDir = strings.TrimSpace(moduleDir)
+	// Reject paths containing shell metacharacters or newlines
+	if strings.ContainsAny(moduleDir, "\n\r$`&|;<>\x00") {
+		moduleDir = "/tmp/invalid-path"
+	}
 	identity := agentSystemdIdentityLines(moduleDir)
 	return fmt.Sprintf(`[Unit]
 Description=HostIt Tunnel Agent
@@ -83,7 +87,7 @@ Type=simple
 EnvironmentFile=-%s
 
 ExecStartPre=/bin/sh -c "test -x ./bin/tunnel-agent || (echo Missing ./bin/tunnel-agent. Run ./build.sh once as your user. >&2; exit 1)"
-ExecStart=/bin/sh %s/client.sh
+ExecStart=/bin/sh %q/client.sh
 
 Restart=always
 RestartSec=2
@@ -241,6 +245,16 @@ func main() {
 			return mailSvc.RunProbe(callCtx, req)
 		}
 	}
+	ctrl.onTLSPinDiscovered = func(pin string) {
+		cfg, _, _, _, _ := ctrl.Get()
+		cfg.TLSPinSHA256 = pin
+		ctrl.SetConfig(cfg)
+		if err := configio.Save(configPath, cfg); err != nil {
+			log.Printf("failed to save auto-pinned TLS config: %v", err)
+		} else {
+			log.Printf("Saved auto-pinned TLS certificate to config")
+		}
+	}
 	if autostart {
 		log.Printf("=== Auto-starting agent ===")
 		log.Printf("Server: %s", cfg.Server)
@@ -281,18 +295,19 @@ func main() {
 type agentController struct {
 	root context.Context
 
-	mu            sync.Mutex
-	cfg           agent.Config
-	running       bool
-	connected     bool
-	lastErr       string
-	routes        []agent.RemoteRoute
-	emailCfg      emailcfg.Config
-	cancel        context.CancelFunc
-	done          chan struct{}
-	runID         uint64
-	onEmailConfig func(emailcfg.Config)
-	onEmailProbe  func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
+	mu                 sync.Mutex
+	cfg                agent.Config
+	running            bool
+	connected          bool
+	lastErr            string
+	routes             []agent.RemoteRoute
+	emailCfg           emailcfg.Config
+	cancel             context.CancelFunc
+	done               chan struct{}
+	runID              uint64
+	onEmailConfig      func(emailcfg.Config)
+	onEmailProbe       func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
+	onTLSPinDiscovered func(pin string)
 }
 
 func newAgentController(root context.Context, cfg agent.Config) *agentController {
@@ -406,6 +421,19 @@ func (a *agentController) Start() {
 				a.lastErr = err.Error()
 			}
 			a.mu.Unlock()
+		},
+		OnTLSPinDiscovered: func(pin string) {
+			a.mu.Lock()
+			if a.runID != rid {
+				a.mu.Unlock()
+				return
+			}
+			a.cfg.TLSPinSHA256 = pin
+			onTLSPinDiscovered := a.onTLSPinDiscovered
+			a.mu.Unlock()
+			if onTLSPinDiscovered != nil {
+				onTLSPinDiscovered(pin)
+			}
 		},
 	}
 
@@ -823,6 +851,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -901,6 +930,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -927,6 +957,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -961,6 +992,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			Password  string `json:"password"`
 			MessageID int64  `json:"messageId"`
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -992,6 +1024,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			Password  string `json:"password"`
 			MessageID int64  `json:"messageId"`
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return

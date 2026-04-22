@@ -34,7 +34,7 @@ func TestRequireAuth_AllowsRepeatedValidSessionPolling(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h := requireAuth(store, false, func(w http.ResponseWriter, r *http.Request) {
+	h := requireAuth(store, false, time.Hour, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -60,7 +60,7 @@ func TestRequireAuth_RateLimitsInvalidSessionsOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h := requireAuth(store, false, func(w http.ResponseWriter, r *http.Request) {
+	h := requireAuth(store, false, time.Hour, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 

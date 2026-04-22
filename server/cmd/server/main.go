@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -507,8 +508,8 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 					render(errMsg, username, errUser, errPass, errConfirm)
 					return
 				}
-				if err := store.CreateUser(r.Context(), username, password); err != nil {
-					render("Create account failed. Please try a different username.", username, true, false, false)
+				if err := store.CreateFirstUser(r.Context(), username, password); err != nil {
+					render("Create account failed. A user may already exist.", username, true, false, false)
 					return
 				}
 				userID, ok, err := store.Authenticate(r.Context(), username, password)
@@ -577,6 +578,8 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 					http.Redirect(w, r, "/login", http.StatusSeeOther)
 					return
 				}
+				// Invalidate all existing sessions for this user on login
+				_ = store.DeleteSessionsByUserID(r.Context(), userID)
 				sid, err := store.CreateSession(r.Context(), userID, sessionTTL)
 				if err != nil {
 					http.Error(w, "session failed", http.StatusInternalServerError)
@@ -593,7 +596,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		}))
 
 		// Logout.
-		mux.HandleFunc("/logout", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/logout", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -615,7 +618,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		// Stats (protected)
-		mux.HandleFunc("/", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -641,7 +644,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		// Network test page (protected)
-		mux.HandleFunc("/network-test", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/network-test", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -663,7 +666,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		// Live stats API (protected)
-		mux.HandleFunc("/api/stats", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/stats", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -711,7 +714,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = json.NewEncoder(w).Encode(resp)
 		})))
 
-		mux.HandleFunc("/api/nettest/ping", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/nettest/ping", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -720,7 +723,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = json.NewEncoder(w).Encode(map[string]any{"serverTimeUnixMs": time.Now().UnixMilli()})
 		})))
 
-		mux.HandleFunc("/api/nettest/direct-download", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/nettest/direct-download", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -760,7 +763,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 		})))
 
-		mux.HandleFunc("/api/nettest/direct-upload", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/nettest/direct-upload", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -785,7 +788,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			})
 		})))
 
-		mux.HandleFunc("/api/nettest/agent", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/nettest/agent", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -833,7 +836,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		// Manual update check (protected)
-		mux.HandleFunc("/api/update/check-now", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/update/check-now", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -853,7 +856,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		// systemd status + control (protected)
-		mux.HandleFunc("/api/systemd/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/systemd/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -862,7 +865,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(st)
 		})))
-		mux.HandleFunc("/api/systemd/restart", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/systemd/restart", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -882,7 +885,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			w.WriteHeader(http.StatusNoContent)
 		})))
-		mux.HandleFunc("/api/systemd/stop", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/systemd/stop", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -904,7 +907,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		// Update APIs (protected)
-		mux.HandleFunc("/api/update/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/update/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -914,7 +917,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(st)
 		})))
-		mux.HandleFunc("/api/update/remind", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/update/remind", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -931,7 +934,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = upd.RemindLater(24 * time.Hour)
 			w.WriteHeader(http.StatusNoContent)
 		})))
-		mux.HandleFunc("/api/update/skip", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/update/skip", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -948,7 +951,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = upd.SkipAvailableVersion()
 			w.WriteHeader(http.StatusNoContent)
 		})))
-		mux.HandleFunc("/api/update/apply", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/update/apply", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -973,7 +976,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			w.WriteHeader(http.StatusAccepted)
 		})))
-		mux.HandleFunc("/api/update/apply-local", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/update/apply-local", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1021,7 +1024,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		// Process control (protected): exits the whole server process.
-		mux.HandleFunc("/api/process/restart", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/process/restart", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1041,7 +1044,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 			}()
 		})))
-		mux.HandleFunc("/api/process/exit", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/process/exit", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1063,7 +1066,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		})))
 
 		// Config (protected)
-		mux.HandleFunc("/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/config", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1113,7 +1116,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplConfig.Execute(w, data)
 		})))
 
-		mux.HandleFunc("/email", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/email", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1154,7 +1157,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplEmail.Execute(w, data)
 		})))
 
-		mux.HandleFunc("/email/setup", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/email/setup", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1196,7 +1199,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplEmailSetup.Execute(w, data)
 		})))
 
-		mux.HandleFunc("/api/email/check", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/email/check", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1220,7 +1223,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = json.NewEncoder(w).Encode(report)
 		})))
 
-		mux.HandleFunc("/domain-manager-info", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/domain-manager-info", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1242,7 +1245,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplDomainGuide.Execute(w, data)
 		})))
 
-		mux.HandleFunc("/controls", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/controls", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1274,7 +1277,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			_ = tplControls.Execute(w, data)
 		})))
 
-		mux.HandleFunc("/api/logs", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/logs", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1301,7 +1304,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			})
 		})))
 
-		mux.HandleFunc("/config/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/config/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1464,7 +1467,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/config", http.StatusSeeOther)
 		})))
 
-		mux.HandleFunc("/email/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/email/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1498,7 +1501,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/email", http.StatusSeeOther)
 		})))
 
-		mux.HandleFunc("/api/routes/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/routes/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1535,7 +1538,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			})
 		})))
 
-		mux.HandleFunc("/api/dashboard/interval", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/api/dashboard/interval", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -1571,7 +1574,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			http.Redirect(w, r, "/controls", http.StatusSeeOther)
 		})))
 
-		mux.HandleFunc("/gen-token", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/gen-token", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -2212,7 +2215,7 @@ const serverStatsHTML = `<!doctype html>
 
   <script>
   (function(){
-    var csrf = "{{.CSRF}}";
+    var csrf = {{.CSRF | js}};
     function $(id){ return document.getElementById(id); }
     function fmtBytes(n){
       n = Number(n||0); if(!isFinite(n)||n<0) n=0;
@@ -3805,7 +3808,7 @@ const serverNetworkTestHTML = `<!doctype html>
 
 	<script>
 	(function(){
-		var csrf = "{{.CSRF}}";
+		var csrf = {{.CSRF | js}};
 		function $(id){ return document.getElementById(id); }
 		function fmtMs(v){ return (Number(v)||0).toFixed(2)+' ms'; }
 		function fmtPct(v){ return (Number(v)||0).toFixed(2)+'%'; }
@@ -4145,7 +4148,7 @@ func computeCSRFToken(nonce string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func requireAuth(store *auth.Store, cookieSecure bool, next http.HandlerFunc) http.HandlerFunc {
+func requireAuth(store *auth.Store, cookieSecure bool, sessionTTL time.Duration, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hasUsers, err := store.HasAnyUsers(r.Context())
 		if err != nil {
@@ -4161,7 +4164,7 @@ func requireAuth(store *auth.Store, cookieSecure bool, next http.HandlerFunc) ht
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-		userID, ok, err := store.GetSession(r.Context(), sid)
+		userID, ok, err := store.GetSession(r.Context(), sid, sessionTTL)
 		if err != nil {
 			http.Error(w, "auth db error", http.StatusInternalServerError)
 			return
@@ -4226,18 +4229,7 @@ func checkCSRF(r *http.Request) bool {
 	// Recompute the expected HMAC from the cookie nonce and compare
 	// against the form-submitted token using constant-time comparison.
 	expected := computeCSRFToken(c.Value)
-	return formTok != "" && subtleEq(formTok, expected)
-}
-
-func subtleEq(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var v byte
-	for i := 0; i < len(a); i++ {
-		v |= a[i] ^ b[i]
-	}
-	return v == 0
+	return formTok != "" && subtle.ConstantTimeCompare([]byte(formTok), []byte(expected)) == 1
 }
 
 func setSessionCookie(w http.ResponseWriter, sid string, secure bool) {

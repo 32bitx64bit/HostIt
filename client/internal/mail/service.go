@@ -1347,10 +1347,17 @@ func ParseMessageSummary(raw []byte) (from string, subject string, err error) {
 	return msg.Header.Get("From"), msg.Header.Get("Subject"), nil
 }
 
+func sanitizeHeader(v string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(v, "\r", ""), "\n", "")
+}
+
 func buildProbeMessage(from, to, probeID string) []byte {
 	if strings.TrimSpace(probeID) == "" {
 		probeID = fmt.Sprintf("probe-%d", time.Now().UnixNano())
 	}
+	from = sanitizeHeader(from)
+	to = sanitizeHeader(to)
+	probeID = sanitizeHeader(probeID)
 	body := "HostIt email architecture probe\r\n"
 	return []byte(strings.Join([]string{
 		"From: " + from,

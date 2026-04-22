@@ -63,7 +63,7 @@ func TestCreateUserAndValidSession(t *testing.T) {
 		t.Fatal("CreateSession: empty session id")
 	}
 
-	gotUserID, valid, err := s.GetSession(ctx, sid)
+	gotUserID, valid, err := s.GetSession(ctx, sid, 0)
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestGetSessionAndDeleteSession(t *testing.T) {
 	userID, _, _ := s.Authenticate(ctx, "charlie", "pass")
 	sid, _ := s.CreateSession(ctx, userID, time.Hour)
 
-	_, valid, _ := s.GetSession(ctx, sid)
+	_, valid, _ := s.GetSession(ctx, sid, 0)
 	if !valid {
 		t.Fatal("GetSession: expected valid before delete")
 	}
@@ -109,7 +109,7 @@ func TestGetSessionAndDeleteSession(t *testing.T) {
 		t.Fatalf("DeleteSession: %v", err)
 	}
 
-	_, valid, _ = s.GetSession(ctx, sid)
+	_, valid, _ = s.GetSession(ctx, sid, 0)
 	if valid {
 		t.Fatal("GetSession: expected invalid after delete")
 	}
@@ -124,7 +124,7 @@ func TestExpiredSessionCleanup(t *testing.T) {
 
 	sid, _ := s.CreateSession(ctx, userID, -1*time.Second)
 
-	_, valid, _ := s.GetSession(ctx, sid)
+	_, valid, _ := s.GetSession(ctx, sid, 0)
 	if valid {
 		t.Fatal("expired session should not be valid")
 	}
@@ -133,7 +133,7 @@ func TestExpiredSessionCleanup(t *testing.T) {
 		t.Fatalf("deleteExpired: %v", err)
 	}
 
-	_, valid, _ = s.GetSession(ctx, sid)
+	_, valid, _ = s.GetSession(ctx, sid, 0)
 	if valid {
 		t.Fatal("expired session should be gone after cleanup")
 	}

@@ -31,6 +31,12 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(5)
 	db.SetMaxIdleConns(2)
 
+	// Enable foreign key constraints
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Store{db: db, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	if err := s.migrate(context.Background()); err != nil {
@@ -120,6 +126,37 @@ func (s *Store) CreateUser(ctx context.Context, username string, password string
 	return nil
 }
 
+// CreateFirstUser creates the first admin user atomically. If any user already
+// exists, it returns an error without creating a new user.
+func (s *Store) CreateFirstUser(ctx context.Context, username string, password string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var one int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM users LIMIT 1`).Scan(&one)
+	if err == nil {
+		return fmt.Errorf("a user already exists")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO users(username, password_hash, created_at) VALUES(?, ?, ?)`,
+		username, hash, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Authenticate(ctx context.Context, username string, password string) (int64, bool, error) {
 	var id int64
 	var hash []byte
@@ -149,7 +186,7 @@ func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Durati
 	return sid, nil
 }
 
-func (s *Store) GetSession(ctx context.Context, sid string) (int64, bool, error) {
+func (s *Store) GetSession(ctx context.Context, sid string, ttl time.Duration) (int64, bool, error) {
 	var userID int64
 	var expiresAt int64
 	err := s.db.QueryRowContext(ctx, `SELECT user_id, expires_at FROM sessions WHERE id = ?`, sid).Scan(&userID, &expiresAt)
@@ -163,11 +200,21 @@ func (s *Store) GetSession(ctx context.Context, sid string) (int64, bool, error)
 		_ = s.DeleteSession(ctx, sid)
 		return 0, false, nil
 	}
+	// Sliding expiration: extend session lifetime on valid use
+	if ttl > 0 {
+		newExp := time.Now().Add(ttl).Unix()
+		_, _ = s.db.ExecContext(ctx, `UPDATE sessions SET expires_at = ? WHERE id = ?`, newExp, sid)
+	}
 	return userID, true, nil
 }
 
 func (s *Store) DeleteSession(ctx context.Context, sid string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, sid)
+	return err
+}
+
+func (s *Store) DeleteSessionsByUserID(ctx context.Context, userID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID)
 	return err
 }
 
