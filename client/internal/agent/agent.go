@@ -12,6 +12,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"hostit/shared/crypto"
@@ -52,7 +53,7 @@ type Agent struct {
 	serverUDP   *net.UDPAddr
 
 	controlWriteMu sync.Mutex
-	routeCacheGen  uint64
+	routeCacheGen  atomic.Uint64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -63,7 +64,7 @@ type Agent struct {
 // control session so they can be forcibly closed when the session ends.
 type connTracker struct {
 	mu     sync.Mutex
-	conns  []net.Conn
+	conns  map[net.Conn]struct{}
 	closed bool
 }
 
@@ -74,20 +75,16 @@ func (ct *connTracker) add(c net.Conn) {
 		_ = c.Close()
 		return
 	}
-	ct.conns = append(ct.conns, c)
+	if ct.conns == nil {
+		ct.conns = make(map[net.Conn]struct{})
+	}
+	ct.conns[c] = struct{}{}
 	ct.mu.Unlock()
 }
 
 func (ct *connTracker) remove(c net.Conn) {
 	ct.mu.Lock()
-	for i, conn := range ct.conns {
-		if conn == c {
-			ct.conns[i] = ct.conns[len(ct.conns)-1]
-			ct.conns[len(ct.conns)-1] = nil
-			ct.conns = ct.conns[:len(ct.conns)-1]
-			break
-		}
-	}
+	delete(ct.conns, c)
 	ct.mu.Unlock()
 }
 
@@ -97,7 +94,7 @@ func (ct *connTracker) closeAll() {
 	ct.conns = nil
 	ct.closed = true
 	ct.mu.Unlock()
-	for _, c := range conns {
+	for c := range conns {
 		_ = c.Close()
 	}
 }
@@ -468,8 +465,8 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 			a.mu.Lock()
 			a.cfg.Routes = routes
 			a.cfg.Email = email
-			a.routeCacheGen++
 			a.mu.Unlock()
+			a.routeCacheGen.Add(1)
 			logging.Global().Infof(logging.CatSystem, "Received %d routes from server", len(routes))
 			if !helloSeen {
 				helloSeen = true
@@ -724,7 +721,7 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 
 type agentUDPSession struct {
 	conn     *net.UDPConn
-	lastSeen time.Time
+	lastSeen int64 // atomic, unix nano
 }
 
 func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
@@ -737,10 +734,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 		client string
 	}
 
-	var (
-		sessionsMu sync.Mutex
-		sessions   = make(map[sessionKey]*agentUDPSession)
-	)
+	var sessions sync.Map
 
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -748,21 +742,21 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 		for {
 			select {
 			case <-ctx.Done():
-				sessionsMu.Lock()
-				for _, s := range sessions {
-					s.conn.Close()
-				}
-				sessionsMu.Unlock()
+				sessions.Range(func(_, v any) bool {
+					v.(*agentUDPSession).conn.Close()
+					return true
+				})
 				return
 			case now := <-ticker.C:
-				sessionsMu.Lock()
-				for id, s := range sessions {
-					if now.Sub(s.lastSeen) > 2*time.Minute {
-						s.conn.Close()
-						delete(sessions, id)
+				cutoff := now.Add(-2 * time.Minute).UnixNano()
+				sessions.Range(func(k, v any) bool {
+					sess := v.(*agentUDPSession)
+					if atomic.LoadInt64(&sess.lastSeen) < cutoff {
+						sess.conn.Close()
+						sessions.Delete(k)
 					}
-				}
-				sessionsMu.Unlock()
+					return true
+				})
 			}
 		}
 	}()
@@ -778,7 +772,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	rebuildRouteCache := func() {
 		routeCache = sync.Map{}
 		a.mu.RLock()
-		lastCacheGen = a.routeCacheGen
+		lastCacheGen = a.routeCacheGen.Load()
 		for _, rt := range a.cfg.Routes {
 			routeCache.Store(rt.Name, routeConfig{
 				isEncrypted: rt.Encrypted,
@@ -790,9 +784,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	}
 
 	refreshRouteCacheIfNeeded := func() {
-		a.mu.RLock()
-		currentCacheGen := a.routeCacheGen
-		a.mu.RUnlock()
+		currentCacheGen := a.routeCacheGen.Load()
 		if currentCacheGen != lastCacheGen {
 			rebuildRouteCache()
 		}
@@ -801,14 +793,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	rebuildRouteCache()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		refreshRouteCacheIfNeeded()
-
 		n, _, err := udpConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -818,14 +802,14 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 			continue
 		}
 
+		refreshRouteCacheIfNeeded()
+
 		err = protocol.UnmarshalUDPTo(buf[:n], &pkt)
 		if err != nil {
 			continue
 		}
 
 		if pkt.Type == protocol.TypeData {
-			refreshRouteCacheIfNeeded()
-
 			routeName := string([]byte(pkt.Route))
 			clientID := string([]byte(pkt.Client))
 
@@ -863,14 +847,10 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 			key := sessionKey{route: routeName, client: clientID}
 
-			sessionsMu.Lock()
-			sess, exists := sessions[key]
+			sessVal, exists := sessions.Load(key)
 			if exists {
-				sess.lastSeen = time.Now()
-				sessionsMu.Unlock()
+				atomic.StoreInt64(&sessVal.(*agentUDPSession).lastSeen, time.Now().UnixNano())
 			} else {
-				sessionsMu.Unlock()
-
 				localAddr, err := net.ResolveUDPAddr("udp", rc.localAddr)
 				if err != nil {
 					logging.Global().Errorf(logging.CatUDP, "failed to resolve local udp addr %s: %v", rc.localAddr, err)
@@ -887,25 +867,20 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 				newSess := &agentUDPSession{
 					conn:     localConn,
-					lastSeen: time.Now(),
+					lastSeen: time.Now().UnixNano(),
 				}
 
-				sessionsMu.Lock()
-				if existing, double := sessions[key]; double {
-					existing.lastSeen = time.Now()
+				actual, loaded := sessions.LoadOrStore(key, newSess)
+				if loaded {
 					localConn.Close()
-					sessionsMu.Unlock()
+					sessVal = actual
 				} else {
-					sessions[key] = newSess
-					sess = newSess
-					sessionsMu.Unlock()
+					sessVal = newSess
 
 					go func(key sessionKey, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
 						defer func() {
 							c.Close()
-							sessionsMu.Lock()
-							delete(sessions, key)
-							sessionsMu.Unlock()
+							sessions.Delete(key)
 						}()
 
 						respBuf := make([]byte, 65536)
@@ -913,12 +888,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 						encryptBuf := make([]byte, 65536)
 						var respPkt protocol.Packet
 						for {
-							select {
-							case <-ctx.Done():
-								return
-							default:
-							}
-
 							c.SetReadDeadline(time.Now().Add(2 * time.Minute))
 							rn, err := c.Read(respBuf)
 							if err != nil {
@@ -928,12 +897,9 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 								return
 							}
 
-							sessionsMu.Lock()
-							s, ok := sessions[key]
-							if ok {
-								s.lastSeen = time.Now()
+							if sessVal, ok := sessions.Load(key); ok {
+								atomic.StoreInt64(&sessVal.(*agentUDPSession).lastSeen, time.Now().UnixNano())
 							}
-							sessionsMu.Unlock()
 
 							payload := respBuf[:rn]
 							if isEncrypted {
@@ -963,15 +929,11 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 				}
 			}
 
-			var sessConn *net.UDPConn
-			sessionsMu.Lock()
-			if s, ok := sessions[key]; ok && s.conn != nil {
-				s.lastSeen = time.Now()
-				sessConn = s.conn
-			}
-			sessionsMu.Unlock()
-			if sessConn != nil {
-				_, _ = sessConn.Write(payload)
+			if sessVal != nil {
+				if s, ok := sessVal.(*agentUDPSession); ok && s.conn != nil {
+					atomic.StoreInt64(&s.lastSeen, time.Now().UnixNano())
+					_, _ = s.conn.Write(payload)
+				}
 			}
 		}
 	}

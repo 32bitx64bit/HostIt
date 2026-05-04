@@ -338,3 +338,208 @@ func TestCryptoConnCloseReadFallsBackToClose(t *testing.T) {
 		t.Fatal("CloseRead() did not close underlying conn when half-close unsupported")
 	}
 }
+
+func TestDeriveKeyAndUDPCipherEdgeCases(t *testing.T) {
+	key128, err := DeriveKey("test-token", AlgAES128)
+	if err != nil {
+		t.Fatalf("DeriveKey AES-128: %v", err)
+	}
+	if len(key128) != 16 {
+		t.Fatalf("AES-128 key length = %d, want 16", len(key128))
+	}
+
+	key256, err := DeriveKey("test-token", AlgAES256)
+	if err != nil {
+		t.Fatalf("DeriveKey AES-256: %v", err)
+	}
+	if len(key256) != 32 {
+		t.Fatalf("AES-256 key length = %d, want 32", len(key256))
+	}
+
+	noKey, err := DeriveKey("test-token", AlgNone)
+	if err != nil {
+		t.Fatalf("DeriveKey none: %v", err)
+	}
+	if noKey != nil {
+		t.Fatalf("DeriveKey none returned %d bytes, want nil", len(noKey))
+	}
+
+	defaultKey, err := DeriveKey("test-token", "")
+	if err != nil {
+		t.Fatalf("DeriveKey empty alg: %v", err)
+	}
+	if defaultKey != nil {
+		t.Fatalf("DeriveKey empty alg returned %d bytes, want nil", len(defaultKey))
+	}
+
+	if _, err := DeriveKey("test-token", "unsupported"); err == nil {
+		t.Fatal("DeriveKey unsupported algorithm error = nil")
+	}
+
+	udpCipher, err := NewUDPCipher(key128)
+	if err != nil {
+		t.Fatalf("NewUDPCipher valid key: %v", err)
+	}
+	if udpCipher == nil {
+		t.Fatal("NewUDPCipher valid key = nil")
+	}
+
+	nilCipher, err := NewUDPCipher(nil)
+	if err != nil {
+		t.Fatalf("NewUDPCipher nil key: %v", err)
+	}
+	if nilCipher != nil {
+		t.Fatal("NewUDPCipher nil key returned non-nil cipher")
+	}
+
+	if _, err := NewUDPCipher([]byte{1, 2, 3}); err == nil {
+		t.Fatal("NewUDPCipher invalid key error = nil")
+	}
+}
+
+func TestUDPEncryptDecryptEdgeCases(t *testing.T) {
+	key := make([]byte, 16)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	udpCipher, err := NewUDPCipher(key)
+	if err != nil {
+		t.Fatalf("NewUDPCipher: %v", err)
+	}
+
+	for _, plaintext := range [][]byte{[]byte("hello"), nil} {
+		ciphertext, err := EncryptUDP(udpCipher, nil, plaintext)
+		if err != nil {
+			t.Fatalf("EncryptUDP(%q): %v", plaintext, err)
+		}
+		decrypted, err := DecryptUDP(udpCipher, nil, ciphertext)
+		if err != nil {
+			t.Fatalf("DecryptUDP(%q): %v", plaintext, err)
+		}
+		if !bytes.Equal(decrypted, plaintext) {
+			t.Fatalf("DecryptUDP = %q, want %q", decrypted, plaintext)
+		}
+	}
+
+	plaintext := []byte("plain passthrough")
+	passthrough, err := EncryptUDP(nil, nil, plaintext)
+	if err != nil {
+		t.Fatalf("EncryptUDP nil cipher: %v", err)
+	}
+	if !bytes.Equal(passthrough, plaintext) {
+		t.Fatalf("EncryptUDP nil cipher = %q, want %q", passthrough, plaintext)
+	}
+	decrypted, err := DecryptUDP(nil, nil, passthrough)
+	if err != nil {
+		t.Fatalf("DecryptUDP nil cipher: %v", err)
+	}
+	if !bytes.Equal(decrypted, plaintext) {
+		t.Fatalf("DecryptUDP nil cipher = %q, want %q", decrypted, plaintext)
+	}
+
+	if _, err := DecryptUDP(udpCipher, nil, []byte("short")); err == nil {
+		t.Fatal("DecryptUDP short ciphertext error = nil")
+	}
+
+	ciphertext, err := EncryptUDP(udpCipher, nil, []byte("tamper me"))
+	if err != nil {
+		t.Fatalf("EncryptUDP tamper fixture: %v", err)
+	}
+	ciphertext[len(ciphertext)-1] ^= 0x01
+	if _, err := DecryptUDP(udpCipher, nil, ciphertext); err == nil {
+		t.Fatal("DecryptUDP tampered ciphertext error = nil")
+	}
+}
+
+func newCryptoConnReadFixture(t *testing.T, data []byte) *cryptoConn {
+	t.Helper()
+	key := bytes.Repeat([]byte{1}, 16)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes.NewCipher: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("cipher.NewGCM: %v", err)
+	}
+	return &cryptoConn{
+		Conn:    &mockConn{r: bytes.NewBuffer(data), w: &bytes.Buffer{}},
+		gcm:     gcm,
+		readBuf: make([]byte, 0, maxPlaintextSize),
+	}
+}
+
+func frameHeaderForTest(frameLen int) []byte {
+	return []byte{byte(frameLen >> 8), byte(frameLen)}
+}
+
+func TestCryptoConnReadRejectsMalformedFrames(t *testing.T) {
+	fixture := newCryptoConnReadFixture(t, nil)
+	minimumFrameBodyLen := gcmNonceSize + fixture.gcm.Overhead()
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "short header", data: []byte{0}},
+		{name: "frame too short", data: frameHeaderForTest(minimumFrameBodyLen - 1)},
+		{name: "frame too large", data: frameHeaderForTest(maxFrameBodySize + 1)},
+		{name: "truncated body", data: append(frameHeaderForTest(minimumFrameBodyLen), bytes.Repeat([]byte{0}, minimumFrameBodyLen-1)...)},
+		{name: "bad tag", data: append(frameHeaderForTest(minimumFrameBodyLen), bytes.Repeat([]byte{0}, minimumFrameBodyLen)...)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := newCryptoConnReadFixture(t, tt.data)
+			if _, err := conn.Read(make([]byte, 1)); err == nil {
+				t.Fatal("Read error = nil, want malformed frame error")
+			}
+		})
+	}
+}
+
+func TestCryptoConnReadBuffersPlaintextAcrossSmallReads(t *testing.T) {
+	key := make([]byte, 16)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	rawClient, rawServer := net.Pipe()
+	defer rawClient.Close()
+	defer rawServer.Close()
+
+	client, err := WrapTCP(rawClient, key, true)
+	if err != nil {
+		t.Fatalf("WrapTCP client: %v", err)
+	}
+	server, err := WrapTCP(rawServer, key, false)
+	if err != nil {
+		t.Fatalf("WrapTCP server: %v", err)
+	}
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = server.SetDeadline(time.Now().Add(5 * time.Second))
+
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := client.Write([]byte("abcdef"))
+		writeErrCh <- err
+	}()
+
+	first := make([]byte, 2)
+	if _, err := io.ReadFull(server, first); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if string(first) != "ab" {
+		t.Fatalf("first read = %q, want %q", string(first), "ab")
+	}
+
+	second := make([]byte, 4)
+	if _, err := io.ReadFull(server, second); err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	if string(second) != "cdef" {
+		t.Fatalf("second read = %q, want %q", string(second), "cdef")
+	}
+	if err := <-writeErrCh; err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+}

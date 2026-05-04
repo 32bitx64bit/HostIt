@@ -509,7 +509,8 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			if systemdutil.SystemctlAvailable() {
 				if err := syncInstalledAgentSystemdUnit(moduleDir); err != nil {
 					log.Printf("Failed to refresh installed systemd unit: %v", err)
-					return err
+					// Continue with restart even if we can't refresh the unit file
+					// (common when running as non-root without write access to /etc/systemd/system)
 				}
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()

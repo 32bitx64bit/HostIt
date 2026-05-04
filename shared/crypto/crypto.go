@@ -123,7 +123,7 @@ const (
 func deriveSeed(key []byte, label string) [gcmNonceSize]byte {
 	var seed [gcmNonceSize]byte
 	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(label))
+	io.WriteString(mac, label)
 	sum := mac.Sum(nil)
 	copy(seed[:], sum)
 	return seed
@@ -154,6 +154,7 @@ func WrapTCP(conn net.Conn, key []byte, isClient bool) (net.Conn, error) {
 		gcm:       gcm,
 		writeSeed: deriveSeed(key, writeLabel),
 		readSeed:  deriveSeed(key, readLabel),
+		readBuf:   make([]byte, 0, maxPlaintextSize),
 	}, nil
 }
 
@@ -214,7 +215,7 @@ func (c *cryptoConn) Read(b []byte) (int, error) {
 		n := copy(b, c.readBuf)
 		c.readBuf = c.readBuf[n:]
 		if len(c.readBuf) == 0 {
-			c.readBuf = nil
+			c.readBuf = c.readBuf[:0]
 		}
 		return n, nil
 	}
@@ -231,22 +232,32 @@ func (c *cryptoConn) Read(b []byte) (int, error) {
 		return 0, errors.New("encrypted frame too large")
 	}
 
-	frame := make([]byte, frameLen)
+	framePtr := readFramePool.Get().(*[maxFrameBodySize]byte)
+	frame := framePtr[:frameLen]
 	if _, err := io.ReadFull(c.Conn, frame); err != nil {
+		readFramePool.Put(framePtr)
 		return 0, err
 	}
 
 	nonce := frame[:gcmNonceSize]
 	ciphertext := frame[gcmNonceSize:]
 
-	plaintext, err := c.gcm.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := c.gcm.Open(c.readBuf[:0], nonce, ciphertext, nil)
+	readFramePool.Put(framePtr)
 	if err != nil {
 		return 0, fmt.Errorf("GCM decrypt failed: %w", err)
 	}
 
+	if len(plaintext) == 0 {
+		c.readBuf = c.readBuf[:0]
+		return c.Read(b)
+	}
+
 	n := copy(b, plaintext)
 	if n < len(plaintext) {
-		c.readBuf = plaintext[n:]
+		c.readBuf = append(c.readBuf[:0], plaintext[n:]...)
+	} else {
+		c.readBuf = c.readBuf[:0]
 	}
 	return n, nil
 }
@@ -254,6 +265,13 @@ func (c *cryptoConn) Read(b []byte) (int, error) {
 var writeBufPool = sync.Pool{
 	New: func() interface{} {
 		var b [maxFrameSize]byte
+		return &b
+	},
+}
+
+var readFramePool = sync.Pool{
+	New: func() interface{} {
+		var b [maxFrameBodySize]byte
 		return &b
 	},
 }

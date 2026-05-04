@@ -10,6 +10,16 @@ import (
 	"testing"
 )
 
+type zeroProgressWriter struct{}
+
+func (zeroProgressWriter) Write([]byte) (int, error) { return 0, nil }
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
 func TestWritePacketRejectsOversizedFields(t *testing.T) {
 	pkt := &Packet{
 		Type:   TypeConnect,
@@ -83,6 +93,56 @@ func TestWritePacketReadPacketRoundTrip(t *testing.T) {
 	}
 	if got.Type != pkt.Type || got.Route != pkt.Route || got.Client != pkt.Client || !bytes.Equal(got.Payload, pkt.Payload) {
 		t.Fatalf("round-trip mismatch: got %+v, want %+v", got, pkt)
+	}
+}
+
+func TestWritePacketHandlesWriterFailures(t *testing.T) {
+	pkt := &Packet{Type: TypePing, Payload: []byte("ping")}
+
+	if err := WritePacket(zeroProgressWriter{}, pkt); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("WritePacket zero-progress error = %v, want %v", err, io.ErrShortWrite)
+	}
+
+	boom := errors.New("boom")
+	if err := WritePacket(failingWriter{err: boom}, pkt); !errors.Is(err, boom) {
+		t.Fatalf("WritePacket writer error = %v, want %v", err, boom)
+	}
+}
+
+func TestMaxSizedFieldsAndPayloadRoundTrip(t *testing.T) {
+	payload := make([]byte, MaxPayloadSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	pkt := &Packet{
+		Type:    TypeData,
+		Route:   strings.Repeat("r", 255),
+		Client:  strings.Repeat("c", 255),
+		Payload: payload,
+	}
+
+	var buf bytes.Buffer
+	if err := WritePacket(&buf, pkt); err != nil {
+		t.Fatalf("WritePacket max packet: %v", err)
+	}
+	got, err := ReadPacket(&buf)
+	if err != nil {
+		t.Fatalf("ReadPacket max packet: %v", err)
+	}
+	if got.Type != pkt.Type || got.Route != pkt.Route || got.Client != pkt.Client || !bytes.Equal(got.Payload, pkt.Payload) {
+		t.Fatal("max-sized TCP packet did not round-trip")
+	}
+
+	udpData, err := MarshalUDP(pkt, nil)
+	if err != nil {
+		t.Fatalf("MarshalUDP max packet: %v", err)
+	}
+	var udpGot Packet
+	if err := UnmarshalUDPTo(udpData, &udpGot); err != nil {
+		t.Fatalf("UnmarshalUDPTo max packet: %v", err)
+	}
+	if udpGot.Type != pkt.Type || udpGot.Route != pkt.Route || udpGot.Client != pkt.Client || !bytes.Equal(udpGot.Payload, pkt.Payload) {
+		t.Fatal("max-sized UDP packet did not round-trip")
 	}
 }
 
@@ -177,5 +237,47 @@ func TestUnmarshalUDPToUnknownType(t *testing.T) {
 	data2 := []byte{99, 0, 0}
 	if err := UnmarshalUDPTo(data2, p); !errors.Is(err, ErrInvalidPacket) {
 		t.Fatalf("UnmarshalUDPTo with type 99: error = %v, want ErrInvalidPacket", err)
+	}
+}
+
+func TestUnmarshalUDPToRejectsTruncatedPackets(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "empty", data: nil},
+		{name: "one byte", data: []byte{TypeData}},
+		{name: "missing client length", data: []byte{TypeData, 1, 'r'}},
+		{name: "route length beyond packet", data: []byte{TypeData, 5, 'r', '1'}},
+		{name: "client length beyond packet", data: []byte{TypeData, 1, 'r', 5, 'c'}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var pkt Packet
+			if err := UnmarshalUDPTo(tt.data, &pkt); !errors.Is(err, ErrInvalidPacket) {
+				t.Fatalf("UnmarshalUDPTo error = %v, want ErrInvalidPacket", err)
+			}
+		})
+	}
+}
+
+func TestReadPacketReturnsErrorForTruncatedFrames(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "partial header", data: []byte{TypeData, 0}},
+		{name: "truncated route", data: []byte{TypeData, 3, 0, 0, 0, 'r'}},
+		{name: "truncated client", data: []byte{TypeData, 0, 3, 0, 0, 'c'}},
+		{name: "truncated payload", data: []byte{TypeData, 0, 0, 0, 3, 'p'}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ReadPacket(bytes.NewReader(tt.data)); err == nil {
+				t.Fatal("ReadPacket error = nil, want error")
+			}
+		})
 	}
 }

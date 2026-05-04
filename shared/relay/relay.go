@@ -16,6 +16,13 @@ type closeReader interface {
 	CloseRead() error
 }
 
+var relayBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 type idleTimeoutConn struct {
 	net.Conn
 	timeout time.Duration
@@ -73,8 +80,10 @@ func ProxyWithIdleTimeout(a, b net.Conn, idleTimeout time.Duration) {
 	pipe := func(dst, src net.Conn) {
 		defer wg.Done()
 
-		buf := make([]byte, 32*1024)
+		bufPtr := relayBufPool.Get().(*[]byte)
+		buf := *bufPtr
 		_, err := io.CopyBuffer(dst, src, buf)
+		relayBufPool.Put(bufPtr)
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			closeOnce.Do(closeBoth)
 			return

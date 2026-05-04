@@ -1,11 +1,146 @@
 package relay
 
 import (
+	"bytes"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
+
+type relayCloseTrackingConn struct {
+	mu       sync.Mutex
+	closed   bool
+	closedCh chan struct{}
+}
+
+func newRelayCloseTrackingConn() *relayCloseTrackingConn {
+	return &relayCloseTrackingConn{closedCh: make(chan struct{})}
+}
+
+func (c *relayCloseTrackingConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (c *relayCloseTrackingConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *relayCloseTrackingConn) LocalAddr() net.Addr         { return relayDummyAddr("local") }
+func (c *relayCloseTrackingConn) RemoteAddr() net.Addr        { return relayDummyAddr("remote") }
+func (c *relayCloseTrackingConn) SetDeadline(time.Time) error { return nil }
+func (c *relayCloseTrackingConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (c *relayCloseTrackingConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func (c *relayCloseTrackingConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	close(c.closedCh)
+	return nil
+}
+
+type relayDummyAddr string
+
+func (d relayDummyAddr) Network() string { return "tcp" }
+func (d relayDummyAddr) String() string  { return string(d) }
+
+func waitRelayClosed(t *testing.T, conn *relayCloseTrackingConn, name string) {
+	t.Helper()
+	select {
+	case <-conn.closedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s was not closed", name)
+	}
+}
+
+func TestProxyNilInputClosesProvidedConn(t *testing.T) {
+	conn := newRelayCloseTrackingConn()
+
+	ProxyWithIdleTimeout(conn, nil, 0)
+
+	waitRelayClosed(t, conn, "non-nil connection")
+}
+
+func TestProxyClosesBothWhenHalfCloseUnavailable(t *testing.T) {
+	a := newRelayCloseTrackingConn()
+	b := newRelayCloseTrackingConn()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		Proxy(a, b)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Proxy did not return after both sides reached EOF")
+	}
+	waitRelayClosed(t, a, "first connection")
+	waitRelayClosed(t, b, "second connection")
+}
+
+func TestProxyRelaysBidirectionalData(t *testing.T) {
+	client, proxyClient := net.Pipe()
+	proxyBackend, backend := net.Pipe()
+	defer client.Close()
+	defer backend.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		Proxy(proxyClient, proxyBackend)
+	}()
+
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = backend.SetDeadline(time.Now().Add(5 * time.Second))
+
+	clientPayload := bytes.Repeat([]byte("client-to-backend:"), 4096)
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := client.Write(clientPayload)
+		writeErrCh <- err
+	}()
+
+	backendBuf := make([]byte, len(clientPayload))
+	if _, err := io.ReadFull(backend, backendBuf); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeErrCh; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(backendBuf, clientPayload) {
+		t.Fatal("backend received different bytes than the client sent")
+	}
+
+	backendPayload := bytes.Repeat([]byte("backend-to-client:"), 4096)
+	go func() {
+		_, err := backend.Write(backendPayload)
+		writeErrCh <- err
+	}()
+
+	clientBuf := make([]byte, len(backendPayload))
+	if _, err := io.ReadFull(client, clientBuf); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeErrCh; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(clientBuf, backendPayload) {
+		t.Fatal("client received different bytes than the backend sent")
+	}
+
+	_ = client.Close()
+	_ = backend.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Proxy did not return after both endpoints closed")
+	}
+}
 
 func TestProxyWithIdleTimeout(t *testing.T) {
 	a, b := net.Pipe()

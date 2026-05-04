@@ -130,7 +130,7 @@ type Server struct {
 	domains           *domainManager
 	domainProxyCache  sync.Map
 
-	pendingTCP map[string]*pendingTCPEntry
+	pendingTCP map[pendingTCPKey]*pendingTCPEntry
 
 	clientIDCounter uint64
 
@@ -156,15 +156,23 @@ type Server struct {
 
 	lastAgentConnectAt    time.Time
 	lastAgentDisconnectAt time.Time
+
+	agentUDPAddr atomic.Value // stores netip.AddrPort
+	agentUDPTime atomic.Int64 // unix nano
 }
 
-func makePendingTCPKey(routeName, clientID string) string {
-	return routeName + ":" + clientID
+type pendingTCPKey struct {
+	route  string
+	client string
+}
+
+func makePendingTCPKey(routeName, clientID string) pendingTCPKey {
+	return pendingTCPKey{route: routeName, client: clientID}
 }
 
 func (s *Server) abortPendingTCPLocked() {
-	for clientID, entry := range s.pendingTCP {
-		delete(s.pendingTCP, clientID)
+	for key, entry := range s.pendingTCP {
+		delete(s.pendingTCP, key)
 		entry.cancel()
 	}
 }
@@ -790,12 +798,13 @@ func NewServer(cfg ServerConfig) *Server {
 		udpCiphers:           make(map[string]cipher.AEAD),
 		publicTCP:            make(map[string]net.Listener),
 		publicUDP:            make(map[string]*net.UDPConn),
-		pendingTCP:           make(map[string]*pendingTCPEntry),
+		pendingTCP:           make(map[pendingTCPKey]*pendingTCPEntry),
 		dash:                 newDashState(),
 		sessions:             make(map[string]*agentSession),
 		probeOutboundTargets: make(map[string]time.Time),
 		maxConnsPerRoute:     defaultMaxConnsPerRoute,
 	}
+	s.agentUDPAddr.Store(netip.AddrPort{})
 	s.domains = newDomainManager(s)
 	for _, rt := range effectiveRoutes(cfg) {
 		if rt.IsEncrypted() {
@@ -1351,10 +1360,11 @@ func (s *Server) acceptData(ln net.Listener) {
 			}
 		}
 
+		pendingKey := makePendingTCPKey(routeName, clientID)
 		s.mu.Lock()
-		entry, ok := s.pendingTCP[makePendingTCPKey(routeName, clientID)]
+		entry, ok := s.pendingTCP[pendingKey]
 		if ok {
-			delete(s.pendingTCP, makePendingTCPKey(routeName, clientID))
+			delete(s.pendingTCP, pendingKey)
 			conn.SetReadDeadline(time.Time{})
 		}
 		s.mu.Unlock()
@@ -1564,17 +1574,11 @@ func (s *Server) acceptAgentUDP() {
 	decryptBuf := make([]byte, 65536)
 	var pkt protocol.Packet
 
-	addrCacheMu := sync.Mutex{}
-	addrCache := make(map[string]*net.UDPAddr)
-	const addrCacheLimit = 50000
+	var pendingBytes int64
+	var pendingBytesTime time.Time
+	const dashBatchInterval = 100 * time.Millisecond
 
 	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-
 		n, addr, err := s.udpDataConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if s.ctx.Err() != nil {
@@ -1591,18 +1595,27 @@ func (s *Server) acceptAgentUDP() {
 		routeName := string([]byte(pkt.Route))
 		clientID := string([]byte(pkt.Client))
 
-		s.mu.Lock()
+		currentAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
 		if pkt.Type == protocol.TypeRegister {
-			if !s.agentUDP.IsValid() || s.agentUDP != addr {
-				s.agentUDP = addr
+			if !currentAddr.IsValid() || currentAddr != addr {
+				s.agentUDPAddr.Store(addr)
 				logging.Global().Infof(logging.CatUDP, "Agent UDP address registered: %s", addr.String())
 			}
-			s.agentUDPAt = time.Now()
-		} else if !s.agentUDP.IsValid() || s.agentUDP != addr {
+			now := time.Now().UnixNano()
+			s.agentUDPTime.Store(now)
+			s.mu.Lock()
 			s.agentUDP = addr
-			s.agentUDPAt = time.Now()
+			s.agentUDPAt = time.Unix(0, now)
+			s.mu.Unlock()
+		} else if !currentAddr.IsValid() || currentAddr != addr {
+			s.agentUDPAddr.Store(addr)
+			now := time.Now().UnixNano()
+			s.agentUDPTime.Store(now)
+			s.mu.Lock()
+			s.agentUDP = addr
+			s.agentUDPAt = time.Unix(0, now)
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 
 		if pkt.Type == protocol.TypeRegister {
 			continue
@@ -1636,34 +1649,20 @@ func (s *Server) acceptAgentUDP() {
 				payload = decrypted
 			}
 
-			addrCacheMu.Lock()
-			clientAddr, ok := addrCache[clientID]
-			addrCacheMu.Unlock()
-			if !ok {
-				var err error
-				clientAddr, err = net.ResolveUDPAddr("udp", clientID)
-				if err != nil {
-					continue
-				}
-				addrCacheMu.Lock()
-				if len(addrCache) >= addrCacheLimit {
-					target := int(float64(addrCacheLimit) * 0.75)
-					for k := range addrCache {
-						if len(addrCache) <= target {
-							break
-						}
-						delete(addrCache, k)
-					}
-				}
-				addrCache[clientID] = clientAddr
-				addrCacheMu.Unlock()
-			}
-			if clientAddr == nil {
+			clientAddrPort, err := netip.ParseAddrPort(clientID)
+			if err != nil {
 				continue
 			}
 
-			s.dash.addBytes(time.Now(), int64(len(payload)))
-			pubConn.WriteToUDP(payload, clientAddr)
+			pendingBytes += int64(len(payload))
+			if pendingBytesTime.IsZero() {
+				pendingBytesTime = time.Now()
+			} else if time.Since(pendingBytesTime) > dashBatchInterval {
+				s.dash.addBytes(pendingBytesTime, pendingBytes)
+				pendingBytes = 0
+				pendingBytesTime = time.Time{}
+			}
+			pubConn.WriteToUDPAddrPort(payload, clientAddrPort)
 		}
 	}
 }
@@ -1679,13 +1678,11 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 	addrStrCache := make(map[netip.AddrPort]string)
 	var pkt protocol.Packet
 
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
+	var pendingBytes int64
+	var pendingBytesTime time.Time
+	const dashBatchInterval = 100 * time.Millisecond
 
+	for {
 		n, addr, err := conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if s.ctx.Err() != nil {
@@ -1703,9 +1700,9 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			addrStrCache[addr] = clientStr
 		}
 
+		agentAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
+		agentUDPAt := time.Unix(0, s.agentUDPTime.Load())
 		s.mu.RLock()
-		agentAddr := s.agentUDP
-		agentUDPAt := s.agentUDPAt
 		udpCipher := s.udpCiphers[routeName]
 		s.mu.RUnlock()
 
@@ -1751,7 +1748,14 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			continue
 		}
 
-		s.dash.addBytes(time.Now(), int64(len(pkt.Payload)))
+		pendingBytes += int64(len(pkt.Payload))
+		if pendingBytesTime.IsZero() {
+			pendingBytesTime = time.Now()
+		} else if time.Since(pendingBytesTime) > dashBatchInterval {
+			s.dash.addBytes(pendingBytesTime, pendingBytes)
+			pendingBytes = 0
+			pendingBytesTime = time.Time{}
+		}
 		s.udpDataConn.WriteToUDPAddrPort(data, agentAddr)
 	}
 }

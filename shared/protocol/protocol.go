@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 )
 
 const (
@@ -25,7 +26,24 @@ var (
 	ErrFieldTooLong  = errors.New("route or client field too long")
 )
 
-const MaxPayloadSize = 64 * 1024 // 64KB
+const MaxPayloadSize = 64*1024 - 1 // Maximum payload frameable in uint16 length field.
+
+const maxPacketBufSize = 5 + 255 + 255 + MaxPayloadSize
+
+var (
+	packetBufPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, maxPacketBufSize)
+			return &b
+		},
+	}
+	headerBufPool = sync.Pool{
+		New: func() interface{} {
+			var b [5]byte
+			return &b
+		},
+	}
+)
 
 type Packet struct {
 	Type    byte
@@ -43,7 +61,9 @@ func WritePacket(w io.Writer, p *Packet) error {
 	}
 
 	totalLen := 5 + len(p.Route) + len(p.Client) + len(p.Payload)
-	buf := make([]byte, totalLen)
+
+	bufPtr := packetBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
 
 	buf[0] = p.Type
 	buf[1] = byte(len(p.Route))
@@ -69,18 +89,23 @@ func WritePacket(w io.Writer, p *Packet) error {
 			buf = buf[n:]
 		}
 		if err != nil {
+			packetBufPool.Put(bufPtr)
 			return err
 		}
 		if n == 0 {
+			packetBufPool.Put(bufPtr)
 			return io.ErrShortWrite
 		}
 	}
+	packetBufPool.Put(bufPtr)
 	return nil
 }
 
 func ReadPacket(r io.Reader) (*Packet, error) {
-	header := make([]byte, 5)
+	headerPtr := headerBufPool.Get().(*[5]byte)
+	header := headerPtr[:]
 	if _, err := io.ReadFull(r, header); err != nil {
+		headerBufPool.Put(headerPtr)
 		return nil, err
 	}
 
@@ -91,6 +116,8 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 	routeLen := int(header[1])
 	clientLen := int(header[2])
 	payloadLen := int(binary.BigEndian.Uint16(header[3:5]))
+
+	headerBufPool.Put(headerPtr)
 
 	if payloadLen > MaxPayloadSize {
 		return nil, ErrPayloadTooBig
