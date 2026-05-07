@@ -308,8 +308,17 @@ func (s *fakeTunnelServer) sendUDPToAgent(t *testing.T, agentAddr *net.UDPAddr, 
 
 func (s *fakeTunnelServer) readUDPData(t *testing.T) *protocol.Packet {
 	t.Helper()
+	pkt, ok := s.readUDPDataWithin(t, 5*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for UDP data from agent")
+	}
+	return pkt
+}
+
+func (s *fakeTunnelServer) readUDPDataWithin(t *testing.T, timeout time.Duration) (*protocol.Packet, bool) {
+	t.Helper()
 	buf := make([]byte, 65536)
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if err := s.dataUDPConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
 			t.Fatal(err)
@@ -326,11 +335,25 @@ func (s *fakeTunnelServer) readUDPData(t *testing.T) *protocol.Packet {
 			continue
 		}
 		if pkt.Type == protocol.TypeData {
-			return pkt
+			return pkt, true
 		}
 	}
-	t.Fatal("timed out waiting for UDP data from agent")
-	return nil
+	return nil, false
+}
+
+func (s *fakeTunnelServer) expectNoDataConn(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	if err := s.dataTCPLn.(*net.TCPListener).SetDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := s.dataTCPLn.Accept()
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("unexpected data TCP connection")
+	}
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("Accept() error = %v, want timeout", err)
+	}
 }
 
 func startUDPEcho(t *testing.T, prefix string) (*net.UDPConn, string) {
@@ -426,6 +449,115 @@ func TestAgentUDPRouteCacheRefreshesOnHello(t *testing.T) {
 	}
 }
 
+func TestAgentUDPEncryptedRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := startFakeTunnelServer(t, "testtoken")
+	defer server.close()
+
+	backend, backendAddr := startUDPEcho(t, "enc:")
+	defer backend.Close()
+
+	connectedCh := make(chan struct{}, 1)
+	go func() {
+		_ = RunWithHooks(ctx, Config{
+			Server:     server.serverAddr(),
+			Token:      "testtoken",
+			DisableTLS: true,
+		}, &Hooks{OnConnected: func() {
+			select {
+			case connectedCh <- struct{}{}:
+			default:
+			}
+		}})
+	}()
+
+	server.sendHello(t, map[string]RemoteRoute{
+		"game": {
+			Name:       "game",
+			Proto:      "udp",
+			PublicAddr: ":47998",
+			LocalAddr:  backendAddr,
+			Encrypted:  true,
+			Algorithm:  sharedcrypto.AlgAES256,
+		},
+	})
+	waitForSignal(t, connectedCh, 5*time.Second, "agent never processed HELLO")
+	agentUDPAddr := server.waitForAgentUDPAddr(t)
+
+	key, err := sharedcrypto.DeriveKey("testtoken", sharedcrypto.AlgAES256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpCipher, err := sharedcrypto.NewUDPCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedPayload, err := sharedcrypto.EncryptUDP(udpCipher, nil, []byte("ping"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.sendUDPToAgent(t, agentUDPAddr, "game", "127.0.0.1:40000", encryptedPayload)
+
+	resp := server.readUDPData(t)
+	decrypted, err := sharedcrypto.DecryptUDP(udpCipher, nil, resp.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(decrypted); got != "enc:ping" {
+		t.Fatalf("encrypted UDP response = %q, want %q", got, "enc:ping")
+	}
+}
+
+func TestAgentUDPDropsUnknownRouteAndInvalidEncryptedPayload(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := startFakeTunnelServer(t, "testtoken")
+	defer server.close()
+
+	backend, backendAddr := startUDPEcho(t, "enc:")
+	defer backend.Close()
+
+	connectedCh := make(chan struct{}, 1)
+	go func() {
+		_ = RunWithHooks(ctx, Config{
+			Server:     server.serverAddr(),
+			Token:      "testtoken",
+			DisableTLS: true,
+		}, &Hooks{OnConnected: func() {
+			select {
+			case connectedCh <- struct{}{}:
+			default:
+			}
+		}})
+	}()
+
+	server.sendHello(t, map[string]RemoteRoute{
+		"secure": {
+			Name:       "secure",
+			Proto:      "udp",
+			PublicAddr: ":47998",
+			LocalAddr:  backendAddr,
+			Encrypted:  true,
+			Algorithm:  sharedcrypto.AlgAES256,
+		},
+	})
+	waitForSignal(t, connectedCh, 5*time.Second, "agent never processed HELLO")
+	agentUDPAddr := server.waitForAgentUDPAddr(t)
+
+	server.sendUDPToAgent(t, agentUDPAddr, "missing", "127.0.0.1:40000", []byte("ping"))
+	if pkt, ok := server.readUDPDataWithin(t, 500*time.Millisecond); ok {
+		t.Fatalf("unexpected UDP response for unknown route: %#v", pkt)
+	}
+
+	server.sendUDPToAgent(t, agentUDPAddr, "secure", "127.0.0.1:40001", []byte("not encrypted"))
+	if pkt, ok := server.readUDPDataWithin(t, 500*time.Millisecond); ok {
+		t.Fatalf("unexpected UDP response for invalid encrypted payload: %#v", pkt)
+	}
+}
+
 func TestAgentTCPConnectRetriesLocalDial(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -506,6 +638,80 @@ func TestAgentTCPConnectRetriesLocalDial(t *testing.T) {
 	}
 	if got := string(buf); got != "ack:hello" {
 		t.Fatalf("TCP response = %q, want %q", got, "ack:hello")
+	}
+}
+
+func TestAgentTCPUnknownRouteDoesNotDialDataServer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := startFakeTunnelServer(t, "testtoken")
+	defer server.close()
+
+	connectedCh := make(chan struct{}, 1)
+	go func() {
+		_ = RunWithHooks(ctx, Config{
+			Server:     server.serverAddr(),
+			Token:      "testtoken",
+			DisableTLS: true,
+		}, &Hooks{OnConnected: func() {
+			select {
+			case connectedCh <- struct{}{}:
+			default:
+			}
+		}})
+	}()
+
+	server.sendHello(t, map[string]RemoteRoute{
+		"known": {Name: "known", Proto: "tcp", PublicAddr: ":47984", LocalAddr: "127.0.0.1:1"},
+	})
+	waitForSignal(t, connectedCh, 5*time.Second, "agent never processed HELLO")
+	server.sendConnect(t, "missing", "client-unknown")
+	server.expectNoDataConn(t, 500*time.Millisecond)
+}
+
+func TestAgentTCPConnectLocalDialFailureClosesDataConn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := startFakeTunnelServer(t, "testtoken")
+	defer server.close()
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendAddr := probe.Addr().String()
+	_ = probe.Close()
+
+	connectedCh := make(chan struct{}, 1)
+	go func() {
+		_ = RunWithHooks(ctx, Config{
+			Server:     server.serverAddr(),
+			Token:      "testtoken",
+			DisableTLS: true,
+		}, &Hooks{OnConnected: func() {
+			select {
+			case connectedCh <- struct{}{}:
+			default:
+			}
+		}})
+	}()
+
+	server.sendHello(t, map[string]RemoteRoute{
+		"game": {Name: "game", Proto: "tcp", PublicAddr: ":47984", LocalAddr: backendAddr},
+	})
+	waitForSignal(t, connectedCh, 5*time.Second, "agent never processed HELLO")
+
+	server.sendConnect(t, "game", "client-fail")
+	dataConn, routeName, clientID := server.acceptDataConn(t)
+	defer dataConn.Close()
+	if routeName != "game" || clientID != "client-fail" {
+		t.Fatalf("unexpected data metadata route=%q client=%q", routeName, clientID)
+	}
+	_ = dataConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := dataConn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("data connection stayed open after local dial failure")
 	}
 }
 
