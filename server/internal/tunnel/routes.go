@@ -43,10 +43,10 @@ func emailClientRoutes(cfg ServerConfig) []RouteConfig {
 		return nil
 	}
 	return []RouteConfig{
-		{Name: internalEmailSubmissionRouteName, Proto: "tcp", PublicAddr: ":587", LocalAddr: emailDialAddr(email.SubmissionAddr, 587)},
-		{Name: internalEmailSubmissionTLSRouteName, Proto: "tcp", PublicAddr: ":465", LocalAddr: emailDialAddr(email.SubmissionTLSAddr, 465)},
-		{Name: internalEmailIMAPRouteName, Proto: "tcp", PublicAddr: ":143", LocalAddr: emailDialAddr(email.IMAPAddr, 143)},
-		{Name: internalEmailIMAPTLSRouteName, Proto: "tcp", PublicAddr: ":993", LocalAddr: emailDialAddr(email.IMAPTLSAddr, 993)},
+		{Name: internalEmailSubmissionRouteName, Proto: routeProtoTCP, PublicAddr: ":587", LocalAddr: emailDialAddr(email.SubmissionAddr, 587)},
+		{Name: internalEmailSubmissionTLSRouteName, Proto: routeProtoTCP, PublicAddr: ":465", LocalAddr: emailDialAddr(email.SubmissionTLSAddr, 465)},
+		{Name: internalEmailIMAPRouteName, Proto: routeProtoTCP, PublicAddr: ":143", LocalAddr: emailDialAddr(email.IMAPAddr, 143)},
+		{Name: internalEmailIMAPTLSRouteName, Proto: routeProtoTCP, PublicAddr: ":993", LocalAddr: emailDialAddr(email.IMAPTLSAddr, 993)},
 	}
 }
 
@@ -57,7 +57,7 @@ func emailInboundRoute(cfg ServerConfig) (RouteConfig, bool) {
 	}
 	return RouteConfig{
 		Name:       internalEmailInboundRouteName,
-		Proto:      "tcp",
+		Proto:      routeProtoTCP,
 		PublicAddr: emailInboundPublicAddr,
 		LocalAddr:  emailDialAddr(email.InboundSMTPAddr, 25),
 	}, true
@@ -121,7 +121,7 @@ func normalizeRoutes(cfg *ServerConfig) {
 
 		cfg.Routes[i].Proto = strings.ToLower(strings.TrimSpace(cfg.Routes[i].Proto))
 		if cfg.Routes[i].Proto == "" {
-			cfg.Routes[i].Proto = "tcp"
+			cfg.Routes[i].Proto = routeProtoTCP
 		}
 		cfg.Routes[i].PublicAddr = strings.TrimSpace(cfg.Routes[i].PublicAddr)
 		cfg.Routes[i].LocalAddr = strings.TrimSpace(cfg.Routes[i].LocalAddr)

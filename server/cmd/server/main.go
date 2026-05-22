@@ -41,6 +41,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+var startTime = time.Now()
+
 func main() {
 	var controlAddr string
 	var dataAddr string
@@ -109,7 +111,7 @@ func main() {
 	if strings.TrimSpace(cfg.Token) == "" {
 		tok, err := genToken()
 		if err != nil {
-			log.Fatal(err)
+			slog.Fatal(logging.CatSystem, "failed to generate server token", serverlog.F("error", err))
 		}
 		cfg.Token = tok
 		_ = configio.Save(configPath, cfg)
@@ -446,6 +448,20 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		mux := http.NewServeMux()
 		lim := newIPRateLimiter(10, 30*time.Second) // 10 attempts per 30s per IP
 
+		mux.HandleFunc("/healthz", securityHeaders(cookieSecure, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			_, st, _ := runner.Get()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":          "ok",
+				"agent_connected": st.AgentConnected,
+				"version":         version.Current,
+			})
+		}))
+
 		mux.HandleFunc("/setup", securityHeaders(cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			hasUsers, err := store.HasAnyUsers(r.Context())
 			if err != nil {
@@ -663,6 +679,24 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"WebHTTPS": webHTTPS,
 			}
 			_ = tplNetwork.Execute(w, data)
+		})))
+
+		// Metrics API (protected)
+		mux.HandleFunc("/metrics", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			cfg, _, snap, _ := runner.Dashboard(time.Now())
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"uptime_seconds":     int64(time.Since(startTime).Seconds()),
+				"agent_connected":    snap.AgentConnected,
+				"routes_count":       len(cfg.Routes),
+				"active_connections": snap.ActiveClients,
+				"bytes_total":        snap.BytesTotal,
+				"version":            version.Current,
+			})
 		})))
 
 		// Live stats API (protected)

@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -34,12 +37,23 @@ import (
 )
 
 var shutdownTimeout = 5 * time.Second
+var startTime = time.Now()
 
 const (
+	defaultWebAddr          = "127.0.0.1:7003"
+	defaultServerHost       = "127.0.0.1"
 	agentSystemdServiceName = "hostit-agent.service"
 	agentSystemdUnitPath    = "/etc/systemd/system/hostit-agent.service"
 	agentSystemdEnvPath     = "/etc/hostit/agent.env"
 )
+
+func generateToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
 
 func init() {
 	if v := os.Getenv("HOSTIT_SHUTDOWN_TIMEOUT"); v != "" {
@@ -165,7 +179,7 @@ func main() {
 
 	flag.StringVar(&serverHost, "server", "", "tunnel server host/IP (optionally include control port, e.g. host:7000)")
 	flag.StringVar(&token, "token", "", "shared token (required)")
-	flag.StringVar(&webAddr, "web", "127.0.0.1:7003", "agent web dashboard listen address (empty to disable)")
+	flag.StringVar(&webAddr, "web", defaultWebAddr, "agent web dashboard listen address (empty to disable)")
 	flag.StringVar(&configPath, "config", "agent.json", "path to agent config JSON")
 	flag.BoolVar(&autostart, "autostart", true, "start agent automatically")
 	flag.DurationVar(&shutdownTimeoutFlag, "shutdown-timeout", 0, "graceful shutdown timeout (e.g. 10s, 1m)")
@@ -273,10 +287,7 @@ func main() {
 	if webAddr != "" {
 		go func() {
 			display := webAddr
-			if strings.HasPrefix(display, ":") {
-				display = "0.0.0.0" + display
-				log.Printf("WARNING: agent web UI is unauthenticated; binding to all interfaces")
-			} else if h, _, err := net.SplitHostPort(display); err == nil {
+			if h, _, err := net.SplitHostPort(display); err == nil {
 				h = strings.TrimSpace(h)
 				if h == "" || h == "0.0.0.0" || h == "::" || h == "[::]" || h == "0:0:0:0:0:0:0:0" {
 					log.Printf("WARNING: agent web UI is unauthenticated; binding to all interfaces")
@@ -565,6 +576,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		return msg
 	}
 
+	// Generate a CSRF token for the session
+	csrfToken := generateToken()
+
 	buildTemplateData := func(cfg agent.Config, running, connected bool, lastErr string, routes []agent.RemoteRoute) map[string]any {
 		data := map[string]any{
 			"Cfg":          cfg,
@@ -577,11 +591,30 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"Version":      version.Current,
 			"Msg":          getMsg(),
 			"RoutesView":   makeRouteViews(routes),
+			"CSRFToken":    csrfToken,
 		}
 		if mailSvc != nil {
 			data["EmailStatus"] = mailSvc.Status()
 		}
 		return data
+	}
+
+	requireCSRF := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				next(w, r)
+				return
+			}
+			submitted := strings.TrimSpace(r.Header.Get("X-CSRF-Token"))
+			if submitted == "" {
+				submitted = strings.TrimSpace(r.PostFormValue("csrf_token"))
+			}
+			if subtle.ConstantTimeCompare([]byte(submitted), []byte(csrfToken)) != 1 {
+				http.Error(w, "invalid csrf token", http.StatusForbidden)
+				return
+			}
+			next(w, r)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -653,7 +686,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, upd.Status())
 	})
-	mux.HandleFunc("/api/update/check-now", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/update/check-now", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -661,7 +694,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = upd.CheckNow(r.Context())
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, upd.Status())
-	})
+	}))
 
 	mux.HandleFunc("/api/systemd/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -672,7 +705,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, st)
 	})
-	mux.HandleFunc("/api/systemd/restart", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/systemd/restart", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -686,8 +719,8 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("/api/systemd/stop", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/systemd/stop", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -697,9 +730,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	})
+	}))
 
-	mux.HandleFunc("/api/process/restart", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/process/restart", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -709,8 +742,8 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			time.Sleep(250 * time.Millisecond)
 			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 		}()
-	})
-	mux.HandleFunc("/api/process/exit", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/process/exit", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -720,24 +753,24 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			time.Sleep(250 * time.Millisecond)
 			os.Exit(0)
 		}()
-	})
-	mux.HandleFunc("/api/update/remind", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/update/remind", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		_ = upd.RemindLater(24 * time.Hour)
 		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("/api/update/skip", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/update/skip", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		_ = upd.SkipAvailableVersion()
 		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("/api/update/apply", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/update/apply", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -752,8 +785,8 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
-	})
-	mux.HandleFunc("/api/update/apply-local", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/api/update/apply-local", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -793,25 +826,25 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
-	})
+	}))
 
-	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/start", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		ctrl.Start()
 		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/stop", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		ctrl.Stop()
 		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("/restart", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/restart", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -819,7 +852,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		ctrl.Stop()
 		ctrl.Start()
 		w.WriteHeader(http.StatusNoContent)
-	})
+	}))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -847,7 +880,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	})
 
-	saveHandler := func(w http.ResponseWriter, r *http.Request) {
+	saveHandler := requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -888,7 +921,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		ctrl.Start()
 		setMsg("Saved + restarted")
 		http.Redirect(w, r, "/", http.StatusSeeOther)
-	}
+	})
 
 	mux.HandleFunc("/save", saveHandler)
 	mux.HandleFunc("/config/save", saveHandler)
@@ -918,7 +951,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		writeJSON(w, accts)
 	})
 
-	mux.HandleFunc("/api/mail/login", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mail/login", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -943,9 +976,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, map[string]string{"username": req.Username, "address": addr})
-	})
+	}))
 
-	mux.HandleFunc("/api/mail/inbox", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mail/inbox", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -977,9 +1010,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, msgs)
-	})
+	}))
 
-	mux.HandleFunc("/api/mail/message", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mail/message", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1009,9 +1042,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, msg)
-	})
+	}))
 
-	mux.HandleFunc("/api/mail/delete", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mail/delete", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1039,7 +1072,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	})
+	}))
 
 	mux.HandleFunc("/mail", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1047,6 +1080,38 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		_ = tplMail.Execute(w, nil)
+	})
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		cfg, running, connected, _, _ := ctrl.Get()
+		writeJSON(w, map[string]any{
+			"status":    "ok",
+			"running":   running,
+			"connected": connected,
+			"version":   version.Current,
+			"server":    cfg.Server,
+		})
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		cfg, running, connected, lastErr, routes := ctrl.Get()
+		writeJSON(w, map[string]any{
+			"uptime_seconds":  time.Since(startTime).Seconds(),
+			"running":         running,
+			"connected":       connected,
+			"routes_count":    len(routes),
+			"last_error":      lastErr,
+			"version":         version.Current,
+			"server":          cfg.Server,
+		})
 	})
 
 	h := &http.Server{
@@ -1103,6 +1168,7 @@ const agentHomeHTML = `<!doctype html>
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<meta name="csrf-token" content="{{.CSRFToken}}" />
 	<title>Tunnel Agent</title>
 	<style>
 		*,*::before,*::after{box-sizing:border-box}
@@ -1209,6 +1275,7 @@ const agentHomeHTML = `<!doctype html>
 
 		<div class="secHead"><h2>Connection</h2></div>
 		<form method="post" action="/save" class="card">
+			<input type="hidden" name="csrf_token" value="{{.CSRFToken}}" />
 			<div class="grid2">
 				<div>
 					<label>Server</label>
@@ -1267,6 +1334,11 @@ const agentHomeHTML = `<!doctype html>
 
 	<script>
 	(function(){
+		var csrfMeta=document.querySelector('meta[name="csrf-token"]');
+		var csrfToken=csrfMeta?csrfMeta.content:'';
+		var origFetch=window.fetch;
+		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
+
 		var updPopup=document.getElementById('updatePopup');
 		var updVer=document.getElementById('updVer');
 		var updInfo=document.getElementById('updInfo');
@@ -1423,6 +1495,7 @@ const agentControlsHTML = `<!doctype html>
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<meta name="csrf-token" content="{{.CSRFToken}}" />
 	<title>Tunnel Agent — Controls</title>
 	<style>
 		*,*::before,*::after{box-sizing:border-box}
@@ -1559,6 +1632,12 @@ const agentControlsHTML = `<!doctype html>
 	</div>
 
 	<script>
+	(function(){
+		var csrfMeta=document.querySelector('meta[name="csrf-token"]');
+		var csrfToken=csrfMeta?csrfMeta.content:'';
+		var origFetch=window.fetch;
+		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
+	})();
 	function esc(v){return String(v||'').replace(/[&<>"']/g,function(ch){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];});}
 	function fmtUnix(ts){if(!ts)return '—'; try{return new Date(ts*1000).toLocaleString();}catch(e){return String(ts);}}
 	function logClass(level){level=String(level||'').toLowerCase(); if(level==='warn')return 'warn'; if(level==='error'||level==='fatal')return 'error'; if(level==='debug')return 'debug'; if(level==='trace')return 'trace'; return 'info';}
@@ -1667,6 +1746,7 @@ const agentMailHTML = `<!doctype html>
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<meta name="csrf-token" content="{{.CSRFToken}}" />
 	<title>Tunnel Agent – Mail</title>
 	<style>
 		*,*::before,*::after{box-sizing:border-box}
@@ -1802,6 +1882,11 @@ const agentMailHTML = `<!doctype html>
 
 	<script>
 	(function(){
+		var csrfMeta=document.querySelector('meta[name="csrf-token"]');
+		var csrfToken=csrfMeta?csrfMeta.content:'';
+		var origFetch=window.fetch;
+		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
+
 		var creds = null; // {username, password}
 		var currentAddress = '';
 

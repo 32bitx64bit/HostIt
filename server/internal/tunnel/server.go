@@ -25,6 +25,40 @@ import (
 	"hostit/shared/relay"
 )
 
+const (
+	routeProtoTCP  = "tcp"
+	routeProtoUDP  = "udp"
+	routeProtoBoth = "both"
+)
+
+const (
+	smtpPortStandard      = 25
+	smtpPortSubmissionTLS = 465
+	smtpPortSubmission    = 587
+)
+
+const (
+	mailDialTimeout        = 10 * time.Second
+	tcpKeepAliveInterval   = 15 * time.Second
+	mailRelayIdleTimeout   = 2 * time.Minute
+	probeDefaultTTL        = 30 * time.Second
+	writeDeadlineShort     = 2 * time.Second
+	writeDeadlineStandard  = 5 * time.Second
+	readDeadlineStandard   = 30 * time.Second
+	authDeadline           = 5 * time.Second
+	handshakeDeadline      = 15 * time.Second
+	pingInterval           = 15 * time.Second
+	healthCheckInterval    = 30 * time.Second
+	healthCheckTimeout     = 35 * time.Second
+	maxControlConnLifetime = 24 * time.Hour
+	proxyIdleTimeout       = 5 * time.Minute
+	udpRegisterTimeout     = 60 * time.Second
+	domainShutdownTimeout  = 5 * time.Second
+	nettestTimeout         = 2 * time.Second
+	bwTestTimeout          = 5 * time.Second
+	emailProbeAllowTTL     = time.Minute
+)
+
 type agentSession struct {
 	conn        net.Conn
 	cancel      context.CancelFunc
@@ -286,7 +320,7 @@ func (s *Server) getRouteConfig(name string) (routeConfig, bool) {
 // private, or link-local addresses.
 func isAllowedOutboundSMTPTarget(addr *net.TCPAddr) bool {
 	switch addr.Port {
-	case 25, 465, 587:
+	case smtpPortStandard, smtpPortSubmissionTLS, smtpPortSubmission:
 		// allowed SMTP ports
 	default:
 		return false
@@ -323,16 +357,16 @@ func (s *Server) dialMailOutboundTCP(conn net.Conn, target string) {
 		return
 	}
 
-	serverConn, err := (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).Dial("tcp", remoteAddr.String())
+	serverConn, err := (&net.Dialer{Timeout: mailDialTimeout, KeepAlive: tcpKeepAliveInterval}).Dial("tcp", remoteAddr.String())
 	if err != nil {
 		logging.Global().Errorf(logging.CatTCP, "mail outbound dial failed for %s: %v", remoteAddr.String(), err)
 		conn.Close()
 		return
 	}
-	netutil.SetTCPKeepAlive(serverConn, 15*time.Second)
+	netutil.SetTCPKeepAlive(serverConn, tcpKeepAliveInterval)
 	_ = conn.SetDeadline(time.Time{})
 	logging.Global().Infof(logging.CatTCP, "Mail outbound relay connected target=%s", remoteAddr.String())
-	go relay.ProxyWithIdleTimeout(serverConn, conn, 2*time.Minute)
+	go relay.ProxyWithIdleTimeout(serverConn, conn, mailRelayIdleTimeout)
 }
 
 func (s *Server) allowProbeOutboundTarget(target string, ttl time.Duration) (string, error) {
@@ -341,7 +375,7 @@ func (s *Server) allowProbeOutboundTarget(target string, ttl time.Duration) (str
 		return "", fmt.Errorf("resolve probe outbound target %q: %w", target, err)
 	}
 	if ttl <= 0 {
-		ttl = 30 * time.Second
+		ttl = probeDefaultTTL
 	}
 	key := remoteAddr.String()
 	now := time.Now()
@@ -476,7 +510,7 @@ func writeMailRouteUnavailable(conn net.Conn, routeName string) {
 	if conn == nil {
 		return
 	}
-	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetWriteDeadline(time.Now().Add(writeDeadlineShort))
 	switch routeName {
 	case internalEmailSubmissionRouteName, internalEmailInboundRouteName:
 		_, _ = io.WriteString(conn, "421 4.3.0 HostIt mail backend unavailable\r\n")
@@ -512,7 +546,7 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 				s.sessionsMu.Lock()
 				if session, ok := s.sessions[remoteAddr]; ok {
 					session.writeMu.Lock()
-					agent.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
 					protocol.WritePacket(agent, helloPkt)
 					session.writeMu.Unlock()
 				}
@@ -576,7 +610,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		s.sessionsMu.Lock()
 		if session, ok := s.sessions[remoteAddr]; ok {
 			session.writeMu.Lock()
-			session.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			session.conn.SetWriteDeadline(time.Now().Add(writeDeadlineShort))
 			err := protocol.WritePacket(session.conn, pkt)
 			session.writeMu.Unlock()
 			s.sessionsMu.Unlock()
@@ -589,7 +623,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 			continue
 		}
 
-		timeout := time.After(2 * time.Second)
+		timeout := time.After(nettestTimeout)
 	waitLoop:
 		for {
 			select {
@@ -649,7 +683,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		s.sessionsMu.Lock()
 		if session, ok := s.sessions[remoteAddr]; ok {
 			session.writeMu.Lock()
-			session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			session.conn.SetWriteDeadline(time.Now().Add(bwTestTimeout))
 			session.writeMu.Unlock()
 		}
 		s.sessionsMu.Unlock()
@@ -680,7 +714,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 		}
 	}()
 
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(bwTestTimeout)
 bwWaitLoop:
 	for bwRecv < bwCount {
 		select {
@@ -740,7 +774,7 @@ func (s *Server) RunAgentEmailProbe(ctx context.Context, req protocol.EmailProbe
 	}()
 
 	if strings.TrimSpace(req.OutboundTarget) != "" {
-		allowedTarget, err := s.allowProbeOutboundTarget(req.OutboundTarget, time.Minute)
+		allowedTarget, err := s.allowProbeOutboundTarget(req.OutboundTarget, emailProbeAllowTTL)
 		if err != nil {
 			return protocol.EmailProbeResult{}, err
 		}
@@ -756,7 +790,7 @@ func (s *Server) RunAgentEmailProbe(ctx context.Context, req protocol.EmailProbe
 	s.sessionsMu.Lock()
 	if session, ok := s.sessions[remoteAddr]; ok {
 		session.writeMu.Lock()
-		session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		session.conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
 		err = protocol.WritePacket(session.conn, pkt)
 		session.writeMu.Unlock()
 		s.sessionsMu.Unlock()
@@ -836,6 +870,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		dataLn, err = net.Listen("tcp", s.cfg.DataAddr)
 		if err != nil {
+			controlLn.Close()
 			return fmt.Errorf("data listen failed: %w", err)
 		}
 	} else {
@@ -853,6 +888,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		dataLn, err = tls.Listen("tcp", s.cfg.DataAddr, tlsConfig)
 		if err != nil {
+			controlLn.Close()
 			return fmt.Errorf("data tls listen failed: %w", err)
 		}
 	}
@@ -879,7 +915,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.acceptAgentUDP()
 
 	for _, rt := range effectiveRoutes(s.cfg) {
-		if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == "tcp" || rt.Proto == "both") {
+		if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == routeProtoTCP || rt.Proto == routeProtoBoth) {
 			ln, err := net.Listen("tcp", rt.PublicAddr)
 			if err != nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to listen on public tcp %s: %v", rt.PublicAddr, err)
@@ -889,7 +925,7 @@ func (s *Server) Start(ctx context.Context) error {
 			s.wg.Add(1)
 			go s.acceptPublicTCP(ln, rt.Name)
 		}
-		if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == "udp" || rt.Proto == "both") {
+		if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == routeProtoUDP || rt.Proto == routeProtoBoth) {
 			addr, err := net.ResolveUDPAddr("udp", rt.PublicAddr)
 			if err != nil {
 				logging.Global().Errorf(logging.CatUDP, "failed to resolve public udp %s: %v", rt.PublicAddr, err)
@@ -928,12 +964,12 @@ func (s *Server) Stop() {
 		s.udpDataConn.Close()
 	}
 	if s.domainHTTPServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), domainShutdownTimeout)
 		_ = s.domainHTTPServer.Shutdown(ctx)
 		cancel()
 	}
 	if s.domainHTTPSServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), domainShutdownTimeout)
 		_ = s.domainHTTPSServer.Shutdown(ctx)
 		cancel()
 	}
@@ -966,9 +1002,9 @@ func (s *Server) acceptControl(ln net.Listener) {
 			logging.Global().Errorf(logging.CatTCP, "control accept error: %v", err)
 			continue
 		}
-		netutil.SetTCPKeepAlive(conn, 15*time.Second)
+		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
 
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		conn.SetDeadline(time.Now().Add(authDeadline))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "control auth failed from %s: %v", conn.RemoteAddr(), err)
 			conn.Close()
@@ -1022,7 +1058,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			continue
 		}
 		session.writeMu.Lock()
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
 		if err := protocol.WritePacket(conn, helloPkt); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
 			conn.Close()
@@ -1057,45 +1093,45 @@ func (s *Server) acceptControl(ln net.Listener) {
 			var lastPong atomic.Value
 			lastPong.Store(time.Now().UnixNano())
 
-			go func() {
-				ticker := time.NewTicker(15 * time.Second)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-pingCtx.Done():
-						return
-					case <-ticker.C:
-						s.mu.RLock()
-						isAgent := s.agentTCP == c && s.agentEpoch == epoch
-						s.mu.RUnlock()
-						if isAgent {
-							session.writeMu.Lock()
-							c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-							if err := protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing}); err != nil {
-								session.writeMu.Unlock()
-								c.Close()
-								return
-							}
+		go func() {
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-pingCtx.Done():
+					return
+				case <-ticker.C:
+					s.mu.RLock()
+					isAgent := s.agentTCP == c && s.agentEpoch == epoch
+					s.mu.RUnlock()
+					if isAgent {
+						session.writeMu.Lock()
+						c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+						if err := protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing}); err != nil {
 							session.writeMu.Unlock()
+							c.Close()
+							return
 						}
+						session.writeMu.Unlock()
 					}
 				}
-			}()
+			}
+		}()
 
-			go func() {
-				ticker := time.NewTicker(30 * time.Second)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-pingCtx.Done():
-						return
-					case <-ticker.C:
-						s.mu.RLock()
-						isAgent := s.agentTCP == c && s.agentEpoch == epoch
-						s.mu.RUnlock()
-						if isAgent {
-							lastPongTime := time.Unix(0, lastPong.Load().(int64))
-							if time.Since(lastPongTime) > 35*time.Second {
+		go func() {
+			ticker := time.NewTicker(healthCheckInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-pingCtx.Done():
+					return
+				case <-ticker.C:
+					s.mu.RLock()
+					isAgent := s.agentTCP == c && s.agentEpoch == epoch
+					s.mu.RUnlock()
+					if isAgent {
+						lastPongTime := time.Unix(0, lastPong.Load().(int64))
+						if time.Since(lastPongTime) > healthCheckTimeout {
 								logging.Global().Errorf(logging.CatTCP, "agent health check timeout, closing connection")
 								c.Close()
 								return
@@ -1106,7 +1142,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 			}()
 
 			connStart := time.Now()
-			const maxControlConnLifetime = 24 * time.Hour
 			for {
 				select {
 				case <-sessionCtx.Done():
@@ -1119,21 +1154,21 @@ func (s *Server) acceptControl(ln net.Listener) {
 					break
 				}
 
-				c.SetReadDeadline(time.Now().Add(30 * time.Second))
-				pkt, err := protocol.ReadPacket(c)
-				if err != nil {
-					break
-				}
-				if pkt.Type == protocol.TypePing {
-					session.writeMu.Lock()
-					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-					protocol.WritePacket(c, &protocol.Packet{
-						Type:    protocol.TypePong,
-						Payload: pkt.Payload,
-					})
-					session.writeMu.Unlock()
-					continue
-				}
+			c.SetReadDeadline(time.Now().Add(readDeadlineStandard))
+			pkt, err := protocol.ReadPacket(c)
+			if err != nil {
+				break
+			}
+			if pkt.Type == protocol.TypePing {
+				session.writeMu.Lock()
+				c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				protocol.WritePacket(c, &protocol.Packet{
+					Type:    protocol.TypePong,
+					Payload: pkt.Payload,
+				})
+				session.writeMu.Unlock()
+				continue
+			}
 				if pkt.Type == protocol.TypePong {
 					lastPong.Store(time.Now().UnixNano())
 					s.mu.RLock()
@@ -1185,16 +1220,16 @@ func (s *Server) acceptData(ln net.Listener) {
 			logging.Global().Errorf(logging.CatTCP, "data accept error: %v", err)
 			continue
 		}
-		netutil.SetTCPKeepAlive(conn, 15*time.Second)
+		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
 
-		handshakeDeadline := time.Now().Add(15 * time.Second)
-		conn.SetDeadline(handshakeDeadline)
+		handshakeDL := time.Now().Add(handshakeDeadline)
+		conn.SetDeadline(handshakeDL)
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "data auth failed from %s: %v", conn.RemoteAddr(), err)
 			conn.Close()
 			continue
 		}
-		conn.SetReadDeadline(handshakeDeadline)
+		conn.SetReadDeadline(handshakeDL)
 
 		var routeLen byte
 		if err := binary.Read(conn, binary.BigEndian, &routeLen); err != nil {
@@ -1218,7 +1253,7 @@ func (s *Server) acceptData(ln net.Listener) {
 			continue
 		}
 		clientID := string(clientBytes)
-		conn.SetReadDeadline(handshakeDeadline)
+		conn.SetReadDeadline(handshakeDL)
 
 		routeName := string(routeBytes)
 		if routeName == protocol.RouteMailOutboundTCP {
@@ -1291,7 +1326,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			continue
 		}
 
-		netutil.SetTCPKeepAlive(conn, 15*time.Second)
+		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
 		clientID := s.nextClientID()
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
 
@@ -1355,7 +1390,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			continue
 		}
 		session.writeMu.Lock()
-		session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		session.conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
 		writeErr := protocol.WritePacket(session.conn, reqPkt)
 		session.writeMu.Unlock()
 		if writeErr != nil {
@@ -1395,7 +1430,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				countBytes := func(n int) {
 					s.dash.addBytes(time.Now(), int64(n))
 				}
-				relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, 5*time.Minute)
+				relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, proxyIdleTimeout)
 
 			case <-timer.C:
 				// Race: delivery may have arrived at the exact moment the timer
@@ -1411,7 +1446,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 					countBytes := func(n int) {
 						s.dash.addBytes(time.Now(), int64(n))
 					}
-					relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, 5*time.Minute)
+					relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, proxyIdleTimeout)
 					return
 				}
 				logging.Global().Warnf(logging.CatTCP, "pair timeout route=%s client=%s", routeName, clientID)
@@ -1596,9 +1631,9 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			continue
 		}
 
-		if !agentUDPAt.IsZero() && time.Since(agentUDPAt) > 60*time.Second {
+		if !agentUDPAt.IsZero() && time.Since(agentUDPAt) > udpRegisterTimeout {
 			s.mu.Lock()
-			if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > 60*time.Second {
+			if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > udpRegisterTimeout {
 				logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
 				s.agentUDP = netip.AddrPort{}
 			}
