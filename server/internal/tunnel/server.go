@@ -957,37 +957,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 	defer s.wg.Done()
 	defer ln.Close()
 
-	// Rate limiter for failed auth attempts per IP
-	type ipFailRecord struct {
-		count int
-		first time.Time
-	}
-	var failMu sync.Mutex
-	failsByIP := make(map[string]*ipFailRecord)
-	const maxFailures = 10
-	const failWindow = 60 * time.Second
-
-	// Background cleanup of stale entries
-	go func() {
-		ticker := time.NewTicker(2 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			case <-ticker.C:
-				now := time.Now()
-				failMu.Lock()
-				for ip, rec := range failsByIP {
-					if now.Sub(rec.first) > failWindow {
-						delete(failsByIP, ip)
-					}
-				}
-				failMu.Unlock()
-			}
-		}
-	}()
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -999,42 +968,12 @@ func (s *Server) acceptControl(ln net.Listener) {
 		}
 		netutil.SetTCPKeepAlive(conn, 15*time.Second)
 
-		// Check per-IP rate limit before doing crypto work
-		remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-		failMu.Lock()
-		rec := failsByIP[remoteIP]
-		if rec != nil && time.Since(rec.first) > failWindow {
-			// Window expired, reset
-			delete(failsByIP, remoteIP)
-			rec = nil
-		}
-		if rec != nil && rec.count >= maxFailures {
-			failMu.Unlock()
-			logging.Global().Errorf(logging.CatTCP, "control auth rate limited for %s (%d failures in window)", remoteIP, rec.count)
-			conn.Close()
-			continue
-		}
-		failMu.Unlock()
-
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "control auth failed from %s: %v", conn.RemoteAddr(), err)
-			// Record failure for rate limiting
-			failMu.Lock()
-			if failsByIP[remoteIP] == nil {
-				failsByIP[remoteIP] = &ipFailRecord{count: 1, first: time.Now()}
-			} else {
-				failsByIP[remoteIP].count++
-			}
-			failMu.Unlock()
-			time.Sleep(100 * time.Millisecond) // Throttle brute-force attempts
 			conn.Close()
 			continue
 		}
-		// Auth succeeded — clear any failure record for this IP
-		failMu.Lock()
-		delete(failsByIP, remoteIP)
-		failMu.Unlock()
 		conn.SetDeadline(time.Time{})
 
 		remoteAddr := conn.RemoteAddr().String()
@@ -1237,37 +1176,6 @@ func (s *Server) acceptData(ln net.Listener) {
 	defer s.wg.Done()
 	defer ln.Close()
 
-	// Rate limiter for failed auth attempts per IP
-	type ipFailRecord struct {
-		count int
-		first time.Time
-	}
-	var failMu sync.Mutex
-	failsByIP := make(map[string]*ipFailRecord)
-	const maxFailures = 10
-	const failWindow = 60 * time.Second
-
-	// Background cleanup of stale entries
-	go func() {
-		ticker := time.NewTicker(2 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			case <-ticker.C:
-				now := time.Now()
-				failMu.Lock()
-				for ip, rec := range failsByIP {
-					if now.Sub(rec.first) > failWindow {
-						delete(failsByIP, ip)
-					}
-				}
-				failMu.Unlock()
-			}
-		}
-	}()
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -1279,33 +1187,10 @@ func (s *Server) acceptData(ln net.Listener) {
 		}
 		netutil.SetTCPKeepAlive(conn, 15*time.Second)
 
-		// Check per-IP rate limit before doing crypto work
-		remoteIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-		failMu.Lock()
-		rec := failsByIP[remoteIP]
-		if rec != nil && time.Since(rec.first) > failWindow {
-			rec = nil
-			delete(failsByIP, remoteIP)
-		}
-		if rec != nil && rec.count >= maxFailures {
-			failMu.Unlock()
-			logging.Global().Warnf(logging.CatTCP, "data auth rate limit exceeded for %s", remoteIP)
-			conn.Close()
-			continue
-		}
-		failMu.Unlock()
-
 		handshakeDeadline := time.Now().Add(15 * time.Second)
 		conn.SetDeadline(handshakeDeadline)
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "data auth failed from %s: %v", conn.RemoteAddr(), err)
-			failMu.Lock()
-			if failsByIP[remoteIP] == nil {
-				failsByIP[remoteIP] = &ipFailRecord{count: 1, first: time.Now()}
-			} else {
-				failsByIP[remoteIP].count++
-			}
-			failMu.Unlock()
 			conn.Close()
 			continue
 		}
@@ -1452,26 +1337,13 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			Route:  routeName,
 			Client: clientID,
 		}
+		// Snapshot the session under the lock, then release it before any
+		// network I/O so a slow agent recv side cannot serialize all public
+		// accepts (or block control-plane registration on sessionsMu).
 		s.sessionsMu.Lock()
-		if session, ok := s.sessions[remoteAddr]; ok {
-			session.writeMu.Lock()
-			session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := protocol.WritePacket(session.conn, reqPkt); err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to request agent connect route=%s client=%s: %v", routeName, clientID, err)
-				session.writeMu.Unlock()
-				s.sessionsMu.Unlock()
-				<-sem
-				writeMailRouteUnavailable(conn, routeName)
-				conn.Close()
-				s.mu.Lock()
-				delete(s.pendingTCP, pendingKey)
-				s.mu.Unlock()
-				entry.cancel()
-				continue
-			}
-			session.writeMu.Unlock()
-		} else {
-			s.sessionsMu.Unlock()
+		session, sessionOK := s.sessions[remoteAddr]
+		s.sessionsMu.Unlock()
+		if !sessionOK {
 			<-sem
 			logging.Global().Warnf(logging.CatTCP, "agent session unavailable for route=%s client=%s", routeName, clientID)
 			writeMailRouteUnavailable(conn, routeName)
@@ -1482,7 +1354,21 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			entry.cancel()
 			continue
 		}
-		s.sessionsMu.Unlock()
+		session.writeMu.Lock()
+		session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		writeErr := protocol.WritePacket(session.conn, reqPkt)
+		session.writeMu.Unlock()
+		if writeErr != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to request agent connect route=%s client=%s: %v", routeName, clientID, writeErr)
+			<-sem
+			writeMailRouteUnavailable(conn, routeName)
+			conn.Close()
+			s.mu.Lock()
+			delete(s.pendingTCP, pendingKey)
+			s.mu.Unlock()
+			entry.cancel()
+			continue
+		}
 
 		go func(c net.Conn, clientID string, sem chan struct{}) {
 			defer c.Close()
