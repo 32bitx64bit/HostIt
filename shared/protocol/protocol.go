@@ -16,6 +16,14 @@ const (
 	TypeConnect           byte = 6
 	TypeEmailProbeRequest byte = 7
 	TypeEmailProbeResult  byte = 8
+	TypeRouteRequest      byte = 9
+	TypeRouteResponse     byte = 10
+	TypeRouteConfirm      byte = 11
+	TypeRouteAck          byte = 12
+	TypeRouteRemove       byte = 13
+	TypeRouteRemoveAck    byte = 14
+	TypeRouteUpdate       byte = 15
+	TypeRouteUpdateAck    byte = 16
 )
 
 const RouteMailOutboundTCP = "hostit_mail_outbound"
@@ -198,7 +206,7 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	}
 
 	p.Type = data[0]
-	if p.Type < TypeRegister || p.Type > TypeEmailProbeResult {
+	if p.Type < TypeRegister || p.Type > TypeRouteUpdateAck {
 		return ErrInvalidPacket
 	}
 

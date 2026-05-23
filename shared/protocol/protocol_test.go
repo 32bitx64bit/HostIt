@@ -262,6 +262,76 @@ func TestUnmarshalUDPToRejectsTruncatedPackets(t *testing.T) {
 	}
 }
 
+func TestNewPacketTypesRoundTrip(t *testing.T) {
+	newTypes := []struct {
+		Type    byte
+		Name    string
+		Payload []byte
+	}{
+		{TypeRouteRequest, "route-req", []byte(`{"name":"app"}`)},
+		{TypeRouteResponse, "route-resp", []byte(`{"status":"active"}`)},
+		{TypeRouteConfirm, "route-confirm", []byte(`{"name":"app","domain":"app.example.com"}`)},
+		{TypeRouteAck, "route-ack", []byte(`{"status":"active"}`)},
+		{TypeRouteRemove, "route-remove", []byte(`{"name":"app"}`)},
+		{TypeRouteRemoveAck, "route-remove-ack", []byte(`{"ok":true}`)},
+	}
+
+	for _, tc := range newTypes {
+		t.Run(tc.Name, func(t *testing.T) {
+			pkt := &Packet{
+				Type:    tc.Type,
+				Route:   tc.Name,
+				Client:  "client-1",
+				Payload: tc.Payload,
+			}
+
+			var buf bytes.Buffer
+			if err := WritePacket(&buf, pkt); err != nil {
+				t.Fatalf("WritePacket: %v", err)
+			}
+			got, err := ReadPacket(&buf)
+			if err != nil {
+				t.Fatalf("ReadPacket: %v", err)
+			}
+			if got.Type != pkt.Type || got.Route != pkt.Route || got.Client != pkt.Client || !bytes.Equal(got.Payload, pkt.Payload) {
+				t.Fatalf("TCP round-trip mismatch: got %+v, want %+v", got, pkt)
+			}
+
+			udpData, err := MarshalUDP(pkt, nil)
+			if err != nil {
+				t.Fatalf("MarshalUDP: %v", err)
+			}
+			var udpGot Packet
+			if err := UnmarshalUDPTo(udpData, &udpGot); err != nil {
+				t.Fatalf("UnmarshalUDPTo: %v", err)
+			}
+			if udpGot.Type != pkt.Type || udpGot.Route != pkt.Route || udpGot.Client != pkt.Client || !bytes.Equal(udpGot.Payload, pkt.Payload) {
+				t.Fatalf("UDP round-trip mismatch: got %+v, want %+v", udpGot, pkt)
+			}
+		})
+	}
+}
+
+func TestUnmarshalUDPToRejectsOutOfRangePacketType(t *testing.T) {
+	cases := []struct {
+		name    string
+		typeVal byte
+	}{
+		{"zero", 0},
+		{"too_high", 17},
+		{"way_too_high", 255},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte{tc.typeVal, 0, 0}
+			var pkt Packet
+			if err := UnmarshalUDPTo(data, &pkt); !errors.Is(err, ErrInvalidPacket) {
+				t.Fatalf("UnmarshalUDPTo with type %d: error = %v, want ErrInvalidPacket", tc.typeVal, err)
+			}
+		})
+	}
+}
+
 func TestReadPacketReturnsErrorForTruncatedFrames(t *testing.T) {
 	tests := []struct {
 		name string
