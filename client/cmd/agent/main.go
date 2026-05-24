@@ -27,6 +27,7 @@ import (
 	"hostit/client/internal/agent"
 	"hostit/client/internal/agentlog"
 	"hostit/client/internal/mail"
+	"hostit/shared/apitypes"
 	"hostit/shared/configio"
 	"hostit/shared/emailcfg"
 	"hostit/shared/module"
@@ -34,6 +35,8 @@ import (
 	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
 	"hostit/shared/version"
+
+	"github.com/coder/websocket"
 )
 
 var shutdownTimeout = 5 * time.Second
@@ -47,12 +50,35 @@ const (
 	agentSystemdEnvPath     = "/etc/hostit/agent.env"
 )
 
+type ctxKey string
+
+var (
+	ctxAPIKeyLabel  ctxKey = "api_key_label"
+	ctxAPIKeyPrefix ctxKey = "api_key_prefix"
+)
+
 func generateToken() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+func generateAPIKey() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return "hit_" + hex.EncodeToString(b)
+}
+
+func isLocalhost(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
 func init() {
@@ -235,6 +261,13 @@ func main() {
 	if p, err := filepath.Abs(configPath); err == nil {
 		absCfg = p
 	}
+	appsConfigPath := filepath.Join(filepath.Dir(absCfg), "apps.json")
+	appsCfg := apitypes.AppsConfig{}
+	if loaded, _ := configio.Load(appsConfigPath, &appsCfg); loaded && len(appsCfg.Apps) > 0 {
+		log.Printf("Loaded %d app configs from %s", len(appsCfg.Apps), appsConfigPath)
+	}
+	ctrl.appsCfg = appsCfg
+	ctrl.appsPath = appsConfigPath
 	mailSvc, err := mail.NewService(filepath.Join(filepath.Dir(absCfg), "mail"))
 	if err != nil {
 		log.Printf("mail service init failed: %v", err)
@@ -308,6 +341,7 @@ type agentController struct {
 
 	mu                 sync.Mutex
 	cfg                agent.Config
+	agentInst          *agent.Agent
 	running            bool
 	connected          bool
 	lastErr            string
@@ -319,6 +353,10 @@ type agentController struct {
 	onEmailConfig      func(emailcfg.Config)
 	onEmailProbe       func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
 	onTLSPinDiscovered func(pin string)
+
+	eventSubs []*eventSubscriber
+	appsCfg   apitypes.AppsConfig
+	appsPath  string
 }
 
 func newAgentController(root context.Context, cfg agent.Config) *agentController {
@@ -336,6 +374,87 @@ func (a *agentController) SetConfig(cfg agent.Config) {
 	a.mu.Lock()
 	a.cfg = cfg
 	a.mu.Unlock()
+}
+
+func (a *agentController) GetAgent() *agent.Agent {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.agentInst
+}
+
+func (a *agentController) RequestRoute(ctx context.Context, req apitypes.RouteRequest) (*apitypes.RouteResponse, error) {
+	a.mu.Lock()
+	ag := a.agentInst
+	a.mu.Unlock()
+	if ag == nil {
+		return nil, fmt.Errorf("agent not running")
+	}
+	return ag.SendRouteRequest(ctx, req)
+}
+
+func (a *agentController) ConfirmRoute(ctx context.Context, confirm apitypes.RouteConfirm) (*apitypes.RouteAck, error) {
+	a.mu.Lock()
+	ag := a.agentInst
+	a.mu.Unlock()
+	if ag == nil {
+		return nil, fmt.Errorf("agent not running")
+	}
+	return ag.SendRouteConfirm(ctx, confirm)
+}
+
+func (a *agentController) RemoveRoute(ctx context.Context, remove apitypes.RouteRemove) (*apitypes.RouteRemoveAck, error) {
+	a.mu.Lock()
+	ag := a.agentInst
+	a.mu.Unlock()
+	if ag == nil {
+		return nil, fmt.Errorf("agent not running")
+	}
+	return ag.SendRouteRemove(ctx, remove)
+}
+
+func (a *agentController) UpdateRoute(ctx context.Context, update apitypes.RouteUpdate) (*apitypes.RouteUpdateAck, error) {
+	a.mu.Lock()
+	ag := a.agentInst
+	a.mu.Unlock()
+	if ag == nil {
+		return nil, fmt.Errorf("agent not running")
+	}
+	return ag.SendRouteUpdate(ctx, update)
+}
+
+type eventSubscriber struct {
+	ch chan apitypes.AppEvent
+}
+
+func (a *agentController) SubscribeEvents() *eventSubscriber {
+	sub := &eventSubscriber{ch: make(chan apitypes.AppEvent, 100)}
+	a.mu.Lock()
+	a.eventSubs = append(a.eventSubs, sub)
+	a.mu.Unlock()
+	return sub
+}
+
+func (a *agentController) UnsubscribeEvents(sub *eventSubscriber) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i, s := range a.eventSubs {
+		if s == sub {
+			a.eventSubs = append(a.eventSubs[:i], a.eventSubs[i+1:]...)
+			return
+		}
+	}
+}
+
+func (a *agentController) pushEvent(event apitypes.AppEvent) {
+	a.mu.Lock()
+	subs := append([]*eventSubscriber(nil), a.eventSubs...)
+	a.mu.Unlock()
+	for _, sub := range subs {
+		select {
+		case sub.ch <- event:
+		default:
+		}
+	}
 }
 
 func (a *agentController) Start() {
@@ -373,6 +492,8 @@ func (a *agentController) Start() {
 			a.connected = true
 			a.lastErr = ""
 			a.mu.Unlock()
+			a.pushEvent(apitypes.AppEvent{Type: "connected", Timestamp: time.Now().UnixMilli()})
+			go registerAppsFromConfig(a.root, a, a.appsCfg.Apps)
 		},
 		OnRoutes: func(routes []agent.RemoteRoute) {
 			a.mu.Lock()
@@ -382,6 +503,7 @@ func (a *agentController) Start() {
 			}
 			a.routes = append([]agent.RemoteRoute(nil), routes...)
 			a.mu.Unlock()
+			a.pushEvent(apitypes.AppEvent{Type: "routes_updated", Timestamp: time.Now().UnixMilli()})
 		},
 		OnEmailConfig: func(cfg emailcfg.Config) {
 			a.mu.Lock()
@@ -420,6 +542,7 @@ func (a *agentController) Start() {
 				a.lastErr = err.Error()
 			}
 			a.mu.Unlock()
+			a.pushEvent(apitypes.AppEvent{Type: "disconnected", Timestamp: time.Now().UnixMilli(), Detail: err.Error()})
 		},
 		OnError: func(err error) {
 			a.mu.Lock()
@@ -448,11 +571,18 @@ func (a *agentController) Start() {
 		},
 	}
 
+	ag := agent.NewAgent(cfg)
+	ag.SetHooks(hooks)
+	a.mu.Lock()
+	a.agentInst = ag
+	a.mu.Unlock()
+
 	go func() {
 		defer close(done)
-		err := agent.RunWithHooks(ctx, cfg, hooks)
+		err := ag.Run(ctx)
 		a.mu.Lock()
 		if a.runID == rid {
+			a.agentInst = nil
 			a.connected = false
 			a.running = false
 			a.cancel = nil
@@ -473,6 +603,7 @@ func (a *agentController) Stop() {
 	a.cancel = nil
 	a.running = false
 	a.connected = false
+	a.agentInst = nil
 	a.mu.Unlock()
 
 	if cancel != nil {
@@ -493,9 +624,45 @@ func maskToken(s string) string {
 	return "****" + s[len(s)-4:]
 }
 
+func registerAppsFromConfig(ctx context.Context, ctrl *agentController, apps []apitypes.AppConfig) {
+	for _, app := range apps {
+		if !app.AutoStart {
+			continue
+		}
+		localHost := "127.0.0.1"
+		if app.LocalHost != "" {
+			localHost = app.LocalHost
+		}
+		localAddr := net.JoinHostPort(localHost, strconv.Itoa(app.LocalPort))
+		req := apitypes.RouteRequest{
+			RequestID:  generateToken(),
+			Name:       app.Name,
+			Proto:      app.Proto,
+			LocalAddr:  localAddr,
+			PublicPort: app.PublicPort,
+			Domain:     app.Domain,
+			Encrypted:  app.Encrypted,
+			Source:     "apps.json",
+		}
+		resp, err := ctrl.RequestRoute(ctx, req)
+		if err != nil {
+			log.Printf("auto-register app %q failed: %v", app.Name, err)
+			continue
+		}
+		if resp.Status == "active" {
+			log.Printf("auto-registered app %q on %s", app.Name, resp.PublicAddr)
+		} else if resp.Status == "pending_domain" {
+			log.Printf("auto-registered app %q pending domain selection", app.Name)
+		} else if resp.Status == "failed" {
+			log.Printf("auto-register app %q rejected: %s", app.Name, resp.Error)
+		}
+	}
+}
+
 func serveAgentDashboard(ctx context.Context, addr string, configPath string, ctrl *agentController, mailSvc *mail.Service) error {
 	tplHome := template.Must(template.New("home").Parse(agentHomeHTML))
 	tplControls := template.Must(template.New("controls").Parse(agentControlsHTML))
+	tplApps := template.Must(template.New("apps").Parse(agentAppsHTML))
 
 	absCfg := configPath
 	if p, err := filepath.Abs(configPath); err == nil {
@@ -549,6 +716,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		Proto       string `json:"proto"`
 		PublicAddr  string `json:"publicAddr"`
 		LocalTarget string `json:"localTarget"`
+	}
+	type apitypesRoute struct {
+		Name       string `json:"name"`
+		Proto      string `json:"proto"`
+		PublicAddr string `json:"public_addr"`
+		LocalAddr  string `json:"local_addr"`
 	}
 	makeRouteViews := func(routes []agent.RemoteRoute) []routeView {
 		out := make([]routeView, 0, len(routes))
@@ -614,6 +787,49 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 				return
 			}
 			next(w, r)
+		}
+	}
+
+	requireAPIKeyOrLocal := func(next http.HandlerFunc, perm string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if isLocalhost(r.RemoteAddr) && r.Header.Get("Authorization") == "" {
+				next(w, r)
+				return
+			}
+			auth := r.Header.Get("Authorization")
+			if !strings.HasPrefix(auth, "Bearer ") {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			key := strings.TrimPrefix(auth, "Bearer ")
+			cfg, _, _, _, _ := ctrl.Get()
+			var matched *apitypes.APIKey
+			for i := range cfg.APIKeys {
+				if subtle.ConstantTimeCompare([]byte(key), []byte(cfg.APIKeys[i].Key)) == 1 {
+					matched = &cfg.APIKeys[i]
+					break
+				}
+			}
+			if matched == nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			hasPerm := perm == ""
+			if !hasPerm {
+				for _, p := range matched.Permissions {
+					if p == perm || p == "*" {
+						hasPerm = true
+						break
+					}
+				}
+			}
+			if !hasPerm {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			ctx := context.WithValue(r.Context(), ctxAPIKeyLabel, matched.Label)
+			ctx = context.WithValue(ctx, ctxAPIKeyPrefix, matched.OwnedRoutePrefix)
+			next(w, r.WithContext(ctx))
 		}
 	}
 
@@ -876,6 +1092,32 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		_ = tplControls.Execute(w, buildTemplateData(cfg, running, connected, lastErr, routes))
 	})
 
+	mux.HandleFunc("/apps", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		cfg, _, connected, lastErr, routes := ctrl.Get()
+		apiRoutes := []apitypesRoute{}
+		for _, rt := range routes {
+			apiRoutes = append(apiRoutes, apitypesRoute{
+				Name:       rt.Name,
+				Proto:      rt.Proto,
+				PublicAddr: rt.PublicAddr,
+				LocalAddr:  rt.EffectiveLocalAddr(),
+			})
+		}
+		data := map[string]any{
+			"Cfg":        cfg,
+			"Connected":  connected,
+			"LastErr":    lastErr,
+			"RoutesView": apiRoutes,
+			"CSRFToken":  csrfToken,
+			"Version":    version.Current,
+		}
+		_ = tplApps.Execute(w, data)
+	})
+
 	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	})
@@ -1114,6 +1356,410 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		})
 	})
 
+	mux.HandleFunc("/api/v1/register", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req apitypes.RegisterRequest
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		if req.Proto == "" {
+			req.Proto = "tcp"
+		}
+		if req.Proto != "tcp" && req.Proto != "udp" && req.Proto != "both" {
+			http.Error(w, "proto must be tcp, udp, or both", http.StatusBadRequest)
+			return
+		}
+		if req.LocalPort <= 0 || req.LocalPort > 65535 {
+			http.Error(w, "local_port must be 1-65535", http.StatusBadRequest)
+			return
+		}
+
+		prefix, _ := r.Context().Value(ctxAPIKeyPrefix).(string)
+		if prefix != "" && !strings.HasPrefix(req.Name, prefix+"-") && req.Name != prefix {
+			http.Error(w, "route name must have prefix "+prefix, http.StatusBadRequest)
+			return
+		}
+
+		localHost := "127.0.0.1"
+		if req.LocalHost != "" {
+			localHost = req.LocalHost
+		}
+		localAddr := net.JoinHostPort(localHost, strconv.Itoa(req.LocalPort))
+
+		_, running, connected, lastErr, _ := ctrl.Get()
+		if !running || !connected {
+			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			return
+		}
+
+		reqID := generateToken()
+		protoReq := apitypes.RouteRequest{
+			RequestID:  reqID,
+			Name:       req.Name,
+			Proto:      req.Proto,
+			LocalAddr:  localAddr,
+			PublicPort: req.PublicPort,
+			Domain:     req.Domain,
+			Encrypted:  req.Encrypted,
+			Source:     "api",
+		}
+
+		resp, err := ctrl.RequestRoute(r.Context(), protoReq)
+		if err != nil {
+			http.Error(w, "route request failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if resp.Status == "failed" {
+			http.Error(w, "route request rejected: "+resp.Error, http.StatusBadRequest)
+			return
+		}
+
+		apiResp := apitypes.RegisterResponse{
+			Status:           resp.Status,
+			RequestID:        resp.RequestID,
+			RouteName:        resp.Name,
+			PublicAddr:       resp.PublicAddr,
+			LocalAddr:        resp.LocalAddr,
+			Proto:            resp.Proto,
+			Domain:           resp.Domain,
+			AvailableDomains: resp.AvailableDomains,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, apiResp)
+	}, "routes:register"))
+
+	mux.HandleFunc("/api/v1/routes", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_, _, _, _, routes := ctrl.Get()
+		out := make([]apitypesRoute, 0, len(routes))
+		for _, rt := range routes {
+			out = append(out, apitypesRoute{
+				Name:       rt.Name,
+				Proto:      rt.Proto,
+				PublicAddr: rt.PublicAddr,
+				LocalAddr:  rt.EffectiveLocalAddr(),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, out)
+	}, "routes:list"))
+
+	mux.HandleFunc("/api/v1/routes/", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/api/v1/routes/")
+		if name == "" {
+			http.Error(w, "route name required", http.StatusBadRequest)
+			return
+		}
+		_, running, connected, lastErr, _ := ctrl.Get()
+		if !running || !connected {
+			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			return
+		}
+		ack, err := ctrl.RemoveRoute(r.Context(), apitypes.RouteRemove{Name: name, Source: "api"})
+		if err != nil {
+			http.Error(w, "route remove failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ack.OK {
+			http.Error(w, "route remove rejected: "+ack.Error, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}, "routes:delete"))
+
+	mux.HandleFunc("/api/v1/domains", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_, _, connected, lastErr, _ := ctrl.Get()
+		if !connected {
+			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			return
+		}
+		protoReq := apitypes.RouteRequest{
+			RequestID:  generateToken(),
+			Name:       "_domain_query",
+			Proto:      "tcp",
+			LocalAddr:  "127.0.0.1:1",
+			PublicPort: 0,
+			Domain:     "_query",
+			Source:     "api",
+		}
+		resp, err := ctrl.RequestRoute(r.Context(), protoReq)
+		if err != nil {
+			http.Error(w, "domain query failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		result := apitypes.DomainsResponse{
+			Base:      resp.Domain,
+			Available: resp.AvailableDomains,
+		}
+		if result.Available == nil {
+			result.Available = []apitypes.DomainOption{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, result)
+	}, "domains:list"))
+
+	mux.HandleFunc("/api/v1/domains/select", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req apitypes.DomainSelectRequest
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if req.RequestID == "" || req.Domain == "" || req.RouteName == "" {
+			http.Error(w, "request_id, route_name, and domain are required", http.StatusBadRequest)
+			return
+		}
+		_, _, connected, lastErr, _ := ctrl.Get()
+		if !connected {
+			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			return
+		}
+		ack, err := ctrl.ConfirmRoute(r.Context(), apitypes.RouteConfirm{
+			RequestID: req.RequestID,
+			Name:      req.RouteName,
+			Domain:    req.Domain,
+		})
+		if err != nil {
+			http.Error(w, "domain confirm failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if ack.Status == "failed" {
+			http.Error(w, "domain confirm rejected: "+ack.Error, http.StatusBadRequest)
+			return
+		}
+		apiResp := apitypes.RegisterResponse{
+			Status:     "active",
+			RequestID:  ack.RequestID,
+			RouteName:  ack.Name,
+			Domain:     ack.Domain,
+			PublicAddr: ack.PublicAddr,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, apiResp)
+	}, "domains:select"))
+
+	mux.HandleFunc("/api/v1/status", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		cfg, running, connected, _, routes := ctrl.Get()
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, apitypes.StatusResponse{
+			Connected:   running && connected,
+			Server:      cfg.Server,
+			Version:     version.Current,
+			RoutesCount: len(routes),
+		})
+	}, ""))
+
+	mux.HandleFunc("/api/v1/keys/generate", requireCSRF(requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Label       string   `json:"label"`
+			Permissions []string `json:"permissions"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.Label) == "" {
+			http.Error(w, "label is required", http.StatusBadRequest)
+			return
+		}
+		if req.Permissions == nil {
+			req.Permissions = []string{"routes:register", "routes:list", "domains:list", "domains:select"}
+		}
+		key := apitypes.APIKey{
+			Key:              generateAPIKey(),
+			Label:            req.Label,
+			Permissions:      req.Permissions,
+			OwnedRoutePrefix: req.Label,
+		}
+		cfg, _, _, _, _ := ctrl.Get()
+		cfg.APIKeys = append(cfg.APIKeys, key)
+		ctrl.SetConfig(cfg)
+		if err := configio.Save(configPath, cfg); err != nil {
+			http.Error(w, "failed to save config: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, map[string]string{"key": key.Key, "label": key.Label})
+	}, "keys:generate")))
+
+	mux.HandleFunc("/api/v1/routes/update", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch && r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Name       string `json:"name"`
+			LocalPort  int    `json:"local_port,omitempty"`
+			LocalHost  string `json:"local_host,omitempty"`
+			PublicPort int    `json:"public_port,omitempty"`
+			Domain     string `json:"domain,omitempty"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		_, _, connected, lastErr, _ := ctrl.Get()
+		if !connected {
+			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			return
+		}
+		update := apitypes.RouteUpdate{
+			RequestID: generateToken(),
+			Name:      req.Name,
+		}
+		if req.LocalPort > 0 {
+			localHost := "127.0.0.1"
+			if req.LocalHost != "" {
+				localHost = req.LocalHost
+			}
+			update.LocalAddr = net.JoinHostPort(localHost, strconv.Itoa(req.LocalPort))
+		}
+		if req.PublicPort > 0 {
+			update.PublicPort = req.PublicPort
+		}
+		if req.Domain != "" {
+			update.Domain = req.Domain
+		}
+		ack, err := ctrl.UpdateRoute(r.Context(), update)
+		if err != nil {
+			http.Error(w, "route update failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if ack.Status == "failed" {
+			http.Error(w, "route update rejected: "+ack.Error, http.StatusBadRequest)
+			return
+		}
+		ctrl.pushEvent(apitypes.AppEvent{Type: "route_updated", Timestamp: time.Now().UnixMilli(), RouteName: req.Name})
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, map[string]any{
+			"status":     "updated",
+			"route_name": ack.Name,
+		})
+	}, "routes:update"))
+
+	mux.HandleFunc("/api/v1/route/stats", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := strings.TrimSpace(r.URL.Query().Get("name"))
+		if name == "" {
+			http.Error(w, "name query parameter required", http.StatusBadRequest)
+			return
+		}
+		_, _, connected, _, routes := ctrl.Get()
+		var found *agent.RemoteRoute
+		for _, rt := range routes {
+			if rt.Name == name {
+				found = &rt
+				break
+			}
+		}
+		if found == nil {
+			http.Error(w, "route not found", http.StatusNotFound)
+			return
+		}
+		stats := apitypes.RouteStats{
+			Name:       found.Name,
+			Proto:      found.Proto,
+			PublicAddr: found.PublicAddr,
+			LocalAddr:  found.EffectiveLocalAddr(),
+			Connected:  connected,
+			Source:     "dynamic",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, stats)
+	}, "routes:list"))
+
+	mux.HandleFunc("/api/v1/events", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			OriginPatterns: []string{"localhost:*", "127.0.0.1:*"},
+		})
+		if err != nil {
+			http.Error(w, "websocket upgrade failed", http.StatusBadRequest)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		sub := ctrl.SubscribeEvents()
+		defer ctrl.UnsubscribeEvents(sub)
+
+		for {
+			select {
+			case event := <-sub.ch:
+				data, err := json.Marshal(event)
+				if err != nil {
+					continue
+				}
+				ctx2, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				err = conn.Write(ctx2, websocket.MessageText, data)
+				cancel()
+				if err != nil {
+					return
+				}
+			case <-r.Context().Done():
+				return
+			case <-time.After(5 * time.Minute):
+				conn.Close(websocket.StatusNormalClosure, "idle timeout")
+				return
+			}
+		}
+	}, ""))
+
+	mux.HandleFunc("/api/v1/apps/register-all", requireCSRF(requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		appsCfg := apitypes.AppsConfig{}
+		configio.Load(ctrl.appsPath, &appsCfg)
+		ctrl.mu.Lock()
+		ctrl.appsCfg = appsCfg
+		ctrl.mu.Unlock()
+		registerAppsFromConfig(r.Context(), ctrl, appsCfg.Apps)
+		w.WriteHeader(http.StatusNoContent)
+	}, "routes:register")))
+
 	h := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -1236,6 +1882,7 @@ const agentHomeHTML = `<!doctype html>
 			<div class="nav">
 				<a class="active" href="/">Home</a>
 				<a href="/controls">Controls</a>
+				<a href="/apps">Apps</a>
 				<a href="/mail">Mail</a>
 			</div>
 		</div>
@@ -1558,6 +2205,7 @@ const agentControlsHTML = `<!doctype html>
 			<div class="nav">
 				<a href="/">Home</a>
 				<a class="active" href="/controls">Controls</a>
+				<a href="/apps">Apps</a>
 				<a href="/mail">Mail</a>
 			</div>
 		</div>
@@ -1818,6 +2466,7 @@ const agentMailHTML = `<!doctype html>
 			<div class="nav">
 				<a href="/">Home</a>
 				<a href="/controls">Controls</a>
+				<a href="/apps">Apps</a>
 				<a class="active" href="/mail">Mail</a>
 			</div>
 		</div>
@@ -2094,6 +2743,198 @@ const agentMailHTML = `<!doctype html>
 		};
 
 		renderSortArrow();
+	})();
+	</script>
+</body>
+</html>`
+
+const agentAppsHTML = `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<meta name="csrf-token" content="{{.CSRFToken}}" />
+	<title>Tunnel Agent — Apps</title>
+	<style>
+		*,*::before,*::after{box-sizing:border-box}
+		:root{--bg:#0f1117;--bg2:#181b25;--bg3:#1e2230;--surface:rgba(255,255,255,.04);--surfaceHover:rgba(255,255,255,.07);--border:rgba(255,255,255,.08);--borderHover:rgba(255,255,255,.14);--text:#e4e6ee;--textMuted:rgba(228,230,238,.55);--accent:#5b8def;--accentDim:rgba(91,141,239,.18);--accentBorder:rgba(91,141,239,.35);--green:#3fb950;--greenDim:rgba(63,185,80,.14);--greenBorder:rgba(63,185,80,.4);--red:#f85149;--redDim:rgba(248,81,73,.12);--redBorder:rgba(248,81,73,.4);--purple:#a371f7;--radius:10px;--radiusLg:14px;--font:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;color-scheme:dark}
+		@media(prefers-color-scheme:light){:root{--bg:#f5f6fa;--bg2:#ebedf5;--bg3:#e2e4ee;--surface:rgba(0,0,0,.03);--surfaceHover:rgba(0,0,0,.06);--border:rgba(0,0,0,.10);--borderHover:rgba(0,0,0,.18);--text:#1a1d28;--textMuted:rgba(26,29,40,.50);--accentDim:rgba(91,141,239,.12);--greenDim:rgba(63,185,80,.10);--redDim:rgba(248,81,73,.08);color-scheme:light}}
+		body{font-family:var(--font);margin:0;padding:0;background:var(--bg);color:var(--text);line-height:1.5}
+		a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+		code{font-family:var(--mono);font-size:.8em;background:var(--surface);padding:2px 6px;border-radius:4px}
+		.wrap{max-width:1060px;margin:0 auto;padding:20px 16px 60px}
+		.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+		.topbar h1{font-size:18px;font-weight:700;margin:0}
+		.topbar .subtitle{font-size:12px;color:var(--textMuted);margin-top:2px}
+		.nav{display:flex;gap:4px}
+		.nav a{font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);transition:all .15s;text-decoration:none}
+		.nav a:hover{background:var(--surfaceHover);border-color:var(--borderHover);text-decoration:none}
+		.nav a.active{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.statusGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:20px}
+		.sCard{padding:12px;border-radius:var(--radiusLg);border:1px solid var(--border);background:var(--surface);text-align:center}
+		.sCard .label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted);margin-bottom:4px}
+		.sCard .val{font-size:15px;font-weight:600}
+		.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid}
+		.pill::before{content:'';width:6px;height:6px;border-radius:50%}
+		.pill.ok{color:var(--green);border-color:var(--greenBorder);background:var(--greenDim)}.pill.ok::before{background:var(--green)}
+		.pill.bad{color:var(--red);border-color:var(--redBorder);background:var(--redDim)}.pill.bad::before{background:var(--red)}
+		.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radiusLg);padding:16px;transition:border-color .15s}
+		.secHead{margin:20px 0 10px}
+		.secHead h2{font-size:14px;font-weight:600;margin:0;text-transform:uppercase;letter-spacing:.05em;color:var(--textMuted)}
+		.btn{font-family:var(--font);font-size:13px;padding:7px 14px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;transition:all .15s}
+		.btn:hover{background:var(--surfaceHover);border-color:var(--borderHover)}
+		.btn.primary{background:var(--accentDim);border-color:var(--accentBorder);color:var(--accent)}
+		.btn.sm{font-size:12px;padding:5px 10px}
+		.flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+		.muted{color:var(--textMuted)}
+		.routeRow{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)}
+		.routeRow:last-child{border-bottom:none}
+		.routeRow .rName{font-weight:600;min-width:80px}
+		.routeRow .rProto{font-size:11px;padding:2px 6px;border-radius:4px;text-transform:uppercase;font-weight:500}
+		.routeRow .rProto.tcp{background:var(--accentDim);color:var(--accent)}
+		.routeRow .rProto.udp{background:rgba(163,113,247,.14);color:var(--purple)}
+		.routeRow .rAddrs{font-size:12px;color:var(--textMuted)}
+		.routeRow .rSource{font-size:11px;padding:2px 8px;border-radius:4px;text-transform:uppercase;font-weight:500;background:var(--surface);color:var(--textMuted)}
+		.eventLog{max-height:320px;overflow:auto;margin-top:8px}
+		.eventRow{display:flex;gap:10px;align-items:flex-start;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px}
+		.eventRow:last-child{border-bottom:none}
+		.eventTime{font-family:var(--mono);color:var(--textMuted);white-space:nowrap;min-width:72px}
+		.eventType{font-weight:600;min-width:90px}
+		.eventDetail{color:var(--textMuted);min-width:0;overflow-wrap:anywhere}
+	</style>
+</head>
+<body>
+	<div class="wrap">
+		<div class="topbar">
+			<div>
+				<h1>Tunnel Agent</h1>
+				<div class="subtitle">Apps &amp; Routes</div>
+			</div>
+			<div class="nav">
+				<a href="/">Home</a>
+				<a href="/controls">Controls</a>
+				<a href="/apps" class="active">Apps</a>
+				<a href="/mail">Mail</a>
+			</div>
+		</div>
+
+		<div class="statusGrid">
+			<div class="sCard">
+				<div class="label">Connection</div>
+				<div class="val"><span id="connPill" class="pill {{if .Connected}}ok{{else}}bad{{end}}">{{if .Connected}}Connected{{else}}Disconnected{{end}}</span></div>
+			</div>
+			<div class="sCard">
+				<div class="label">Routes</div>
+				<div class="val" id="routeCount">{{len .RoutesView}}</div>
+			</div>
+		</div>
+
+		{{if .LastErr}}<div style="font-size:12px;padding:8px 10px;margin-bottom:16px;border-radius:8px;background:var(--redDim);border:1px solid var(--redBorder);color:var(--red);word-break:break-all"><b>Error:</b> {{.LastErr}}</div>{{end}}
+
+		<div class="flex" style="margin-bottom:16px">
+			<button class="btn sm primary" id="btnRegisterAll">Register all apps</button>
+			<button class="btn sm" id="btnRefresh">Refresh</button>
+		</div>
+
+		<div class="secHead"><h2>Active Routes</h2></div>
+		<div class="card">
+			<div id="routesEmpty" class="muted" {{if .Connected}}style="display:none"{{end}}>Routes appear after the agent connects.</div>
+			<div id="routesList">
+				{{range .RoutesView}}
+				<div class="routeRow">
+					<span class="rName">{{.Name}}</span>
+					<span class="rProto {{.Proto}}">{{.Proto}}</span>
+					<span class="rAddrs"><code>{{.PublicAddr}}</code> &rarr; <code>{{.LocalAddr}}</code></span>
+					<span class="rSource">dynamic</span>
+				</div>
+				{{end}}
+			</div>
+		</div>
+
+		<div class="secHead"><h2>Events</h2></div>
+		<div class="card">
+			<div id="eventLog" class="eventLog">
+				<div class="muted" id="eventsEmpty">Listening for events…</div>
+			</div>
+		</div>
+	</div>
+
+	<script>
+	(function(){
+		var csrfMeta=document.querySelector('meta[name="csrf-token"]');
+		var csrfToken=csrfMeta?csrfMeta.content:'';
+		var origFetch=window.fetch;
+		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
+
+		function esc(s){return s==null?'':String(s).replace(/[&<>"']/g,function(ch){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];});}
+		function fmtMs(ts){if(!ts)return '';try{return new Date(ts).toLocaleTimeString();}catch(e){return String(ts);}}
+
+		var connPill=document.getElementById('connPill');
+		var routeCount=document.getElementById('routeCount');
+		var routesEmpty=document.getElementById('routesEmpty');
+		var routesList=document.getElementById('routesList');
+		var eventLog=document.getElementById('eventLog');
+		var eventsEmpty=document.getElementById('eventsEmpty');
+
+		function renderRoutes(routes){
+			if(!routesList)return;
+			routesList.innerHTML='';
+			if(!routes||!routes.length){if(routesEmpty)routesEmpty.style.display='';return;}
+			if(routesEmpty)routesEmpty.style.display='none';
+			for(var i=0;i<routes.length;i++){
+				var rt=routes[i]||{};
+				var row=document.createElement('div');row.className='routeRow';
+				var nm=document.createElement('span');nm.className='rName';nm.textContent=esc(rt.name);row.appendChild(nm);
+				var pr=document.createElement('span');pr.className='rProto '+(esc(rt.proto).toLowerCase());pr.textContent=esc(rt.proto);row.appendChild(pr);
+				var ad=document.createElement('span');ad.className='rAddrs';
+				var c1=document.createElement('code');c1.textContent=esc(rt.public_addr||rt.publicAddr||'');ad.appendChild(c1);
+				ad.appendChild(document.createTextNode(' \u2192 '));
+				var c2=document.createElement('code');c2.textContent=esc(rt.local_addr||rt.localAddr||'');ad.appendChild(c2);
+				row.appendChild(ad);
+				var src=document.createElement('span');src.className='rSource';src.textContent=esc(rt.source||'dynamic');row.appendChild(src);
+				routesList.appendChild(row);
+			}
+			if(routeCount)routeCount.textContent=String(routes.length);
+		}
+
+		function addEvent(ev){
+			if(eventsEmpty){eventsEmpty.style.display='none';}
+			var row=document.createElement('div');row.className='eventRow';
+			var tm=document.createElement('span');tm.className='eventTime';tm.textContent=fmtMs(ev.timestamp);row.appendChild(tm);
+			var tp=document.createElement('span');tp.className='eventType';tp.textContent=esc(ev.type);row.appendChild(tp);
+			var dt=document.createElement('span');dt.className='eventDetail';dt.textContent=esc(ev.route_name?(ev.route_name+' '+(ev.detail||'')):ev.detail||'');row.appendChild(dt);
+			eventLog.insertBefore(row,eventLog.firstChild);
+			while(eventLog.children.length>100){eventLog.removeChild(eventLog.lastChild);}
+		}
+
+		function setPill(el,ok,t){if(!el)return;el.classList.remove('ok','bad');el.classList.add(ok?'ok':'bad');el.textContent=t;}
+
+		async function pollOnce(){
+			try{
+				var res=await fetch('/api/status',{cache:'no-store'});
+				if(!res.ok)throw new Error('http '+res.status);
+				var j=await res.json();
+				setPill(connPill,!!j.connected,j.connected?'Connected':'Disconnected');
+				renderRoutes(j.routes);
+			}catch(e){}
+		}
+
+		document.getElementById('btnRefresh').onclick=pollOnce;
+
+		document.getElementById('btnRegisterAll').onclick=async function(){
+			try{await fetch('/api/v1/apps/register-all',{method:'POST'});}catch(_){}
+			setTimeout(pollOnce,500);
+		};
+
+		pollOnce();setInterval(pollOnce,3000);
+
+		try{
+			var ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/api/v1/events');
+			ws.onmessage=function(e){
+				try{var ev=JSON.parse(e.data);addEvent(ev);}catch(_){}
+			};
+			ws.onclose=function(){setTimeout(function(){location.reload();},5000);};
+		}catch(e){}
 	})();
 	</script>
 </body>

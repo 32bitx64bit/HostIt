@@ -7,8 +7,12 @@ import (
 	"strconv"
 	"strings"
 
+	"hostit/shared/apitypes"
 	"hostit/shared/emailcfg"
 )
+
+type AppsConfig = apitypes.AppsConfig
+type AppConfig = apitypes.AppConfig
 
 type RemoteRoute struct {
 	Name       string
@@ -36,6 +40,7 @@ type Config struct {
 	TLSPinSHA256 string
 	Email        emailcfg.Config        `json:"-"`
 	Routes       map[string]RemoteRoute `json:"-"`
+	APIKeys      []apitypes.APIKey       `json:",omitempty"`
 }
 
 func (c Config) Validate() error {

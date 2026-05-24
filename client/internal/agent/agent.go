@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"hostit/shared/apitypes"
 	"hostit/shared/crypto"
 	"hostit/shared/emailcfg"
 	"hostit/shared/logging"
@@ -28,7 +29,10 @@ type Hooks struct {
 	OnEmailConfig      func(cfg emailcfg.Config)
 	OnEmailProbe       func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
 	OnRoutes           func(routes []RemoteRoute)
-	OnDisconnected     func(err error)
+	OnRouteResponse    func(apitypes.RouteResponse)
+	OnRouteAck        func(apitypes.RouteAck)
+	OnRouteRemoveAck  func(apitypes.RouteRemoveAck)
+	OnDisconnected    func(err error)
 	OnError            func(err error)
 	OnTLSPinDiscovered func(pin string)
 }
@@ -54,6 +58,11 @@ type Agent struct {
 
 	controlWriteMu sync.Mutex
 	routeCacheGen  atomic.Uint64
+
+	pendingRouteReqs   map[string]chan *apitypes.RouteResponse
+	pendingRouteAcks   map[string]chan *apitypes.RouteAck
+	pendingRemoveAcks  map[string]chan *apitypes.RouteRemoveAck
+	pendingUpdateAcks  map[string]chan *apitypes.RouteUpdateAck
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -101,7 +110,190 @@ func (ct *connTracker) closeAll() {
 
 func NewAgent(cfg Config) *Agent {
 	return &Agent{
-		cfg: cfg,
+		cfg:                cfg,
+		pendingRouteReqs:   make(map[string]chan *apitypes.RouteResponse),
+		pendingRouteAcks:   make(map[string]chan *apitypes.RouteAck),
+		pendingRemoveAcks:  make(map[string]chan *apitypes.RouteRemoveAck),
+		pendingUpdateAcks:  make(map[string]chan *apitypes.RouteUpdateAck),
+	}
+}
+
+func (a *Agent) SetHooks(hooks *Hooks) {
+	a.hooks = hooks
+}
+
+func (a *Agent) ControlConn() net.Conn {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.controlConn
+}
+
+func (a *Agent) SendRouteRequest(ctx context.Context, req apitypes.RouteRequest) (*apitypes.RouteResponse, error) {
+	ch := make(chan *apitypes.RouteResponse, 1)
+	a.mu.Lock()
+	a.pendingRouteReqs[req.RequestID] = ch
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.pendingRouteReqs, req.RequestID)
+		a.mu.Unlock()
+	}()
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.RLock()
+	conn := a.controlConn
+	a.mu.RUnlock()
+	a.controlWriteMu.Lock()
+	if conn == nil {
+		a.controlWriteMu.Unlock()
+		return nil, fmt.Errorf("not connected to server")
+	}
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteRequest, Payload: payload}); err != nil {
+		conn.SetWriteDeadline(time.Time{})
+		a.controlWriteMu.Unlock()
+		return nil, err
+	}
+	conn.SetWriteDeadline(time.Time{})
+	a.controlWriteMu.Unlock()
+
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("route request timed out")
+	}
+}
+
+func (a *Agent) SendRouteConfirm(ctx context.Context, confirm apitypes.RouteConfirm) (*apitypes.RouteAck, error) {
+	ch := make(chan *apitypes.RouteAck, 1)
+	a.mu.Lock()
+	a.pendingRouteAcks[confirm.RequestID] = ch
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.pendingRouteAcks, confirm.RequestID)
+		a.mu.Unlock()
+	}()
+
+	payload, err := json.Marshal(confirm)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.RLock()
+	conn := a.controlConn
+	a.mu.RUnlock()
+	a.controlWriteMu.Lock()
+	if conn == nil {
+		a.controlWriteMu.Unlock()
+		return nil, fmt.Errorf("not connected to server")
+	}
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteConfirm, Payload: payload}); err != nil {
+		conn.SetWriteDeadline(time.Time{})
+		a.controlWriteMu.Unlock()
+		return nil, err
+	}
+	conn.SetWriteDeadline(time.Time{})
+	a.controlWriteMu.Unlock()
+
+	select {
+	case ack := <-ch:
+		return ack, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("route confirm timed out")
+	}
+}
+
+func (a *Agent) SendRouteRemove(ctx context.Context, remove apitypes.RouteRemove) (*apitypes.RouteRemoveAck, error) {
+	ch := make(chan *apitypes.RouteRemoveAck, 1)
+	a.mu.Lock()
+	a.pendingRemoveAcks[remove.Name] = ch
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.pendingRemoveAcks, remove.Name)
+		a.mu.Unlock()
+	}()
+
+	payload, err := json.Marshal(remove)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.RLock()
+	conn := a.controlConn
+	a.mu.RUnlock()
+	a.controlWriteMu.Lock()
+	if conn == nil {
+		a.controlWriteMu.Unlock()
+		return nil, fmt.Errorf("not connected to server")
+	}
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteRemove, Payload: payload}); err != nil {
+		conn.SetWriteDeadline(time.Time{})
+		a.controlWriteMu.Unlock()
+		return nil, err
+	}
+	conn.SetWriteDeadline(time.Time{})
+	a.controlWriteMu.Unlock()
+
+	select {
+	case ack := <-ch:
+		return ack, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("route remove timed out")
+	}
+}
+
+func (a *Agent) SendRouteUpdate(ctx context.Context, update apitypes.RouteUpdate) (*apitypes.RouteUpdateAck, error) {
+	ch := make(chan *apitypes.RouteUpdateAck, 1)
+	a.mu.Lock()
+	if a.pendingUpdateAcks == nil {
+		a.pendingUpdateAcks = make(map[string]chan *apitypes.RouteUpdateAck)
+	}
+	a.pendingUpdateAcks[update.RequestID] = ch
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.pendingUpdateAcks, update.RequestID)
+		a.mu.Unlock()
+	}()
+
+	payload, err := json.Marshal(update)
+	if err != nil {
+		return nil, err
+	}
+	a.controlWriteMu.Lock()
+	conn := a.controlConn
+	if conn == nil {
+		a.controlWriteMu.Unlock()
+		return nil, fmt.Errorf("not connected to server")
+	}
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteUpdate, Payload: payload}); err != nil {
+		conn.SetWriteDeadline(time.Time{})
+		a.controlWriteMu.Unlock()
+		return nil, err
+	}
+	conn.SetWriteDeadline(time.Time{})
+	a.controlWriteMu.Unlock()
+
+	select {
+	case ack := <-ch:
+		return ack, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("route update timed out")
 	}
 }
 
@@ -485,6 +677,71 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 			if a.hooks != nil && a.hooks.OnEmailConfig != nil {
 				a.hooks.OnEmailConfig(email)
 			}
+			continue
+		}
+
+		if pkt.Type == protocol.TypeRouteResponse {
+			var resp apitypes.RouteResponse
+			if err := json.Unmarshal(pkt.Payload, &resp); err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to parse route response: %v", err)
+				continue
+			}
+			a.mu.Lock()
+			if ch, ok := a.pendingRouteReqs[resp.RequestID]; ok {
+				ch <- &resp
+			}
+			a.mu.Unlock()
+			if a.hooks != nil && a.hooks.OnRouteResponse != nil {
+				a.hooks.OnRouteResponse(resp)
+			}
+			continue
+		}
+
+		if pkt.Type == protocol.TypeRouteAck {
+			var ack apitypes.RouteAck
+			if err := json.Unmarshal(pkt.Payload, &ack); err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to parse route ack: %v", err)
+				continue
+			}
+			a.mu.Lock()
+			if ch, ok := a.pendingRouteAcks[ack.RequestID]; ok {
+				ch <- &ack
+			}
+			a.mu.Unlock()
+			if a.hooks != nil && a.hooks.OnRouteAck != nil {
+				a.hooks.OnRouteAck(ack)
+			}
+			continue
+		}
+
+		if pkt.Type == protocol.TypeRouteRemoveAck {
+			var ack apitypes.RouteRemoveAck
+			if err := json.Unmarshal(pkt.Payload, &ack); err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to parse route remove ack: %v", err)
+				continue
+			}
+			a.mu.Lock()
+			if ch, ok := a.pendingRemoveAcks[ack.Name]; ok {
+				ch <- &ack
+			}
+			a.mu.Unlock()
+			if a.hooks != nil && a.hooks.OnRouteRemoveAck != nil {
+				a.hooks.OnRouteRemoveAck(ack)
+			}
+			continue
+		}
+
+		if pkt.Type == protocol.TypeRouteUpdateAck {
+			var ack apitypes.RouteUpdateAck
+			if err := json.Unmarshal(pkt.Payload, &ack); err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to parse route update ack: %v", err)
+				continue
+			}
+			a.mu.Lock()
+			if ch, ok := a.pendingUpdateAcks[ack.RequestID]; ok {
+				ch <- &ack
+			}
+			a.mu.Unlock()
 			continue
 		}
 
