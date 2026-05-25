@@ -13,8 +13,6 @@ import (
 	"hostit/shared/protocol"
 )
 
-func boolPtr(b bool) *bool { return &b }
-
 func fakeEncryptedAgent(ctx context.Context, controlAddr, dataAddr, localAddr, token string) {
 	key, _ := crypto.DeriveKey(token, crypto.AlgAES256)
 	fakeEncryptedAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{"default": localAddr}, token, key)
@@ -156,7 +154,7 @@ func TestEndToEndTCPEncrypted(t *testing.T) {
 		PairTimeout:         10 * time.Second,
 		DisableTLS:          true,
 		EncryptionAlgorithm: "aes-256",
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	go fakeEncryptedAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
@@ -209,7 +207,7 @@ func TestEndToEndTCPEncryptedConcurrent(t *testing.T) {
 		PairTimeout:         10 * time.Second,
 		DisableTLS:          true,
 		EncryptionAlgorithm: "aes-256",
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	go fakeEncryptedAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
@@ -283,7 +281,7 @@ func TestEndToEndTCPEncryptedLargeData(t *testing.T) {
 		PairTimeout:         10 * time.Second,
 		DisableTLS:          true,
 		EncryptionAlgorithm: "aes-256",
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	go fakeEncryptedAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")

@@ -19,9 +19,12 @@ const (
 	internalEmailACMEHTTPRouteName      = "hostit_mail_acme_http"
 )
 
-func effectiveRoutes(cfg ServerConfig) []RouteConfig {
+func effectiveRoutes(cfg ServerConfig, dynamicRoutes map[string]dynamicRouteEntry) []RouteConfig {
 	routes := append([]RouteConfig(nil), cfg.Routes...)
 	routes = append(routes, emailSynthRoutes(cfg)...)
+	for _, dr := range dynamicRoutes {
+		routes = append(routes, dr.Route)
+	}
 	return routes
 }
 

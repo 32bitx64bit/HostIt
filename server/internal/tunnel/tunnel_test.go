@@ -146,7 +146,7 @@ func TestEndToEndTCP(t *testing.T) {
 	publicAddr := publicLn.Addr().String()
 	publicLn.Close()
 
-	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 10 * time.Second, DisableTLS: true})
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 10 * time.Second, DisableTLS: true}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	go fakeAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
@@ -191,7 +191,7 @@ func TestEndToEndTCPConcurrent(t *testing.T) {
 	publicAddr := publicLn.Addr().String()
 	publicLn.Close()
 
-	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 10 * time.Second, DisableTLS: true})
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 10 * time.Second, DisableTLS: true}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	go fakeAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
@@ -273,7 +273,7 @@ func TestEndToEndTCPConcurrentMultiRoute(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 10 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	go fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{
@@ -440,7 +440,7 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 3 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	var conn net.Conn
@@ -503,7 +503,7 @@ func TestMailOutboundRelayRejectsLoopbackTarget(t *testing.T) {
 	dataAddr := dataLn.Addr().String()
 	dataLn.Close()
 
-	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Token: "testtoken", PairTimeout: 3 * time.Second, DisableTLS: true})
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Token: "testtoken", PairTimeout: 3 * time.Second, DisableTLS: true}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	var dataConn net.Conn
@@ -557,7 +557,7 @@ func TestMailOutboundRelayAllowsTemporarilyWhitelistedProbeTarget(t *testing.T) 
 	dataAddr := dataLn.Addr().String()
 	dataLn.Close()
 
-	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Token: "testtoken", PairTimeout: 3 * time.Second, DisableTLS: true})
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Token: "testtoken", PairTimeout: 3 * time.Second, DisableTLS: true}, nil)
 	allowedTarget, err := srv.allowProbeOutboundTarget(echoAddr, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -676,7 +676,7 @@ func TestServerMultiConn_PendingCleanupAndAgentRestart(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 3 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	agentCtx, agentCancel := context.WithCancel(ctx)
@@ -819,7 +819,7 @@ func TestServerRapidReconnectWithStaleControlSession(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 5 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	dialControl := func(t *testing.T) net.Conn {
@@ -1009,7 +1009,7 @@ func TestServerMultiConn_NoAgentRejectsQuickly(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 250 * time.Millisecond,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	time.Sleep(50 * time.Millisecond)
@@ -1064,7 +1064,7 @@ func TestPublicTCPRejectWithoutAgentDoesNotLeakConnectionSlot(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 500 * time.Millisecond,
 		DisableTLS:  true,
-	})
+	}, nil)
 	srv.maxConnsPerRoute = 1
 	go func() { _ = srv.Run(ctx) }()
 
@@ -1177,7 +1177,7 @@ func TestRealisticSunshineScenario(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 10 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	go fakeAgentRoutes(ctx, controlAddr, dataAddr, services, "testtoken")

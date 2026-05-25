@@ -146,7 +146,7 @@ func TestPendingTCPEntryDuplicateDeliveryClosesSecondConn(t *testing.T) {
 }
 
 func TestAbortPendingTCPClearsEntriesAndClosesDeliveredConns(t *testing.T) {
-	srv := NewServer(ServerConfig{})
+	srv := NewServer(ServerConfig{}, nil)
 	firstEntry := newPendingTCPEntry()
 	secondEntry := newPendingTCPEntry()
 	delivered := newCloseTrackingConn()
@@ -186,7 +186,7 @@ func TestDataHandshakeUnknownPairClosesConnectionWithoutPendingLeak(t *testing.T
 		Token:       "testtoken",
 		PairTimeout: time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	conn := dialTCPForLifecycleTest(t, dataAddr)
@@ -226,7 +226,7 @@ func TestPublicTCPDisabledRouteClosesWithoutConnectOrPending(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	agentConn := dialControlForLifecycleTest(t, controlAddr, "testtoken")
@@ -267,7 +267,7 @@ func TestPublicTCPPairTimeoutCleansPendingAndReleasesLimit(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 100 * time.Millisecond,
 		DisableTLS:  true,
-	})
+	}, nil)
 	srv.maxConnsPerRoute = 1
 	go func() { _ = srv.Run(ctx) }()
 
@@ -321,7 +321,7 @@ func TestLateDataHandshakeAfterPairTimeoutIsClosed(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 100 * time.Millisecond,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	agentConn := dialControlForLifecycleTest(t, controlAddr, "testtoken")
@@ -368,7 +368,7 @@ func TestAgentDisconnectAbortsPendingPublicConnection(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 5 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	agentConn := dialControlForLifecycleTest(t, controlAddr, "testtoken")
@@ -407,7 +407,7 @@ func TestDataHandshakeDeliveredConnPairsWithWaitingPublicClient(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 5 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 
 	agentConn := dialControlForLifecycleTest(t, controlAddr, "testtoken")

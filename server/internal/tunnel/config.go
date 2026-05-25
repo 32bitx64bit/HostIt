@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -117,7 +118,7 @@ func validateRouteName(name string) error {
 		}
 	}
 	switch strings.ToLower(name) {
-	case "_system", "system", "default", "all", "any", internalEmailInboundRouteName, internalEmailSubmissionRouteName, internalEmailSubmissionTLSRouteName, internalEmailIMAPRouteName, internalEmailIMAPTLSRouteName, internalEmailACMEHTTPRouteName, protocol.RouteMailOutboundTCP:
+	case "_system", "_domain_query", "system", "default", "all", "any", internalEmailInboundRouteName, internalEmailSubmissionRouteName, internalEmailSubmissionTLSRouteName, internalEmailIMAPRouteName, internalEmailIMAPTLSRouteName, internalEmailACMEHTTPRouteName, protocol.RouteMailOutboundTCP:
 		return fmt.Errorf("route name %q is reserved", name)
 	}
 	return nil
@@ -180,29 +181,32 @@ func (r *RouteConfig) Validate() error {
 }
 
 type ServerConfig struct {
-	ControlAddr          string
-	DataAddr             string
-	PublicAddr           string
-	Token                string
-	DisableTLS           bool
-	TLSCertFile          string
-	TLSKeyFile           string
-	WebHTTPS             bool
-	WebTLSCertFile       string
-	WebTLSKeyFile        string
-	DomainManagerEnabled bool          `json:",omitempty"`
-	DomainHTTPAddr       string        `json:",omitempty"`
-	DomainHTTPSAddr      string        `json:",omitempty"`
-	DomainBase           string        `json:",omitempty"`
-	DomainAutoTLS        bool          `json:",omitempty"`
-	DomainACMEEmail      string        `json:",omitempty"`
-	DomainCertDir        string        `json:",omitempty"`
-	DomainRenewBefore    time.Duration `json:",omitempty"`
-	PairTimeout          time.Duration
-	DashboardInterval    time.Duration   `json:",omitempty"`
-	EncryptionAlgorithm  string          `json:",omitempty"`
-	Email                emailcfg.Config `json:"email,omitempty"`
-	Routes               []RouteConfig
+	ControlAddr              string
+	DataAddr                 string
+	PublicAddr               string
+	Token                    string
+	DisableTLS               bool
+	TLSCertFile              string
+	TLSKeyFile               string
+	WebHTTPS                 bool
+	WebTLSCertFile           string
+	WebTLSKeyFile            string
+	DomainManagerEnabled     bool          `json:",omitempty"`
+	DomainHTTPAddr           string        `json:",omitempty"`
+	DomainHTTPSAddr          string        `json:",omitempty"`
+	DomainBase               string        `json:",omitempty"`
+	DomainAutoTLS            bool          `json:",omitempty"`
+	DomainACMEEmail          string        `json:",omitempty"`
+	DomainCertDir            string        `json:",omitempty"`
+	DomainRenewBefore        time.Duration `json:",omitempty"`
+	DynamicPortRange         string        `json:",omitempty"`
+	MaxDynamicRoutesPerAgent int           `json:",omitempty"`
+	PairTimeout              time.Duration
+	DashboardInterval        time.Duration   `json:",omitempty"`
+	EncryptionAlgorithm      string          `json:",omitempty"`
+	AppDBPath                string          `json:",omitempty"`
+	Email                    emailcfg.Config `json:"email,omitempty"`
+	Routes                   []RouteConfig
 }
 
 func (c *ServerConfig) Validate() error {
@@ -274,6 +278,22 @@ func (c *ServerConfig) Validate() error {
 
 	if c.PairTimeout < 0 {
 		errs = append(errs, "pair_timeout must be >= 0")
+	}
+
+	if strings.TrimSpace(c.DynamicPortRange) != "" {
+		parts := strings.SplitN(strings.TrimSpace(c.DynamicPortRange), "-", 2)
+		if len(parts) != 2 {
+			errs = append(errs, "dynamic_port_range must be format low-high (e.g. 10000-60000)")
+		} else {
+			low, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+			high, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if err1 != nil || err2 != nil || low < 1 || low > 65535 || high < 1 || high > 65535 || low > high {
+				errs = append(errs, "dynamic_port_range invalid: must be valid ports with low <= high")
+			}
+		}
+	}
+	if c.MaxDynamicRoutesPerAgent < 0 {
+		errs = append(errs, "max_dynamic_routes_per_agent must be >= 0")
 	}
 
 	if c.DashboardInterval > 0 && c.DashboardInterval < 5*time.Second {

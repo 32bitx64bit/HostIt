@@ -28,7 +28,7 @@ func TestBuildHelloPayloadIncludesRoutesAndEmailConfig(t *testing.T) {
 		}},
 	}
 
-	payload := buildHelloPayload(cfg)
+	payload := buildHelloPayload(cfg, nil)
 	rt, ok := payload.Routes["web"]
 	if !ok {
 		t.Fatalf("buildHelloPayload() missing route: %#v", payload.Routes)
@@ -81,7 +81,7 @@ func TestServerDashboardIncludesRuntimeStats(t *testing.T) {
 			PublicAddr: ":443",
 			LocalAddr:  "127.0.0.1:3000",
 		}},
-	})
+	}, nil)
 
 	srv.mu.Lock()
 	srv.pendingTCP[makePendingTCPKey("web", "client-1")] = newPendingTCPEntry()
@@ -134,7 +134,7 @@ func TestGetRouteEnabled_UsesEffectiveRoutes(t *testing.T) {
 			InboundSMTP:     true,
 			InboundSMTPAddr: "0.0.0.0:25",
 		},
-	})
+	}, nil)
 
 	if !srv.GetRouteEnabled(internalEmailInboundRouteName) {
 		t.Fatalf("GetRouteEnabled(%q) = false, want true", internalEmailInboundRouteName)

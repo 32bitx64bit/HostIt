@@ -146,7 +146,7 @@ func TestManagedDomainHTTPSProxy(t *testing.T) {
 		}},
 	}
 
-	srv := NewServer(cfg)
+	srv := NewServer(cfg, nil)
 	go func() { _ = srv.Run(ctx) }()
 	go fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{"web": backendURL.Host}, "testtoken")
 
@@ -180,7 +180,7 @@ func TestManagedDomainCertificateFallsBackWithoutSNIForSingleDomain(t *testing.T
 			Domain:        "app.example.test",
 			DomainEnabled: &domainEnabled,
 		}},
-	})
+	}, nil)
 	mgr := newDomainCertManager(srv)
 	cert, err := mgr.GetCertificate(&tls.ClientHelloInfo{})
 	if err != nil {
@@ -207,7 +207,7 @@ func TestManagedDomainCertificateWithoutSNIUsesFirstSortedDomain(t *testing.T) {
 			{Name: "web-1", Proto: "tcp", Domain: "app1.example.test", DomainEnabled: &domainEnabled},
 			{Name: "web-2", Proto: "tcp", Domain: "app2.example.test", DomainEnabled: &domainEnabled},
 		},
-	})
+	}, nil)
 	mgr := newDomainCertManager(srv)
 	cert, err := mgr.GetCertificate(&tls.ClientHelloInfo{})
 	if err != nil {
@@ -286,7 +286,7 @@ func TestManagedDomainEnsureFreshSkipsValidACMECert(t *testing.T) {
 			Domain:        "app.example.test",
 			DomainEnabled: &domainEnabled,
 		}},
-	})
+	}, nil)
 	mgr := newDomainCertManager(srv)
 	mgr.autocert.Cache = cache
 
@@ -356,7 +356,7 @@ func TestManagedDomainHTTPRedirect(t *testing.T) {
 		}},
 	}
 
-	srv := NewServer(cfg)
+	srv := NewServer(cfg, nil)
 	go func() { _ = srv.Run(ctx) }()
 	go fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{"web": backendURL.Host}, "testtoken")
 
@@ -426,7 +426,7 @@ func TestManagedDomainHTTPSProxyReusesBackendConnections(t *testing.T) {
 		}},
 	}
 
-	srv := NewServer(cfg)
+	srv := NewServer(cfg, nil)
 	go func() { _ = srv.Run(ctx) }()
 	go fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{"web": backendURL.Host}, "testtoken")
 
@@ -445,7 +445,7 @@ func TestManagedDomainHTTPSProxyReusesBackendConnections(t *testing.T) {
 }
 
 func TestManagedDomainProxyTransportAllowsLongPosts(t *testing.T) {
-	srv := NewServer(ServerConfig{})
+	srv := NewServer(ServerConfig{}, nil)
 	proxy := srv.domainProxy("web", "app.example.test")
 	if proxy == nil {
 		t.Fatal("domainProxy() returned nil")

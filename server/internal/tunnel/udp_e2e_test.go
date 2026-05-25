@@ -215,7 +215,7 @@ func TestEndToEndUDP(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 5 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
 	startFakeUDPAgent(t, ctx, dataAddr, map[string]string{"game": "udp:"}, nil)
@@ -245,7 +245,7 @@ func TestEndToEndUDPConcurrentClients(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 5 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
 	startFakeUDPAgent(t, ctx, dataAddr, map[string]string{"game": "udp:"}, nil)
@@ -309,7 +309,7 @@ func TestEndToEndUDPMultiRoute(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 5 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "route-a")
 	waitPublicUDPRoute(t, srv, "route-b")
@@ -360,7 +360,7 @@ func TestEndToEndUDPEncrypted(t *testing.T) {
 		PairTimeout:         5 * time.Second,
 		DisableTLS:          true,
 		EncryptionAlgorithm: crypto.AlgAES256,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
 	startFakeUDPAgent(t, ctx, dataAddr, map[string]string{"game": "secure:"}, map[string]cipher.AEAD{"game": udpCipher})
@@ -395,7 +395,7 @@ func TestPublicUDPDropsWithoutAgentAndWhenDisabled(t *testing.T) {
 		Token:       "testtoken",
 		PairTimeout: 5 * time.Second,
 		DisableTLS:  true,
-	})
+	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "no-agent")
 	waitPublicUDPRoute(t, srv, "disabled")

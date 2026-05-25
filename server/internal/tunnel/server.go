@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"hostit/server/internal/appstore"
+	"hostit/shared/apitypes"
 	"hostit/shared/crypto"
 	"hostit/shared/emailcfg"
 	"hostit/shared/logging"
@@ -140,7 +142,8 @@ func (p *pendingTCPEntry) take() net.Conn {
 }
 
 type Server struct {
-	cfg ServerConfig
+	cfg      ServerConfig
+	appStore *appstore.Store
 
 	derivedKeys map[string][]byte
 	udpCiphers  map[string]cipher.AEAD
@@ -191,6 +194,11 @@ type Server struct {
 	lastAgentConnectAt    time.Time
 	lastAgentDisconnectAt time.Time
 
+	dynamicRoutes    map[string]dynamicRouteEntry
+	dynamicPortLow   int
+	dynamicPortHigh  int
+	pendingUpdateAcks map[string]chan *apitypes.RouteUpdateAck
+
 	agentUDPAddr atomic.Value // stores netip.AddrPort
 	agentUDPTime atomic.Int64 // unix nano
 }
@@ -198,6 +206,12 @@ type Server struct {
 type pendingTCPKey struct {
 	route  string
 	client string
+}
+
+type dynamicRouteEntry struct {
+	Route     RouteConfig
+	CreatedAt time.Time
+	Source    string
 }
 
 func makePendingTCPKey(routeName, clientID string) pendingTCPKey {
@@ -300,7 +314,18 @@ func (s *Server) updateRouteCache() {
 	defer s.mu.RUnlock()
 
 	newCache := make(map[string]routeConfig)
-	for _, rt := range effectiveRoutes(s.cfg) {
+	for _, rt := range effectiveRoutes(s.cfg, s.dynamicRoutes) {
+		newCache[rt.Name] = routeConfig{
+			enabled:     rt.IsEnabled(),
+			isEncrypted: rt.IsEncrypted(),
+		}
+	}
+	s.routeCache.Store(newCache)
+}
+
+func (s *Server) updateRouteCacheLocked() {
+	newCache := make(map[string]routeConfig)
+	for _, rt := range effectiveRoutes(s.cfg, s.dynamicRoutes) {
 		newCache[rt.Name] = routeConfig{
 			enabled:     rt.IsEnabled(),
 			isEncrypted: rt.IsEncrypted(),
@@ -419,8 +444,8 @@ func (s *Server) isAllowedProbeOutboundTarget(target string) bool {
 	return ok && expiresAt.After(now)
 }
 
-func buildHelloRoutes(cfg ServerConfig) map[string]helloRoute {
-	effective := effectiveRoutes(cfg)
+func buildHelloRoutes(cfg ServerConfig, dynamicRoutes map[string]dynamicRouteEntry) map[string]helloRoute {
+	effective := effectiveRoutes(cfg, dynamicRoutes)
 	routes := make(map[string]helloRoute, len(effective))
 	for _, rt := range effective {
 		routes[rt.Name] = helloRoute{
@@ -435,9 +460,9 @@ func buildHelloRoutes(cfg ServerConfig) map[string]helloRoute {
 	return routes
 }
 
-func buildHelloPayload(cfg ServerConfig) helloPayload {
+func buildHelloPayload(cfg ServerConfig, dynamicRoutes map[string]dynamicRouteEntry) helloPayload {
 	return helloPayload{
-		Routes: buildHelloRoutes(cfg),
+		Routes: buildHelloRoutes(cfg, dynamicRoutes),
 		Email:  emailcfg.Normalize(cfg.Email),
 	}
 }
@@ -445,8 +470,9 @@ func buildHelloPayload(cfg ServerConfig) helloPayload {
 func (s *Server) buildHelloPacket() (*protocol.Packet, error) {
 	s.mu.RLock()
 	cfg := s.cfg
+	dr := s.dynamicRoutes
 	s.mu.RUnlock()
-	payload, err := json.Marshal(buildHelloPayload(cfg))
+	payload, err := json.Marshal(buildHelloPayload(cfg, dr))
 	if err != nil {
 		return nil, err
 	}
@@ -531,13 +557,14 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 			val := enabled
 			s.cfg.Routes[i].Enabled = &val
 			cfg := s.cfg
+			dr := s.dynamicRoutes
 			agent := s.agentTCP
 			s.mu.Unlock()
 
 			s.updateRouteCache()
 
 			if agent != nil {
-				payload, err := json.Marshal(buildHelloPayload(cfg))
+				payload, err := json.Marshal(buildHelloPayload(cfg, dr))
 				if err != nil {
 					return false
 				}
@@ -555,6 +582,35 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 			return true
 		}
 	}
+	if dr, ok := s.dynamicRoutes[name]; ok {
+		val := enabled
+		dr.Route.Enabled = &val
+		s.dynamicRoutes[name] = dr
+		cfg := s.cfg
+		drMap := s.dynamicRoutes
+		agent := s.agentTCP
+		s.mu.Unlock()
+
+		s.updateRouteCache()
+
+		if agent != nil {
+			payload, err := json.Marshal(buildHelloPayload(cfg, drMap))
+			if err != nil {
+				return false
+			}
+			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: payload}
+			remoteAddr := agent.RemoteAddr().String()
+			s.sessionsMu.Lock()
+			if session, ok := s.sessions[remoteAddr]; ok {
+				session.writeMu.Lock()
+				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				protocol.WritePacket(agent, helloPkt)
+				session.writeMu.Unlock()
+			}
+			s.sessionsMu.Unlock()
+		}
+		return true
+	}
 	s.mu.Unlock()
 	return false
 }
@@ -562,6 +618,893 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 func (s *Server) GetRouteEnabled(name string) bool {
 	rc, ok := s.getRouteConfig(name)
 	return ok && rc.enabled
+}
+
+func (s *Server) ListApps(ctx context.Context) ([]appstore.Application, error) {
+	if s.appStore == nil {
+		return nil, nil
+	}
+	return s.appStore.ListApplications(ctx)
+}
+
+func (s *Server) SetAppEnabled(label string, enabled bool) bool {
+	if s.appStore == nil {
+		return false
+	}
+	if err := s.appStore.SetApplicationEnabled(context.Background(), label, enabled); err != nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	apps, err := s.appStore.ListApplications(context.Background())
+	if err != nil {
+		return true
+	}
+	for _, app := range apps {
+		for _, route := range app.Routes {
+			if dr, ok := s.dynamicRoutes[route.RouteName]; ok {
+				val := app.Enabled && route.Enabled
+				dr.Route.Enabled = &val
+				s.dynamicRoutes[route.RouteName] = dr
+				if ln, hasLn := s.publicTCP[route.RouteName]; hasLn && !val {
+					ln.Close()
+					delete(s.publicTCP, route.RouteName)
+				}
+				if conn, hasConn := s.publicUDP[route.RouteName]; hasConn && !val {
+					conn.Close()
+					delete(s.publicUDP, route.RouteName)
+				}
+				if val {
+					if _, hasLn := s.publicTCP[route.RouteName]; !hasLn && (dr.Route.Proto == routeProtoTCP || dr.Route.Proto == routeProtoBoth) && strings.TrimSpace(dr.Route.PublicAddr) != "" {
+						ln, err := net.Listen("tcp", dr.Route.PublicAddr)
+						if err == nil {
+							s.publicTCP[route.RouteName] = ln
+							if s.ctx != nil {
+								s.wg.Add(1)
+								go s.acceptPublicTCP(ln, route.RouteName)
+							}
+						}
+					}
+					if _, hasConn := s.publicUDP[route.RouteName]; !hasConn && (dr.Route.Proto == routeProtoUDP || dr.Route.Proto == routeProtoBoth) && strings.TrimSpace(dr.Route.PublicAddr) != "" {
+						addr, err := net.ResolveUDPAddr("udp", dr.Route.PublicAddr)
+						if err == nil {
+							conn, err := net.ListenUDP("udp", addr)
+							if err == nil {
+								conn.SetReadBuffer(8 * 1024 * 1024)
+								conn.SetWriteBuffer(8 * 1024 * 1024)
+								s.publicUDP[route.RouteName] = conn
+								if s.ctx != nil {
+									s.wg.Add(1)
+									go s.acceptPublicUDP(conn, route.RouteName)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	s.updateRouteCacheLocked()
+	cfg := s.cfg
+	dr := s.dynamicRoutes
+	agent := s.agentTCP
+	if agent != nil {
+		helloPayload := buildHelloPayload(cfg, dr)
+		helloPayloadBytes, err := json.Marshal(helloPayload)
+		if err == nil {
+			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
+			remoteAddr := agent.RemoteAddr().String()
+			s.sessionsMu.Lock()
+			if session, ok := s.sessions[remoteAddr]; ok {
+				session.writeMu.Lock()
+				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				protocol.WritePacket(agent, helloPkt)
+				session.writeMu.Unlock()
+			}
+			s.sessionsMu.Unlock()
+		}
+	}
+	return true
+}
+
+func (s *Server) DeleteApp(label string) bool {
+	if s.appStore == nil {
+		return false
+	}
+	app, err := s.appStore.GetApplication(context.Background(), label)
+	if err != nil || app == nil {
+		return false
+	}
+	s.mu.Lock()
+	for _, route := range app.Routes {
+		if ln, ok := s.publicTCP[route.RouteName]; ok {
+			ln.Close()
+			delete(s.publicTCP, route.RouteName)
+		}
+		if conn, ok := s.publicUDP[route.RouteName]; ok {
+			conn.Close()
+			delete(s.publicUDP, route.RouteName)
+		}
+		delete(s.dynamicRoutes, route.RouteName)
+		delete(s.derivedKeys, route.RouteName)
+		delete(s.udpCiphers, route.RouteName)
+	}
+	s.updateRouteCacheLocked()
+	agent := s.agentTCP
+	cfg := s.cfg
+	dr := s.dynamicRoutes
+	s.mu.Unlock()
+
+	if err := s.appStore.DeleteApplication(context.Background(), label); err != nil {
+		return false
+	}
+
+	if agent != nil {
+		helloPayload := buildHelloPayload(cfg, dr)
+		helloPayloadBytes, err := json.Marshal(helloPayload)
+		if err == nil {
+			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
+			remoteAddr := agent.RemoteAddr().String()
+			s.sessionsMu.Lock()
+			if session, ok := s.sessions[remoteAddr]; ok {
+				session.writeMu.Lock()
+				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				protocol.WritePacket(agent, helloPkt)
+				session.writeMu.Unlock()
+			}
+			s.sessionsMu.Unlock()
+		}
+	}
+	return true
+}
+
+func boolPtr(b bool) *bool {
+	return &b
+}
+
+func (s *Server) handleRouteRequest(conn net.Conn, session *agentSession, payload []byte) {
+	var req apitypes.RouteRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to parse route request: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	resp := s.processRouteRequestLocked(req)
+
+	respPayload, err := json.Marshal(resp)
+	if err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to marshal route response: %v", err)
+		return
+	}
+
+	session.writeMu.Lock()
+	conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteResponse, Payload: respPayload}); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to send route response: %v", err)
+	}
+	conn.SetWriteDeadline(time.Time{})
+	session.writeMu.Unlock()
+}
+
+func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest) apitypes.RouteResponse {
+	if req.Name == "" {
+		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Error: "name is required"}
+	}
+	if err := validateRouteName(req.Name); err != nil {
+		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: err.Error()}
+	}
+
+	switch strings.ToLower(strings.TrimSpace(req.Proto)) {
+	case "tcp", "udp", "both":
+	default:
+		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "invalid proto"}
+	}
+
+	allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
+	routeNames := make(map[string]bool)
+	for _, rt := range allRoutes {
+		routeNames[rt.Name] = true
+	}
+	if routeNames[req.Name] {
+		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "route name already exists"}
+	}
+
+	domain := strings.TrimSpace(req.Domain)
+	var availableDomains []apitypes.DomainOption
+
+	if domain == "_query" {
+		availableDomains = s.buildDomainOptionsLocked()
+		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "pending_domain", Name: req.Name, Domain: normalizeHostname(s.cfg.DomainBase), AvailableDomains: availableDomains}
+	}
+
+	var publicAddr string
+	if req.PublicPort > 0 {
+		publicAddr = fmt.Sprintf(":%d", req.PublicPort)
+		for _, rt := range allRoutes {
+			if rt.PublicAddr != "" && publicTCPAddrsConflict(rt.PublicAddr, publicAddr) {
+				return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("public port %d conflicts with route %q", req.PublicPort, rt.Name)}
+			}
+		}
+	} else {
+		assigned := s.assignPortLocked(allRoutes)
+		if assigned == 0 {
+			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "no available ports in dynamic range"}
+		}
+		publicAddr = fmt.Sprintf(":%d", assigned)
+	}
+
+	if req.Source == "api" && s.cfg.MaxDynamicRoutesPerAgent > 0 {
+		dynamicCount := len(s.dynamicRoutes)
+		if dynamicCount >= s.cfg.MaxDynamicRoutesPerAgent {
+			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "max dynamic routes reached"}
+		}
+	}
+
+	if domain == "auto" || (domain != "" && s.cfg.DomainManagerEnabled) {
+		availableDomains = s.buildDomainOptionsLocked()
+		if domain == "auto" {
+			suggested := req.Name + "." + normalizeHostname(s.cfg.DomainBase)
+			suggestedAvail := true
+			for _, rt := range allRoutes {
+				if rt.IsDomainEnabled() && normalizeHostname(rt.Domain) == normalizeHostname(suggested) {
+					suggestedAvail = false
+					break
+				}
+			}
+			if suggestedAvail {
+				domain = suggested
+			}
+			if domain == "auto" {
+				return apitypes.RouteResponse{RequestID: req.RequestID, Status: "pending_domain", Name: req.Name, PublicAddr: publicAddr, AvailableDomains: availableDomains}
+			}
+		}
+		if domain != "" && s.cfg.DomainManagerEnabled {
+			normalized := normalizeHostname(domain)
+			if err := validateHostname(normalized); err != nil {
+				return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "invalid domain: " + err.Error()}
+			}
+			if base := normalizeHostname(s.cfg.DomainBase); base != "" && !hostnameWithinBase(normalized, base) {
+				return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("domain %q must be within base domain %q", normalized, s.cfg.DomainBase)}
+			}
+			domainConflicts := false
+			for _, rt := range allRoutes {
+				if rt.IsDomainEnabled() && normalizeHostname(rt.Domain) == normalized {
+					domainConflicts = true
+					break
+				}
+			}
+			if domainConflicts {
+				if domain == "auto" {
+					return apitypes.RouteResponse{RequestID: req.RequestID, Status: "pending_domain", Name: req.Name, PublicAddr: publicAddr, AvailableDomains: availableDomains}
+				}
+				return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "domain already in use"}
+			}
+			if strings.ToLower(strings.TrimSpace(req.Proto)) == "udp" {
+				return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "domain routing requires tcp or both"}
+			}
+		}
+	}
+
+	domainEnabled := domain != "" && s.cfg.DomainManagerEnabled
+	enc := req.Encrypted
+	rt := RouteConfig{
+		Name:          req.Name,
+		Proto:         strings.ToLower(strings.TrimSpace(req.Proto)),
+		PublicAddr:    publicAddr,
+		LocalAddr:     strings.TrimSpace(req.LocalAddr),
+		Enabled:       boolPtr(true),
+		Encrypted:     &enc,
+		Domain:        domain,
+		DomainEnabled: &domainEnabled,
+	}
+
+	s.dynamicRoutes[req.Name] = dynamicRouteEntry{
+		Route:     rt,
+		CreatedAt: time.Now(),
+		Source:    req.Source,
+	}
+
+	if s.appStore != nil {
+		if req.Source == "api" {
+			app, err := s.appStore.GetApplication(context.Background(), req.Name)
+			if err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to get application %s: %v", req.Name, err)
+			} else if app == nil {
+				app, err = s.appStore.CreateApplication(context.Background(), req.Name, "")
+				if err != nil {
+					logging.Global().Errorf(logging.CatTCP, "failed to create application %s: %v", req.Name, err)
+				}
+			}
+			if app != nil {
+				_, err := s.appStore.AddRoute(context.Background(), app.ID, appstore.AppRoute{
+					RouteName:     rt.Name,
+					Proto:         rt.Proto,
+					PublicAddr:    rt.PublicAddr,
+					LocalAddr:     rt.LocalAddr,
+					Encrypted:     rt.IsEncrypted(),
+					Domain:        rt.Domain,
+					DomainEnabled: rt.IsDomainEnabled(),
+					Enabled:       rt.IsEnabled(),
+				})
+				if err != nil {
+					logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", rt.Name, err)
+				}
+			}
+		} else {
+			routes, err := s.appStore.ListRoutes(context.Background())
+			if err == nil {
+				var appID int64
+				for _, r := range routes {
+					if r.RouteName == rt.Name {
+						appID = r.AppID
+						break
+					}
+				}
+				if appID == 0 {
+					app, aerr := s.appStore.CreateApplication(context.Background(), rt.Name, "")
+					if aerr != nil {
+						logging.Global().Errorf(logging.CatTCP, "failed to create application for non-api route %s: %v", rt.Name, aerr)
+					} else {
+						appID = app.ID
+					}
+				}
+				if appID != 0 {
+					_, err = s.appStore.AddRoute(context.Background(), appID, appstore.AppRoute{
+						RouteName:     rt.Name,
+						Proto:         rt.Proto,
+						PublicAddr:    rt.PublicAddr,
+						LocalAddr:     rt.LocalAddr,
+						Encrypted:     rt.IsEncrypted(),
+						Domain:        rt.Domain,
+						DomainEnabled: rt.IsDomainEnabled(),
+						Enabled:       rt.IsEnabled(),
+					})
+					if err != nil {
+						logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", rt.Name, err)
+					}
+				}
+			}
+		}
+	}
+
+	if rt.IsEncrypted() {
+		key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
+		if err == nil {
+			s.derivedKeys[rt.Name] = key
+			aead, _ := crypto.NewUDPCipher(key)
+			if aead != nil {
+				s.udpCiphers[rt.Name] = aead
+			}
+		}
+	}
+
+	if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == routeProtoTCP || rt.Proto == routeProtoBoth) {
+		ln, err := net.Listen("tcp", rt.PublicAddr)
+		if err != nil {
+			delete(s.dynamicRoutes, req.Name)
+			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen on %s: %v", rt.PublicAddr, err)}
+		}
+		s.publicTCP[rt.Name] = ln
+		if s.ctx != nil {
+			s.wg.Add(1)
+			go s.acceptPublicTCP(ln, rt.Name)
+		}
+	}
+	if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == routeProtoUDP || rt.Proto == routeProtoBoth) {
+		addr, err := net.ResolveUDPAddr("udp", rt.PublicAddr)
+		if err == nil {
+			conn, err := net.ListenUDP("udp", addr)
+			if err == nil {
+				conn.SetReadBuffer(8 * 1024 * 1024)
+				conn.SetWriteBuffer(8 * 1024 * 1024)
+				s.publicUDP[rt.Name] = conn
+				if s.ctx != nil {
+					s.wg.Add(1)
+					go s.acceptPublicUDP(conn, rt.Name)
+				}
+			}
+		}
+	}
+
+	s.updateRouteCacheLocked()
+
+	cfg := s.cfg
+	dr := s.dynamicRoutes
+	agent := s.agentTCP
+	if agent != nil {
+		helloPayload := buildHelloPayload(cfg, dr)
+		helloPayloadBytes, err := json.Marshal(helloPayload)
+		if err == nil {
+			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
+			remoteAddr := agent.RemoteAddr().String()
+			s.sessionsMu.Lock()
+			if session, ok := s.sessions[remoteAddr]; ok {
+				session.writeMu.Lock()
+				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				protocol.WritePacket(agent, helloPkt)
+				session.writeMu.Unlock()
+			}
+			s.sessionsMu.Unlock()
+		}
+	}
+
+	status := "active"
+	if domain == "auto" && len(availableDomains) > 0 {
+		status = "pending_domain"
+	}
+
+	return apitypes.RouteResponse{
+		RequestID:        req.RequestID,
+		Status:           status,
+		Name:             req.Name,
+		Proto:            rt.Proto,
+		PublicAddr:       rt.PublicAddr,
+		LocalAddr:        rt.LocalAddr,
+		Domain:           domain,
+		AvailableDomains: availableDomains,
+	}
+}
+
+func (s *Server) assignPortLocked(allRoutes []RouteConfig) int {
+	used := make(map[int]bool)
+	for _, rt := range allRoutes {
+		if strings.TrimSpace(rt.PublicAddr) != "" {
+			if addr, err := net.ResolveTCPAddr("tcp", rt.PublicAddr); err == nil && addr != nil {
+				used[addr.Port] = true
+			}
+		}
+	}
+	for port := s.dynamicPortLow; port <= s.dynamicPortHigh; port++ {
+		if !used[port] {
+			return port
+		}
+	}
+	return 0
+}
+
+func (s *Server) buildDomainOptionsLocked() []apitypes.DomainOption {
+	if !s.cfg.DomainManagerEnabled {
+		return nil
+	}
+	base := normalizeHostname(s.cfg.DomainBase)
+	if base == "" {
+		return nil
+	}
+	allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
+	usedDomains := make(map[string]string)
+	for _, rt := range allRoutes {
+		if rt.IsDomainEnabled() {
+			h := normalizeHostname(rt.Domain)
+			if h != "" {
+				usedDomains[h] = rt.Name
+			}
+		}
+	}
+	var options []apitypes.DomainOption
+	for name := range s.dynamicRoutes {
+		suggested := name + "." + base
+		_, used := usedDomains[suggested]
+		options = append(options, apitypes.DomainOption{
+			Host:      suggested,
+			Available: !used,
+		})
+		if used {
+			options[len(options)-1].UsedBy = usedDomains[suggested]
+			options[len(options)-1].Reason = "already in use"
+		}
+	}
+	return options
+}
+
+func (s *Server) handleRouteConfirm(conn net.Conn, session *agentSession, payload []byte) {
+	var confirm apitypes.RouteConfirm
+	if err := json.Unmarshal(payload, &confirm); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to parse route confirm: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ack := s.processRouteConfirmLocked(confirm)
+
+	ackPayload, err := json.Marshal(ack)
+	if err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to marshal route ack: %v", err)
+		return
+	}
+
+	session.writeMu.Lock()
+	conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteAck, Payload: ackPayload}); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to send route ack: %v", err)
+	}
+	conn.SetWriteDeadline(time.Time{})
+	session.writeMu.Unlock()
+}
+
+func (s *Server) processRouteConfirmLocked(confirm apitypes.RouteConfirm) apitypes.RouteAck {
+	dr, ok := s.dynamicRoutes[confirm.Name]
+	if !ok {
+		return apitypes.RouteAck{RequestID: confirm.RequestID, Status: "failed", Name: confirm.Name, Error: "dynamic route not found"}
+	}
+
+	domain := normalizeHostname(confirm.Domain)
+	if err := validateHostname(domain); err != nil {
+		return apitypes.RouteAck{RequestID: confirm.RequestID, Status: "failed", Name: confirm.Name, Error: "invalid domain: " + err.Error()}
+	}
+
+	allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
+	for _, rt := range allRoutes {
+		if rt.Name != confirm.Name && rt.IsDomainEnabled() && normalizeHostname(rt.Domain) == domain {
+			return apitypes.RouteAck{RequestID: confirm.RequestID, Status: "failed", Name: confirm.Name, Domain: domain, Error: "domain already taken by route " + rt.Name}
+		}
+	}
+
+	dr.Route.Domain = domain
+	domainEnabled := true
+	dr.Route.DomainEnabled = &domainEnabled
+	s.dynamicRoutes[confirm.Name] = dr
+
+	if s.appStore != nil {
+		if err := s.appStore.RemoveRoute(context.Background(), confirm.Name); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to remove old persisted route %s for confirm: %v", confirm.Name, err)
+		}
+		app, aerr := s.appStore.FindApplicationByRouteName(context.Background(), confirm.Name)
+		if aerr != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to find application for confirmed route %s: %v", confirm.Name, aerr)
+		} else if app != nil {
+			_, err := s.appStore.AddRoute(context.Background(), app.ID, appstore.AppRoute{
+				RouteName:     dr.Route.Name,
+				Proto:         dr.Route.Proto,
+				PublicAddr:    dr.Route.PublicAddr,
+				LocalAddr:     dr.Route.LocalAddr,
+				Encrypted:     dr.Route.IsEncrypted(),
+				Domain:        domain,
+				DomainEnabled: true,
+				Enabled:       dr.Route.IsEnabled(),
+			})
+			if err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to persist confirmed route %s: %v", confirm.Name, err)
+			}
+		}
+	}
+
+	s.updateRouteCacheLocked()
+
+	cfg := s.cfg
+	drMap := s.dynamicRoutes
+	agent := s.agentTCP
+	if agent != nil {
+		helloPayload := buildHelloPayload(cfg, drMap)
+		helloPayloadBytes, err := json.Marshal(helloPayload)
+		if err == nil {
+			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
+			remoteAddr := agent.RemoteAddr().String()
+			s.sessionsMu.Lock()
+			if session, ok := s.sessions[remoteAddr]; ok {
+				session.writeMu.Lock()
+				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				protocol.WritePacket(agent, helloPkt)
+				session.writeMu.Unlock()
+			}
+			s.sessionsMu.Unlock()
+		}
+	}
+
+	return apitypes.RouteAck{
+		RequestID:  confirm.RequestID,
+		Status:     "active",
+		Name:       confirm.Name,
+		Domain:     domain,
+		PublicAddr: dr.Route.PublicAddr,
+	}
+}
+
+func (s *Server) handleRouteRemove(conn net.Conn, session *agentSession, payload []byte) {
+	var remove apitypes.RouteRemove
+	if err := json.Unmarshal(payload, &remove); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to parse route remove: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ack := s.processRouteRemoveLocked(remove)
+
+	ackPayload, err := json.Marshal(ack)
+	if err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to marshal route remove ack: %v", err)
+		return
+	}
+
+	session.writeMu.Lock()
+	conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteRemoveAck, Payload: ackPayload}); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to send route remove ack: %v", err)
+	}
+	conn.SetWriteDeadline(time.Time{})
+	session.writeMu.Unlock()
+}
+
+func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove) apitypes.RouteRemoveAck {
+	_, ok := s.dynamicRoutes[remove.Name]
+	if !ok {
+		return apitypes.RouteRemoveAck{Name: remove.Name, Error: "dynamic route not found"}
+	}
+
+	if ln, exists := s.publicTCP[remove.Name]; exists {
+		ln.Close()
+		delete(s.publicTCP, remove.Name)
+	}
+	if conn, exists := s.publicUDP[remove.Name]; exists {
+		conn.Close()
+		delete(s.publicUDP, remove.Name)
+	}
+
+	delete(s.dynamicRoutes, remove.Name)
+	delete(s.derivedKeys, remove.Name)
+	delete(s.udpCiphers, remove.Name)
+
+	if s.appStore != nil {
+		if err := s.appStore.RemoveRoute(context.Background(), remove.Name); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to remove persisted route %s: %v", remove.Name, err)
+		}
+	}
+
+	s.updateRouteCacheLocked()
+
+	cfg := s.cfg
+	dr := s.dynamicRoutes
+	agent := s.agentTCP
+	if agent != nil {
+		helloPayload := buildHelloPayload(cfg, dr)
+		helloPayloadBytes, err := json.Marshal(helloPayload)
+		if err == nil {
+			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
+			remoteAddr := agent.RemoteAddr().String()
+			s.sessionsMu.Lock()
+			if session, ok := s.sessions[remoteAddr]; ok {
+				session.writeMu.Lock()
+				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				protocol.WritePacket(agent, helloPkt)
+				session.writeMu.Unlock()
+			}
+			s.sessionsMu.Unlock()
+		}
+	}
+
+	return apitypes.RouteRemoveAck{Name: remove.Name, OK: true}
+}
+
+func (s *Server) handleRouteUpdate(conn net.Conn, session *agentSession, payload []byte) {
+	var req apitypes.RouteUpdate
+	if err := json.Unmarshal(payload, &req); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to parse route update: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ack := s.processRouteUpdateLocked(req)
+
+	ackPayload, err := json.Marshal(ack)
+	if err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to marshal route update ack: %v", err)
+		return
+	}
+
+	session.writeMu.Lock()
+	conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteUpdateAck, Payload: ackPayload}); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to send route update ack: %v", err)
+	}
+	conn.SetWriteDeadline(time.Time{})
+	session.writeMu.Unlock()
+}
+
+func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate) apitypes.RouteUpdateAck {
+	dr, ok := s.dynamicRoutes[req.Name]
+	if !ok {
+		return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "dynamic route not found"}
+	}
+
+	if req.LocalAddr != "" {
+		dr.Route.LocalAddr = strings.TrimSpace(req.LocalAddr)
+	}
+
+	if req.PublicPort > 0 {
+		newAddr := fmt.Sprintf(":%d", req.PublicPort)
+		allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
+		for _, rt := range allRoutes {
+			if rt.Name != req.Name && rt.PublicAddr != "" && publicTCPAddrsConflict(rt.PublicAddr, newAddr) {
+				return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("public port %d conflicts with route %q", req.PublicPort, rt.Name)}
+			}
+		}
+		oldLn, hasOldLn := s.publicTCP[req.Name]
+		if hasOldLn {
+			oldLn.Close()
+			delete(s.publicTCP, req.Name)
+		}
+		oldConn, hasOldConn := s.publicUDP[req.Name]
+		if hasOldConn {
+			oldConn.Close()
+			delete(s.publicUDP, req.Name)
+		}
+		dr.Route.PublicAddr = newAddr
+
+		if dr.Route.Proto == routeProtoTCP || dr.Route.Proto == routeProtoBoth {
+			ln, err := net.Listen("tcp", newAddr)
+			if err != nil {
+				return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen on %s: %v", newAddr, err)}
+			}
+			s.publicTCP[req.Name] = ln
+			s.wg.Add(1)
+			go s.acceptPublicTCP(ln, req.Name)
+		}
+		if dr.Route.Proto == routeProtoUDP || dr.Route.Proto == routeProtoBoth {
+			addr, err := net.ResolveUDPAddr("udp", newAddr)
+			if err == nil {
+				conn, err := net.ListenUDP("udp", addr)
+				if err == nil {
+					conn.SetReadBuffer(8 * 1024 * 1024)
+					conn.SetWriteBuffer(8 * 1024 * 1024)
+					s.publicUDP[req.Name] = conn
+					s.wg.Add(1)
+					go s.acceptPublicUDP(conn, req.Name)
+				}
+			}
+		}
+	}
+
+	if req.Domain != "" {
+		normalized := normalizeHostname(req.Domain)
+		if err := validateHostname(normalized); err != nil {
+			return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "invalid domain: " + err.Error()}
+		}
+		if base := normalizeHostname(s.cfg.DomainBase); base != "" && !hostnameWithinBase(normalized, base) {
+			return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("domain %q must be within base domain %q", normalized, s.cfg.DomainBase)}
+		}
+		allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
+		for _, rt := range allRoutes {
+			if rt.Name != req.Name && rt.IsDomainEnabled() && normalizeHostname(rt.Domain) == normalized {
+				return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "domain already in use by route " + rt.Name}
+			}
+		}
+		dr.Route.Domain = normalized
+		domainEnabled := true
+		dr.Route.DomainEnabled = &domainEnabled
+	}
+
+	if req.Encrypted != nil {
+		dr.Route.Encrypted = req.Encrypted
+		if *req.Encrypted {
+			key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
+			if err == nil {
+				s.derivedKeys[req.Name] = key
+				aead, _ := crypto.NewUDPCipher(key)
+				if aead != nil {
+					s.udpCiphers[req.Name] = aead
+				}
+			}
+		} else {
+			delete(s.derivedKeys, req.Name)
+			delete(s.udpCiphers, req.Name)
+		}
+	}
+
+	s.dynamicRoutes[req.Name] = dr
+	s.updateRouteCacheLocked()
+
+	if s.appStore != nil {
+		ctx := context.Background()
+		if existing, err := s.appStore.GetRouteByRouteName(ctx, req.Name); err == nil && existing != nil {
+			ar := appstore.AppRoute{
+				AppID:         existing.AppID,
+				RouteName:     dr.Route.Name,
+				Proto:         dr.Route.Proto,
+				PublicAddr:    dr.Route.PublicAddr,
+				LocalAddr:     dr.Route.LocalAddr,
+				Encrypted:     dr.Route.IsEncrypted(),
+				Domain:        dr.Route.Domain,
+				DomainEnabled: dr.Route.IsDomainEnabled(),
+				Enabled:       dr.Route.IsEnabled(),
+				CreatedAt:     existing.CreatedAt,
+			}
+			s.appStore.RemoveRoute(ctx, req.Name)
+			s.appStore.AddRoute(ctx, existing.AppID, ar)
+		}
+	}
+
+	s.pushHelloToAgentLocked()
+
+	return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "updated", Name: req.Name}
+}
+
+func (s *Server) pushHelloToAgentLocked() {
+	agent := s.agentTCP
+	if agent == nil {
+		return
+	}
+	cfg := s.cfg
+	dr := s.dynamicRoutes
+	helloPayload := buildHelloPayload(cfg, dr)
+	helloPayloadBytes, err := json.Marshal(helloPayload)
+	if err != nil {
+		return
+	}
+	helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
+	remoteAddr := agent.RemoteAddr().String()
+	s.sessionsMu.Lock()
+	if session, ok := s.sessions[remoteAddr]; ok {
+		session.writeMu.Lock()
+		agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+		protocol.WritePacket(agent, helloPkt)
+		session.writeMu.Unlock()
+	}
+	s.sessionsMu.Unlock()
+}
+
+func (s *Server) RouteStats(routeName string) *apitypes.RouteStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
+	var found *RouteConfig
+	for _, rt := range allRoutes {
+		if rt.Name == routeName {
+			found = &rt
+			break
+		}
+	}
+	if found == nil {
+		return nil
+	}
+
+	source := "config"
+	if _, ok := s.dynamicRoutes[routeName]; ok {
+		source = "dynamic"
+	}
+
+	return &apitypes.RouteStats{
+		Name:       found.Name,
+		Proto:      found.Proto,
+		PublicAddr: found.PublicAddr,
+		LocalAddr:  found.LocalAddr,
+		Domain:     found.Domain,
+		Connected:  s.agentTCP != nil,
+		Source:     source,
+	}
+}
+
+func (s *Server) AllRouteStats() []apitypes.RouteStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
+	connected := s.agentTCP != nil
+	stats := make([]apitypes.RouteStats, 0, len(allRoutes))
+	for _, rt := range allRoutes {
+		source := "config"
+		if _, ok := s.dynamicRoutes[rt.Name]; ok {
+			source = "dynamic"
+		}
+		stats = append(stats, apitypes.RouteStats{
+			Name:       rt.Name,
+			Proto:      rt.Proto,
+			PublicAddr: rt.PublicAddr,
+			LocalAddr:  rt.LocalAddr,
+			Domain:     rt.Domain,
+			Connected:  connected,
+			Source:     source,
+		})
+	}
+	return stats
 }
 
 func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (AgentNettestResult, error) {
@@ -825,9 +1768,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 const defaultMaxConnsPerRoute = 4096
 
-func NewServer(cfg ServerConfig) *Server {
+func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 	s := &Server{
 		cfg:                  cfg,
+		appStore:             appStore,
 		derivedKeys:          make(map[string][]byte),
 		udpCiphers:           make(map[string]cipher.AEAD),
 		publicTCP:            make(map[string]net.Listener),
@@ -837,10 +1781,25 @@ func NewServer(cfg ServerConfig) *Server {
 		sessions:             make(map[string]*agentSession),
 		probeOutboundTargets: make(map[string]time.Time),
 		maxConnsPerRoute:     defaultMaxConnsPerRoute,
+		dynamicRoutes:        make(map[string]dynamicRouteEntry),
+		pendingUpdateAcks:    make(map[string]chan *apitypes.RouteUpdateAck),
 	}
 	s.agentUDPAddr.Store(netip.AddrPort{})
 	s.domains = newDomainManager(s)
-	for _, rt := range effectiveRoutes(cfg) {
+	if strings.TrimSpace(cfg.DynamicPortRange) != "" {
+		parts := strings.SplitN(strings.TrimSpace(cfg.DynamicPortRange), "-", 2)
+		if len(parts) == 2 {
+			s.dynamicPortLow, _ = strconv.Atoi(strings.TrimSpace(parts[0]))
+			s.dynamicPortHigh, _ = strconv.Atoi(strings.TrimSpace(parts[1]))
+		}
+	}
+	if s.dynamicPortLow == 0 {
+		s.dynamicPortLow = 10000
+	}
+	if s.dynamicPortHigh == 0 {
+		s.dynamicPortHigh = 60000
+	}
+	for _, rt := range effectiveRoutes(cfg, s.dynamicRoutes) {
 		if rt.IsEncrypted() {
 			key, err := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
 			if err != nil {
@@ -849,6 +1808,44 @@ func NewServer(cfg ServerConfig) *Server {
 				s.derivedKeys[rt.Name] = key
 				cipher, _ := crypto.NewUDPCipher(key)
 				s.udpCiphers[rt.Name] = cipher
+			}
+		}
+	}
+	if appStore != nil {
+		apps, err := appStore.ListApplications(context.Background())
+		if err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to load persisted applications: %v", err)
+		} else {
+			for _, app := range apps {
+				for _, route := range app.Routes {
+					enc := route.Encrypted
+					domainEnabled := route.DomainEnabled
+					rt := RouteConfig{
+						Name:          route.RouteName,
+						Proto:         route.Proto,
+						PublicAddr:    route.PublicAddr,
+						LocalAddr:     route.LocalAddr,
+						Enabled:       boolPtr(route.Enabled),
+						Encrypted:     &enc,
+						Domain:        route.Domain,
+						DomainEnabled: &domainEnabled,
+					}
+					s.dynamicRoutes[route.RouteName] = dynamicRouteEntry{
+						Route:     rt,
+						CreatedAt: route.CreatedAt,
+						Source:    "api",
+					}
+					if enc {
+						key, err := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
+						if err == nil {
+							s.derivedKeys[route.RouteName] = key
+							aead, _ := crypto.NewUDPCipher(key)
+							if aead != nil {
+								s.udpCiphers[route.RouteName] = aead
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -914,7 +1911,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go s.acceptAgentUDP()
 
-	for _, rt := range effectiveRoutes(s.cfg) {
+	for _, rt := range effectiveRoutes(s.cfg, s.dynamicRoutes) {
 		if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == routeProtoTCP || rt.Proto == routeProtoBoth) {
 			ln, err := net.Listen("tcp", rt.PublicAddr)
 			if err != nil {
@@ -1093,45 +2090,45 @@ func (s *Server) acceptControl(ln net.Listener) {
 			var lastPong atomic.Value
 			lastPong.Store(time.Now().UnixNano())
 
-		go func() {
-			ticker := time.NewTicker(pingInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-pingCtx.Done():
-					return
-				case <-ticker.C:
-					s.mu.RLock()
-					isAgent := s.agentTCP == c && s.agentEpoch == epoch
-					s.mu.RUnlock()
-					if isAgent {
-						session.writeMu.Lock()
-						c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-						if err := protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing}); err != nil {
+			go func() {
+				ticker := time.NewTicker(pingInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-pingCtx.Done():
+						return
+					case <-ticker.C:
+						s.mu.RLock()
+						isAgent := s.agentTCP == c && s.agentEpoch == epoch
+						s.mu.RUnlock()
+						if isAgent {
+							session.writeMu.Lock()
+							c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+							if err := protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing}); err != nil {
+								session.writeMu.Unlock()
+								c.Close()
+								return
+							}
 							session.writeMu.Unlock()
-							c.Close()
-							return
 						}
-						session.writeMu.Unlock()
 					}
 				}
-			}
-		}()
+			}()
 
-		go func() {
-			ticker := time.NewTicker(healthCheckInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-pingCtx.Done():
-					return
-				case <-ticker.C:
-					s.mu.RLock()
-					isAgent := s.agentTCP == c && s.agentEpoch == epoch
-					s.mu.RUnlock()
-					if isAgent {
-						lastPongTime := time.Unix(0, lastPong.Load().(int64))
-						if time.Since(lastPongTime) > healthCheckTimeout {
+			go func() {
+				ticker := time.NewTicker(healthCheckInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-pingCtx.Done():
+						return
+					case <-ticker.C:
+						s.mu.RLock()
+						isAgent := s.agentTCP == c && s.agentEpoch == epoch
+						s.mu.RUnlock()
+						if isAgent {
+							lastPongTime := time.Unix(0, lastPong.Load().(int64))
+							if time.Since(lastPongTime) > healthCheckTimeout {
 								logging.Global().Errorf(logging.CatTCP, "agent health check timeout, closing connection")
 								c.Close()
 								return
@@ -1154,21 +2151,21 @@ func (s *Server) acceptControl(ln net.Listener) {
 					break
 				}
 
-			c.SetReadDeadline(time.Now().Add(readDeadlineStandard))
-			pkt, err := protocol.ReadPacket(c)
-			if err != nil {
-				break
-			}
-			if pkt.Type == protocol.TypePing {
-				session.writeMu.Lock()
-				c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				protocol.WritePacket(c, &protocol.Packet{
-					Type:    protocol.TypePong,
-					Payload: pkt.Payload,
-				})
-				session.writeMu.Unlock()
-				continue
-			}
+				c.SetReadDeadline(time.Now().Add(readDeadlineStandard))
+				pkt, err := protocol.ReadPacket(c)
+				if err != nil {
+					break
+				}
+				if pkt.Type == protocol.TypePing {
+					session.writeMu.Lock()
+					c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+					protocol.WritePacket(c, &protocol.Packet{
+						Type:    protocol.TypePong,
+						Payload: pkt.Payload,
+					})
+					session.writeMu.Unlock()
+					continue
+				}
 				if pkt.Type == protocol.TypePong {
 					lastPong.Store(time.Now().UnixNano())
 					s.mu.RLock()
@@ -1192,17 +2189,33 @@ func (s *Server) acceptControl(ln net.Listener) {
 						}
 					}
 				}
+				if pkt.Type == protocol.TypeRouteRequest {
+					s.handleRouteRequest(c, session, pkt.Payload)
+					continue
+				}
+				if pkt.Type == protocol.TypeRouteConfirm {
+					s.handleRouteConfirm(c, session, pkt.Payload)
+					continue
+				}
+				if pkt.Type == protocol.TypeRouteRemove {
+					s.handleRouteRemove(c, session, pkt.Payload)
+					continue
+				}
+				if pkt.Type == protocol.TypeRouteUpdate {
+					s.handleRouteUpdate(c, session, pkt.Payload)
+					continue
+				}
 			}
 
-			s.mu.Lock()
-			if s.agentTCP == c && s.agentEpoch == epoch {
-				s.agentTCP = nil
-				s.lastAgentDisconnectAt = time.Now()
-				s.closeDomainProxyIdleConnections()
-				s.abortPendingTCPLocked()
-				logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
-			}
-			s.mu.Unlock()
+		s.mu.Lock()
+		if s.agentTCP == c && s.agentEpoch == epoch {
+			s.agentTCP = nil
+			s.lastAgentDisconnectAt = time.Now()
+			s.closeDomainProxyIdleConnections()
+			s.abortPendingTCPLocked()
+			logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
+		}
+		s.mu.Unlock()
 		}(conn, session, remoteAddr, currentEpoch)
 	}
 }
