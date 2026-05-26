@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"hostit/server/internal/appstore"
 	"hostit/server/internal/auth"
 	"hostit/server/internal/serverlog"
 	"hostit/server/internal/tlsutil"
@@ -180,7 +181,13 @@ func main() {
 		}
 	}
 
-	runner := newServerRunner(ctx, cfg)
+	appStore, err := appstore.Open(authDBPath)
+	if err != nil {
+		slog.Fatal(logging.CatSystem, "failed to open app database", serverlog.F("error", err, "path", authDBPath))
+	}
+	defer appStore.Close()
+
+	runner := newServerRunner(ctx, cfg, appStore)
 	runner.Start()
 	slog.Info(logging.CatSystem, "server started", serverlog.F(
 		"control_addr", cfg.ControlAddr,
@@ -221,16 +228,17 @@ func main() {
 type serverRunner struct {
 	root context.Context
 
-	mu     sync.Mutex
-	cfg    tunnel.ServerConfig
-	srv    *tunnel.Server
-	cancel context.CancelFunc
-	done   chan struct{}
-	err    error
+	mu       sync.Mutex
+	cfg      tunnel.ServerConfig
+	srv      *tunnel.Server
+	appStore *appstore.Store
+	cancel   context.CancelFunc
+	done     chan struct{}
+	err      error
 }
 
-func newServerRunner(root context.Context, cfg tunnel.ServerConfig) *serverRunner {
-	return &serverRunner{root: root, cfg: cfg}
+func newServerRunner(root context.Context, cfg tunnel.ServerConfig, appStore *appstore.Store) *serverRunner {
+	return &serverRunner{root: root, cfg: cfg, appStore: appStore}
 }
 
 func (r *serverRunner) Start() {
@@ -241,7 +249,7 @@ func (r *serverRunner) Start() {
 	}
 	ctx, cancel := context.WithCancel(r.root)
 	r.cancel = cancel
-	r.srv = tunnel.NewServer(r.cfg)
+	r.srv = tunnel.NewServer(r.cfg, r.appStore)
 	done := make(chan struct{})
 	r.done = done
 	go func(s *tunnel.Server) {
@@ -330,6 +338,36 @@ func (r *serverRunner) EmailStatus() tunnel.EmailRuntimeStatus {
 	return srv.EmailStatus()
 }
 
+func (r *serverRunner) ListApps(ctx context.Context) ([]appstore.Application, error) {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return nil, fmt.Errorf("server not running")
+	}
+	return srv.ListApps(ctx)
+}
+
+func (r *serverRunner) SetAppEnabled(label string, enabled bool) bool {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return false
+	}
+	return srv.SetAppEnabled(label, enabled)
+}
+
+func (r *serverRunner) DeleteApp(label string) bool {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return false
+	}
+	return srv.DeleteApp(label)
+}
+
 // SetRouteEnabled toggles a route's enabled state at runtime.
 // Returns false if the route doesn't exist.
 func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
@@ -382,6 +420,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 	tplDomainGuide := template.Must(template.New("domain-guide").Parse(serverDomainGuideHTML))
 	tplControls := template.Must(template.New("controls").Parse(serverControlsHTML))
 	tplNetwork := template.Must(template.New("network").Parse(serverNetworkTestHTML))
+	tplApps := template.Must(template.New("apps").Parse(serverAppsHTML))
 	tplLogin := template.Must(template.New("login").Parse(loginPageHTML))
 	tplSetup := template.Must(template.New("setup").Parse(setupPageHTML))
 
@@ -679,6 +718,109 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"WebHTTPS": webHTTPS,
 			}
 			_ = tplNetwork.Execute(w, data)
+		})))
+
+		mux.HandleFunc("/apps", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			csrf := ensureCSRF(w, r, cookieSecure)
+			if csrf == "" {
+				return
+			}
+			apps, err := runner.ListApps(r.Context())
+			if err != nil {
+				apps = nil
+			}
+			cfg, _, _ := runner.Get()
+			data := map[string]any{
+				"CSRF":     csrf,
+				"Msg":      getMsg(),
+				"Apps":     apps,
+				"Cfg":      cfg,
+				"WebHTTPS": webHTTPS,
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_ = tplApps.Execute(w, data)
+		})))
+
+		mux.HandleFunc("/api/apps/toggle", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			label := strings.TrimSpace(r.Form.Get("app"))
+			if label == "" {
+				http.Error(w, "app label required", http.StatusBadRequest)
+				return
+			}
+			enabled := strings.TrimSpace(r.Form.Get("enabled")) != ""
+			if !runner.SetAppEnabled(label, enabled) {
+				http.Error(w, "app not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"app":     label,
+				"enabled": enabled,
+			})
+		})))
+
+		mux.HandleFunc("/api/apps/delete", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			label := strings.TrimSpace(r.Form.Get("app"))
+			if label == "" {
+				http.Error(w, "app label required", http.StatusBadRequest)
+				return
+			}
+			if !runner.DeleteApp(label) {
+				http.Error(w, "app not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"app":     label,
+				"deleted": true,
+			})
+		})))
+
+		mux.HandleFunc("/api/apps/list", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			apps, err := runner.ListApps(r.Context())
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if apps == nil {
+				apps = []appstore.Application{}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(apps)
 		})))
 
 		// Metrics API (protected)
@@ -2098,6 +2240,7 @@ const serverStatsHTML = `<!doctype html>
 			  <a href="/config">Config</a>
 			  <a href="/email">Email</a>
           <a href="/controls">Controls</a>
+          <a href="/apps">Apps</a>
 					<a href="/network-test">Network Test</a>
         </div>
         <form method="post" action="/logout" style="margin:0">
@@ -2731,6 +2874,7 @@ const serverConfigHTML = `<!doctype html>
 					<a class="active" href="/config">Config</a>
 					<a href="/email">Email</a>
 					<a href="/controls">Controls</a>
+					<a href="/apps">Apps</a>
 					<a href="/network-test">Network Test</a>
 				</div>
 				<form method="post" action="/logout" style="margin:0">
@@ -3003,6 +3147,7 @@ const serverEmailHTML = `<!doctype html>
 					<a href="/config">Config</a>
 					<a class="active" href="/email">Email</a>
 					<a href="/controls">Controls</a>
+					<a href="/apps">Apps</a>
 					<a href="/network-test">Network Test</a>
 				</div>
 				<form method="post" action="/logout" style="margin:0">
@@ -3253,6 +3398,7 @@ const serverControlsHTML = `<!doctype html>
 					<a href="/config">Config</a>
 					<a href="/email">Email</a>
 					<a class="active" href="/controls">Controls</a>
+					<a href="/apps">Apps</a>
 					<a href="/network-test">Network Test</a>
 				</div>
 				<form method="post" action="/logout" style="margin:0">
@@ -3516,6 +3662,7 @@ const serverEmailSetupHTML = `<!doctype html>
 				<a href="/email">Email</a>
 				<a class="active" href="/email/setup">Email DNS Setup</a>
 				<a href="/controls">Controls</a>
+				<a href="/apps">Apps</a>
 				<a href="/network-test">Network Test</a>
 			</div>
 		</div>
@@ -3692,6 +3839,7 @@ const serverDomainGuideHTML = `<!doctype html>
 				<a href="/config">Config</a>
 				<a href="/email">Email</a>
 				<a href="/controls">Controls</a>
+				<a href="/apps">Apps</a>
 				<a class="active" href="/domain-manager-info">Domain Guide</a>
 			</div>
 		</div>
@@ -3806,6 +3954,7 @@ const serverNetworkTestHTML = `<!doctype html>
 				<a href="/config">Config</a>
 				<a href="/email">Email</a>
 				<a href="/controls">Controls</a>
+				<a href="/apps">Apps</a>
 				<a class="active" href="/network-test">Network Test</a>
 			</div>
 		</div>
@@ -3944,6 +4093,186 @@ const serverNetworkTestHTML = `<!doctype html>
 		});
 	})();
 	</script>
+</body>
+</html>`
+
+const serverAppsHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="csrf-token" content="{{.CSRF}}" />
+  <title>Applications - Tunnel Server</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --bg: #0f1117; --bg2: #181b25; --bg3: #1e2230;
+      --surface: rgba(255,255,255,.04); --surfaceHover: rgba(255,255,255,.07);
+      --border: rgba(255,255,255,.08); --borderHover: rgba(255,255,255,.14);
+      --text: #e4e6ee; --textMuted: rgba(228,230,238,.55);
+      --accent: #5b8def; --accentDim: rgba(91,141,239,.18); --accentBorder: rgba(91,141,239,.35);
+      --green: #3fb950; --greenDim: rgba(63,185,80,.14); --greenBorder: rgba(63,185,80,.4);
+      --red: #f85149; --redDim: rgba(248,81,73,.12); --redBorder: rgba(248,81,73,.4);
+      --orange: #d29922; --orangeDim: rgba(210,153,34,.12); --orangeBorder: rgba(210,153,34,.4);
+      --purple: #a371f7; --purpleDim: rgba(163,113,247,.12);
+      --radius: 10px; --radiusLg: 14px;
+      --font: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      --mono: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+      color-scheme: dark;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f5f6fa; --bg2: #ebedf5; --bg3: #e2e4ee;
+        --surface: rgba(0,0,0,.03); --surfaceHover: rgba(0,0,0,.06);
+        --border: rgba(0,0,0,.10); --borderHover: rgba(0,0,0,.18);
+        --text: #1a1d28; --textMuted: rgba(26,29,40,.50);
+        --accentDim: rgba(91,141,239,.12); --greenDim: rgba(63,185,80,.10);
+        --redDim: rgba(248,81,73,.08); --orangeDim: rgba(210,153,34,.08);
+        --purpleDim: rgba(163,113,247,.08);
+        color-scheme: light;
+      }
+    }
+    body { font-family: var(--font); margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.5; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { font-family: var(--mono); font-size: .8em; background: var(--surface); padding: 2px 6px; border-radius: 4px; }
+    .wrap { max-width: 1060px; margin: 0 auto; padding: 20px 16px 60px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    .topbar h1 { font-size: 18px; font-weight: 700; margin: 0; letter-spacing: -.02em; }
+    .topbar .subtitle { font-size: 12px; color: var(--textMuted); margin-top: 2px; }
+    .nav { display: flex; gap: 4px; }
+    .nav a, .nav button { font-family: var(--font); font-size: 13px; padding: 7px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; transition: all .15s; text-decoration: none; }
+    .nav a:hover, .nav button:hover { background: var(--surfaceHover); border-color: var(--borderHover); text-decoration: none; }
+    .nav a.active { background: var(--accentDim); border-color: var(--accentBorder); color: var(--accent); }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radiusLg); padding: 16px; transition: border-color .15s; }
+    .card:hover { border-color: var(--borderHover); }
+    .pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; border: 1px solid; }
+    .pill::before { content: ''; width: 6px; height: 6px; border-radius: 50%; }
+    .pill.ok { color: var(--green); border-color: var(--greenBorder); background: var(--greenDim); }
+    .pill.ok::before { background: var(--green); }
+    .pill.bad { color: var(--red); border-color: var(--redBorder); background: var(--redDim); }
+    .pill.bad::before { background: var(--red); }
+    .pill.warn { color: var(--orange); border-color: var(--orangeBorder); background: var(--orangeDim); }
+    .pill.warn::before { background: var(--orange); }
+    .flex { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .secHead { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 24px 0 10px; }
+    .secHead h2 { font-size: 14px; font-weight: 600; margin: 0; text-transform: uppercase; letter-spacing: .05em; color: var(--textMuted); }
+    .btn { font-family: var(--font); font-size: 13px; padding: 7px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; transition: all .15s; }
+    .btn:hover { background: var(--surfaceHover); border-color: var(--borderHover); }
+    .btn.primary { background: var(--accentDim); border-color: var(--accentBorder); color: var(--accent); }
+    .btn.primary:hover { background: rgba(91,141,239,.25); }
+    .btn.sm { font-size: 12px; padding: 5px 10px; }
+    .btn.warn { color: var(--red); border-color: var(--redBorder); background: var(--redDim); }
+    .btn.warn:hover { background: rgba(248,81,73,.2); }
+    .btn[disabled] { opacity: .4; cursor: not-allowed; }
+    .flash { padding: 10px 14px; border-radius: var(--radius); font-size: 13px; margin-bottom: 16px; background: var(--greenDim); border: 1px solid var(--greenBorder); color: var(--green); }
+    .muted { color: var(--textMuted); }
+    .appCard { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radiusLg); padding: 16px; margin-bottom: 12px; }
+    .appHead { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+    .appHead h3 { margin: 0; font-size: 15px; font-weight: 600; }
+    .appMeta { font-size: 12px; color: var(--textMuted); }
+    .routeSub { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 8px; }
+    .routeRow { display: flex; align-items: center; gap: 10px; padding: 4px 0; flex-wrap: wrap; }
+    .rName { font-weight: 600; font-size: 13px; }
+    .rProto { font-size: 12px; padding: 2px 8px; border-radius: 4px; font-weight: 500; }
+    .rProto.tcp { background: rgba(91,141,239,.15); color: #5b8def; }
+    .rProto.udp { background: var(--purpleDim); color: var(--purple); }
+    .rProto.both { background: var(--orangeDim); color: var(--orange); }
+    .rAddrs { font-family: var(--mono); font-size: 12px; color: var(--textMuted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <h1>Tunnel Server</h1>
+        <div class="subtitle">Registered applications</div>
+      </div>
+      <div class="flex">
+        <div class="nav">
+          <a href="/">Dashboard</a>
+          <a href="/config">Config</a>
+          <a href="/email">Email</a>
+          <a href="/controls">Controls</a>
+          <a class="active" href="/apps">Apps</a>
+          <a href="/network-test">Network Test</a>
+        </div>
+        <form method="post" action="/logout" style="margin:0">
+          <input type="hidden" name="csrf" value="{{.CSRF}}" />
+          <button type="submit" class="btn sm">Logout</button>
+        </form>
+      </div>
+    </div>
+
+    {{if .Msg}}<div class="flash">{{.Msg}}</div>{{end}}
+
+    <div class="secHead"><h2>Registered Applications</h2></div>
+
+    {{if .Apps}}
+      {{range .Apps}}
+      <div class="appCard" id="app-{{.Label}}">
+        <div class="appHead">
+          <div>
+            <h3>{{.Label}}</h3>
+            <div class="appMeta">{{len .Routes}} route{{if ne (len .Routes) 1}}s{{end}} &middot; Created {{.CreatedAt.Format "2006-01-02"}}</div>
+          </div>
+          <div class="flex">
+            <span class="pill {{if .Enabled}}ok{{else}}bad{{end}}">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</span>
+            <button class="btn sm" onclick="toggleApp('{{.Label}}',{{if .Enabled}}false{{else}}true{{end}})">{{if .Enabled}}Disable{{else}}Enable{{end}}</button>
+            <button class="btn sm warn" onclick="deleteApp('{{.Label}}')">Delete</button>
+          </div>
+        </div>
+        {{if .Routes}}
+        <div class="routeSub">
+          {{range .Routes}}
+          <div class="routeRow">
+            <span class="rName">{{.RouteName}}</span>
+            <span class="rProto {{.Proto}}">{{.Proto}}</span>
+            <span class="rAddrs"><code>{{.PublicAddr}}</code> &rarr; <code>{{.LocalAddr}}</code></span>
+            {{if .Domain}}<span class="rAddrs" style="margin-left:8px"><code>{{.Domain}}</code></span>{{end}}
+            <span class="pill {{if .Enabled}}ok{{else}}bad{{end}}" style="margin-left:auto">{{if .Enabled}}On{{else}}Off{{end}}</span>
+          </div>
+          {{end}}
+        </div>
+        {{end}}
+      </div>
+      {{end}}
+    {{else}}
+      <div class="card">
+        <div class="muted">No applications registered. Apps registered via the agent Integration API will appear here.</div>
+      </div>
+    {{end}}
+  </div>
+
+  <script>
+  (function(){
+    var csrfMeta=document.querySelector('meta[name="csrf-token"]');
+    var csrfToken=csrfMeta?csrfMeta.content:'';
+    var origFetch=window.fetch;
+    window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
+
+    function postForm(url, body) {
+      var params = new URLSearchParams();
+      for (var k in body) { params.append(k, body[k]); }
+      return fetch(url, {method:'POST', body: params, credentials:'include'});
+    }
+
+    window.toggleApp = function(label, enabled) {
+      postForm('/api/apps/toggle', {app: label, enabled: enabled ? '1' : ''}).then(function(r) {
+        if (r.ok) location.reload();
+        else r.text().then(function(t) { alert('Toggle failed: ' + t); });
+      });
+    };
+
+    window.deleteApp = function(label) {
+      if (!confirm('Delete application "' + label + '" and all its routes?')) return;
+      postForm('/api/apps/delete', {app: label}).then(function(r) {
+        if (r.ok) location.reload();
+        else r.text().then(function(t) { alert('Delete failed: ' + t); });
+      });
+    };
+  })();
+  </script>
 </body>
 </html>`
 
