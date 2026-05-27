@@ -52,25 +52,12 @@ const (
 
 type ctxKey string
 
-var (
-	ctxAPIKeyLabel  ctxKey = "api_key_label"
-	ctxAPIKeyPrefix ctxKey = "api_key_prefix"
-)
-
 func generateToken() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
-}
-
-func generateAPIKey() string {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	return "hit_" + hex.EncodeToString(b)
 }
 
 func isLocalhost(remoteAddr string) bool {
@@ -790,49 +777,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 	}
 
-	requireAPIKeyOrLocal := func(next http.HandlerFunc, perm string) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			if isLocalhost(r.RemoteAddr) && r.Header.Get("Authorization") == "" {
-				next(w, r)
-				return
-			}
-			auth := r.Header.Get("Authorization")
-			if !strings.HasPrefix(auth, "Bearer ") {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			key := strings.TrimPrefix(auth, "Bearer ")
-			cfg, _, _, _, _ := ctrl.Get()
-			var matched *apitypes.APIKey
-			for i := range cfg.APIKeys {
-				if subtle.ConstantTimeCompare([]byte(key), []byte(cfg.APIKeys[i].Key)) == 1 {
-					matched = &cfg.APIKeys[i]
-					break
-				}
-			}
-			if matched == nil {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			hasPerm := perm == ""
-			if !hasPerm {
-				for _, p := range matched.Permissions {
-					if p == perm || p == "*" {
-						hasPerm = true
-						break
-					}
-				}
-			}
-			if !hasPerm {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-			ctx := context.WithValue(r.Context(), ctxAPIKeyLabel, matched.Label)
-			ctx = context.WithValue(ctx, ctxAPIKeyPrefix, matched.OwnedRoutePrefix)
-			next(w, r.WithContext(ctx))
-		}
-	}
-
 	mux := http.NewServeMux()
 
 	writeJSON := func(w http.ResponseWriter, v any) {
@@ -1356,7 +1300,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		})
 	})
 
-	mux.HandleFunc("/api/v1/register", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1380,12 +1324,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		if req.LocalPort <= 0 || req.LocalPort > 65535 {
 			http.Error(w, "local_port must be 1-65535", http.StatusBadRequest)
-			return
-		}
-
-		prefix, _ := r.Context().Value(ctxAPIKeyPrefix).(string)
-		if prefix != "" && !strings.HasPrefix(req.Name, prefix+"-") && req.Name != prefix {
-			http.Error(w, "route name must have prefix "+prefix, http.StatusBadRequest)
 			return
 		}
 
@@ -1437,9 +1375,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, apiResp)
-	}, "routes:register"))
+	})
 
-	mux.HandleFunc("/api/v1/routes", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/routes", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1456,9 +1394,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, out)
-	}, "routes:list"))
+	})
 
-	mux.HandleFunc("/api/v1/routes/", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/routes/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1483,9 +1421,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	}, "routes:delete"))
+	})
 
-	mux.HandleFunc("/api/v1/domains", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/domains", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1518,9 +1456,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, result)
-	}, "domains:list"))
+	})
 
-	mux.HandleFunc("/api/v1/domains/select", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/domains/select", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1562,9 +1500,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, apiResp)
-	}, "domains:select"))
+	})
 
-	mux.HandleFunc("/api/v1/status", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1577,47 +1515,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			Version:     version.Current,
 			RoutesCount: len(routes),
 		})
-	}, ""))
+	})
 
-	mux.HandleFunc("/api/v1/keys/generate", requireCSRF(requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Label       string   `json:"label"`
-			Permissions []string `json:"permissions"`
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		if strings.TrimSpace(req.Label) == "" {
-			http.Error(w, "label is required", http.StatusBadRequest)
-			return
-		}
-		if req.Permissions == nil {
-			req.Permissions = []string{"routes:register", "routes:list", "domains:list", "domains:select"}
-		}
-		key := apitypes.APIKey{
-			Key:              generateAPIKey(),
-			Label:            req.Label,
-			Permissions:      req.Permissions,
-			OwnedRoutePrefix: req.Label,
-		}
-		cfg, _, _, _, _ := ctrl.Get()
-		cfg.APIKeys = append(cfg.APIKeys, key)
-		ctrl.SetConfig(cfg)
-		if err := configio.Save(configPath, cfg); err != nil {
-			http.Error(w, "failed to save config: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, map[string]string{"key": key.Key, "label": key.Label})
-	}, "keys:generate")))
-
-	mux.HandleFunc("/api/v1/routes/update", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/routes/update", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch && r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1675,9 +1575,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"status":     "updated",
 			"route_name": ack.Name,
 		})
-	}, "routes:update"))
+	})
 
-	mux.HandleFunc("/api/v1/route/stats", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/route/stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1709,9 +1609,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, stats)
-	}, "routes:list"))
+	})
 
-	mux.HandleFunc("/api/v1/events", requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns: []string{"localhost:*", "127.0.0.1:*"},
 		})
@@ -1744,9 +1644,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 				return
 			}
 		}
-	}, ""))
+	})
 
-	mux.HandleFunc("/api/v1/apps/register-all", requireCSRF(requireAPIKeyOrLocal(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/apps/register-all", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1758,7 +1658,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		ctrl.mu.Unlock()
 		registerAppsFromConfig(r.Context(), ctrl, appsCfg.Apps)
 		w.WriteHeader(http.StatusNoContent)
-	}, "routes:register")))
+	}))
 
 	h := &http.Server{
 		Addr:              addr,

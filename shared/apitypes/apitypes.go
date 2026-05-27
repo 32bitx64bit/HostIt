@@ -96,13 +96,6 @@ type StatusResponse struct {
 	DomainBase  string `json:"domain_base,omitempty"`
 }
 
-type APIKey struct {
-	Key              string   `json:"key"`
-	Label            string   `json:"label"`
-	Permissions      []string `json:"permissions"`
-	OwnedRoutePrefix string  `json:"owned_route_prefix,omitempty"`
-}
-
 type RouteUpdate struct {
 	RequestID  string `json:"request_id"`
 	Name       string `json:"name"`

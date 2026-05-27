@@ -29,11 +29,6 @@ func TestClientRegister(t *testing.T) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if auth := r.Header.Get("Authorization"); auth != "Bearer hit_testkey" {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-
 		var req RegisterRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -55,7 +50,7 @@ func TestClientRegister(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "hit_testkey")
+	client := NewClient(srv.URL)
 	resp, err := client.Register(context.Background(), RegisterRequest{
 		Name:      wantName,
 		Proto:     wantProto,
@@ -72,23 +67,6 @@ func TestClientRegister(t *testing.T) {
 	}
 	if resp.PublicAddr != ":9090" {
 		t.Fatalf("PublicAddr = %q, want %q", resp.PublicAddr, ":9090")
-	}
-}
-
-func TestClientRegisterUnauthorized(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-
-	client := NewClient(srv.URL, "bad_key")
-	_, err := client.Register(context.Background(), RegisterRequest{
-		Name:      "app",
-		Proto:     "tcp",
-		LocalPort: 8080,
-	})
-	if err == nil {
-		t.Fatal("expected error for unauthorized request")
 	}
 }
 
@@ -109,7 +87,7 @@ func TestClientListRoutes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "hit_testkey")
+	client := NewClient(srv.URL)
 	routes, err := client.ListRoutes(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +115,7 @@ func TestClientRemoveRoute(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "hit_testkey")
+	client := NewClient(srv.URL)
 	if err := client.RemoveRoute(context.Background(), "myapp"); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +127,7 @@ func TestClientRemoveRouteError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "hit_testkey")
+	client := NewClient(srv.URL)
 	err := client.RemoveRoute(context.Background(), "nonexistent")
 	if err == nil {
 		t.Fatal("expected error for missing route")
@@ -172,7 +150,7 @@ func TestClientListDomains(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "hit_testkey")
+	client := NewClient(srv.URL)
 	resp, err := client.ListDomains(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -209,7 +187,7 @@ func TestClientSelectDomain(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "hit_testkey")
+	client := NewClient(srv.URL)
 	resp, err := client.SelectDomain(context.Background(), "req-1", "myapp", "myapp.example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +216,7 @@ func TestClientStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "hit_testkey")
+	client := NewClient(srv.URL)
 	resp, err := client.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -259,13 +237,13 @@ func TestClientNoAPIKey(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "")
+	client := NewClient(srv.URL)
 	_, err := client.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "" {
-		t.Fatalf("Authorization header = %q, want empty when no API key set", gotAuth)
+		t.Fatalf("Authorization header = %q, want empty", gotAuth)
 	}
 }
 
@@ -275,7 +253,7 @@ func TestClientBaseURLTrailingSlash(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL+"/", "hit_testkey")
+	client := NewClient(srv.URL + "/")
 	resp, err := client.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -340,7 +318,7 @@ func TestClientServerErrors(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			client := NewClient(srv.URL, "hit_testkey")
+			client := NewClient(srv.URL)
 			err := tc.method(client)
 			if err == nil {
 				t.Fatal("expected error for server error response")

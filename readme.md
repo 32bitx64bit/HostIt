@@ -121,7 +121,7 @@ func main() {
 }
 ```
 
-Leave the API key empty for localhost-only access (no auth required). For remote or multi-user setups, generate a key via the agent dashboard or `POST /api/v1/keys/generate`.
+The agent API is open on localhost.
 
 ### Domain Routing
 

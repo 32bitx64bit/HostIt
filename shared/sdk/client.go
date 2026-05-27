@@ -12,14 +12,12 @@ import (
 
 type Client struct {
 	baseURL    string
-	apiKey     string
 	httpClient *http.Client
 }
 
-func NewClient(baseURL, apiKey string) *Client {
+func NewClient(baseURL string) *Client {
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
-		apiKey:     apiKey,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -34,9 +32,6 @@ func (c *Client) Register(ctx context.Context, req RegisterRequest) (*RegisterRe
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -57,9 +52,6 @@ func (c *Client) ListRoutes(ctx context.Context) ([]Route, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/routes", nil)
 	if err != nil {
 		return nil, err
-	}
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -82,9 +74,6 @@ func (c *Client) RemoveRoute(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return err
@@ -101,9 +90,6 @@ func (c *Client) ListDomains(ctx context.Context) (*DomainsResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/domains", nil)
 	if err != nil {
 		return nil, err
-	}
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -131,9 +117,6 @@ func (c *Client) SelectDomain(ctx context.Context, requestID, routeName, domain 
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -154,9 +137,6 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/status", nil)
 	if err != nil {
 		return nil, err
-	}
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -184,9 +164,6 @@ func (c *Client) UpdateRoute(ctx context.Context, name string, req RouteUpdate) 
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -207,9 +184,6 @@ func (c *Client) RouteStats(ctx context.Context, name string) (*RouteStats, erro
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/routes/"+name+"/stats", nil)
 	if err != nil {
 		return nil, err
-	}
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {

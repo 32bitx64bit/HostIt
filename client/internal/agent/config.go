@@ -40,7 +40,6 @@ type Config struct {
 	TLSPinSHA256 string
 	Email        emailcfg.Config        `json:"-"`
 	Routes       map[string]RemoteRoute `json:"-"`
-	APIKeys      []apitypes.APIKey       `json:",omitempty"`
 }
 
 func (c Config) Validate() error {
