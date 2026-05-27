@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+type envelope struct {
+	Status  string          `json:"status"`
+	Data    json.RawMessage `json:"data"`
+	Message string          `json:"message"`
+}
+
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -20,6 +26,31 @@ func NewClient(baseURL string) *Client {
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+func decodeResponse(resp *http.Response, out any) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		var e envelope
+		if err := json.Unmarshal(body, &e); err != nil {
+			return fmt.Errorf("request failed: %d", resp.StatusCode)
+		}
+		return fmt.Errorf("%s", e.Message)
+	}
+	var e envelope
+	if err := json.Unmarshal(body, &e); err != nil {
+		return err
+	}
+	if e.Status != "ok" {
+		return fmt.Errorf("unexpected status: %s", e.Status)
+	}
+	if out != nil && len(e.Data) > 0 {
+		return json.Unmarshal(e.Data, out)
+	}
+	return nil
 }
 
 func (c *Client) Register(ctx context.Context, req RegisterRequest) (*RegisterResponse, error) {
@@ -37,12 +68,8 @@ func (c *Client) Register(ctx context.Context, req RegisterRequest) (*RegisterRe
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("register failed: %d: %s", resp.StatusCode, respBody)
-	}
 	var result RegisterResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeResponse(resp, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -58,12 +85,8 @@ func (c *Client) ListRoutes(ctx context.Context) ([]Route, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list routes failed: %d: %s", resp.StatusCode, respBody)
-	}
 	var routes []Route
-	if err := json.NewDecoder(resp.Body).Decode(&routes); err != nil {
+	if err := decodeResponse(resp, &routes); err != nil {
 		return nil, err
 	}
 	return routes, nil
@@ -79,11 +102,7 @@ func (c *Client) RemoveRoute(ctx context.Context, name string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("remove route failed: %d: %s", resp.StatusCode, respBody)
-	}
-	return nil
+	return decodeResponse(resp, nil)
 }
 
 func (c *Client) ListDomains(ctx context.Context) (*DomainsResponse, error) {
@@ -96,12 +115,8 @@ func (c *Client) ListDomains(ctx context.Context) (*DomainsResponse, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list domains failed: %d: %s", resp.StatusCode, respBody)
-	}
 	var result DomainsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeResponse(resp, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -122,12 +137,8 @@ func (c *Client) SelectDomain(ctx context.Context, requestID, routeName, domain 
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("select domain failed: %d: %s", resp.StatusCode, respBody)
-	}
 	var result RegisterResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeResponse(resp, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -143,12 +154,8 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("status failed: %d: %s", resp.StatusCode, respBody)
-	}
 	var result StatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeResponse(resp, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -169,12 +176,8 @@ func (c *Client) UpdateRoute(ctx context.Context, name string, req RouteUpdate) 
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("update route failed: %d: %s", resp.StatusCode, respBody)
-	}
 	var result RegisterResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeResponse(resp, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -190,12 +193,8 @@ func (c *Client) RouteStats(ctx context.Context, name string) (*RouteStats, erro
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("route stats failed: %d: %s", resp.StatusCode, respBody)
-	}
 	var result RouteStats
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeResponse(resp, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -216,12 +215,8 @@ func (c *Client) CreateMailAccount(ctx context.Context, username, password strin
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("create mail account failed: %d: %s", resp.StatusCode, respBody)
-	}
 	var result MailAccount
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeResponse(resp, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -242,11 +237,7 @@ func (c *Client) UpdateMailAccountPassword(ctx context.Context, username, passwo
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("update mail account password failed: %d: %s", resp.StatusCode, respBody)
-	}
-	return nil
+	return decodeResponse(resp, nil)
 }
 
 func (c *Client) DeleteMailAccount(ctx context.Context, username string) error {
@@ -259,11 +250,94 @@ func (c *Client) DeleteMailAccount(ctx context.Context, username string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete mail account failed: %d: %s", resp.StatusCode, respBody)
+	return decodeResponse(resp, nil)
+}
+
+func (c *Client) AuthenticateMail(ctx context.Context, username, password string) (string, error) {
+	body, err := json.Marshal(map[string]string{"username": username, "password": password})
+	if err != nil {
+		return "", err
 	}
-	return nil
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/login", strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Username string `json:"username"`
+		Address  string `json:"address"`
+	}
+	if err := decodeResponse(resp, &result); err != nil {
+		return "", err
+	}
+	return result.Address, nil
+}
+
+func (c *Client) ListMailMessages(ctx context.Context, username, password string) ([]MailMessage, error) {
+	body, err := json.Marshal(map[string]string{"username": username, "password": password})
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/inbox", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var msgs []MailMessage
+	if err := decodeResponse(resp, &msgs); err != nil {
+		return nil, err
+	}
+	return msgs, nil
+}
+
+func (c *Client) GetMailMessage(ctx context.Context, username, password string, messageID int64) (*MailMessageFull, error) {
+	body, err := json.Marshal(map[string]any{"username": username, "password": password, "messageId": messageID})
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/message", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var result MailMessageFull
+	if err := decodeResponse(resp, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) DeleteMailMessage(ctx context.Context, username, password string, messageID int64) error {
+	body, err := json.Marshal(map[string]any{"username": username, "password": password, "messageId": messageID})
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/delete", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return decodeResponse(resp, nil)
 }
 
 func (c *Client) EventsURL() string {

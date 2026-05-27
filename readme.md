@@ -121,7 +121,17 @@ func main() {
 }
 ```
 
-The agent API is open on localhost.
+The agent API is open on localhost. All responses use a JSON envelope:
+
+```json
+// Success
+{"status": "ok", "data": {...}}
+
+// Error
+{"status": "error", "message": "..."}
+```
+
+The SDK unwraps this automatically.
 
 ### Domain Routing
 
@@ -193,6 +203,34 @@ These correspond to the agent's HTTP endpoints:
 - `POST /api/mail/accounts` — create account
 - `PATCH /api/mail/accounts/{username}` — change password
 - `DELETE /api/mail/accounts/{username}` — delete account
+
+### Email Message Operations
+
+Read and manage messages for a specific account:
+
+```go
+// Authenticate and get the account address
+addr, err := client.AuthenticateMail(ctx, "alice", "password123")
+
+// List inbox messages
+msgs, err := client.ListMailMessages(ctx, "alice", "password123")
+for _, m := range msgs {
+    fmt.Printf("[%d] %s - %s\n", m.ID, m.From, m.Subject)
+}
+
+// Read a full message
+full, err := client.GetMailMessage(ctx, "alice", "password123", 42)
+fmt.Println(full.Body)
+
+// Delete a message
+err = client.DeleteMailMessage(ctx, "alice", "password123", 42)
+```
+
+Endpoints:
+- `POST /api/mail/login` — authenticate, returns address
+- `POST /api/mail/inbox` — list messages
+- `POST /api/mail/message` — read full message
+- `POST /api/mail/delete` — delete message
 
 ### Declarative Config (apps.json)
 

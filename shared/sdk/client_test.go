@@ -9,10 +9,16 @@ import (
 	"testing"
 )
 
-func writeJSONResponse(w http.ResponseWriter, status int, v any) {
+func writeOKResponse(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	json.NewEncoder(w).Encode(map[string]any{"status": "ok", "data": data})
+}
+
+func writeErrorResponse(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": message})
 }
 
 func TestClientRegister(t *testing.T) {
@@ -26,20 +32,20 @@ func TestClientRegister(t *testing.T) {
 			return
 		}
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		var req RegisterRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeErrorResponse(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		if req.Name != wantName || req.Proto != wantProto || req.LocalPort != wantLocalPort {
-			http.Error(w, "unexpected request fields", http.StatusBadRequest)
+			writeErrorResponse(w, http.StatusBadRequest, "unexpected request fields")
 			return
 		}
 
-		writeJSONResponse(w, http.StatusOK, RegisterResponse{
+		writeOKResponse(w, http.StatusOK, RegisterResponse{
 			Status:     "active",
 			RequestID: "req-1",
 			RouteName:  req.Name,
@@ -77,10 +83,10 @@ func TestClientListRoutes(t *testing.T) {
 			return
 		}
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		writeJSONResponse(w, http.StatusOK, []Route{
+		writeOKResponse(w, http.StatusOK, []Route{
 			{Name: "app", Proto: "tcp", PublicAddr: ":9090", LocalAddr: "127.0.0.1:3000"},
 			{Name: "api", Proto: "udp", PublicAddr: ":9091", LocalAddr: "127.0.0.1:4000"},
 		})
@@ -103,15 +109,15 @@ func TestClientListRoutes(t *testing.T) {
 func TestClientRemoveRoute(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		name := r.URL.Path[len("/api/v1/routes/"):]
 		if name != "myapp" {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeErrorResponse(w, http.StatusNotFound, "not found")
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
+		writeOKResponse(w, http.StatusOK, nil)
 	}))
 	defer srv.Close()
 
@@ -123,7 +129,7 @@ func TestClientRemoveRoute(t *testing.T) {
 
 func TestClientRemoveRouteError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not found", http.StatusNotFound)
+		writeErrorResponse(w, http.StatusNotFound, "not found")
 	}))
 	defer srv.Close()
 
@@ -140,7 +146,7 @@ func TestClientListDomains(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		writeJSONResponse(w, http.StatusOK, DomainsResponse{
+		writeOKResponse(w, http.StatusOK, DomainsResponse{
 			Base: "example.com",
 			Available: []DomainOption{
 				{Host: "app.example.com", Available: true},
@@ -170,15 +176,15 @@ func TestClientSelectDomain(t *testing.T) {
 			return
 		}
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		var req DomainSelectRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeErrorResponse(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		writeJSONResponse(w, http.StatusOK, RegisterResponse{
+		writeOKResponse(w, http.StatusOK, RegisterResponse{
 			Status:     "active",
 			RouteName:  req.RouteName,
 			Domain:     req.Domain,
@@ -206,7 +212,7 @@ func TestClientStatus(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		writeJSONResponse(w, http.StatusOK, StatusResponse{
+		writeOKResponse(w, http.StatusOK, StatusResponse{
 			Connected:   true,
 			Server:      "tunnel.example.com",
 			Version:     "1.0.0",
@@ -233,7 +239,7 @@ func TestClientNoAPIKey(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
-		writeJSONResponse(w, http.StatusOK, StatusResponse{Connected: true})
+		writeOKResponse(w, http.StatusOK, StatusResponse{Connected: true})
 	}))
 	defer srv.Close()
 
@@ -249,7 +255,7 @@ func TestClientNoAPIKey(t *testing.T) {
 
 func TestClientBaseURLTrailingSlash(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSONResponse(w, http.StatusOK, StatusResponse{Connected: true})
+		writeOKResponse(w, http.StatusOK, StatusResponse{Connected: true})
 	}))
 	defer srv.Close()
 
@@ -314,7 +320,7 @@ func TestClientServerErrors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				http.Error(w, fmt.Sprintf("error %d", tc.statusCode), tc.statusCode)
+				writeErrorResponse(w, tc.statusCode, fmt.Sprintf("error %d", tc.statusCode))
 			}))
 			defer srv.Close()
 
@@ -334,15 +340,15 @@ func TestClientCreateMailAccount(t *testing.T) {
 			return
 		}
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		var req map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeErrorResponse(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		writeJSONResponse(w, http.StatusCreated, MailAccount{
+		writeOKResponse(w, http.StatusCreated, MailAccount{
 			Username: req["username"],
 			Address:  req["username"] + "@example.com",
 		})
@@ -366,10 +372,10 @@ func TestClientUpdateMailAccountPassword(t *testing.T) {
 			return
 		}
 		if r.Method != http.MethodPatch {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
+		writeOKResponse(w, http.StatusOK, nil)
 	}))
 	defer srv.Close()
 
@@ -386,10 +392,10 @@ func TestClientDeleteMailAccount(t *testing.T) {
 			return
 		}
 		if r.Method != http.MethodDelete {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
+		writeOKResponse(w, http.StatusOK, nil)
 	}))
 	defer srv.Close()
 

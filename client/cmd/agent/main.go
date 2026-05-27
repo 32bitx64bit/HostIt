@@ -769,25 +769,37 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			if submitted == "" {
 				submitted = strings.TrimSpace(r.PostFormValue("csrf_token"))
 			}
-			if subtle.ConstantTimeCompare([]byte(submitted), []byte(csrfToken)) != 1 {
-				http.Error(w, "invalid csrf token", http.StatusForbidden)
-				return
-			}
+		if subtle.ConstantTimeCompare([]byte(submitted), []byte(csrfToken)) != 1 {
+			http.Error(w, "invalid csrf token", http.StatusForbidden)
+			return
+		}
 			next(w, r)
 		}
 	}
 
 	mux := http.NewServeMux()
 
-	writeJSON := func(w http.ResponseWriter, v any) {
-		if err := json.NewEncoder(w).Encode(v); err != nil {
+	writeOK := func(w http.ResponseWriter, data any) {
+		w.Header().Set("Content-Type", "application/json")
+		out := map[string]any{"status": "ok"}
+		if data != nil {
+			out["data"] = data
+		}
+		if err := json.NewEncoder(w).Encode(out); err != nil {
 			log.Printf("json encode: %v", err)
+		}
+	}
+	writeError := func(w http.ResponseWriter, status int, message string) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if err := json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": message}); err != nil {
+			log.Printf("json encode error: %v", err)
 		}
 	}
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		cfg, running, connected, lastErr, routes := ctrl.Get()
@@ -807,12 +819,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			resp["email"] = mailSvc.Status()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, resp)
+		writeOK(w, resp)
 	})
 
 	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		level := strings.TrimSpace(r.URL.Query().Get("level"))
@@ -829,7 +841,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			entries = agentlog.UILogs.Entries(level, limit)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, map[string]any{
+		writeOK(w, map[string]any{
 			"level":   level,
 			"limit":   limit,
 			"stats":   stats,
@@ -839,54 +851,54 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/api/update/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		upd.CheckIfDue(r.Context())
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, upd.Status())
+		writeOK(w, upd.Status())
 	})
 	mux.HandleFunc("/api/update/check-now", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		_ = upd.CheckNow(r.Context())
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, upd.Status())
+		writeOK(w, upd.Status())
 	}))
 
 	mux.HandleFunc("/api/systemd/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		st := systemdutil.Status(r.Context(), agentSystemdServiceName)
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, st)
+		writeOK(w, st)
 	})
 	mux.HandleFunc("/api/systemd/restart", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		if err := syncInstalledAgentSystemdUnit(moduleDir); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if err := systemdutil.Action(r.Context(), "restart", agentSystemdServiceName); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	mux.HandleFunc("/api/systemd/stop", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		if err := systemdutil.Action(r.Context(), "stop", agentSystemdServiceName); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -894,7 +906,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/api/process/restart", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -905,7 +917,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}))
 	mux.HandleFunc("/api/process/exit", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -916,7 +928,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}))
 	mux.HandleFunc("/api/update/remind", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		_ = upd.RemindLater(24 * time.Hour)
@@ -924,7 +936,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}))
 	mux.HandleFunc("/api/update/skip", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		_ = upd.SkipAvailableVersion()
@@ -932,12 +944,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}))
 	mux.HandleFunc("/api/update/apply", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		started, err := upd.Apply(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if !started {
@@ -948,28 +960,28 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}))
 	mux.HandleFunc("/api/update/apply-local", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 512<<20)
 		if err := r.ParseMultipartForm(512 << 20); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		componentZipPath, hasComponent, err := writeUploadedZipTemp(r, "componentZip", "hostit-client-component-*.zip")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if !hasComponent {
-			http.Error(w, "component zip is required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "component zip is required")
 			return
 		}
 		defer os.Remove(componentZipPath)
 
 		sharedZipPath, hasShared, err := writeUploadedZipTemp(r, "sharedZip", "hostit-client-shared-*.zip")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if hasShared {
@@ -978,7 +990,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 		started, err := upd.ApplyLocal(r.Context(), componentZipPath, sharedZipPath)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if !started {
@@ -990,7 +1002,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/start", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		ctrl.Start()
@@ -998,7 +1010,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}))
 	mux.HandleFunc("/stop", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		ctrl.Stop()
@@ -1006,7 +1018,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}))
 	mux.HandleFunc("/restart", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		ctrl.Stop()
@@ -1020,7 +1032,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		cfg, running, connected, lastErr, routes := ctrl.Get()
@@ -1029,7 +1041,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/controls", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		cfg, running, connected, lastErr, routes := ctrl.Get()
@@ -1038,7 +1050,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/apps", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		cfg, _, connected, lastErr, routes := ctrl.Get()
@@ -1068,12 +1080,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	saveHandler := requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		old, _, _, _, _ := ctrl.Get()
@@ -1087,19 +1099,19 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		cfg.TLSPinSHA256 = strings.TrimSpace(r.Form.Get("tls_pin_sha256"))
 		if cfg.Server == "" {
-			http.Error(w, "server is required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "server is required")
 			return
 		}
 		if cfg.Token == "" {
-			http.Error(w, "token is required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "token is required")
 			return
 		}
 		if err := cfg.Validate(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if err := configio.Save(configPath, cfg); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		ctrl.Stop()
@@ -1119,24 +1131,24 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		if mailSvc == nil {
 			if r.Method == http.MethodGet {
 				w.Header().Set("Content-Type", "application/json")
-				writeJSON(w, []mail.WebAccount{})
+				writeOK(w, []mail.WebAccount{})
 				return
 			}
-			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "mail service unavailable")
 			return
 		}
 		switch r.Method {
 		case http.MethodGet:
 			accts, err := mailSvc.ListAccounts()
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			if accts == nil {
 				accts = []mail.WebAccount{}
 			}
 			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, accts)
+			writeOK(w, accts)
 		case http.MethodPost:
 			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			var req struct {
@@ -1144,30 +1156,30 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 				Password string `json:"password"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "bad request", http.StatusBadRequest)
+				writeError(w, http.StatusBadRequest, "bad request")
 				return
 			}
 			acct, err := mailSvc.CreateAccount(req.Username, req.Password)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			writeJSON(w, acct)
+			writeOK(w, acct)
 		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 	})
 
 	mux.HandleFunc("/api/mail/accounts/", func(w http.ResponseWriter, r *http.Request) {
 		if mailSvc == nil {
-			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "mail service unavailable")
 			return
 		}
 		username := strings.TrimPrefix(r.URL.Path, "/api/mail/accounts/")
 		if username == "" {
-			http.Error(w, "username required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "username required")
 			return
 		}
 		switch r.Method {
@@ -1177,32 +1189,32 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 				Password string `json:"password"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "bad request", http.StatusBadRequest)
+				writeError(w, http.StatusBadRequest, "bad request")
 				return
 			}
 			if err := mailSvc.UpdateAccountPassword(username, req.Password); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodDelete:
 			if err := mailSvc.DeleteAccount(username); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 	})
 
 	mux.HandleFunc("/api/mail/login", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		if mailSvc == nil {
-			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "mail service unavailable")
 			return
 		}
 		var req struct {
@@ -1211,25 +1223,25 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		addr, err := mailSvc.Authenticate(req.Username, req.Password)
 		if err != nil {
-			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "authentication failed")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, map[string]string{"username": req.Username, "address": addr})
+		writeOK(w, map[string]string{"username": req.Username, "address": addr})
 	}))
 
 	mux.HandleFunc("/api/mail/inbox", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		if mailSvc == nil {
-			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "mail service unavailable")
 			return
 		}
 		var req struct {
@@ -1238,32 +1250,32 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
-			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "authentication failed")
 			return
 		}
 		msgs, err := mailSvc.ListInbox(req.Username)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		if msgs == nil {
 			msgs = []mail.WebMessage{}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, msgs)
+		writeOK(w, msgs)
 	}))
 
 	mux.HandleFunc("/api/mail/message", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		if mailSvc == nil {
-			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "mail service unavailable")
 			return
 		}
 		var req struct {
@@ -1273,29 +1285,29 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
-			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "authentication failed")
 			return
 		}
 		msg, err := mailSvc.GetMessage(req.Username, req.MessageID)
 		if err != nil {
-			http.Error(w, "message not found", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "message not found")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, msg)
+		writeOK(w, msg)
 	}))
 
 	mux.HandleFunc("/api/mail/delete", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		if mailSvc == nil {
-			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "mail service unavailable")
 			return
 		}
 		var req struct {
@@ -1305,15 +1317,15 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
-			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "authentication failed")
 			return
 		}
 		if err := mailSvc.DeleteMessage(req.Username, req.MessageID); err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -1321,7 +1333,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/mail", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		_ = tplMail.Execute(w, nil)
@@ -1329,11 +1341,11 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		cfg, running, connected, _, _ := ctrl.Get()
-		writeJSON(w, map[string]any{
+		writeOK(w, map[string]any{
 			"status":    "ok",
 			"running":   running,
 			"connected": connected,
@@ -1344,11 +1356,11 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		cfg, running, connected, lastErr, routes := ctrl.Get()
-		writeJSON(w, map[string]any{
+		writeOK(w, map[string]any{
 			"uptime_seconds":  time.Since(startTime).Seconds(),
 			"running":         running,
 			"connected":       connected,
@@ -1361,28 +1373,28 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/api/v1/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		var req apitypes.RegisterRequest
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		if strings.TrimSpace(req.Name) == "" {
-			http.Error(w, "name is required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "name is required")
 			return
 		}
 		if req.Proto == "" {
 			req.Proto = "tcp"
 		}
 		if req.Proto != "tcp" && req.Proto != "udp" && req.Proto != "both" {
-			http.Error(w, "proto must be tcp, udp, or both", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "proto must be tcp, udp, or both")
 			return
 		}
 		if req.LocalPort <= 0 || req.LocalPort > 65535 {
-			http.Error(w, "local_port must be 1-65535", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "local_port must be 1-65535")
 			return
 		}
 
@@ -1394,7 +1406,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 		_, running, connected, lastErr, _ := ctrl.Get()
 		if !running || !connected {
-			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "agent not connected: "+lastErr)
 			return
 		}
 
@@ -1412,12 +1424,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 		resp, err := ctrl.RequestRoute(r.Context(), protoReq)
 		if err != nil {
-			http.Error(w, "route request failed: "+err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "route request failed: "+err.Error())
 			return
 		}
 
 		if resp.Status == "failed" {
-			http.Error(w, "route request rejected: "+resp.Error, http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "route request rejected: "+resp.Error)
 			return
 		}
 
@@ -1433,12 +1445,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, apiResp)
+		writeOK(w, apiResp)
 	})
 
 	mux.HandleFunc("/api/v1/routes", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		_, _, _, _, routes := ctrl.Get()
@@ -1452,31 +1464,31 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, out)
+		writeOK(w, out)
 	})
 
 	mux.HandleFunc("/api/v1/routes/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		name := strings.TrimPrefix(r.URL.Path, "/api/v1/routes/")
 		if name == "" {
-			http.Error(w, "route name required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "route name required")
 			return
 		}
 		_, running, connected, lastErr, _ := ctrl.Get()
 		if !running || !connected {
-			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "agent not connected: "+lastErr)
 			return
 		}
 		ack, err := ctrl.RemoveRoute(r.Context(), apitypes.RouteRemove{Name: name, Source: "api"})
 		if err != nil {
-			http.Error(w, "route remove failed: "+err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "route remove failed: "+err.Error())
 			return
 		}
 		if !ack.OK {
-			http.Error(w, "route remove rejected: "+ack.Error, http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "route remove rejected: "+ack.Error)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -1484,12 +1496,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/api/v1/domains", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		_, _, connected, lastErr, _ := ctrl.Get()
 		if !connected {
-			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "agent not connected: "+lastErr)
 			return
 		}
 		protoReq := apitypes.RouteRequest{
@@ -1503,7 +1515,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		resp, err := ctrl.RequestRoute(r.Context(), protoReq)
 		if err != nil {
-			http.Error(w, "domain query failed: "+err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "domain query failed: "+err.Error())
 			return
 		}
 		result := apitypes.DomainsResponse{
@@ -1514,27 +1526,27 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			result.Available = []apitypes.DomainOption{}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, result)
+		writeOK(w, result)
 	})
 
 	mux.HandleFunc("/api/v1/domains/select", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		var req apitypes.DomainSelectRequest
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		if req.RequestID == "" || req.Domain == "" || req.RouteName == "" {
-			http.Error(w, "request_id, route_name, and domain are required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "request_id, route_name, and domain are required")
 			return
 		}
 		_, _, connected, lastErr, _ := ctrl.Get()
 		if !connected {
-			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "agent not connected: "+lastErr)
 			return
 		}
 		ack, err := ctrl.ConfirmRoute(r.Context(), apitypes.RouteConfirm{
@@ -1543,11 +1555,11 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			Domain:    req.Domain,
 		})
 		if err != nil {
-			http.Error(w, "domain confirm failed: "+err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "domain confirm failed: "+err.Error())
 			return
 		}
 		if ack.Status == "failed" {
-			http.Error(w, "domain confirm rejected: "+ack.Error, http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "domain confirm rejected: "+ack.Error)
 			return
 		}
 		apiResp := apitypes.RegisterResponse{
@@ -1558,17 +1570,17 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			PublicAddr: ack.PublicAddr,
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, apiResp)
+		writeOK(w, apiResp)
 	})
 
 	mux.HandleFunc("/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		cfg, running, connected, _, routes := ctrl.Get()
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, apitypes.StatusResponse{
+		writeOK(w, apitypes.StatusResponse{
 			Connected:   running && connected,
 			Server:      cfg.Server,
 			Version:     version.Current,
@@ -1578,7 +1590,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/api/v1/routes/update", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch && r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		var req struct {
@@ -1590,16 +1602,16 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
 		if strings.TrimSpace(req.Name) == "" {
-			http.Error(w, "name is required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "name is required")
 			return
 		}
 		_, _, connected, lastErr, _ := ctrl.Get()
 		if !connected {
-			http.Error(w, "agent not connected: "+lastErr, http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "agent not connected: "+lastErr)
 			return
 		}
 		update := apitypes.RouteUpdate{
@@ -1621,16 +1633,16 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		ack, err := ctrl.UpdateRoute(r.Context(), update)
 		if err != nil {
-			http.Error(w, "route update failed: "+err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "route update failed: "+err.Error())
 			return
 		}
 		if ack.Status == "failed" {
-			http.Error(w, "route update rejected: "+ack.Error, http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "route update rejected: "+ack.Error)
 			return
 		}
 		ctrl.pushEvent(apitypes.AppEvent{Type: "route_updated", Timestamp: time.Now().UnixMilli(), RouteName: req.Name})
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, map[string]any{
+		writeOK(w, map[string]any{
 			"status":     "updated",
 			"route_name": ack.Name,
 		})
@@ -1638,12 +1650,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/api/v1/route/stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		name := strings.TrimSpace(r.URL.Query().Get("name"))
 		if name == "" {
-			http.Error(w, "name query parameter required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "name query parameter required")
 			return
 		}
 		_, _, connected, _, routes := ctrl.Get()
@@ -1655,7 +1667,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			}
 		}
 		if found == nil {
-			http.Error(w, "route not found", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "route not found")
 			return
 		}
 		stats := apitypes.RouteStats{
@@ -1667,7 +1679,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			Source:     "dynamic",
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, stats)
+		writeOK(w, stats)
 	})
 
 	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
@@ -1675,7 +1687,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			OriginPatterns: []string{"localhost:*", "127.0.0.1:*"},
 		})
 		if err != nil {
-			http.Error(w, "websocket upgrade failed", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "websocket upgrade failed")
 			return
 		}
 		defer conn.Close(websocket.StatusNormalClosure, "")
@@ -1707,7 +1719,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 
 	mux.HandleFunc("/api/v1/apps/register-all", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		appsCfg := apitypes.AppsConfig{}

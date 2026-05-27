@@ -1,6 +1,10 @@
 package sdk
 
-import "hostit/shared/apitypes"
+import (
+	"time"
+
+	"hostit/shared/apitypes"
+)
 
 type RegisterRequest = apitypes.RegisterRequest
 type RegisterResponse = apitypes.RegisterResponse
@@ -24,4 +28,20 @@ type Route struct {
 type MailAccount struct {
 	Username string `json:"username"`
 	Address  string `json:"address"`
+}
+
+type MailMessage struct {
+	ID      int64     `json:"id"`
+	Mailbox string    `json:"mailbox"`
+	Date    time.Time `json:"date"`
+	From    string    `json:"from"`
+	To      string    `json:"to"`
+	Subject string    `json:"subject"`
+	Flags   []string  `json:"flags,omitempty"`
+	Size    int       `json:"size"`
+}
+
+type MailMessageFull struct {
+	MailMessage
+	Body string `json:"body"`
 }
