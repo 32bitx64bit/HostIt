@@ -1116,25 +1116,84 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	tplMail := template.Must(template.New("mail").Parse(agentMailHTML))
 
 	mux.HandleFunc("/api/mail/accounts", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
 		if mailSvc == nil {
+			if r.Method == http.MethodGet {
+				w.Header().Set("Content-Type", "application/json")
+				writeJSON(w, []mail.WebAccount{})
+				return
+			}
+			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			accts, err := mailSvc.ListAccounts()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if accts == nil {
+				accts = []mail.WebAccount{}
+			}
 			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, []mail.WebAccount{})
+			writeJSON(w, accts)
+		case http.MethodPost:
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			var req struct {
+				Username string `json:"username"`
+				Password string `json:"password"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			acct, err := mailSvc.CreateAccount(req.Username, req.Password)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			writeJSON(w, acct)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/api/mail/accounts/", func(w http.ResponseWriter, r *http.Request) {
+		if mailSvc == nil {
+			http.Error(w, "mail service unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		accts, err := mailSvc.ListAccounts()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		username := strings.TrimPrefix(r.URL.Path, "/api/mail/accounts/")
+		if username == "" {
+			http.Error(w, "username required", http.StatusBadRequest)
 			return
 		}
-		if accts == nil {
-			accts = []mail.WebAccount{}
+		switch r.Method {
+		case http.MethodPatch:
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			var req struct {
+				Password string `json:"password"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if err := mailSvc.UpdateAccountPassword(username, req.Password); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodDelete:
+			if err := mailSvc.DeleteAccount(username); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, accts)
 	})
 
 	mux.HandleFunc("/api/mail/login", requireCSRF(func(w http.ResponseWriter, r *http.Request) {

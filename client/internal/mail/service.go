@@ -345,6 +345,103 @@ func (s *Service) DeleteMessage(username string, messageID int64) error {
 	return nil
 }
 
+// CreateAccount creates a new email account with the given username and plaintext password.
+func (s *Service) CreateAccount(username, password string) (*WebAccount, error) {
+	username = strings.TrimSpace(strings.ToLower(username))
+	if username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if password == "" {
+		return nil, fmt.Errorf("password is required")
+	}
+	s.mu.RLock()
+	domain := s.cfg.Domain
+	s.mu.RUnlock()
+	if domain == "" {
+		return nil, fmt.Errorf("email domain is not configured")
+	}
+	address := username + "@" + domain
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	now := time.Now().Unix()
+	_, err = s.db.Exec(`INSERT INTO accounts(username, address, password_hash, enabled, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		username, address, string(hash), 1, now, now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create account: %w", err)
+	}
+
+	s.mu.Lock()
+	s.refreshStatusLocked("")
+	s.mu.Unlock()
+	return &WebAccount{Username: username, Address: address}, nil
+}
+
+// UpdateAccountPassword updates the password for an existing account.
+func (s *Service) UpdateAccountPassword(username, password string) error {
+	username = strings.TrimSpace(strings.ToLower(username))
+	if username == "" {
+		return fmt.Errorf("username is required")
+	}
+	if password == "" {
+		return fmt.Errorf("password is required")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	res, err := s.db.Exec(`UPDATE accounts SET password_hash = ?, updated_at = ? WHERE username = ?`,
+		string(hash), time.Now().Unix(), username)
+	if err != nil {
+		return fmt.Errorf("failed to update account: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("account not found")
+	}
+	return nil
+}
+
+// DeleteAccount deletes an account and all of its messages.
+func (s *Service) DeleteAccount(username string) error {
+	username = strings.TrimSpace(strings.ToLower(username))
+	if username == "" {
+		return fmt.Errorf("username is required")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM messages WHERE username = ?`, username); err != nil {
+		return fmt.Errorf("failed to delete messages: %w", err)
+	}
+	res, err := tx.Exec(`DELETE FROM accounts WHERE username = ?`, username)
+	if err != nil {
+		return fmt.Errorf("failed to delete account: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("account not found")
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit: %w", err)
+	}
+
+	s.mu.Lock()
+	delete(s.imapMessages, username)
+	s.refreshStatusLocked("")
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *Service) SetOutboundDialer(dialer func(context.Context, string) (net.Conn, error)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

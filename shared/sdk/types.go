@@ -20,3 +20,8 @@ type Route struct {
 	LocalAddr  string `json:"local_addr"`
 	Domain     string `json:"domain,omitempty"`
 }
+
+type MailAccount struct {
+	Username string `json:"username"`
+	Address  string `json:"address"`
+}

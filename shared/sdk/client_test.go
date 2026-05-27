@@ -326,3 +326,75 @@ func TestClientServerErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestClientCreateMailAccount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/mail/accounts" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		writeJSONResponse(w, http.StatusCreated, MailAccount{
+			Username: req["username"],
+			Address:  req["username"] + "@example.com",
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	acct, err := client.CreateMailAccount(context.Background(), "alice", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acct.Username != "alice" {
+		t.Fatalf("Username = %q, want %q", acct.Username, "alice")
+	}
+}
+
+func TestClientUpdateMailAccountPassword(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/mail/accounts/alice" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPatch {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	if err := client.UpdateMailAccountPassword(context.Background(), "alice", "newsecret"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientDeleteMailAccount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/mail/accounts/alice" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	if err := client.DeleteMailAccount(context.Background(), "alice"); err != nil {
+		t.Fatal(err)
+	}
+}

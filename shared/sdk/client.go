@@ -201,6 +201,71 @@ func (c *Client) RouteStats(ctx context.Context, name string) (*RouteStats, erro
 	return &result, nil
 }
 
+func (c *Client) CreateMailAccount(ctx context.Context, username, password string) (*MailAccount, error) {
+	body, err := json.Marshal(map[string]string{"username": username, "password": password})
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/accounts", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("create mail account failed: %d: %s", resp.StatusCode, respBody)
+	}
+	var result MailAccount
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) UpdateMailAccountPassword(ctx context.Context, username, password string) error {
+	body, err := json.Marshal(map[string]string{"password": password})
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.baseURL+"/api/mail/accounts/"+username, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("update mail account password failed: %d: %s", resp.StatusCode, respBody)
+	}
+	return nil
+}
+
+func (c *Client) DeleteMailAccount(ctx context.Context, username string) error {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/mail/accounts/"+username, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete mail account failed: %d: %s", resp.StatusCode, respBody)
+	}
+	return nil
+}
+
 func (c *Client) EventsURL() string {
 	return strings.Replace(c.baseURL, "http", "ws", 1) + "/api/v1/events"
 }

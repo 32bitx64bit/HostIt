@@ -106,7 +106,7 @@ replace github.com/32bitx64bit/HostIt/shared => ./path/to/HostIt/shared
 import "github.com/32bitx64bit/HostIt/shared/sdk"
 
 func main() {
-    client := sdk.NewClient("http://127.0.0.1:7003", "")
+    client := sdk.NewClient("http://127.0.0.1:7003")
 
     resp, err := client.Register(ctx, sdk.RegisterRequest{
         Name:      "my-app",
@@ -168,6 +168,31 @@ client.RemoveRoute(ctx, "my-app")         // unregister
 status, _ := client.Status(ctx)           // agent connection status
 wsURL := client.EventsURL()               // WebSocket URL for real-time events
 ```
+
+### Email Account Management
+
+If the agent has the email service enabled, you can manage accounts through the SDK:
+
+```go
+// Create a new email account
+acct, err := client.CreateMailAccount(ctx, "alice", "password123")
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Created: %s\n", acct.Address) // alice@<domain>
+
+// Change password
+err = client.UpdateMailAccountPassword(ctx, "alice", "newpassword456")
+
+// Delete account (and all its messages)
+err = client.DeleteMailAccount(ctx, "alice")
+```
+
+These correspond to the agent's HTTP endpoints:
+- `GET /api/mail/accounts` — list all accounts
+- `POST /api/mail/accounts` — create account
+- `PATCH /api/mail/accounts/{username}` — change password
+- `DELETE /api/mail/accounts/{username}` — delete account
 
 ### Declarative Config (apps.json)
 
