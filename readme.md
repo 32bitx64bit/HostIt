@@ -81,3 +81,117 @@ Both dashboards now include **Process → Restart / Exit**.
 - When running under systemd, clicking these will terminate the process and systemd will bring it back.
 - If not running under systemd, it will just exit.
 
+## Developer Integration
+
+HostIt provides a Go SDK that lets your application register tunnel routes through a running HostIt agent. Your app talks to the local agent on `127.0.0.1:7003`, and the agent handles the rest — server negotiation, domain selection, conflict resolution.
+
+### Import
+
+Add the SDK to your project:
+
+```sh
+go get github.com/32bitx64bit/HostIt/shared/sdk
+```
+
+Then in your `go.mod`, add a replace directive pointing to the local path (since the shared module isn't published separately yet):
+
+```
+require github.com/32bitx64bit/HostIt/shared v0.0.0
+replace github.com/32bitx64bit/HostIt/shared => ./path/to/HostIt/shared
+```
+
+### Basic Usage
+
+```go
+import "github.com/32bitx64bit/HostIt/shared/sdk"
+
+func main() {
+    client := sdk.NewClient("http://127.0.0.1:7003", "")
+
+    resp, err := client.Register(ctx, sdk.RegisterRequest{
+        Name:      "my-app",
+        Proto:     "tcp",
+        LocalPort: 3000,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Printf("Tunnel active: %s -> %s\n", resp.PublicAddr, resp.LocalAddr)
+}
+```
+
+Leave the API key empty for localhost-only access (no auth required). For remote or multi-user setups, generate a key via the agent dashboard or `POST /api/v1/keys/generate`.
+
+### Domain Routing
+
+If the server has the domain manager enabled, your app can request a domain:
+
+```go
+resp, err := client.Register(ctx, sdk.RegisterRequest{
+    Name:      "my-app",
+    Proto:     "tcp",
+    LocalPort: 3000,
+    Domain:    "auto",
+})
+```
+
+- `""` — port-only tunnel, no domain
+- `"auto"` — auto-suggests `my-app.<base-domain>`, prompts for selection if taken
+- `"app.example.com"` — explicit domain, fails if already in use
+
+When `resp.Status == "pending_domain"`, list available domains and let the user pick:
+
+```go
+domains, _ := client.ListDomains(ctx)
+// Present domains to user...
+resp, _ = client.SelectDomain(ctx, resp.RequestID, resp.RouteName, "my-app.example.com")
+```
+
+### Updating Routes
+
+Change a route's local port without re-registering (useful when your app restarts on a different port):
+
+```go
+client.UpdateRoute(ctx, "my-app", sdk.RouteUpdate{
+    Name:      "my-app",
+    LocalAddr: "127.0.0.1:4000",
+})
+```
+
+### Other Operations
+
+```go
+routes, _ := client.ListRoutes(ctx)       // all active routes
+stats, _ := client.RouteStats(ctx, "my-app") // per-route status
+client.RemoveRoute(ctx, "my-app")         // unregister
+status, _ := client.Status(ctx)           // agent connection status
+wsURL := client.EventsURL()               // WebSocket URL for real-time events
+```
+
+### Declarative Config (apps.json)
+
+For apps that always need the same routes, place an `apps.json` next to `agent.json`:
+
+```json
+{
+  "apps": [
+    {
+      "name": "webapp",
+      "proto": "tcp",
+      "local_port": 3000,
+      "domain": "auto",
+      "auto_start": true
+    },
+    {
+      "name": "api",
+      "proto": "tcp",
+      "local_port": 8080,
+      "public_port": 9090
+    }
+  ]
+}
+```
+
+Routes with `auto_start: true` register automatically when the agent connects to the server.
+
