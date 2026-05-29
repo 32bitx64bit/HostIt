@@ -1208,7 +1208,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 	})
 
-	mux.HandleFunc("/api/mail/login", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mail/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -1233,9 +1233,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeOK(w, map[string]string{"username": req.Username, "address": addr})
-	}))
+	})
 
-	mux.HandleFunc("/api/mail/inbox", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mail/inbox", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -1267,9 +1267,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeOK(w, msgs)
-	}))
+	})
 
-	mux.HandleFunc("/api/mail/message", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mail/message", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -1299,9 +1299,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writeOK(w, msg)
-	}))
+	})
 
-	mux.HandleFunc("/api/mail/delete", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mail/delete", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -1329,7 +1329,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	}))
+	})
 
 	mux.HandleFunc("/mail", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

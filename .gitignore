@@ -4,6 +4,11 @@
 **/*.dll
 **/*.so
 **/*.dylib
+**/*.s
+**/*.S
+**/*.asm
+**/tunnel-agent
+**/tunnel-server
 
 # Runtime configs / local state
 **/*.json

@@ -1,11 +1,15 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,10 +39,13 @@ func decodeResponse(resp *http.Response, out any) error {
 	}
 	if resp.StatusCode >= 400 {
 		var e envelope
-		if err := json.Unmarshal(body, &e); err != nil {
+		if err := json.Unmarshal(body, &e); err != nil || e.Message == "" {
 			return fmt.Errorf("request failed: %d", resp.StatusCode)
 		}
 		return fmt.Errorf("%s", e.Message)
+	}
+	if len(body) == 0 {
+		return nil
 	}
 	var e envelope
 	if err := json.Unmarshal(body, &e); err != nil {
@@ -58,7 +65,7 @@ func (c *Client) Register(ctx context.Context, req RegisterRequest) (*RegisterRe
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/register", strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/register", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +134,7 @@ func (c *Client) SelectDomain(ctx context.Context, requestID, routeName, domain 
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/domains/select", strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/domains/select", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -162,11 +169,34 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 }
 
 func (c *Client) UpdateRoute(ctx context.Context, name string, req RouteUpdate) (*RegisterResponse, error) {
-	body, err := json.Marshal(req)
+	bodyMap := map[string]any{"name": name}
+	if req.LocalAddr != "" {
+		host, portStr, err := net.SplitHostPort(req.LocalAddr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid LocalAddr %q: %w", req.LocalAddr, err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port in LocalAddr %q: %w", req.LocalAddr, err)
+		}
+		if port > 0 {
+			bodyMap["local_port"] = port
+			if host != "" && host != "127.0.0.1" {
+				bodyMap["local_host"] = host
+			}
+		}
+	}
+	if req.PublicPort > 0 {
+		bodyMap["public_port"] = req.PublicPort
+	}
+	if req.Domain != "" {
+		bodyMap["domain"] = req.Domain
+	}
+	body, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.baseURL+"/api/v1/routes/"+name, strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/routes/update", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +214,8 @@ func (c *Client) UpdateRoute(ctx context.Context, name string, req RouteUpdate) 
 }
 
 func (c *Client) RouteStats(ctx context.Context, name string) (*RouteStats, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/routes/"+name+"/stats", nil)
+	u := c.baseURL + "/api/v1/route/stats?name=" + url.QueryEscape(name)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -200,12 +231,29 @@ func (c *Client) RouteStats(ctx context.Context, name string) (*RouteStats, erro
 	return &result, nil
 }
 
+func (c *Client) ListMailAccounts(ctx context.Context) ([]MailAccount, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/mail/accounts", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var accts []MailAccount
+	if err := decodeResponse(resp, &accts); err != nil {
+		return nil, err
+	}
+	return accts, nil
+}
+
 func (c *Client) CreateMailAccount(ctx context.Context, username, password string) (*MailAccount, error) {
 	body, err := json.Marshal(map[string]string{"username": username, "password": password})
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/accounts", strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/accounts", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +275,7 @@ func (c *Client) UpdateMailAccountPassword(ctx context.Context, username, passwo
 	if err != nil {
 		return err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.baseURL+"/api/mail/accounts/"+username, strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.baseURL+"/api/mail/accounts/"+username, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -258,7 +306,7 @@ func (c *Client) AuthenticateMail(ctx context.Context, username, password string
 	if err != nil {
 		return "", err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/login", strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/login", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -283,7 +331,7 @@ func (c *Client) ListMailMessages(ctx context.Context, username, password string
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/inbox", strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/inbox", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +353,7 @@ func (c *Client) GetMailMessage(ctx context.Context, username, password string, 
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/message", strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/message", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +375,7 @@ func (c *Client) DeleteMailMessage(ctx context.Context, username, password strin
 	if err != nil {
 		return err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/delete", strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/delete", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
