@@ -1,141 +1,141 @@
 # HostIt
-HostIt is a high performance self hosted version of similar services such as Playit.gg or Ngrok used to create a tunnel to forward your local projects to the wider web.
-Very useful especially in cases where your ISP or router can't do port forwarding, and also provides better security than port forwarding. 
+
+[![Go Version](https://img.shields.io/badge/Go-1.26.1-00ADD8?logo=go)](https://go.dev/)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
+[![Release](https://img.shields.io/badge/release-v3.0.0-brightgreen)](https://github.com/32bitx64bit/HostIt/releases/latest)
+
+A high-performance, self-hosted tunneling service — an alternative to services like Playit.gg or Ngrok. Expose your local projects to the internet even when your ISP or router blocks port forwarding, with better security than raw port forwarding.
+
+## Features
+
+- **TCP & UDP tunneling** — forward any local service through a single outbound connection
+- **Domain-based routing** — assign custom domains to tunnels with automatic Let's Encrypt TLS certificates
+- **Built-in email server** — SMTP, IMAP, and POP3 with DKIM signing and SQLite storage
+- **Web dashboard** — manage tunnels, domains, and email accounts from a browser
+- **Declarative config** — define tunnels in `apps.json` for auto-registration on agent start
+- **Systemd integration** — run as a background service with automatic restart
+- **Go SDK** — programmatically register and manage tunnels from your own Go applications
 
 ## Quick Start
 
 ### Prerequisites
-- GO version 1.26.1 (Or greater) needs to be installed.
-- VPS for a Linux server (With go installed as well)
-- Ports 7000/7001 (agent control and data listeners), 7002 (dashboard). So ensure these ports are opened and not blocked.
-- Make sure the respective folders are on the respective machines. Client + Shared for the client, and then server + shared for the server.
 
-### Server (Linux only)
-1. cd into the server directory
-Then run
-   ```sh
-   ./build.sh
-   ```
-2. Start the server. 
-   ```sh
-   ./server.sh
-   ```
-3. Open the dashboard (`http://<server-host>:7002`) to finish setup. First start shows the setup wizard, once finished the server has been setup.
+- Go 1.26.1 or newer
+- A Linux VPS for the server
+- Ports **7000** (control), **7001** (data), and **7002** (dashboard) open on the server
+- Client machine needs `client/` + `shared/` directories; server needs `server/` + `shared/`
 
-4. Optionally, run it as a service, via install-service.sh (Must be ran as sudo)
+### Server (Linux)
+
+```sh
+cd server
+./build.sh
+./server.sh
+```
+
+Open `http://<server-host>:7002` in a browser. The first visit shows a setup wizard — complete it, and the server is ready.
+
+To run as a systemd service:
+
+```sh
+sudo sh server/install-service.sh
+```
 
 ### Client
 
-#### Linux client
-1. cd into the client dictory and run
-   ```sh
-   ./build.sh
-   ```
-2. Start the agent launcher script (the dashboard runs on `127.0.0.1:7003` by default):
-   ```sh
-   ./client.sh
-   ```
-3. Setup the client with the correct token and server IP.
+#### Linux
 
-4. Click "Save + restart agent", it should connect successfully to the server, unless something is misconfigured.
+```sh
+cd client
+./build.sh
+./client.sh
+```
 
-5. Optionally run it as a service, via install-service.sh (must be ran as sudo)
-#### Windows client
-1. cd into the client dictory and run 
-   ```powershell
-   .\build.ps1
-   ```
-2. Run the launcher:
-   ```powershell
-   .\client.ps1
-   ```
-3. Setup the client with the correct token and server IP.
+Open the dashboard at `http://127.0.0.1:7003`, enter your server IP and setup token, then click **Save + restart agent**.
 
-4. Click "Save + restart agent", it should connect successfully to the server, unless something is misconfigured.
+#### Windows (experimental)
 
-5. Additional note, windows is considered experimental, and untested. Expect bugs!
+```powershell
+cd client
+.\build.ps1
+.\client.ps1
+```
 
-## Run in the background (daemon) on Linux
+Open `http://127.0.0.1:7003` and configure the server IP and token.
 
-If you launch the server from a SSH, it will close when the SSH tunnel is terminated / closed. If you launch the client from the terminal, and it closes, the client will close.
+> Windows support is experimental and not fully tested. Expect rough edges.
 
-Use systemd so it keeps running in the background and can auto-restart.
+### Systemd Services
 
-### Server systemd service
+Running via SSH or terminal means the process dies when the session ends. Use systemd to keep it alive.
 
-- Build once: `cd server && ./build.sh`
-- Install + start (requires sudo): `sudo sh ./server/install-service.sh`
-- Logs: `journalctl -u hostit-server.service -f`
-- Stop completely: `sudo systemctl stop hostit-server.service`
+| Service | Unit | Logs |
+|---------|------|------|
+| Server | `hostit-server.service` | `journalctl -u hostit-server.service -f` |
+| Agent | `hostit-agent.service` | `journalctl -u hostit-agent.service -f` |
 
-### Agent systemd service
+```sh
+# Server
+cd server && ./build.sh
+sudo sh server/install-service.sh
 
-- Build once: `cd client && ./build.sh`
-- Install + start (requires sudo): `sudo sh ./client/install-service.sh`
-- Logs: `journalctl -u hostit-agent.service -f`
-- Stop completely: `sudo systemctl stop hostit-agent.service`
+# Agent
+cd client && ./build.sh
+sudo sh client/install-service.sh
 
-### Restart/exit from inside the app
+# Stop
+sudo systemctl stop hostit-server.service
+sudo systemctl stop hostit-agent.service
+```
 
-Both dashboards now include **Process → Restart / Exit**.
-- When running under systemd, clicking these will terminate the process and systemd will bring it back.
-- If not running under systemd, it will just exit.
+Both dashboards include **Process → Restart / Exit**. Under systemd, these terminate the process and systemd restarts it automatically.
 
 ## Developer Integration
 
-HostIt provides a Go SDK that lets your application register tunnel routes through a running HostIt agent. Your app talks to the local agent on `127.0.0.1:7003`, and the agent handles the rest — server negotiation, domain selection, conflict resolution.
+HostIt provides a Go SDK for registering and managing tunnels programmatically. Your app talks to the local agent at `http://127.0.0.1:7003` — the agent handles server negotiation, domain selection, and conflict resolution.
 
-### Import
+### Setup
 
-Add the SDK to your project:
-
-```sh
-go get github.com/32bitx64bit/HostIt/shared/sdk
-```
-
-Then in your `go.mod`, add a replace directive pointing to the local path (since the shared module isn't published separately yet):
+Clone the repository and use a `replace` directive to point at the local `shared` module:
 
 ```
-require github.com/32bitx64bit/HostIt/shared v0.0.0
-replace github.com/32bitx64bit/HostIt/shared => ./path/to/HostIt/shared
+require hostit/shared v0.0.0
+replace hostit/shared => ./path/to/HostIt/shared
+```
+
+Then import the SDK:
+
+```go
+import "hostit/shared/sdk"
 ```
 
 ### Basic Usage
 
 ```go
-import "github.com/32bitx64bit/HostIt/shared/sdk"
+client := sdk.NewClient("http://127.0.0.1:7003")
 
-func main() {
-    client := sdk.NewClient("http://127.0.0.1:7003")
-
-    resp, err := client.Register(ctx, sdk.RegisterRequest{
-        Name:      "my-app",
-        Proto:     "tcp",
-        LocalPort: 3000,
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    fmt.Printf("Tunnel active: %s -> %s\n", resp.PublicAddr, resp.LocalAddr)
+resp, err := client.Register(ctx, sdk.RegisterRequest{
+    Name:      "my-app",
+    Proto:     "tcp",
+    LocalPort: 3000,
+})
+if err != nil {
+    log.Fatal(err)
 }
+
+fmt.Printf("Tunnel active: %s -> %s\n", resp.PublicAddr, resp.LocalAddr)
 ```
 
-The agent API is open on localhost. All responses use a JSON envelope:
+All API responses use a JSON envelope that the SDK unwraps automatically:
 
 ```json
-// Success
-{"status": "ok", "data": {...}}
-
-// Error
+{"status": "ok",    "data": {...}}
 {"status": "error", "message": "..."}
 ```
 
-The SDK unwraps this automatically.
-
 ### Domain Routing
 
-If the server has the domain manager enabled, your app can request a domain:
+When the server's domain manager is enabled:
 
 ```go
 resp, err := client.Register(ctx, sdk.RegisterRequest{
@@ -150,21 +150,19 @@ resp, err := client.Register(ctx, sdk.RegisterRequest{
 - `"auto"` — auto-suggests `my-app.<base-domain>`, prompts for selection if taken
 - `"app.example.com"` — explicit domain, fails if already in use
 
-When `resp.Status == "pending_domain"`, list available domains and let the user pick:
+When `resp.Status == "pending_domain"`, present available domains to the user:
 
 ```go
 domains, _ := client.ListDomains(ctx)
-// Present domains to user...
 resp, _ = client.SelectDomain(ctx, resp.RequestID, resp.RouteName, "my-app.example.com")
 ```
 
 ### Updating Routes
 
-Change a route's local port without re-registering (useful when your app restarts on a different port):
+Change a route's local port without re-registering:
 
 ```go
 client.UpdateRoute(ctx, "my-app", sdk.RouteUpdate{
-    Name:      "my-app",
     LocalAddr: "127.0.0.1:4000",
 })
 ```
@@ -172,69 +170,60 @@ client.UpdateRoute(ctx, "my-app", sdk.RouteUpdate{
 ### Other Operations
 
 ```go
-routes, _ := client.ListRoutes(ctx)       // all active routes
-stats, _ := client.RouteStats(ctx, "my-app") // per-route status
-client.RemoveRoute(ctx, "my-app")         // unregister
-status, _ := client.Status(ctx)           // agent connection status
-wsURL := client.EventsURL()               // WebSocket URL for real-time events
+routes, _ := client.ListRoutes(ctx)               // all active routes
+stats, _  := client.RouteStats(ctx, "my-app")      // per-route status
+client.RemoveRoute(ctx, "my-app")                   // unregister
+status, _ := client.Status(ctx)                     // agent connection status
+wsURL    := client.EventsURL()                      // WebSocket URL for live events
 ```
 
 ### Email Account Management
 
-If the agent has the email service enabled, you can manage accounts through the SDK:
+When the agent's email service is enabled:
 
 ```go
-// Create a new email account
 acct, err := client.CreateMailAccount(ctx, "alice", "password123")
-if err != nil {
-    log.Fatal(err)
-}
 fmt.Printf("Created: %s\n", acct.Address) // alice@<domain>
 
-// Change password
-err = client.UpdateMailAccountPassword(ctx, "alice", "newpassword456")
-
-// Delete account (and all its messages)
-err = client.DeleteMailAccount(ctx, "alice")
+client.UpdateMailAccountPassword(ctx, "alice", "newpassword456")
+client.DeleteMailAccount(ctx, "alice")
 ```
 
-These correspond to the agent's HTTP endpoints:
-- `GET /api/mail/accounts` — list all accounts
-- `POST /api/mail/accounts` — create account
-- `PATCH /api/mail/accounts/{username}` — change password
-- `DELETE /api/mail/accounts/{username}` — delete account
+HTTP endpoints:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/mail/accounts` | List all accounts |
+| `POST` | `/api/mail/accounts` | Create account |
+| `PATCH` | `/api/mail/accounts/{username}` | Change password |
+| `DELETE` | `/api/mail/accounts/{username}` | Delete account |
 
 ### Email Message Operations
 
-Read and manage messages for a specific account:
-
 ```go
-// Authenticate and get the account address
-addr, err := client.AuthenticateMail(ctx, "alice", "password123")
+addr, _ := client.AuthenticateMail(ctx, "alice", "password123")
 
-// List inbox messages
-msgs, err := client.ListMailMessages(ctx, "alice", "password123")
+msgs, _ := client.ListMailMessages(ctx, "alice", "password123")
 for _, m := range msgs {
     fmt.Printf("[%d] %s - %s\n", m.ID, m.From, m.Subject)
 }
 
-// Read a full message
-full, err := client.GetMailMessage(ctx, "alice", "password123", 42)
+full, _ := client.GetMailMessage(ctx, "alice", "password123", 42)
 fmt.Println(full.Body)
 
-// Delete a message
-err = client.DeleteMailMessage(ctx, "alice", "password123", 42)
+client.DeleteMailMessage(ctx, "alice", "password123", 42)
 ```
 
-Endpoints:
-- `POST /api/mail/login` — authenticate, returns address
-- `POST /api/mail/inbox` — list messages
-- `POST /api/mail/message` — read full message
-- `POST /api/mail/delete` — delete message
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/mail/login` | Authenticate, returns email address |
+| `POST` | `/api/mail/inbox` | List messages |
+| `POST` | `/api/mail/message` | Read full message with body |
+| `POST` | `/api/mail/delete` | Delete message |
 
 ### Declarative Config (apps.json)
 
-For apps that always need the same routes, place an `apps.json` next to `agent.json`:
+Place an `apps.json` next to `agent.json` for routes that should always be registered:
 
 ```json
 {
@@ -256,5 +245,4 @@ For apps that always need the same routes, place an `apps.json` next to `agent.j
 }
 ```
 
-Routes with `auto_start: true` register automatically when the agent connects to the server.
-
+Routes with `"auto_start": true` register automatically when the agent connects to the server.
