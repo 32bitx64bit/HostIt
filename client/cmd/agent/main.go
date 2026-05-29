@@ -1331,6 +1331,31 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	mux.HandleFunc("/api/mail/lock", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if mailSvc == nil {
+			writeError(w, http.StatusServiceUnavailable, "mail service unavailable")
+			return
+		}
+		var req struct {
+			Locked bool `json:"locked"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad request")
+			return
+		}
+		if err := mailSvc.SetSDKLock(req.Locked); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeOK(w, map[string]any{"locked": req.Locked, "enabled": mailSvc.Config().Enabled})
+	})
+
 	mux.HandleFunc("/mail", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")

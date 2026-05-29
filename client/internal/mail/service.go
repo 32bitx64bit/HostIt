@@ -38,6 +38,7 @@ const outboundSMTPAttemptTimeout = 45 * time.Second
 
 type Status struct {
 	Enabled           bool      `json:"enabled"`
+	LockedBySDK       bool      `json:"lockedBySDK"`
 	Running           bool      `json:"running"`
 	Domain            string    `json:"domain,omitempty"`
 	MailHost          string    `json:"mailHost,omitempty"`
@@ -74,6 +75,7 @@ type Service struct {
 	mu             sync.RWMutex
 	cfg            emailcfg.Config
 	status         Status
+	lockedBySDK    bool
 	started        bool
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -143,6 +145,10 @@ func NewService(dataDir string) (*Service, error) {
 	}
 	cfg, _ := s.loadConfig(context.Background())
 	s.cfg = cfg
+	s.lockedBySDK, _ = s.loadSDKLock(context.Background())
+	if s.lockedBySDK {
+		s.cfg.Enabled = false
+	}
 	s.refreshStatusLocked("")
 	return s, nil
 }
@@ -180,6 +186,12 @@ func (s *Service) Stop() {
 
 func (s *Service) ApplyConfig(cfg emailcfg.Config) error {
 	cfg = emailcfg.Normalize(cfg)
+	s.mu.RLock()
+	locked := s.lockedBySDK
+	s.mu.RUnlock()
+	if locked {
+		cfg.Enabled = false
+	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -625,6 +637,7 @@ func (s *Service) refreshStatusLocked(lastErr string) {
 	storageUsed, _ := s.storageUsageLocked()
 	s.status = Status{
 		Enabled:           s.cfg.Enabled,
+		LockedBySDK:       s.lockedBySDK,
 		Running:           s.started && s.cfg.Enabled,
 		Domain:            s.cfg.Domain,
 		MailHost:          s.cfg.EffectiveMailHost(),
@@ -653,6 +666,50 @@ func (s *Service) refreshStatusLocked(lastErr string) {
 		LastError:         lastErr,
 		UpdatedAt:         time.Now(),
 	}
+}
+
+func (s *Service) loadSDKLock(ctx context.Context) (bool, error) {
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM config WHERE key = 'mail_sdk_lock'`).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	var v bool
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return false, err
+	}
+	return v, nil
+}
+
+func (s *Service) SetSDKLock(locked bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	payload, _ := json.Marshal(locked)
+	_, err := s.db.Exec(`INSERT INTO config(key, value) VALUES('mail_sdk_lock', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, string(payload))
+	if err != nil {
+		return err
+	}
+	s.lockedBySDK = locked
+	if locked && s.cfg.Enabled {
+		s.cfg.Enabled = false
+		if err := s.saveConfigLocked(s.cfg); err != nil {
+			return err
+		}
+		if s.started {
+			return s.restartServersLocked("")
+		}
+	}
+	s.refreshStatusLocked("")
+	return nil
+}
+
+func (s *Service) IsSDKLocked() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lockedBySDK
 }
 
 func (s *Service) countAccountsLocked() (int, error) {

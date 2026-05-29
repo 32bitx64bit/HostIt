@@ -672,3 +672,34 @@ func TestClientUpdateRouteInvalidLocalAddr(t *testing.T) {
 		t.Fatal("expected error for invalid LocalAddr")
 	}
 }
+
+func TestClientLockMailService(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/mail/lock" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var req map[string]bool
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErrorResponse(w, http.StatusBadRequest, "bad request")
+			return
+		}
+		writeOKResponse(w, http.StatusOK, map[string]any{
+			"locked":  req["locked"],
+			"enabled": false,
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	if err := client.LockMailService(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.LockMailService(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+}

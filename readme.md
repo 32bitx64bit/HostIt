@@ -221,6 +221,26 @@ client.DeleteMailMessage(ctx, "alice", "password123", 42)
 | `POST` | `/api/mail/message` | Read full message with body |
 | `POST` | `/api/mail/delete` | Delete message |
 
+### Taking Over Mail with the SDK Lock
+
+If your application wants to run its own mail server and prevent the built-in mail service from being accidentally re-enabled, use the SDK lock:
+
+```go
+client.LockMailService(ctx, true)
+```
+
+When locked:
+- The built-in mail service is forced disabled, even if the server dashboard tries to enable it
+- The lock persists across agent restarts
+- `lockedBySDK` is reported as `true` in the agent's `/api/status` under `email`
+- Your app can use HostIt's TCP tunnels to expose your own mail server on standard ports (25, 465, 587, 143, 993)
+
+Release the lock when your app shuts down:
+
+```go
+client.LockMailService(ctx, false)
+```
+
 ### Declarative Config (apps.json)
 
 Place an `apps.json` next to `agent.json` for routes that should always be registered:

@@ -388,6 +388,24 @@ func (c *Client) DeleteMailMessage(ctx context.Context, username, password strin
 	return decodeResponse(resp, nil)
 }
 
+func (c *Client) LockMailService(ctx context.Context, locked bool) error {
+	body, err := json.Marshal(map[string]bool{"locked": locked})
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/lock", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return decodeResponse(resp, nil)
+}
+
 func (c *Client) EventsURL() string {
 	return strings.Replace(c.baseURL, "http", "ws", 1) + "/api/v1/events"
 }
