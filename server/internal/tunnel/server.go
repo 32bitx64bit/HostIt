@@ -307,6 +307,8 @@ func (s *Server) Dashboard(now time.Time) DashboardSnapshot {
 type routeConfig struct {
 	enabled     bool
 	isEncrypted bool
+	udpCipher   cipher.AEAD
+	derivedKey  []byte
 }
 
 func (s *Server) updateRouteCache() {
@@ -318,6 +320,8 @@ func (s *Server) updateRouteCache() {
 		newCache[rt.Name] = routeConfig{
 			enabled:     rt.IsEnabled(),
 			isEncrypted: rt.IsEncrypted(),
+			udpCipher:   s.udpCiphers[rt.Name],
+			derivedKey:  s.derivedKeys[rt.Name],
 		}
 	}
 	s.routeCache.Store(newCache)
@@ -329,6 +333,8 @@ func (s *Server) updateRouteCacheLocked() {
 		newCache[rt.Name] = routeConfig{
 			enabled:     rt.IsEnabled(),
 			isEncrypted: rt.IsEncrypted(),
+			udpCipher:   s.udpCiphers[rt.Name],
+			derivedKey:  s.derivedKeys[rt.Name],
 		}
 	}
 	s.routeCache.Store(newCache)
@@ -1919,7 +1925,9 @@ func (s *Server) Start(ctx context.Context) error {
 				logging.Global().Errorf(logging.CatTCP, "failed to listen on public tcp %s: %v", rt.PublicAddr, err)
 				continue
 			}
+			s.mu.Lock()
 			s.publicTCP[rt.Name] = ln
+			s.mu.Unlock()
 			s.wg.Add(1)
 			go s.acceptPublicTCP(ln, rt.Name)
 		}
@@ -1936,7 +1944,9 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 			conn.SetReadBuffer(8 * 1024 * 1024)
 			conn.SetWriteBuffer(8 * 1024 * 1024)
+			s.mu.Lock()
 			s.publicUDP[rt.Name] = conn
+			s.mu.Unlock()
 			s.wg.Add(1)
 			go s.acceptPublicUDP(conn, rt.Name)
 		}
@@ -2282,7 +2292,7 @@ func (s *Server) acceptData(ln net.Listener) {
 		isEncrypted := rc.isEncrypted
 
 		if isEncrypted {
-			key := s.derivedKeys[routeName]
+			key := rc.derivedKey
 			if key == nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: key is nil", routeName)
 				conn.Close()
@@ -2562,7 +2572,6 @@ func (s *Server) acceptAgentUDP() {
 		if pkt.Type == protocol.TypeData {
 			s.mu.RLock()
 			pubConn, ok := s.publicUDP[routeName]
-			udpCipher := s.udpCiphers[routeName]
 			s.mu.RUnlock()
 
 			if !ok {
@@ -2577,10 +2586,10 @@ func (s *Server) acceptAgentUDP() {
 
 			payload := pkt.Payload
 			if rc.isEncrypted {
-				if udpCipher == nil {
+				if rc.udpCipher == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(udpCipher, decryptBuf, payload)
+				decrypted, err := crypto.DecryptUDP(rc.udpCipher, decryptBuf, payload)
 				if err != nil {
 					continue
 				}
@@ -2614,6 +2623,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 	encryptBuf := make([]byte, 65536)
 
 	addrStrCache := make(map[netip.AddrPort]string)
+	const maxAddrStrCache = 10000
 	var pkt protocol.Packet
 
 	var pendingBytes int64
@@ -2632,17 +2642,19 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		clientStr, ok := addrStrCache[addr]
 		if !ok {
 			clientStr = addr.String()
-			if len(addrStrCache) > 10000 {
-				addrStrCache = make(map[netip.AddrPort]string)
+			if len(addrStrCache) >= maxAddrStrCache {
+				// Evict a single arbitrary entry to stay bounded without the
+				// O(n) repopulation spike a full flush would cause.
+				for k := range addrStrCache {
+					delete(addrStrCache, k)
+					break
+				}
 			}
 			addrStrCache[addr] = clientStr
 		}
 
 		agentAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
 		agentUDPAt := time.Unix(0, s.agentUDPTime.Load())
-		s.mu.RLock()
-		udpCipher := s.udpCiphers[routeName]
-		s.mu.RUnlock()
 
 		if !agentAddr.IsValid() {
 			continue
@@ -2666,10 +2678,10 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 
 		payload := buf[:n]
 		if rc.isEncrypted {
-			if udpCipher == nil {
+			if rc.udpCipher == nil {
 				continue
 			}
-			encrypted, err := crypto.EncryptUDP(udpCipher, encryptBuf, payload)
+			encrypted, err := crypto.EncryptUDP(rc.udpCipher, encryptBuf, payload)
 			if err != nil {
 				continue
 			}

@@ -143,3 +143,10 @@ type AppConfig struct {
 	Encrypted  bool   `json:"encrypted,omitempty"`
 	AutoStart  bool   `json:"auto_start,omitempty"`
 }
+
+type APIKey struct {
+	Key              string   `json:"key"`
+	Label            string   `json:"label"`
+	Permissions      []string `json:"permissions"`
+	OwnedRoutePrefix string   `json:"owned_route_prefix,omitempty"`
+}
