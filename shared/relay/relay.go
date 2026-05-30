@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,15 +24,52 @@ var relayBufPool = sync.Pool{
 	},
 }
 
+// idleTimeoutConn refreshes a combined read/write deadline on activity so the
+// connection is torn down only after `timeout` with no traffic in EITHER
+// direction. To avoid a SetDeadline syscall on every Read/Write, the refresh is
+// throttled: the deadline is pushed forward at most once per `threshold`. This
+// keeps idle detection accurate to within `threshold` while removing per-chunk
+// syscall overhead on busy connections.
 type idleTimeoutConn struct {
 	net.Conn
-	timeout time.Duration
+	timeout         time.Duration
+	threshold       time.Duration
+	lastRefreshNano int64 // atomic; UnixNano of the last SetDeadline call
+}
+
+func newIdleTimeoutConn(c net.Conn, timeout time.Duration) *idleTimeoutConn {
+	threshold := timeout / 16
+	if threshold <= 0 {
+		threshold = timeout
+	}
+	now := time.Now()
+	c.SetDeadline(now.Add(timeout))
+	return &idleTimeoutConn{
+		Conn:            c,
+		timeout:         timeout,
+		threshold:       threshold,
+		lastRefreshNano: now.UnixNano(),
+	}
+}
+
+func (c *idleTimeoutConn) refresh() {
+	now := time.Now()
+	nowNano := now.UnixNano()
+	last := atomic.LoadInt64(&c.lastRefreshNano)
+	if nowNano-last < int64(c.threshold) {
+		return
+	}
+	// Only one goroutine wins the CAS and issues the syscall; the other
+	// direction's refresh in the same window is harmlessly skipped.
+	if atomic.CompareAndSwapInt64(&c.lastRefreshNano, last, nowNano) {
+		c.Conn.SetDeadline(now.Add(c.timeout))
+	}
 }
 
 func (c *idleTimeoutConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		c.Conn.SetDeadline(time.Now().Add(c.timeout))
+		c.refresh()
 	}
 	return n, err
 }
@@ -39,7 +77,7 @@ func (c *idleTimeoutConn) Read(p []byte) (int, error) {
 func (c *idleTimeoutConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	if n > 0 {
-		c.Conn.SetDeadline(time.Now().Add(c.timeout))
+		c.refresh()
 	}
 	return n, err
 }
@@ -60,11 +98,8 @@ func ProxyWithIdleTimeout(a, b net.Conn, idleTimeout time.Duration) {
 	}
 
 	if idleTimeout > 0 {
-		now := time.Now()
-		a.SetDeadline(now.Add(idleTimeout))
-		b.SetDeadline(now.Add(idleTimeout))
-		a = &idleTimeoutConn{Conn: a, timeout: idleTimeout}
-		b = &idleTimeoutConn{Conn: b, timeout: idleTimeout}
+		a = newIdleTimeoutConn(a, idleTimeout)
+		b = newIdleTimeoutConn(b, idleTimeout)
 	}
 
 	var (

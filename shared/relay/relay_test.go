@@ -173,6 +173,88 @@ func TestProxyWithIdleTimeout(t *testing.T) {
 	}
 }
 
+// TestProxyIdleTimeoutStaysAliveWhileActive verifies the throttled idle-timeout
+// refresh keeps a busy connection open: data is relayed continuously for well
+// over the idle timeout, then the connection is expected to close shortly after
+// traffic stops.
+func TestProxyIdleTimeoutStaysAliveWhileActive(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendLn.Close()
+
+	// Backend echoes every byte it receives.
+	go func() {
+		conn, err := backendLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 64)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				if _, werr := conn.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	frontLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frontLn.Close()
+
+	const idleTimeout = 200 * time.Millisecond
+	go func() {
+		frontConn, err := frontLn.Accept()
+		if err != nil {
+			return
+		}
+		backendConn, err := net.Dial("tcp", backendLn.Addr().String())
+		if err != nil {
+			_ = frontConn.Close()
+			return
+		}
+		ProxyWithIdleTimeout(frontConn, backendConn, idleTimeout)
+	}()
+
+	client, err := net.Dial("tcp", frontLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// Push data across several idle-timeout windows. If the throttled refresh
+	// were broken, the relay would tear the connection down mid-stream.
+	buf := make([]byte, 1)
+	for i := 0; i < 20; i++ {
+		_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := client.Write([]byte{byte(i)}); err != nil {
+			t.Fatalf("write %d failed (connection closed while active): %v", i, err)
+		}
+		if _, err := io.ReadFull(client, buf); err != nil {
+			t.Fatalf("read %d failed (connection closed while active): %v", i, err)
+		}
+		if buf[0] != byte(i) {
+			t.Fatalf("echo mismatch: got %d want %d", buf[0], i)
+		}
+		time.Sleep(idleTimeout / 4)
+	}
+
+	// Now stop sending; the relay should close the idle connection.
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(client, buf); err == nil {
+		t.Fatal("expected connection to close after going idle, but read succeeded")
+	}
+}
+
 func TestProxyPropagatesHalfClose(t *testing.T) {
 	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
