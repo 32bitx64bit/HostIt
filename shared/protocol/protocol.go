@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"sync"
+
+	"hostit/shared/netutil"
 )
 
 const (
@@ -91,22 +93,9 @@ func WritePacket(w io.Writer, p *Packet) error {
 		copy(buf[offset:], p.Payload)
 	}
 
-	for len(buf) > 0 {
-		n, err := w.Write(buf)
-		if n > 0 {
-			buf = buf[n:]
-		}
-		if err != nil {
-			packetBufPool.Put(bufPtr)
-			return err
-		}
-		if n == 0 {
-			packetBufPool.Put(bufPtr)
-			return io.ErrShortWrite
-		}
-	}
+	_, err := netutil.WriteAll(w, buf)
 	packetBufPool.Put(bufPtr)
-	return nil
+	return err
 }
 
 func ReadPacket(r io.Reader) (*Packet, error) {

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+
+	"hostit/shared/netutil"
 )
 
 func AuthenticateClient(conn net.Conn, token string) error {
@@ -20,7 +22,7 @@ func AuthenticateClient(conn net.Conn, token string) error {
 	buf := make([]byte, 64)
 	copy(buf[:32], clientNonce)
 	copy(buf[32:], clientMac)
-	if _, err := writeAll(conn, buf); err != nil {
+	if _, err := netutil.WriteAll(conn, buf); err != nil {
 		return fmt.Errorf("failed to write client auth: %w", err)
 	}
 
@@ -68,7 +70,7 @@ func AuthenticateServer(conn net.Conn, token string) error {
 	respBuf := make([]byte, 64)
 	copy(respBuf[:32], serverNonce)
 	copy(respBuf[32:], serverMac)
-	if _, err := writeAll(conn, respBuf); err != nil {
+	if _, err := netutil.WriteAll(conn, respBuf); err != nil {
 		return fmt.Errorf("failed to write server response: %w", err)
 	}
 

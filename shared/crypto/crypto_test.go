@@ -177,6 +177,78 @@ func TestWrapTCP(t *testing.T) {
 	}
 }
 
+// TestCryptoConnHalfClose guards the relay's half-close handshake: a wrapped
+// connection must satisfy CloseWrite/CloseRead and a CloseWrite must let the
+// peer drain buffered plaintext and then observe EOF (no truncation).
+func TestCryptoConnHalfClose(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer l.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := l.Accept()
+		if err == nil {
+			accepted <- c
+		}
+	}()
+
+	rawClient, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	rawServer := <-accepted
+
+	var wServer net.Conn
+	done := make(chan struct{})
+	go func() {
+		wServer, _ = WrapTCP(rawServer, key, false)
+		close(done)
+	}()
+	wClient, err := WrapTCP(rawClient, key, true)
+	if err != nil {
+		t.Fatalf("WrapTCP client failed: %v", err)
+	}
+	<-done
+	defer wClient.Close()
+	defer wServer.Close()
+
+	// The relay relies on these interface assertions.
+	if _, ok := wClient.(interface{ CloseWrite() error }); !ok {
+		t.Fatal("cryptoConn does not implement CloseWrite")
+	}
+	if _, ok := wClient.(interface{ CloseRead() error }); !ok {
+		t.Fatal("cryptoConn does not implement CloseRead")
+	}
+
+	payload := bytes.Repeat([]byte("half-close-payload:"), 1000)
+	writeErr := make(chan error, 1)
+	go func() {
+		if _, err := wClient.Write(payload); err != nil {
+			writeErr <- err
+			return
+		}
+		writeErr <- wClient.(interface{ CloseWrite() error }).CloseWrite()
+	}()
+
+	_ = rawServer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := io.ReadAll(wServer)
+	if err != nil {
+		t.Fatalf("ReadAll after CloseWrite failed: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("client write/close-write failed: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("peer received %d bytes, want %d (data truncated by half-close)", len(got), len(payload))
+	}
+}
+
 type shortWriteConn struct {
 	net.Conn
 	w        *bytes.Buffer

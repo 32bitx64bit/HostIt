@@ -14,25 +14,9 @@ import (
 	"sync"
 
 	"golang.org/x/crypto/pbkdf2"
-)
 
-func writeAll(w io.Writer, b []byte) (int, error) {
-	total := 0
-	for len(b) > 0 {
-		n, err := w.Write(b)
-		if n > 0 {
-			total += n
-			b = b[n:]
-		}
-		if err != nil {
-			return total, err
-		}
-		if n == 0 {
-			return total, io.ErrShortWrite
-		}
-	}
-	return total, nil
-}
+	"hostit/shared/netutil"
+)
 
 const (
 	AlgAES128 = "aes-128"
@@ -177,33 +161,11 @@ func buildNonce(seed *[gcmNonceSize]byte, counter uint64) [gcmNonceSize]byte {
 }
 
 func (c *cryptoConn) CloseRead() error {
-	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
-		return cr.CloseRead()
-	}
-	type netConner interface{ NetConn() net.Conn }
-	if wrapped, ok := c.Conn.(netConner); ok {
-		if nc := wrapped.NetConn(); nc != nil && nc != c.Conn {
-			if cr, ok := nc.(interface{ CloseRead() error }); ok {
-				return cr.CloseRead()
-			}
-		}
-	}
-	return c.Conn.Close()
+	return netutil.CloseRead(c.Conn)
 }
 
 func (c *cryptoConn) CloseWrite() error {
-	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	type netConner interface{ NetConn() net.Conn }
-	if wrapped, ok := c.Conn.(netConner); ok {
-		if nc := wrapped.NetConn(); nc != nil && nc != c.Conn {
-			if cw, ok := nc.(interface{ CloseWrite() error }); ok {
-				return cw.CloseWrite()
-			}
-		}
-	}
-	return c.Conn.Close()
+	return netutil.CloseWrite(c.Conn)
 }
 
 func (c *cryptoConn) NetConn() net.Conn {
@@ -296,7 +258,7 @@ func (c *cryptoConn) Write(b []byte) (n int, err error) {
 		c.gcm.Seal(buf[frameLenSize+gcmNonceSize:frameLenSize+gcmNonceSize], nonce[:], b[:chunk], nil)
 
 		totalLen := frameLenSize + frameBodyLen
-		_, werr := writeAll(c.Conn, buf[:totalLen])
+		_, werr := netutil.WriteAll(c.Conn, buf[:totalLen])
 		writeBufPool.Put(bufPtr)
 
 		if werr != nil {
