@@ -389,6 +389,7 @@ func (s *Server) dialMailOutboundTCP(conn net.Conn, target string) {
 		return
 	}
 	netutil.SetTCPKeepAlive(serverConn, tcpKeepAliveInterval)
+	netutil.SetTCPNoDelay(serverConn)
 	_ = conn.SetDeadline(time.Time{})
 	logging.Global().Infof(logging.CatTCP, "Mail outbound relay connected target=%s", remoteAddr.String())
 	go relay.ProxyWithIdleTimeout(serverConn, conn, mailRelayIdleTimeout)
@@ -2000,6 +2001,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			continue
 		}
 		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
+		netutil.SetTCPNoDelay(conn)
 
 		conn.SetDeadline(time.Now().Add(authDeadline))
 		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
@@ -2234,6 +2236,7 @@ func (s *Server) acceptData(ln net.Listener) {
 			continue
 		}
 		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
+		netutil.SetTCPNoDelay(conn)
 
 		handshakeDL := time.Now().Add(handshakeDeadline)
 		conn.SetDeadline(handshakeDL)
@@ -2340,6 +2343,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		}
 
 		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
+		netutil.SetTCPNoDelay(conn)
 		clientID := s.nextClientID()
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
 

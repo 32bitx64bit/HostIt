@@ -399,6 +399,7 @@ func (a *Agent) connectAndRun() error {
 		return fmt.Errorf("control dial failed: %w", err)
 	}
 	netutil.SetTCPKeepAlive(conn, 15*time.Second)
+	netutil.SetTCPNoDelay(conn)
 	a.mu.Lock()
 	a.controlConn = conn
 	a.mu.Unlock()
@@ -787,6 +788,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 					return
 				}
 				netutil.SetTCPKeepAlive(dataConn, 15*time.Second)
+				netutil.SetTCPNoDelay(dataConn)
 
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
 				if err := crypto.AuthenticateClient(dataConn, a.cfg.Token); err != nil {
@@ -838,6 +840,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				if tcpConn, ok := localConn.(*net.TCPConn); ok {
 					tcpConn.SetKeepAlive(true)
 					tcpConn.SetKeepAlivePeriod(15 * time.Second)
+					tcpConn.SetNoDelay(true)
 				}
 
 				if rt.Encrypted {
@@ -890,6 +893,7 @@ func dialLocalTCP(ctx context.Context, localAddr string) (net.Conn, error) {
 		conn, err := dialer.Dial("tcp", localAddr)
 		if err == nil {
 			netutil.SetTCPKeepAlive(conn, 15*time.Second)
+			netutil.SetTCPNoDelay(conn)
 			return conn, nil
 		}
 		lastErr = err
@@ -944,6 +948,7 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 		return nil, fmt.Errorf("dial data server %s: %w", cfg.DataAddr(), err)
 	}
 	netutil.SetTCPKeepAlive(dataConn, 15*time.Second)
+	netutil.SetTCPNoDelay(dataConn)
 
 	if err := dataConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		dataConn.Close()
