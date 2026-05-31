@@ -3,7 +3,7 @@
 [![Go Version](https://img.shields.io/badge/Go-1.26.1-00ADD8?logo=go)](https://go.dev/)
 [![Core License](https://img.shields.io/badge/core-AGPL--3.0-blue)](./LICENSE)
 [![SDK License](https://img.shields.io/badge/SDK-LGPL--3.0-blue)](./LICENSE-SDK)
-[![Release](https://img.shields.io/badge/release-v3.1.0-brightgreen)](https://github.com/32bitx64bit/HostIt/releases/latest)
+[![Release](https://img.shields.io/badge/release-v3.1.1-brightgreen)](https://github.com/32bitx64bit/HostIt/releases/latest)
 
 A high-performance, self-hosted tunneling service — an alternative to services like Playit.gg or Ngrok. Expose your local projects to the internet even when your ISP or router blocks port forwarding, with better security than raw port forwarding.
 
