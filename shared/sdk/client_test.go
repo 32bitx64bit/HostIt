@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-3.0-only
+
 package sdk
 
 import (
@@ -47,7 +49,7 @@ func TestClientRegister(t *testing.T) {
 
 		writeOKResponse(w, http.StatusOK, RegisterResponse{
 			Status:     "active",
-			RequestID: "req-1",
+			RequestID:  "req-1",
 			RouteName:  req.Name,
 			PublicAddr: ":9090",
 			LocalAddr:  "127.0.0.1:8080",
@@ -369,8 +371,8 @@ func TestClientUpdateRoute(t *testing.T) {
 			return
 		}
 		writeOKResponse(w, http.StatusOK, RegisterResponse{
-			Status:    "updated",
-			RouteName: "myapp",
+			Status:     "updated",
+			RouteName:  "myapp",
 			PublicAddr: ":9091",
 		})
 	}))

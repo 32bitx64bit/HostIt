@@ -1,7 +1,8 @@
 # HostIt
 
 [![Go Version](https://img.shields.io/badge/Go-1.26.1-00ADD8?logo=go)](https://go.dev/)
-[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
+[![Core License](https://img.shields.io/badge/core-AGPL--3.0-blue)](./LICENSE)
+[![SDK License](https://img.shields.io/badge/SDK-LGPL--3.0-blue)](./LICENSE-SDK)
 [![Release](https://img.shields.io/badge/release-v3.1.0-brightgreen)](https://github.com/32bitx64bit/HostIt/releases/latest)
 
 A high-performance, self-hosted tunneling service — an alternative to services like Playit.gg or Ngrok. Expose your local projects to the internet even when your ISP or router blocks port forwarding, with better security than raw port forwarding.
@@ -266,3 +267,14 @@ Place an `apps.json` next to `agent.json` for routes that should always be regis
 ```
 
 Routes with `"auto_start": true` register automatically when the agent connects to the server.
+
+## License
+
+HostIt uses a split license:
+
+- Core project components are licensed under the GNU Affero General Public License v3.0. This includes the server, agent, dashboards, tunnel runtime, mail runtime, and shared code outside the SDK integration surface.
+- The Go SDK integration surface is licensed under the GNU Lesser General Public License v3.0. This includes `shared/sdk` and the shared API type definitions in `shared/apitypes` that the SDK exposes.
+
+The LGPLv3 SDK license allows proprietary applications to use the SDK without requiring the application's own source code to be published solely because it links to or imports the SDK, subject to the LGPLv3 terms. Changes to the SDK integration surface itself remain covered by LGPLv3.
+
+`LICENSE-GPL` is included because LGPLv3 incorporates GPLv3 terms by reference. It supports the SDK license and does not change the core project license from AGPLv3.
