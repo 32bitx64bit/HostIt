@@ -44,6 +44,18 @@ func TestTokenInputHasNoDeadShowHideToggle(t *testing.T) {
 	}
 }
 
+func TestStatusPollersRecoverAfterDashboardRestart(t *testing.T) {
+	for name, html := range map[string]string{"dashboard": agentHomeHTML, "apps": agentAppsHTML} {
+		t.Run(name, func(t *testing.T) {
+			for _, want := range []string{"function scheduleReload()", "async function fetchJSON(url)", "AbortController", "Accept':'application/json'", "Syncing"} {
+				if !strings.Contains(html, want) {
+					t.Fatalf("template missing restart recovery fragment %q", want)
+				}
+			}
+		})
+	}
+}
+
 func containingLine(s string, start, end int) string {
 	lineStart := strings.LastIndex(s[:start], "\n")
 	if lineStart == -1 {

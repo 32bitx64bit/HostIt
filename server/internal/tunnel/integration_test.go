@@ -1,20 +1,55 @@
 package tunnel
 
 import (
+	"fmt"
+	"net"
 	"testing"
 	"time"
 
 	"hostit/shared/apitypes"
 )
 
+func freeTCPPortForIntegrationTest(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return port
+}
+
+func freeTCPPortsForIntegrationTest(t *testing.T, count int) []int {
+	t.Helper()
+	ports := make([]int, 0, count)
+	seen := make(map[int]bool, count)
+	for len(ports) < count {
+		port := freeTCPPortForIntegrationTest(t)
+		if seen[port] {
+			continue
+		}
+		seen[port] = true
+		ports = append(ports, port)
+	}
+	return ports
+}
+
+func singlePortRangeForIntegrationTest(port int) string {
+	return fmt.Sprintf("%d-%d", port, port)
+}
+
 func TestDynamicRouteRegisterConfirmRemove(t *testing.T) {
+	port := freeTCPPortForIntegrationTest(t)
 	s := NewServer(ServerConfig{
 		ControlAddr:          "127.0.0.1:0",
 		DataAddr:             "127.0.0.1:0",
 		Token:                "testtoken",
 		DisableTLS:           true,
 		PairTimeout:          3 * time.Second,
-		DynamicPortRange:     "40000-40100",
+		DynamicPortRange:     singlePortRangeForIntegrationTest(port),
 		DomainManagerEnabled: true,
 		DomainBase:           "example.com",
 		DomainHTTPSAddr:      "127.0.0.1:443",
@@ -68,20 +103,21 @@ func TestDynamicRouteRegisterConfirmRemove(t *testing.T) {
 }
 
 func TestDynamicRouteUpdateLocalAddr(t *testing.T) {
+	port := freeTCPPortForIntegrationTest(t)
 	s := NewServer(ServerConfig{
 		ControlAddr:      "127.0.0.1:0",
 		DataAddr:         "127.0.0.1:0",
 		Token:            "testtoken",
 		DisableTLS:       true,
 		PairTimeout:      3 * time.Second,
-		DynamicPortRange: "40100-40200",
+		DynamicPortRange: singlePortRangeForIntegrationTest(port),
 	}, nil)
 
 	s.mu.Lock()
 
 	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
 		RequestID: "e2e-2", Name: "myapp", Proto: "tcp",
-		LocalAddr: "127.0.0.1:3000", PublicPort: 40100, Source: "api",
+		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
 	if resp.Status != "active" {
 		t.Fatalf("register: Status = %q", resp.Status)
@@ -106,13 +142,14 @@ func TestDynamicRouteUpdateLocalAddr(t *testing.T) {
 }
 
 func TestDynamicRouteUpdateNonExistent(t *testing.T) {
+	port := freeTCPPortForIntegrationTest(t)
 	s := NewServer(ServerConfig{
 		ControlAddr:      "127.0.0.1:0",
 		DataAddr:         "127.0.0.1:0",
 		Token:            "testtoken",
 		DisableTLS:       true,
 		PairTimeout:      3 * time.Second,
-		DynamicPortRange: "40200-40300",
+		DynamicPortRange: singlePortRangeForIntegrationTest(port),
 	}, nil)
 
 	s.mu.Lock()
@@ -127,20 +164,21 @@ func TestDynamicRouteUpdateNonExistent(t *testing.T) {
 }
 
 func TestDynamicRoutePortConflictBetweenDynamic(t *testing.T) {
+	port := freeTCPPortForIntegrationTest(t)
 	s := NewServer(ServerConfig{
 		ControlAddr:      "127.0.0.1:0",
 		DataAddr:         "127.0.0.1:0",
 		Token:            "testtoken",
 		DisableTLS:       true,
 		PairTimeout:      3 * time.Second,
-		DynamicPortRange: "40300-40400",
+		DynamicPortRange: singlePortRangeForIntegrationTest(port),
 	}, nil)
 
 	s.mu.Lock()
 
 	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
 		RequestID: "e2e-pc1", Name: "app1", Proto: "tcp",
-		LocalAddr: "127.0.0.1:3000", PublicPort: 40300, Source: "api",
+		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
 	if r1.Status != "active" {
 		t.Fatalf("app1: Status = %q", r1.Status)
@@ -148,7 +186,7 @@ func TestDynamicRoutePortConflictBetweenDynamic(t *testing.T) {
 
 	r2 := s.processRouteRequestLocked(apitypes.RouteRequest{
 		RequestID: "e2e-pc2", Name: "app2", Proto: "tcp",
-		LocalAddr: "127.0.0.1:4000", PublicPort: 40300, Source: "api",
+		LocalAddr: "127.0.0.1:4000", PublicPort: port, Source: "api",
 	})
 	s.mu.Unlock()
 
@@ -158,13 +196,14 @@ func TestDynamicRoutePortConflictBetweenDynamic(t *testing.T) {
 }
 
 func TestDynamicRouteMultipleProtos(t *testing.T) {
+	ports := freeTCPPortsForIntegrationTest(t, 3)
 	s := NewServer(ServerConfig{
 		ControlAddr:      "127.0.0.1:0",
 		DataAddr:         "127.0.0.1:0",
 		Token:            "testtoken",
 		DisableTLS:       true,
 		PairTimeout:      3 * time.Second,
-		DynamicPortRange: "40400-40500",
+		DynamicPortRange: fmt.Sprintf("%d-%d", ports[0], ports[0]),
 	}, nil)
 
 	s.mu.Lock()
@@ -173,7 +212,7 @@ func TestDynamicRouteMultipleProtos(t *testing.T) {
 		name := "app-" + proto
 		resp := s.processRouteRequestLocked(apitypes.RouteRequest{
 			RequestID: "e2e-proto", Name: name, Proto: proto,
-			LocalAddr: "127.0.0.1:3000", PublicPort: 40400 + i, Source: "api",
+			LocalAddr: "127.0.0.1:3000", PublicPort: ports[i], Source: "api",
 		})
 		if resp.Status != "active" {
 			t.Errorf("proto %s: Status = %q, want active", proto, resp.Status)
@@ -184,19 +223,20 @@ func TestDynamicRouteMultipleProtos(t *testing.T) {
 }
 
 func TestRouteStats(t *testing.T) {
+	port := freeTCPPortForIntegrationTest(t)
 	s := NewServer(ServerConfig{
 		ControlAddr:      "127.0.0.1:0",
 		DataAddr:         "127.0.0.1:0",
 		Token:            "testtoken",
 		DisableTLS:       true,
 		PairTimeout:      3 * time.Second,
-		DynamicPortRange: "40500-40600",
+		DynamicPortRange: singlePortRangeForIntegrationTest(port),
 	}, nil)
 
 	s.mu.Lock()
 	s.processRouteRequestLocked(apitypes.RouteRequest{
 		RequestID: "e2e-st", Name: "statapp", Proto: "tcp",
-		LocalAddr: "127.0.0.1:3000", PublicPort: 40500, Source: "api",
+		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
 	s.mu.Unlock()
 
@@ -210,8 +250,9 @@ func TestRouteStats(t *testing.T) {
 	if stats.Source != "dynamic" {
 		t.Fatalf("Source = %q, want dynamic", stats.Source)
 	}
-	if stats.PublicAddr != ":40500" {
-		t.Fatalf("PublicAddr = %q, want :40500", stats.PublicAddr)
+	wantPublicAddr := fmt.Sprintf(":%d", port)
+	if stats.PublicAddr != wantPublicAddr {
+		t.Fatalf("PublicAddr = %q, want %s", stats.PublicAddr, wantPublicAddr)
 	}
 
 	allStats := s.AllRouteStats()
@@ -233,13 +274,14 @@ func TestRouteStats(t *testing.T) {
 }
 
 func TestDynamicRouteAutoDomainWithConfirm(t *testing.T) {
+	port := freeTCPPortForIntegrationTest(t)
 	s := NewServer(ServerConfig{
 		ControlAddr:          "127.0.0.1:0",
 		DataAddr:             "127.0.0.1:0",
 		Token:                "testtoken",
 		DisableTLS:           true,
 		PairTimeout:          3 * time.Second,
-		DynamicPortRange:     "40600-40700",
+		DynamicPortRange:     singlePortRangeForIntegrationTest(port),
 		DomainManagerEnabled: true,
 		DomainBase:           "example.com",
 		DomainHTTPSAddr:      "127.0.0.1:443",
@@ -262,13 +304,14 @@ func TestDynamicRouteAutoDomainWithConfirm(t *testing.T) {
 }
 
 func TestEffectiveRoutesIncludesDynamic(t *testing.T) {
+	port := freeTCPPortForIntegrationTest(t)
 	s := NewServer(ServerConfig{
 		ControlAddr:      "127.0.0.1:0",
 		DataAddr:         "127.0.0.1:0",
 		Token:            "testtoken",
 		DisableTLS:       true,
 		PairTimeout:      3 * time.Second,
-		DynamicPortRange: "40700-40800",
+		DynamicPortRange: singlePortRangeForIntegrationTest(port),
 		Routes: []RouteConfig{
 			{Name: "static-web", Proto: "tcp", PublicAddr: ":8080"},
 		},
@@ -277,7 +320,7 @@ func TestEffectiveRoutesIncludesDynamic(t *testing.T) {
 	s.mu.Lock()
 	s.processRouteRequestLocked(apitypes.RouteRequest{
 		RequestID: "e2e-er", Name: "dynamic-api", Proto: "tcp",
-		LocalAddr: "127.0.0.1:3000", PublicPort: 40700, Source: "api",
+		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
 
 	routes := effectiveRoutes(s.cfg, s.dynamicRoutes)
@@ -296,19 +339,20 @@ func TestEffectiveRoutesIncludesDynamic(t *testing.T) {
 }
 
 func TestBuildHelloIncludesDynamicRoutes(t *testing.T) {
+	port := freeTCPPortForIntegrationTest(t)
 	s := NewServer(ServerConfig{
 		ControlAddr:      "127.0.0.1:0",
 		DataAddr:         "127.0.0.1:0",
 		Token:            "testtoken",
 		DisableTLS:       true,
 		PairTimeout:      3 * time.Second,
-		DynamicPortRange: "40800-40900",
+		DynamicPortRange: singlePortRangeForIntegrationTest(port),
 	}, nil)
 
 	s.mu.Lock()
 	s.processRouteRequestLocked(apitypes.RouteRequest{
 		RequestID: "e2e-hi", Name: "hello-route", Proto: "tcp",
-		LocalAddr: "127.0.0.1:3000", PublicPort: 40800, Source: "api",
+		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
 
 	helloRoutes := buildHelloRoutes(s.cfg, s.dynamicRoutes)
@@ -320,20 +364,21 @@ func TestBuildHelloIncludesDynamicRoutes(t *testing.T) {
 }
 
 func TestDynamicRouteUpdatePortChange(t *testing.T) {
+	ports := freeTCPPortsForIntegrationTest(t, 2)
 	s := NewServer(ServerConfig{
 		ControlAddr:      "127.0.0.1:0",
 		DataAddr:         "127.0.0.1:0",
 		Token:            "testtoken",
 		DisableTLS:       true,
 		PairTimeout:      3 * time.Second,
-		DynamicPortRange: "40900-41000",
+		DynamicPortRange: fmt.Sprintf("%d-%d", ports[0], ports[0]),
 	}, nil)
 
 	s.mu.Lock()
 
 	s.processRouteRequestLocked(apitypes.RouteRequest{
 		RequestID: "e2e-pu", Name: "portchange", Proto: "tcp",
-		LocalAddr: "127.0.0.1:3000", PublicPort: 40900, Source: "api",
+		LocalAddr: "127.0.0.1:3000", PublicPort: ports[0], Source: "api",
 	})
 
 	if _, ok := s.publicTCP["portchange"]; !ok {
@@ -341,7 +386,7 @@ func TestDynamicRouteUpdatePortChange(t *testing.T) {
 	}
 
 	ack := s.processRouteUpdateLocked(apitypes.RouteUpdate{
-		RequestID: "e2e-pu2", Name: "portchange", PublicPort: 40901,
+		RequestID: "e2e-pu2", Name: "portchange", PublicPort: ports[1],
 	})
 	if ack.Status != "updated" {
 		t.Fatalf("update: Status = %q, want updated", ack.Status)
@@ -352,8 +397,9 @@ func TestDynamicRouteUpdatePortChange(t *testing.T) {
 	}
 
 	dr := s.dynamicRoutes["portchange"]
-	if dr.Route.PublicAddr != ":40901" {
-		t.Fatalf("PublicAddr = %q, want :40901", dr.Route.PublicAddr)
+	wantPublicAddr := fmt.Sprintf(":%d", ports[1])
+	if dr.Route.PublicAddr != wantPublicAddr {
+		t.Fatalf("PublicAddr = %q, want %s", dr.Route.PublicAddr, wantPublicAddr)
 	}
 
 	s.mu.Unlock()

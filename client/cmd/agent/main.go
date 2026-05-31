@@ -1997,6 +1997,9 @@ const agentHomeHTML = `<!doctype html>
 		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
 		function apiData(payload){return payload&&payload.status==='ok'&&Object.prototype.hasOwnProperty.call(payload,'data')?payload.data:payload;}
 		async function readAPI(res){return apiData(await res.json());}
+		var reloadScheduled=false;
+		function scheduleReload(){if(reloadScheduled)return;reloadScheduled=true;setTimeout(function(){location.reload();},1500);}
+		async function fetchJSON(url){var ctl=new AbortController();var timer=setTimeout(function(){ctl.abort();},5000);try{var res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'},signal:ctl.signal});var ct=res.headers.get('content-type')||'';if(res.redirected||ct.indexOf('application/json')<0){scheduleReload();throw new Error('dashboard response changed');}if(!res.ok)throw new Error('http '+res.status);return await readAPI(res);}finally{clearTimeout(timer);}}
 
 		var updPopup=document.getElementById('updatePopup');
 		var updVer=document.getElementById('updVer');
@@ -2005,7 +2008,7 @@ const agentHomeHTML = `<!doctype html>
 		var updLog=document.getElementById('updLog');
 		function sleep(ms){return new Promise(function(r){setTimeout(r,ms)});}
 		async function postU(p){try{await fetch(p,{method:'POST'});}catch(_){}}
-		async function fetchUpd(){try{var r=await fetch('/api/update/status',{cache:'no-store'});if(!r.ok)return null;return await readAPI(r);}catch(e){return null;}}
+		async function fetchUpd(){try{return await fetchJSON('/api/update/status');}catch(e){return null;}}
 		function setVis(v){if(updPopup)updPopup.style.display=v?'':'none';}
 		function renderSteps(st){
 			if(!updSteps)return;
@@ -2053,7 +2056,7 @@ const agentHomeHTML = `<!doctype html>
 		fetchUpd().then(renderUpd);
 		setInterval(function(){fetchUpd().then(renderUpd);},30000);
 
-		function setPill(el,ok,t){if(!el)return;el.classList.remove('ok','bad');el.classList.add(ok?'ok':'bad');el.textContent=t;}
+		function setPill(el,ok,t){if(!el)return;el.classList.remove('ok','bad','warn');el.classList.add(ok==='warn'?'warn':(ok?'ok':'bad'));el.textContent=t;}
 		function esc(s){return s==null?'':String(s);}
 		var svcPill=document.getElementById('svcPill');
 		var ctlPill=document.getElementById('ctlPill');
@@ -2115,9 +2118,7 @@ const agentHomeHTML = `<!doctype html>
 
 		async function pollOnce(){
 			try{
-				var res=await fetch('/api/status',{cache:'no-store'});
-				if(!res.ok)throw new Error('http '+res.status);
-				var j=await readAPI(res);
+				var j=await fetchJSON('/api/status');
 				setPill(svcPill,!!j.running,j.running?'Running':'Stopped');
 				setPill(ctlPill,!!j.connected,j.connected?'Connected':'Disconnected');
 				setPill(tokenPill,!!j.tokenSet,j.tokenSet?'Set':'Missing');
@@ -2140,7 +2141,7 @@ const agentHomeHTML = `<!doctype html>
 				if(errRow&&errText){if(j.lastErr){errRow.style.display='';errText.textContent=esc(j.lastErr);}else{errRow.style.display='none';}}
 				renderRoutes(j.routes);
 				if(liveText)liveText.textContent='Updated '+new Date().toLocaleTimeString();
-			}catch(e){if(liveText)liveText.textContent='Offline';}
+			}catch(e){setPill(svcPill,'warn','Syncing');setPill(ctlPill,'warn','Syncing');if(liveText)liveText.textContent='Syncing with agent...';}
 		}
 		bindDKIMCopy();
 		pollOnce();setInterval(pollOnce,2000);
@@ -2883,6 +2884,9 @@ const agentAppsHTML = `<!doctype html>
 		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
 		function apiData(payload){return payload&&payload.status==='ok'&&Object.prototype.hasOwnProperty.call(payload,'data')?payload.data:payload;}
 		async function readAPI(res){return apiData(await res.json());}
+		var reloadScheduled=false;
+		function scheduleReload(){if(reloadScheduled)return;reloadScheduled=true;setTimeout(function(){location.reload();},1500);}
+		async function fetchJSON(url){var ctl=new AbortController();var timer=setTimeout(function(){ctl.abort();},5000);try{var res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'},signal:ctl.signal});var ct=res.headers.get('content-type')||'';if(res.redirected||ct.indexOf('application/json')<0){scheduleReload();throw new Error('dashboard response changed');}if(!res.ok)throw new Error('http '+res.status);return await readAPI(res);}finally{clearTimeout(timer);}}
 
 		function esc(s){return s==null?'':String(s).replace(/[&<>"']/g,function(ch){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];});}
 		function fmtMs(ts){if(!ts)return '';try{return new Date(ts).toLocaleTimeString();}catch(e){return String(ts);}}
@@ -2925,16 +2929,14 @@ const agentAppsHTML = `<!doctype html>
 			while(eventLog.children.length>100){eventLog.removeChild(eventLog.lastChild);}
 		}
 
-		function setPill(el,ok,t){if(!el)return;el.classList.remove('ok','bad');el.classList.add(ok?'ok':'bad');el.textContent=t;}
+		function setPill(el,ok,t){if(!el)return;el.classList.remove('ok','bad','warn');el.classList.add(ok==='warn'?'warn':(ok?'ok':'bad'));el.textContent=t;}
 
 		async function pollOnce(){
 			try{
-				var res=await fetch('/api/status',{cache:'no-store'});
-				if(!res.ok)throw new Error('http '+res.status);
-				var j=await readAPI(res);
+				var j=await fetchJSON('/api/status');
 				setPill(connPill,!!j.connected,j.connected?'Connected':'Disconnected');
 				renderRoutes(j.routes);
-			}catch(e){}
+			}catch(e){setPill(connPill,'warn','Syncing');}
 		}
 
 		document.getElementById('btnRefresh').onclick=pollOnce;

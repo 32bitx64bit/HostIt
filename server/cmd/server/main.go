@@ -2403,10 +2403,25 @@ const serverStatsHTML = `<!doctype html>
     function fmtNum(n){ return Number(n||0).toLocaleString(); }
     function setPill(el,ok,t){
       if(!el)return;
-      el.className='pill '+(ok?'ok':'bad');
+			el.className='pill '+(ok==='warn'?'warn':(ok?'ok':'bad'));
       el.textContent=t;
     }
     function sleep(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
+		var reloadScheduled=false;
+		function scheduleReload(){ if(reloadScheduled)return; reloadScheduled=true; setTimeout(function(){ location.reload(); },1500); }
+		async function fetchJSON(url){
+			var ctl = new AbortController();
+			var timer = setTimeout(function(){ ctl.abort(); }, 5000);
+			try{
+				var res = await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'},signal:ctl.signal});
+				var ct = res.headers.get('content-type') || '';
+				if(res.redirected || ct.indexOf('application/json') < 0){ scheduleReload(); throw new Error('dashboard response changed'); }
+				if(!res.ok) throw new Error('http '+res.status);
+				return await res.json();
+			} finally {
+				clearTimeout(timer);
+			}
+		}
     async function postForm(p){
       try{ return await fetch(p,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'csrf='+encodeURIComponent(csrf)}); }catch(e){ return null; }
     }
@@ -2630,9 +2645,7 @@ const serverStatsHTML = `<!doctype html>
 
     async function poll(){
       try {
-        var res = await fetch('/api/stats',{cache:'no-store'});
-        if(!res.ok) throw new Error('http '+res.status);
-        var j = await res.json();
+				var j = await fetchJSON('/api/stats');
         if(j.bucketSec){
           window._bucketSec = j.bucketSec;
           var il = $('bwIntervalLabel'); if(il) il.textContent = '('+fmtInterval(j.bucketSec)+')';
@@ -2717,6 +2730,7 @@ const serverStatsHTML = `<!doctype html>
 				renderEventList($('udpGlobalLog'), globalUDP, 'No UDP events yet.');
 				renderEventList($('tcpGlobalLog'), globalTCP, 'No TCP events yet.');
       } catch(e){
+				setPill($('agentPill'),'warn','Syncing');
         if($('liveText')) $('liveText').textContent = 'Offline';
       }
     }
