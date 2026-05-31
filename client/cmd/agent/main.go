@@ -611,6 +611,20 @@ func maskToken(s string) string {
 	return "****" + s[len(s)-4:]
 }
 
+// mergeToken decides which token to persist when the config form is saved.
+// The token field is never pre-filled with the real (or masked) token, so a
+// blank submission means "keep the currently stored token". A value beginning
+// with "****" is treated the same way for backward compatibility with older
+// cached dashboard pages that still submitted the masked placeholder. Any other
+// value replaces the stored token.
+func mergeToken(oldToken, submitted string) string {
+	submitted = strings.TrimSpace(submitted)
+	if submitted == "" || strings.HasPrefix(submitted, "****") {
+		return oldToken
+	}
+	return submitted
+}
+
 func registerAppsFromConfig(ctx context.Context, ctrl *agentController, apps []apitypes.AppConfig) {
 	for _, app := range apps {
 		if !app.AutoStart {
@@ -740,18 +754,23 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	csrfToken := generateToken()
 
 	buildTemplateData := func(cfg agent.Config, running, connected bool, lastErr string, routes []agent.RemoteRoute) map[string]any {
+		hasToken := strings.TrimSpace(cfg.Token) != ""
+		tokenPlaceholder := "Enter token (required)"
+		if hasToken {
+			tokenPlaceholder = "Leave blank to keep current token (" + maskToken(cfg.Token) + ")"
+		}
 		data := map[string]any{
-			"Cfg":          cfg,
-			"Running":      running,
-			"Connected":    connected,
-			"HasToken":     strings.TrimSpace(cfg.Token) != "",
-			"TokenDisplay": maskToken(cfg.Token),
-			"LastErr":      lastErr,
-			"ConfigPath":   configPath,
-			"Version":      version.Current,
-			"Msg":          getMsg(),
-			"RoutesView":   makeRouteViews(routes),
-			"CSRFToken":    csrfToken,
+			"Cfg":              cfg,
+			"Running":          running,
+			"Connected":        connected,
+			"HasToken":         hasToken,
+			"TokenPlaceholder": tokenPlaceholder,
+			"LastErr":          lastErr,
+			"ConfigPath":       configPath,
+			"Version":          version.Current,
+			"Msg":              getMsg(),
+			"RoutesView":       makeRouteViews(routes),
+			"CSRFToken":        csrfToken,
 		}
 		if mailSvc != nil {
 			data["EmailStatus"] = mailSvc.Status()
@@ -1091,12 +1110,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		old, _, _, _, _ := ctrl.Get()
 		cfg := old
 		cfg.Server = strings.TrimSpace(r.Form.Get("server"))
-		submittedToken := strings.TrimSpace(r.Form.Get("token"))
-		if strings.HasPrefix(submittedToken, "****") {
-			cfg.Token = old.Token
-		} else {
-			cfg.Token = submittedToken
-		}
+		cfg.Token = mergeToken(old.Token, r.Form.Get("token"))
 		cfg.TLSPinSHA256 = strings.TrimSpace(r.Form.Get("tls_pin_sha256"))
 		if cfg.Server == "" {
 			writeError(w, http.StatusBadRequest, "server is required")
@@ -1927,8 +1941,8 @@ const agentHomeHTML = `<!doctype html>
 				</div>
 				<div>
 					<label>Token</label>
-					<div class="help">Required. Must match the server token.</div>
-					<input type="password" id="tokenInput" name="token" value="{{.TokenDisplay}}" /><button type="button" class="btn sm" onclick="var i=document.getElementById('tokenInput');i.type=i.type==='password'?'text':'password';this.textContent=i.type==='password'?'Show':'Hide'">Show</button>
+					<div class="help">Required. Must match the server token. Leave blank to keep the current token.</div>
+					<input type="text" id="tokenInput" name="token" value="" placeholder="{{.TokenPlaceholder}}" autocomplete="off" />
 				</div>
 				<div>
 					<label>TLS Pin (SHA256)</label>
@@ -1981,6 +1995,8 @@ const agentHomeHTML = `<!doctype html>
 		var csrfToken=csrfMeta?csrfMeta.content:'';
 		var origFetch=window.fetch;
 		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
+		function apiData(payload){return payload&&payload.status==='ok'&&Object.prototype.hasOwnProperty.call(payload,'data')?payload.data:payload;}
+		async function readAPI(res){return apiData(await res.json());}
 
 		var updPopup=document.getElementById('updatePopup');
 		var updVer=document.getElementById('updVer');
@@ -1989,7 +2005,7 @@ const agentHomeHTML = `<!doctype html>
 		var updLog=document.getElementById('updLog');
 		function sleep(ms){return new Promise(function(r){setTimeout(r,ms)});}
 		async function postU(p){try{await fetch(p,{method:'POST'});}catch(_){}}
-		async function fetchUpd(){try{var r=await fetch('/api/update/status',{cache:'no-store'});if(!r.ok)return null;return await r.json();}catch(e){return null;}}
+		async function fetchUpd(){try{var r=await fetch('/api/update/status',{cache:'no-store'});if(!r.ok)return null;return await readAPI(r);}catch(e){return null;}}
 		function setVis(v){if(updPopup)updPopup.style.display=v?'':'none';}
 		function renderSteps(st){
 			if(!updSteps)return;
@@ -2101,7 +2117,7 @@ const agentHomeHTML = `<!doctype html>
 			try{
 				var res=await fetch('/api/status',{cache:'no-store'});
 				if(!res.ok)throw new Error('http '+res.status);
-				var j=await res.json();
+				var j=await readAPI(res);
 				setPill(svcPill,!!j.running,j.running?'Running':'Stopped');
 				setPill(ctlPill,!!j.connected,j.connected?'Connected':'Disconnected');
 				setPill(tokenPill,!!j.tokenSet,j.tokenSet?'Set':'Missing');
@@ -2282,6 +2298,8 @@ const agentControlsHTML = `<!doctype html>
 		var origFetch=window.fetch;
 		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
 	})();
+	function apiData(payload){return payload&&payload.status==='ok'&&Object.prototype.hasOwnProperty.call(payload,'data')?payload.data:payload;}
+	async function readAPI(res){return apiData(await res.json());}
 	function esc(v){return String(v||'').replace(/[&<>"']/g,function(ch){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];});}
 	function fmtUnix(ts){if(!ts)return '—'; try{return new Date(ts*1000).toLocaleString();}catch(e){return String(ts);}}
 	function logClass(level){level=String(level||'').toLowerCase(); if(level==='warn')return 'warn'; if(level==='error'||level==='fatal')return 'error'; if(level==='debug')return 'debug'; if(level==='trace')return 'trace'; return 'info';}
@@ -2311,7 +2329,7 @@ const agentControlsHTML = `<!doctype html>
 		try{
 			var r=await fetch('/api/logs?level='+encodeURIComponent(level)+'&limit=300',{cache:'no-store'});
 			if(!r.ok){throw new Error(await r.text()||('http '+r.status));}
-			var payload=await r.json();
+			var payload=await readAPI(r);
 			renderLogs(payload);
 			if(state)state.textContent='Showing '+(((payload&&payload.entries)||[]).length)+' log entries.';
 		}catch(e){
@@ -2326,12 +2344,12 @@ const agentControlsHTML = `<!doctype html>
 		var log=document.getElementById('updateLog');
 		if(st.job&&st.job.log){log.style.display='block';log.textContent=st.job.log;}else{log.style.display='none';}
 	}
-	async function refreshUpd(){var r=await fetch('/api/update/status',{cache:'no-store'});if(r.ok)setUpd(await r.json());}
+	async function refreshUpd(){var r=await fetch('/api/update/status',{cache:'no-store'});if(r.ok)setUpd(await readAPI(r));}
 	async function checkNow(){
 		document.getElementById('updateState').textContent='Checking…';
 		var r=await fetch('/api/update/check-now',{method:'POST'});
 		if(!r.ok){try{var t=await r.text();document.getElementById('updateState').textContent='Failed: '+t;}catch(e){}return;}
-		setUpd(await r.json());
+		setUpd(await readAPI(r));
 	}
 	async function applyUpd(){
 		document.getElementById('updateState').textContent='Starting…';
@@ -2357,7 +2375,7 @@ const agentControlsHTML = `<!doctype html>
 		document.getElementById('systemdState').textContent=st.available?(st.active||'unknown'):'unavailable';
 		document.getElementById('systemdMsg').textContent=st.error||'—';
 	}
-	async function refreshSys(){var r=await fetch('/api/systemd/status',{cache:'no-store'});if(r.ok)setSys(await r.json());}
+	async function refreshSys(){var r=await fetch('/api/systemd/status',{cache:'no-store'});if(r.ok)setSys(await readAPI(r));}
 	async function sysAction(p,t){
 		document.getElementById('systemdMsg').textContent=t;
 		var r=await fetch(p,{method:'POST'});
@@ -2531,6 +2549,8 @@ const agentMailHTML = `<!doctype html>
 		var csrfToken=csrfMeta?csrfMeta.content:'';
 		var origFetch=window.fetch;
 		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
+		function apiData(payload){return payload&&payload.status==='ok'&&Object.prototype.hasOwnProperty.call(payload,'data')?payload.data:payload;}
+		async function readAPI(res){return apiData(await res.json());}
 
 		var creds = null; // {username, password}
 		var currentAddress = '';
@@ -2614,7 +2634,7 @@ const agentMailHTML = `<!doctype html>
 		}
 
 		// Load accounts
-		fetch('/api/mail/accounts').then(function(r){return r.json()}).then(function(accts){
+		fetch('/api/mail/accounts').then(readAPI).then(function(accts){
 			acctSelect.innerHTML='';
 			if(!accts||accts.length===0){
 				acctSelect.innerHTML='<option value="">No accounts</option>';
@@ -2638,7 +2658,7 @@ const agentMailHTML = `<!doctype html>
 			fetch('/api/mail/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})})
 			.then(function(r){
 				if(!r.ok) throw new Error('Invalid credentials');
-				return r.json();
+				return readAPI(r);
 			})
 			.then(function(data){
 				creds={username:u,password:p};
@@ -2665,7 +2685,7 @@ const agentMailHTML = `<!doctype html>
 			fetch('/api/mail/inbox',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(creds)})
 			.then(function(r){
 				if(!r.ok) throw new Error('Failed to load inbox');
-				return r.json();
+				return readAPI(r);
 			})
 			.then(function(msgs){
 				currentMessages=Array.isArray(msgs)?msgs:[];
@@ -2689,7 +2709,7 @@ const agentMailHTML = `<!doctype html>
 			fetch('/api/mail/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:creds.username,password:creds.password,messageId:id})})
 			.then(function(r){
 				if(!r.ok) throw new Error('Failed to load message');
-				return r.json();
+				return readAPI(r);
 			})
 			.then(function(msg){
 				document.getElementById('msgFrom').textContent=msg.from;
@@ -2861,6 +2881,8 @@ const agentAppsHTML = `<!doctype html>
 		var csrfToken=csrfMeta?csrfMeta.content:'';
 		var origFetch=window.fetch;
 		window.fetch=function(url,opts){opts=opts||{};if(opts.method&&opts.method.toUpperCase()!=='GET'&&opts.method.toUpperCase()!=='HEAD'){opts.headers=opts.headers||{};if(typeof opts.headers==='object'&&!opts.headers['X-CSRF-Token']){opts.headers['X-CSRF-Token']=csrfToken;}}return origFetch(url,opts);};
+		function apiData(payload){return payload&&payload.status==='ok'&&Object.prototype.hasOwnProperty.call(payload,'data')?payload.data:payload;}
+		async function readAPI(res){return apiData(await res.json());}
 
 		function esc(s){return s==null?'':String(s).replace(/[&<>"']/g,function(ch){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];});}
 		function fmtMs(ts){if(!ts)return '';try{return new Date(ts).toLocaleTimeString();}catch(e){return String(ts);}}
@@ -2909,7 +2931,7 @@ const agentAppsHTML = `<!doctype html>
 			try{
 				var res=await fetch('/api/status',{cache:'no-store'});
 				if(!res.ok)throw new Error('http '+res.status);
-				var j=await res.json();
+				var j=await readAPI(res);
 				setPill(connPill,!!j.connected,j.connected?'Connected':'Disconnected');
 				renderRoutes(j.routes);
 			}catch(e){}
