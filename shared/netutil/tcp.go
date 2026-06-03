@@ -75,8 +75,14 @@ func SetTCPNoDelay(conn net.Conn) bool {
 
 // WriteAll writes all of b to w, looping over partial writes until the buffer
 // is fully drained or an error occurs. It returns io.ErrShortWrite if the
-// writer reports zero bytes written without an error.
+// writer reports zero bytes written without an error. For *net.TCPConn and
+// related stdlib types, the standard library's Write already loops on
+// short writes, so we skip our outer loop and call Write once.
 func WriteAll(w io.Writer, b []byte) (int, error) {
+	switch w.(type) {
+	case *net.TCPConn, *net.UDPConn, *net.UnixConn, *net.IPConn:
+		return w.Write(b)
+	}
 	total := 0
 	for len(b) > 0 {
 		n, err := w.Write(b)
