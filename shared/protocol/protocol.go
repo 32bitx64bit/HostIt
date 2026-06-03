@@ -41,6 +41,13 @@ const MaxPayloadSize = 64*1024 - 1 // Maximum payload frameable in uint16 length
 
 const maxPacketBufSize = 5 + 255 + 255 + MaxPayloadSize
 
+type Packet struct {
+	Type    byte
+	Route   string
+	Client  string
+	Payload []byte
+}
+
 var (
 	packetBufPool = sync.Pool{
 		New: func() interface{} {
@@ -56,11 +63,16 @@ var (
 	}
 )
 
-type Packet struct {
-	Type    byte
-	Route   string
-	Client  string
-	Payload []byte
+type UDPScratch struct {
+	buf []byte
+}
+
+func (s *UDPScratch) resetFor(n int) {
+	if cap(s.buf) < n {
+		s.buf = make([]byte, n, n)
+	} else {
+		s.buf = s.buf[:n]
+	}
 }
 
 func WritePacket(w io.Writer, p *Packet) error {
@@ -236,7 +248,8 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	if len(data) < i+routeLen+1 {
 		return ErrInvalidPacket
 	}
-	p.Route = bytesToString(data[i : i+routeLen])
+
+	p.Route = string(data[i : i+routeLen])
 	i += routeLen
 
 	clientLen := int(data[i])
@@ -245,7 +258,7 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	if len(data) < i+clientLen {
 		return ErrInvalidPacket
 	}
-	p.Client = bytesToString(data[i : i+clientLen])
+	p.Client = string(data[i : i+clientLen])
 	i += clientLen
 
 	p.Payload = data[i:]

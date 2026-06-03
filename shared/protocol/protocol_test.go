@@ -332,6 +332,79 @@ func TestUnmarshalUDPToRejectsOutOfRangePacketType(t *testing.T) {
 	}
 }
 
+// TestUnmarshalUDPToStringsOutliveInputBuffer guards the contract that
+// p.Route and p.Client returned by UnmarshalUDPTo are independent of the
+// input buffer, even though they are stored in the Packet's own scratch
+// (not aliased to the caller's reused read buffer). The production UDP
+// hot path reuses its read buffer for every datagram, so the next
+// ReadFromUDPAddrPort must not invalidate strings from the previous
+// parse. This was the bug that broke UDP forwarding (Sunshine remote
+// desktop showed a black screen because the route cache lookups were
+// returning the wrong route and silently dropping packets).
+func TestUnmarshalUDPToStringsOutliveInputBuffer(t *testing.T) {
+	// Wire format: [type:1][routeLen:1][route][clientLen:1][client][payload]
+	first := []byte{TypeData, 5, 'r', 'o', 'u', 't', 'e', 1, 'A'}
+	second := []byte{TypeData, 5, 'r', 'o', 'u', 't', 'e', 1, 'B'}
+
+	buf := make([]byte, 64)
+	copy(buf, first)
+
+	var pkt Packet
+	if err := UnmarshalUDPTo(buf[:len(first)], &pkt); err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Route != "route" || pkt.Client != "A" {
+		t.Fatalf("first read: route=%q client=%q, want route/A", pkt.Route, pkt.Client)
+	}
+
+	// Capture the strings. After the buffer is overwritten and the
+	// next datagram is parsed, these captured strings must still hold
+	// the first packet's route and client — they are copies into the
+	// Packet's own scratch, not aliases of buf.
+	routeA := pkt.Route
+	clientA := pkt.Client
+
+	for i := range buf {
+		buf[i] = 0
+	}
+	copy(buf, second)
+
+	if err := UnmarshalUDPTo(buf[:len(second)], &pkt); err != nil {
+		t.Fatal(err)
+	}
+	if routeA != "route" || clientA != "A" {
+		t.Fatalf("captured strings mutated after buffer reuse: routeA=%q clientA=%q, want route/A "+
+			"(UnmarshalUDPTo aliased the caller's buffer)", routeA, clientA)
+	}
+}
+
+func TestUnmarshalUDPToReusesReadBufferStress(t *testing.T) {
+	routes := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+	buf := make([]byte, 64)
+	var pkt Packet
+	for i := 0; i < 1000; i++ {
+		route := routes[i%len(routes)]
+		expected := []byte{TypeData, byte(len(route))}
+		expected = append(expected, []byte(route)...)
+		expected = append(expected, 1, 'A')
+
+		for j := range buf {
+			buf[j] = 0
+		}
+		copy(buf, expected)
+
+		if err := UnmarshalUDPTo(buf[:len(expected)], &pkt); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		if pkt.Route != route {
+			t.Fatalf("iter %d: route = %q, want %q (buffer aliasing?)", i, pkt.Route, route)
+		}
+		if pkt.Client != "A" {
+			t.Fatalf("iter %d: client = %q, want A (buffer aliasing?)", i, pkt.Client)
+		}
+	}
+}
+
 func TestReadPacketReturnsErrorForTruncatedFrames(t *testing.T) {
 	tests := []struct {
 		name string
