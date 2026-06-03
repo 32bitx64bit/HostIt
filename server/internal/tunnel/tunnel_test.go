@@ -486,9 +486,9 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 }
 
 func TestMailOutboundRelayRejectsLoopbackTarget(t *testing.T) {
-	// The security fix rejects loopback/private IPs and non-SMTP ports.
-	// This test verifies that a loopback echo target is properly rejected
-	// (server closes the data connection).
+	// Verifies a loopback echo target is rejected (server closes the
+	// data connection) so the outbound relay can't be used as a
+	// localhost proxy.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -533,7 +533,7 @@ func TestMailOutboundRelayRejectsLoopbackTarget(t *testing.T) {
 	if _, err := dataConn.Write(header); err != nil {
 		t.Fatal(err)
 	}
-	// The server should reject the loopback target and close the connection.
+	// Server should reject the loopback target and close the connection.
 	_ = dataConn.SetDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 64)
 	_, err := dataConn.Read(buf)
@@ -1301,6 +1301,95 @@ func TestRealisticSunshineScenario(t *testing.T) {
 
 func fakeAgent(ctx context.Context, controlAddr, dataAddr, localAddr string, token string) {
 	fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{"default": localAddr}, token)
+}
+
+// TestSameSourceIPConnectionsDoNotBlock guards the regression where dead or
+// long-lived connections from a single source IP would block new connections
+// from that IP. It holds a batch of paired connections and verifies a fresh
+// connection from the same loopback IP still pairs and echoes promptly.
+func TestSameSourceIPConnectionsDoNotBlock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	echoLn, echoAddr := startEcho(t)
+	defer echoLn.Close()
+
+	controlLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	controlAddr := controlLn.Addr().String()
+	controlLn.Close()
+
+	dataLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataAddr := dataLn.Addr().String()
+	dataLn.Close()
+
+	publicLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	publicAddr := publicLn.Addr().String()
+	publicLn.Close()
+
+	srv := NewServer(ServerConfig{ControlAddr: controlAddr, DataAddr: dataAddr, Routes: []RouteConfig{{Name: "default", Proto: "tcp", PublicAddr: publicAddr}}, Token: "testtoken", PairTimeout: 10 * time.Second, DisableTLS: true}, nil)
+	go func() { _ = srv.Run(ctx) }()
+
+	go fakeAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
+
+	waitEchoReady(t, publicAddr)
+
+	// roundTrip dials the public addr, sends a probe, and confirms the echo.
+	roundTrip := func(c net.Conn, payload string) error {
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Write([]byte(payload)); err != nil {
+			return err
+		}
+		buf := make([]byte, len(payload))
+		if _, err := io.ReadFull(c, buf); err != nil {
+			return err
+		}
+		if string(buf) != payload {
+			return fmt.Errorf("echo mismatch: got %q want %q", string(buf), payload)
+		}
+		return nil
+	}
+
+	// Hold a batch of paired connections from the same source IP (the
+	// number observed stacking before a restart was required).
+	const held = 14
+	var holdConns []net.Conn
+	defer func() {
+		for _, c := range holdConns {
+			_ = c.Close()
+		}
+	}()
+	for i := 0; i < held; i++ {
+		c, err := net.Dial("tcp", publicAddr)
+		if err != nil {
+			t.Fatalf("held dial %d: %v", i, err)
+		}
+		if err := roundTrip(c, fmt.Sprintf("held-%d\n", i)); err != nil {
+			t.Fatalf("held conn %d failed to pair: %v", i, err)
+		}
+		holdConns = append(holdConns, c)
+	}
+
+	// A fresh connection from the same loopback IP must still be served
+	// quickly while the previous ones remain open.
+	done := make(chan error, 1)
+	go func() {
+		c, err := net.Dial("tcp", publicAddr)
+		if err != nil {
+			done <- fmt.Errorf("fresh dial: %w", err)
+			return
+		}
+		defer c.Close()
+		done <- roundTrip(c, "fresh\n")
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("fresh connection from same IP blocked/failed: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("fresh connection from same IP did not complete: dead/held connections are blocking new ones")
+	}
 }
 
 func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAddrs map[string]string, token string) {

@@ -31,7 +31,7 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(5)
 	db.SetMaxIdleConns(2)
 
-	// Enable foreign key constraints
+	// SQLite requires this per-connection PRAGMA to enforce FK constraints.
 	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
@@ -200,7 +200,7 @@ func (s *Store) GetSession(ctx context.Context, sid string, ttl time.Duration) (
 		_ = s.DeleteSession(ctx, sid)
 		return 0, false, nil
 	}
-	// Sliding expiration: extend session lifetime on valid use
+	// Sliding expiration: extend session lifetime on valid use.
 	if ttl > 0 {
 		newExp := time.Now().Add(ttl).Unix()
 		_, _ = s.db.ExecContext(ctx, `UPDATE sessions SET expires_at = ? WHERE id = ?`, newExp, sid)

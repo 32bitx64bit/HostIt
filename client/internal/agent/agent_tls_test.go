@@ -9,13 +9,11 @@ import (
 func TestTLSConfigWithPin_WithoutPinRequiresExplicitInsecure(t *testing.T) {
 	t.Parallel()
 
-	// Without pin and without InsecureTLS, should error
 	_, err := tlsConfigWithPin(Config{})
 	if err == nil {
 		t.Fatal("tlsConfigWithPin(empty) error = nil, want error")
 	}
 
-	// Without pin but with InsecureTLS, should succeed
 	cfg, err := tlsConfigWithPin(Config{InsecureTLS: true})
 	if err != nil {
 		t.Fatalf("tlsConfigWithPin(InsecureTLS=true) error = %v, want nil", err)

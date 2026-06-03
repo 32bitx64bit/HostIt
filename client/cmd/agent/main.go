@@ -612,11 +612,11 @@ func maskToken(s string) string {
 }
 
 // mergeToken decides which token to persist when the config form is saved.
-// The token field is never pre-filled with the real (or masked) token, so a
-// blank submission means "keep the currently stored token". A value beginning
-// with "****" is treated the same way for backward compatibility with older
-// cached dashboard pages that still submitted the masked placeholder. Any other
-// value replaces the stored token.
+// The form never pre-fills the real token, so a blank submission means
+// "keep the current token"; a "****"-prefixed value is treated the same
+// way for backward compatibility with older cached dashboard pages that
+// still submitted the masked placeholder. Any other value replaces the
+// stored token.
 func mergeToken(oldToken, submitted string) string {
 	submitted = strings.TrimSpace(submitted)
 	if submitted == "" || strings.HasPrefix(submitted, "****") {
@@ -688,8 +688,9 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			if systemdutil.SystemctlAvailable() {
 				if err := syncInstalledAgentSystemdUnit(moduleDir); err != nil {
 					log.Printf("Failed to refresh installed systemd unit: %v", err)
-					// Continue with restart even if we can't refresh the unit file
-					// (common when running as non-root without write access to /etc/systemd/system)
+					// Continue even if we can't refresh the unit file
+					// (common when running as non-root without write
+					// access to /etc/systemd/system).
 				}
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
@@ -750,7 +751,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		return msg
 	}
 
-	// Generate a CSRF token for the session
+	// Generate a CSRF token for the session.
 	csrfToken := generateToken()
 
 	buildTemplateData := func(cfg agent.Config, running, connected bool, lastErr string, routes []agent.RemoteRoute) map[string]any {

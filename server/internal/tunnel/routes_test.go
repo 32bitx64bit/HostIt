@@ -136,9 +136,8 @@ func TestIsEmailRoute(t *testing.T) {
 }
 
 func TestWriteMailRouteUnavailable_NoPlaintextOnTLSRoutes(t *testing.T) {
-	// Verify that writeMailRouteUnavailable does NOT write plaintext data
-	// on implicit-TLS routes.  Sending plaintext to a client that expects
-	// TLS causes "first record does not look like a TLS handshake".
+	// Sending plaintext to a client that expects TLS causes
+	// "first record does not look like a TLS handshake".
 	for _, name := range []string{internalEmailSubmissionTLSRouteName, internalEmailIMAPTLSRouteName} {
 		client, server := net.Pipe()
 		defer client.Close()

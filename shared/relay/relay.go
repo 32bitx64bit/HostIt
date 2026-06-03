@@ -25,11 +25,10 @@ var relayBufPool = sync.Pool{
 }
 
 // idleTimeoutConn refreshes a combined read/write deadline on activity so the
-// connection is torn down only after `timeout` with no traffic in EITHER
-// direction. To avoid a SetDeadline syscall on every Read/Write, the refresh is
-// throttled: the deadline is pushed forward at most once per `threshold`. This
-// keeps idle detection accurate to within `threshold` while removing per-chunk
-// syscall overhead on busy connections.
+// connection is torn down only after `timeout` of silence in either direction.
+// The refresh is throttled to at most once per `threshold` to avoid a
+// SetDeadline syscall on every Read/Write, keeping idle detection accurate
+// to within `threshold` without per-chunk syscall overhead.
 type idleTimeoutConn struct {
 	net.Conn
 	timeout         time.Duration

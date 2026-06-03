@@ -352,7 +352,6 @@ func (s *Server) getRouteConfig(name string) (routeConfig, bool) {
 func isAllowedOutboundSMTPTarget(addr *net.TCPAddr) bool {
 	switch addr.Port {
 	case smtpPortStandard, smtpPortSubmissionTLS, smtpPortSubmission:
-		// allowed SMTP ports
 	default:
 		return false
 	}
@@ -550,9 +549,8 @@ func writeMailRouteUnavailable(conn net.Conn, routeName string) {
 	case internalEmailIMAPRouteName:
 		_, _ = io.WriteString(conn, "* BYE HostIt mail backend unavailable\r\n")
 	case internalEmailSubmissionTLSRouteName, internalEmailIMAPTLSRouteName:
-		// Implicit TLS – close silently; writing plaintext to a client
-		// that expects TLS would cause "first record does not look like
-		// a TLS handshake".
+		// Implicit TLS: close silently. Writing plaintext would trigger
+		// "first record does not look like a TLS handshake" on the client.
 	}
 	_ = conn.SetWriteDeadline(time.Time{})
 }
@@ -2354,6 +2352,10 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 
 		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
 		netutil.SetTCPNoDelay(conn)
+		// Reap public peers that vanish without a clean shutdown quickly,
+		// so the relay (and the agent's downstream session) is freed
+		// before the relay idle timeout.
+		netutil.TuneDeadPeerDetection(conn)
 		clientID := s.nextClientID()
 		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
 
@@ -2380,10 +2382,9 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		pendingKey := makePendingTCPKey(routeName, clientID)
 		s.mu.Lock()
 		if s.agentEpoch != epoch {
-			// Agent reconnected between capturing it and adding this
-			// pending entry. The abort already ran so this entry would
-			// be orphaned — reject immediately instead of hanging for
-			// PairTimeout.
+			// Agent reconnected mid-handshake: the abort already ran and
+			// this entry would be orphaned, so reject now instead of
+			// waiting for PairTimeout.
 			s.mu.Unlock()
 			<-sem
 			logging.Global().Warnf(logging.CatTCP, "agent epoch changed, rejecting stale public TCP route=%s client=%s", routeName, clientID)
@@ -2401,7 +2402,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 		}
 		// Snapshot the session under the lock, then release it before any
 		// network I/O so a slow agent recv side cannot serialize all public
-		// accepts (or block control-plane registration on sessionsMu).
+		// accepts or block control-plane registration on sessionsMu.
 		s.sessionsMu.Lock()
 		session, sessionOK := s.sessions[remoteAddr]
 		s.sessionsMu.Unlock()
@@ -2460,9 +2461,8 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, proxyIdleTimeout)
 
 			case <-timer.C:
-				// Race: delivery may have arrived at the exact moment the timer
-				// fired. If a connection was already delivered, use it rather
-				// than discarding a valid pairing.
+				// Race: delivery may have landed at the same moment the
+				// timer fired. Use it instead of discarding a valid pair.
 				agentConn := entry.take()
 				if agentConn != nil {
 					logging.Global().Infof(logging.CatTCP, "paired public TCP route=%s client=%s (race recovery)", routeName, clientID)
@@ -2643,8 +2643,8 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		if !ok {
 			clientStr = addr.String()
 			if len(addrStrCache) >= maxAddrStrCache {
-				// Evict a single arbitrary entry to stay bounded without the
-				// O(n) repopulation spike a full flush would cause.
+				// Evict one entry to stay bounded without the O(n)
+				// repopulation spike a full flush would cause.
 				for k := range addrStrCache {
 					delete(addrStrCache, k)
 					break

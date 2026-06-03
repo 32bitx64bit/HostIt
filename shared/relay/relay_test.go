@@ -231,8 +231,8 @@ func TestProxyIdleTimeoutStaysAliveWhileActive(t *testing.T) {
 	}
 	defer client.Close()
 
-	// Push data across several idle-timeout windows. If the throttled refresh
-	// were broken, the relay would tear the connection down mid-stream.
+	// Push data across several idle-timeout windows. If the throttled
+	// refresh were broken, the relay would tear the connection down mid-stream.
 	buf := make([]byte, 1)
 	for i := 0; i < 20; i++ {
 		_ = client.SetDeadline(time.Now().Add(2 * time.Second))
@@ -321,5 +321,52 @@ func TestProxyPropagatesHalfClose(t *testing.T) {
 	}
 	if string(resp) != "ack:hello" {
 		t.Fatalf("unexpected response %q", string(resp))
+	}
+}
+
+// TestProxyReapsStalledPeerAndClosesBothLegs reproduces the "connection
+// stacking" failure: a backend service (e.g. a game-streaming host) keeps
+// pushing data toward a client that has silently vanished without closing its
+// socket. The relay must reap the stalled connection within the idle window and
+// close BOTH legs so the backend session is released for the next client,
+// rather than leaving the backend leg open and blocking reconnection.
+func TestProxyReapsStalledPeerAndClosesBothLegs(t *testing.T) {
+	frontRelay, frontPeer := net.Pipe() // frontPeer models the vanished client (never reads)
+	backRelay, backPeer := net.Pipe()   // backPeer models the backend service
+
+	const idleTimeout = 150 * time.Millisecond
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ProxyWithIdleTimeout(frontRelay, backRelay, idleTimeout)
+	}()
+
+	// Backend continuously pushes data toward the dead client.
+	go func() {
+		payload := make([]byte, 32*1024)
+		for {
+			_ = backPeer.SetWriteDeadline(time.Now().Add(time.Second))
+			if _, err := backPeer.Write(payload); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay did not reap stalled connection within idle window")
+	}
+
+	// Backend leg must be closed so the downstream session is freed.
+	_ = backPeer.SetDeadline(time.Now().Add(time.Second))
+	if _, err := backPeer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("backend leg still open after stalled peer was reaped")
+	}
+
+	// Front leg must be closed too.
+	_ = frontPeer.SetDeadline(time.Now().Add(time.Second))
+	if _, err := frontPeer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("front leg still open after stalled peer was reaped")
 	}
 }

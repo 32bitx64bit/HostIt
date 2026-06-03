@@ -74,7 +74,6 @@ func main() {
 	flag.DurationVar(&webShutdownTimeout, "web-shutdown-timeout", 2*time.Second, "web server graceful shutdown timeout")
 	flag.Parse()
 
-	// Initialize centralized logging
 	serverlog.Init()
 	log.SetOutput(io.MultiWriter(os.Stderr, serverlog.NewUILogWriter("stdio", serverlog.UILogs)))
 	slog := serverlog.Log
@@ -135,7 +134,8 @@ func main() {
 		slog.Info(logging.CatEncryption, "tunnel TLS enabled", serverlog.F("cert_sha256", fp))
 	}
 
-	// Enable WebHTTPS by default for new configurations and generate dashboard TLS cert
+	// Enable WebHTTPS by default for new configurations and generate the
+	// dashboard TLS cert.
 	cfgDir := filepath.Dir(configPath)
 	if cfg.DomainRenewBefore <= 0 {
 		cfg.DomainRenewBefore = 7 * 24 * time.Hour
@@ -155,7 +155,7 @@ func main() {
 		cfg.Routes[i].Domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.Routes[i].Domain)), ".")
 	}
 	if !cfg.WebHTTPS {
-		// Check if this is a fresh config (no dashboard cert exists yet) - enable HTTPS by default
+		// Fresh config (no dashboard cert exists yet): enable HTTPS by default.
 		webCert := strings.TrimSpace(cfg.WebTLSCertFile)
 		if webCert == "" {
 			webCert = filepath.Join(cfgDir, "web.crt")
@@ -374,7 +374,6 @@ func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Update the runner's config so it persists across restarts
 	found := false
 	for i, rt := range r.cfg.Routes {
 		if rt.Name == routeName {
@@ -441,7 +440,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		if _, err := os.Stat(bin); err != nil {
 			return err
 		}
-		// If we're running under systemd, restart the service (or exit and let systemd restart).
+		// Under systemd, ask the unit to restart (or exit and let it restart us).
 		if systemdutil.RunningUnderSystemd() {
 			if systemdutil.SystemctlAvailable() {
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1976,7 +1975,7 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		if name == "" {
 			name = fmt.Sprintf("route-%d", i)
 		}
-		// Validate and sanitize route name: must be alphanumeric with hyphens/underscores, max 64 chars
+		// Route name must be alphanumeric with hyphens/underscores, max 64 chars.
 		sanitized := make([]rune, 0, len(name))
 		for _, r := range name {
 			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
@@ -4424,7 +4423,7 @@ func newIPRateLimiter(limit int, window time.Duration) *ipRateLimiter {
 		window = 30 * time.Second
 	}
 	l := &ipRateLimiter{limit: limit, window: window, byIP: map[string][]time.Time{}}
-	// Start background cleanup to prevent memory growth
+	// Background cleanup prevents the byIP map from growing without bound.
 	go l.cleanupLoop()
 	return l
 }
@@ -4466,7 +4465,7 @@ func (l *ipRateLimiter) Allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	arr := l.byIP[ip]
-	// prune
+	// Prune entries older than the window.
 	j := 0
 	for ; j < len(arr); j++ {
 		if arr[j].After(cut) {
@@ -4486,8 +4485,8 @@ func (l *ipRateLimiter) Allow(ip string) bool {
 }
 
 func clientIP(r *http.Request) string {
-	// Note: we deliberately do NOT trust X-Forwarded-For here.
-	// If you run behind a reverse proxy, enforce auth/rate-limit there too.
+	// Note: we deliberately do NOT trust X-Forwarded-For. If you run
+	// behind a reverse proxy, enforce auth/rate-limit there too.
 	if r == nil {
 		return ""
 	}
@@ -4560,11 +4559,11 @@ func requireAuth(store *auth.Store, cookieSecure bool, sessionTTL time.Duration,
 }
 
 func ensureCSRF(w http.ResponseWriter, r *http.Request, secure bool) string {
-	// Read existing nonce from the cookie; if present, reuse it.
+	// Reuse the existing nonce from the cookie if present.
 	if c, err := r.Cookie("csrf"); err == nil && c.Value != "" {
 		return computeCSRFToken(c.Value)
 	}
-	// Generate a fresh random nonce and set it as the cookie value.
+	// Otherwise generate a fresh random nonce and set it as the cookie value.
 	nonce, err := genToken()
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -4603,8 +4602,8 @@ func checkCSRF(r *http.Request) bool {
 	if err != nil || c.Value == "" {
 		return false
 	}
-	// Recompute the expected HMAC from the cookie nonce and compare
-	// against the form-submitted token using constant-time comparison.
+	// Recompute the expected HMAC from the cookie nonce and compare in
+	// constant time against the form-submitted token.
 	expected := computeCSRFToken(c.Value)
 	return formTok != "" && subtle.ConstantTimeCompare([]byte(formTok), []byte(expected)) == 1
 }

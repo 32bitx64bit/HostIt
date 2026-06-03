@@ -148,7 +148,7 @@ func TestWrapTCP(t *testing.T) {
 
 	payload := []byte("hello world")
 
-	// Test write from wc1 to wc2
+	// Test write from wc1 to wc2.
 	if _, err := wc1.Write(payload); err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestWrapTCP(t *testing.T) {
 		t.Fatalf("Expected %q, got %q", payload, buf)
 	}
 
-	// Test write from wc2 to wc1
+	// Test write from wc2 to wc1.
 	if _, err := wc2.Write(payload); err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
@@ -359,7 +359,7 @@ func TestCryptoConnWriteHandlesShortWrites(t *testing.T) {
 		t.Fatalf("expected %d bytes written, got %d", len(payload), n)
 	}
 
-	// Verify by reading back frames and decrypting
+	// Verify by reading back frames and decrypting.
 	raw := underlying.w.Bytes()
 	offset := 0
 	var decrypted []byte

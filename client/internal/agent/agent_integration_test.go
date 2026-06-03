@@ -766,8 +766,7 @@ func TestDialMailOutboundTCPUsesReservedRelayRoute(t *testing.T) {
 	}
 }
 
-// selfSignedTLSConfig generates a self-signed TLS certificate and returns a
-// *tls.Config suitable for tests.
+// selfSignedTLSConfig generates a self-signed cert for use in tests.
 func selfSignedTLSConfig(t *testing.T) *tls.Config {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -814,9 +813,9 @@ func TestAgentTCPConnectImplicitTLS(t *testing.T) {
 
 	tlsCfg := selfSignedTLSConfig(t)
 
-	// Start a local TLS echo server simulating the mail service's implicit TLS
-	// listener. tls.NewListener wraps a raw TCP listener exactly like
-	// startSubmissionTLSLocked / startIMAPTLSLocked do.
+	// Start a local TLS echo server mirroring the mail service's implicit
+	// TLS listener (tls.NewListener wraps a raw TCP listener exactly like
+	// startSubmissionTLSLocked / startIMAPTLSLocked do).
 	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -877,8 +876,8 @@ func TestAgentTCPConnectImplicitTLS(t *testing.T) {
 	}
 
 	// The data connection is now relayed by the agent to the local TLS
-	// listener.  Perform a TLS handshake through it, exactly as a remote
-	// email client would through the public port → tunnel → agent chain.
+	// listener. Perform a TLS handshake through it, exactly as a remote
+	// email client would through public port -> tunnel -> agent.
 	if err := dataConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}

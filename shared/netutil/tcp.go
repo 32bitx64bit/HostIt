@@ -18,6 +18,48 @@ func SetTCPKeepAlive(conn net.Conn, period time.Duration) {
 	_ = tcpConn.SetKeepAlivePeriod(period)
 }
 
+// Dead-peer detection defaults. A relayed connection whose remote peer
+// vanishes without a clean TCP shutdown (network drop, killed client,
+// half-open NAT entry) must be reaped quickly so the relay tears down
+// both legs and the downstream service frees the session. Without this,
+// such connections only die on the multi-minute relay idle timeout or
+// kernel retransmit budget, causing connections to "stack" until restart.
+const (
+	deadPeerKeepAliveIdle     = 10 * time.Second
+	deadPeerKeepAliveInterval = 5 * time.Second
+	deadPeerKeepAliveCount    = 3
+	deadPeerUserTimeout       = 20 * time.Second
+)
+
+// SetTCPKeepAliveConfig enables keepalive with an explicit idle/interval/count
+// so an unreachable peer is detected within roughly idle+interval*count rather
+// than the platform default (which can be hours). It is a no-op for non-TCP
+// connections or when the platform rejects the configuration.
+func SetTCPKeepAliveConfig(conn net.Conn, idle, interval time.Duration, count int) {
+	tcpConn := UnwrapTCPConn(conn)
+	if tcpConn == nil {
+		return
+	}
+	_ = tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     idle,
+		Interval: interval,
+		Count:    count,
+	})
+}
+
+// TuneDeadPeerDetection applies aggressive keepalive plus (on supported
+// platforms) TCP_USER_TIMEOUT so that a connection whose peer has silently
+// disappeared is reset within a bounded, short window rather than lingering
+// for minutes. Keepalive handles the idle-but-dead case; TCP_USER_TIMEOUT
+// handles the case where the relay is actively pushing data to a peer that
+// has stopped acknowledging. It is safe to call on any net.Conn; it is a
+// no-op for non-TCP connections.
+func TuneDeadPeerDetection(conn net.Conn) {
+	SetTCPKeepAliveConfig(conn, deadPeerKeepAliveIdle, deadPeerKeepAliveInterval, deadPeerKeepAliveCount)
+	_ = SetTCPUserTimeout(conn, deadPeerUserTimeout)
+}
+
 // SetTCPNoDelay disables Nagle's algorithm on the underlying TCP connection so
 // small writes are sent immediately instead of being coalesced. This lowers
 // latency for interactive/relayed traffic without affecting bulk throughput.

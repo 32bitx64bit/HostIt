@@ -31,8 +31,8 @@ func TestMergeToken(t *testing.T) {
 }
 
 func TestMaskTokenNeverLooksLikeRealToken(t *testing.T) {
-	// A real (hex) token never begins with "****", so masked output can be used
-	// as a safe sentinel for "unchanged" without colliding with a genuine token.
+	// A real (hex) token never starts with "****", so the masked form is
+	// a safe sentinel for "unchanged" without colliding with a real token.
 	cases := []struct {
 		in   string
 		want string

@@ -131,13 +131,9 @@ func (m *domainCertManager) ensureFresh(host string) error {
 		return nil
 	}
 	if m.autocert != nil {
-		// Check the ACME cache before calling GetCertificate.
-		// autocert.GetCertificate will attempt an ACME renewal when the
-		// cached cert is within its internal renewal window (~30 days),
-		// which can hit Let's Encrypt rate limits if a valid cert is
-		// already on disk.  We only proceed when the cached cert is
-		// actually missing or close to expiry according to our own
-		// renewBefore threshold.
+		// Skip GetCertificate to avoid autocert's internal 30-day renewal
+		// window, which can hit Let's Encrypt rate limits when a valid cert
+		// is already on disk.
 		if !m.acmeCertNeedsRenew(host) {
 			return nil
 		}
@@ -159,11 +155,9 @@ func (m *domainCertManager) acmeCertNeedsRenew(host string) bool {
 	defer cancel()
 	certData, err := m.autocert.Cache.Get(ctx, host)
 	if err != nil {
-		// Cache miss — cert hasn't been issued yet.
 		return true
 	}
-	// The autocert cache entry contains a PEM bundle (private key + cert chain).
-	// Walk PEM blocks looking for the leaf certificate.
+	// The autocert cache stores a PEM bundle; walk it to find the leaf cert.
 	rest := certData
 	for {
 		var blk *pem.Block
@@ -184,10 +178,8 @@ func (m *domainCertManager) acmeCertNeedsRenew(host string) bool {
 				host, time.Until(leaf.NotAfter).Round(time.Minute), m.renewBefore)
 			return true
 		}
-		// Cert is still valid and not close to expiry.
 		return false
 	}
-	// No CERTIFICATE block found — treat as missing.
 	return true
 }
 
@@ -448,8 +440,8 @@ func (s *Server) startDomainGateway() error {
 	}
 	s.domainHTTPSLn = httpsLn
 
-	// Pre-load a default self-signed certificate so the TLS config always
-	// has something to serve when clients connect without SNI.
+	// Pre-load a default self-signed cert so the TLS config has something
+	// to serve when clients connect without SNI.
 	var defaultCerts []tls.Certificate
 	if defaultHost := s.domains.defaultHTTPSHost(); defaultHost != "" {
 		if cert, err := s.domainCerts.selfSignedCertificate(defaultHost); err == nil {

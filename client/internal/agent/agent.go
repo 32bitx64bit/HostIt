@@ -370,7 +370,7 @@ func (a *Agent) connectAndRun() error {
 	} else {
 		var tlsCfg *tls.Config
 		if a.cfg.TLSPinSHA256 == "" && !a.cfg.InsecureTLS {
-			// Auto-pin mode: connect permissively to capture the server's certificate fingerprint
+			// Auto-pin: connect permissively once to capture the server's cert fingerprint.
 			tlsCfg = &tls.Config{InsecureSkipVerify: true}
 		} else {
 			var tlsErr error
@@ -789,6 +789,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				}
 				netutil.SetTCPKeepAlive(dataConn, 15*time.Second)
 				netutil.SetTCPNoDelay(dataConn)
+				netutil.TuneDeadPeerDetection(dataConn)
 
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
 				if err := crypto.AuthenticateClient(dataConn, a.cfg.Token); err != nil {
@@ -842,6 +843,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 					tcpConn.SetKeepAlivePeriod(15 * time.Second)
 					tcpConn.SetNoDelay(true)
 				}
+				netutil.TuneDeadPeerDetection(localConn)
 
 				if rt.Encrypted {
 					if rt.DerivedKey == nil {
