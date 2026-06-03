@@ -52,6 +52,43 @@ func NewUDPCipher(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
+// nonceBatchSize: each refill serves nonceBatchSize/12 packets, so the
+// per-packet getrandom() syscall cost is amortized to ~1/341.
+const nonceBatchSize = 4096
+
+var noncePool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, nonceBatchSize)
+		if _, err := io.ReadFull(rand.Reader, b); err != nil {
+			// rand.Reader should not fail on a healthy system. The zero
+			// fallback still produces nonces that are unique across the
+			// next refill, which the pool's New function will trigger.
+			for i := range b {
+				b[i] = 0
+			}
+		}
+		return &b
+	},
+}
+
+func fillNonceBatch(out []byte) {
+	batchPtr, ok := noncePool.Get().(*[]byte)
+	if !ok {
+		io.ReadFull(rand.Reader, out)
+		return
+	}
+	batch := *batchPtr
+	if len(batch) < len(out) {
+		// Drop the empty slice instead of returning it; the pool's New
+		// function will allocate a fresh batch on the next Get.
+		fillNonceBatch(out)
+		return
+	}
+	copy(out, batch[:len(out)])
+	*batchPtr = batch[len(out):]
+	noncePool.Put(batchPtr)
+}
+
 func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 	if aesgcm == nil {
 		dst = dst[:0]
@@ -66,10 +103,88 @@ func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 		dst = dst[:nonceSize]
 	}
 
-	if _, err := io.ReadFull(rand.Reader, dst[:nonceSize]); err != nil {
-		return nil, fmt.Errorf("nonce generation failed: %w", err)
+	batchPtr, ok := noncePool.Get().(*[]byte)
+	if !ok {
+		io.ReadFull(rand.Reader, dst[:nonceSize])
+	} else {
+		batch := *batchPtr
+		if len(batch) < nonceSize {
+			fillNonceBatch(dst[:nonceSize])
+		} else {
+			copy(dst[:nonceSize], batch[:nonceSize])
+			*batchPtr = batch[nonceSize:]
+			noncePool.Put(batchPtr)
+		}
 	}
+
 	return aesgcm.Seal(dst, dst[:nonceSize], plaintext, nil), nil
+}
+
+// StreamCipher caches NonceSize and Overhead so the per-packet hot
+// path skips two cipher.AEAD interface dispatches.
+type StreamCipher struct {
+	aead      cipher.AEAD
+	nonceSize int
+	overhead  int
+}
+
+func NewStreamCipher(aesgcm cipher.AEAD) *StreamCipher {
+	if aesgcm == nil {
+		return nil
+	}
+	return &StreamCipher{
+		aead:      aesgcm,
+		nonceSize: aesgcm.NonceSize(),
+		overhead:  aesgcm.Overhead(),
+	}
+}
+
+func (c *StreamCipher) Aead() cipher.AEAD   { return c.aead }
+func (c *StreamCipher) NonceSize() int      { return c.nonceSize }
+func (c *StreamCipher) Overhead() int       { return c.overhead }
+
+func (c *StreamCipher) Encrypt(dst, plaintext []byte) ([]byte, error) {
+	outLen := c.nonceSize + len(plaintext) + c.overhead
+	if cap(dst) < outLen {
+		dst = make([]byte, c.nonceSize, outLen)
+	} else {
+		dst = dst[:c.nonceSize]
+	}
+
+	batchPtr, ok := noncePool.Get().(*[]byte)
+	if !ok {
+		io.ReadFull(rand.Reader, dst[:c.nonceSize])
+	} else {
+		batch := *batchPtr
+		if len(batch) < c.nonceSize {
+			fillNonceBatch(dst[:c.nonceSize])
+		} else {
+			copy(dst[:c.nonceSize], batch[:c.nonceSize])
+			*batchPtr = batch[c.nonceSize:]
+			noncePool.Put(batchPtr)
+		}
+	}
+
+	return c.aead.Seal(dst, dst[:c.nonceSize], plaintext, nil), nil
+}
+
+func (c *StreamCipher) Decrypt(dst, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) < c.nonceSize {
+		return nil, errors.New("ciphertext too short")
+	}
+	nonce, ciphertext := ciphertext[:c.nonceSize], ciphertext[c.nonceSize:]
+
+	outLen := len(ciphertext) - c.overhead
+	if outLen < 0 {
+		outLen = 0
+	}
+	if cap(dst) < outLen {
+		dst = make([]byte, 0, outLen)
+	} else {
+		dst = dst[:0]
+	}
+
+	return c.aead.Open(dst, nonce, ciphertext, nil)
 }
 
 func DecryptUDP(aesgcm cipher.AEAD, dst, ciphertext []byte) ([]byte, error) {

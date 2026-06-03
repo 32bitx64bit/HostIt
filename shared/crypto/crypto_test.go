@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -469,6 +470,97 @@ func TestDeriveKeyAndUDPCipherEdgeCases(t *testing.T) {
 	}
 }
 
+func TestNoncePoolProducesUniqueNonces(t *testing.T) {
+	// Encrypt many small payloads back-to-back. The nonce pool reuses a
+	// single 4096-byte random batch across calls, so the test exercises
+	// the batch-exhausted and refilled paths. After decryption each
+	// plaintext must round-trip exactly, and the 12-byte nonces at the
+	// head of every ciphertext must be pairwise distinct. A regression
+	// in either the copy or the rotation logic would show up as a
+	// duplicate nonce or a corrupted plaintext.
+	const iters = 10_000
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := NewUDPCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := make(map[[gcmNonceSize]byte]struct{}, iters)
+	dst := make([]byte, 0, 64)
+	for i := 0; i < iters; i++ {
+		body := []byte{byte(i), byte(i >> 8)}
+		ct, err := EncryptUDP(gcm, dst[:0], body)
+		if err != nil {
+			t.Fatalf("iter %d: EncryptUDP: %v", i, err)
+		}
+		var nonce [gcmNonceSize]byte
+		copy(nonce[:], ct[:gcmNonceSize])
+		if _, dup := seen[nonce]; dup {
+			t.Fatalf("iter %d: duplicate nonce %x", i, nonce)
+		}
+		seen[nonce] = struct{}{}
+
+		pt, err := DecryptUDP(gcm, nil, ct)
+		if err != nil {
+			t.Fatalf("iter %d: DecryptUDP: %v", i, err)
+		}
+		if !bytes.Equal(pt, body) {
+			t.Fatalf("iter %d: round-trip mismatch: got %x, want %x", i, pt, body)
+		}
+	}
+}
+
+// TestNoncePoolConcurrentUniqueness is the multi-goroutine counterpart to
+// TestNoncePoolProducesUniqueNonces. The pool is shared across goroutines,
+// so the test confirms the Get/Put dance does not let two encryptions
+// accidentally reuse the same nonce (which would silently corrupt the
+// AEAD authentication tag).
+func TestNoncePoolConcurrentUniqueness(t *testing.T) {
+	const goroutines = 8
+	const itersPerG = 2_000
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := NewUDPCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	seen := make(map[[gcmNonceSize]byte]struct{}, goroutines*itersPerG)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			dst := make([]byte, 0, 64)
+			for i := 0; i < itersPerG; i++ {
+				body := []byte{byte(gid), byte(i)}
+				ct, err := EncryptUDP(gcm, dst[:0], body)
+				if err != nil {
+					t.Errorf("g%d iter %d: EncryptUDP: %v", gid, i, err)
+					return
+				}
+				var nonce [gcmNonceSize]byte
+				copy(nonce[:], ct[:gcmNonceSize])
+				mu.Lock()
+				if _, dup := seen[nonce]; dup {
+					mu.Unlock()
+					t.Errorf("g%d iter %d: duplicate nonce %x", gid, i, nonce)
+					return
+				}
+				seen[nonce] = struct{}{}
+				mu.Unlock()
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
 func TestUDPEncryptDecryptEdgeCases(t *testing.T) {
 	key := make([]byte, 16)
 	if _, err := rand.Read(key); err != nil {
@@ -520,6 +612,86 @@ func TestUDPEncryptDecryptEdgeCases(t *testing.T) {
 	ciphertext[len(ciphertext)-1] ^= 0x01
 	if _, err := DecryptUDP(udpCipher, nil, ciphertext); err == nil {
 		t.Fatal("DecryptUDP tampered ciphertext error = nil")
+	}
+}
+
+// TestStreamCipherByteCompatible pins the StreamCipher fast path as
+// wire-compatible with the standard EncryptUDP/DecryptUDP path. Both
+// read and write the same 12-byte-nonce-then-ciphertext frame, and a
+// ciphertext produced by one must decrypt cleanly under the other.
+// This is the contract the production code relies on if it ever
+// switches from cipher.AEAD to *StreamCipher on the per-packet hot
+// path; the test catches a future change that breaks it.
+func TestStreamCipherByteCompatible(t *testing.T) {
+	sizes := []int{0, 1, 64, 512, 1400, 8192, 32 * 1024}
+	keySizes := []int{16, 32} // AES-128, AES-256
+
+	for _, keyLen := range keySizes {
+		key := make([]byte, keyLen)
+		if _, err := rand.Read(key); err != nil {
+			t.Fatal(err)
+		}
+		aead, err := NewUDPCipher(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sc := NewStreamCipher(aead)
+		if sc == nil {
+			t.Fatalf("keyLen=%d: NewStreamCipher returned nil", keyLen)
+		}
+		if sc.Aead() != aead {
+			t.Fatalf("keyLen=%d: Aead() did not return the original AEAD", keyLen)
+		}
+		if sc.NonceSize() != aead.NonceSize() {
+			t.Fatalf("keyLen=%d: NonceSize mismatch", keyLen)
+		}
+		if sc.Overhead() != aead.Overhead() {
+			t.Fatalf("keyLen=%d: Overhead mismatch", keyLen)
+		}
+
+		for _, n := range sizes {
+			plain := make([]byte, n)
+			rand.Read(plain)
+			dst := make([]byte, 0, n+64)
+
+			// Encrypt with the standard API, decrypt with the stream
+			// API. The result must equal the plaintext.
+			ct, err := EncryptUDP(aead, dst, plain)
+			if err != nil {
+				t.Fatalf("keyLen=%d size=%d: EncryptUDP: %v", keyLen, n, err)
+			}
+			pt, err := sc.Decrypt(nil, ct)
+			if err != nil {
+				t.Fatalf("keyLen=%d size=%d: StreamCipher.Decrypt: %v", keyLen, n, err)
+			}
+			if !bytes.Equal(pt, plain) {
+				t.Fatalf("keyLen=%d size=%d: round-trip mismatch", keyLen, n)
+			}
+
+			// Encrypt with the stream API, decrypt with the standard
+			// API. The result must equal the plaintext.
+			ct, err = sc.Encrypt(nil, plain)
+			if err != nil {
+				t.Fatalf("keyLen=%d size=%d: StreamCipher.Encrypt: %v", keyLen, n, err)
+			}
+			pt, err = DecryptUDP(aead, nil, ct)
+			if err != nil {
+				t.Fatalf("keyLen=%d size=%d: DecryptUDP: %v", keyLen, n, err)
+			}
+			if !bytes.Equal(pt, plain) {
+				t.Fatalf("keyLen=%d size=%d: reverse round-trip mismatch", keyLen, n)
+			}
+		}
+	}
+}
+
+// TestNewStreamCipherNilAEAD guards the contract that NewStreamCipher
+// returns nil when given a nil AEAD. Production code that swaps in the
+// stream cipher relies on this nil check to fall back to the
+// non-encrypted path.
+func TestNewStreamCipherNilAEAD(t *testing.T) {
+	if got := NewStreamCipher(nil); got != nil {
+		t.Fatalf("NewStreamCipher(nil) = %v, want nil", got)
 	}
 }
 
