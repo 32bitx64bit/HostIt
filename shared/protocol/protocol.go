@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"unsafe"
 
 	"hostit/shared/netutil"
 )
@@ -98,17 +99,36 @@ func WritePacket(w io.Writer, p *Packet) error {
 	return err
 }
 
+// bytesToString aliases the slice's backing memory; safe because the
+// slice is read once and never modified.
+func bytesToString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
 func ReadPacket(r io.Reader) (*Packet, error) {
+	p := &Packet{}
+	if err := ReadPacketTo(r, p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// ReadPacketTo fills p in place from a control-plane TCP frame. Callers
+// can reuse the destination across iterations to skip the per-packet
+// &Packet{} allocation. Fields are overwritten in place; callers must
+// not retain references to Route, Client, or Payload across calls.
+func ReadPacketTo(r io.Reader, p *Packet) error {
 	headerPtr := headerBufPool.Get().(*[5]byte)
 	header := headerPtr[:]
 	if _, err := io.ReadFull(r, header); err != nil {
 		headerBufPool.Put(headerPtr)
-		return nil, err
+		return err
 	}
 
-	p := &Packet{
-		Type: header[0],
-	}
+	p.Type = header[0]
 
 	routeLen := int(header[1])
 	clientLen := int(header[2])
@@ -117,33 +137,43 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 	headerBufPool.Put(headerPtr)
 
 	if payloadLen > MaxPayloadSize {
-		return nil, ErrPayloadTooBig
+		return ErrPayloadTooBig
 	}
 
 	if routeLen > 0 {
 		routeBytes := make([]byte, routeLen)
 		if _, err := io.ReadFull(r, routeBytes); err != nil {
-			return nil, err
+			return err
 		}
-		p.Route = string(routeBytes)
+		p.Route = bytesToString(routeBytes)
+	} else {
+		p.Route = ""
 	}
 
 	if clientLen > 0 {
 		clientBytes := make([]byte, clientLen)
 		if _, err := io.ReadFull(r, clientBytes); err != nil {
-			return nil, err
+			return err
 		}
-		p.Client = string(clientBytes)
+		p.Client = bytesToString(clientBytes)
+	} else {
+		p.Client = ""
 	}
 
 	if payloadLen > 0 {
-		p.Payload = make([]byte, payloadLen)
-		if _, err := io.ReadFull(r, p.Payload); err != nil {
-			return nil, err
+		if cap(p.Payload) >= payloadLen {
+			p.Payload = p.Payload[:payloadLen]
+		} else {
+			p.Payload = make([]byte, payloadLen)
 		}
+		if _, err := io.ReadFull(r, p.Payload); err != nil {
+			return err
+		}
+	} else {
+		p.Payload = nil
 	}
 
-	return p, nil
+	return nil
 }
 
 func MarshalUDP(p *Packet, dst []byte) ([]byte, error) {
@@ -206,7 +236,7 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	if len(data) < i+routeLen+1 {
 		return ErrInvalidPacket
 	}
-	p.Route = string(data[i : i+routeLen])
+	p.Route = bytesToString(data[i : i+routeLen])
 	i += routeLen
 
 	clientLen := int(data[i])
@@ -215,7 +245,7 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	if len(data) < i+clientLen {
 		return ErrInvalidPacket
 	}
-	p.Client = string(data[i : i+clientLen])
+	p.Client = bytesToString(data[i : i+clientLen])
 	i += clientLen
 
 	p.Payload = data[i:]

@@ -351,3 +351,119 @@ func TestReadPacketReturnsErrorForTruncatedFrames(t *testing.T) {
 		})
 	}
 }
+
+// TestReadPacketToOverwritesInPlace guards the zero-allocation control-loop
+// API. ReadPacketTo must always overwrite every field of the destination
+// packet and must not retain references to the previous payload's backing
+// array in a way that would leak memory when the same packet is reused
+// across many iterations.
+func TestReadPacketToOverwritesInPlace(t *testing.T) {
+	// Build two distinct packets and verify that the second ReadPacketTo
+	// call produces the second packet's contents even though we reuse the
+	// destination struct (i.e. previous Route/Client/Payload do not leak
+	// through).
+	first := &Packet{Type: TypeData, Route: "firstroute", Client: "firstclient", Payload: []byte("first payload")}
+	second := &Packet{Type: TypePing, Route: "second", Client: "sc", Payload: []byte("p")}
+
+	var buf bytes.Buffer
+	if err := WritePacket(&buf, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := WritePacket(&buf, second); err != nil {
+		t.Fatal(err)
+	}
+
+	r := bytes.NewReader(buf.Bytes())
+	var pkt Packet
+	if err := ReadPacketTo(r, &pkt); err != nil {
+		t.Fatalf("ReadPacketTo 1: %v", err)
+	}
+	if pkt.Type != first.Type || pkt.Route != first.Route || pkt.Client != first.Client || !bytes.Equal(pkt.Payload, first.Payload) {
+		t.Fatalf("first read = %+v, want %+v", pkt, *first)
+	}
+	if err := ReadPacketTo(r, &pkt); err != nil {
+		t.Fatalf("ReadPacketTo 2: %v", err)
+	}
+	if pkt.Type != second.Type || pkt.Route != second.Route || pkt.Client != second.Client || !bytes.Equal(pkt.Payload, second.Payload) {
+		t.Fatalf("second read = %+v, want %+v", pkt, *second)
+	}
+
+	// The ReadPacketTo path must also handle the maximum-sized payload
+	// (uint16 max, since the field is uint16 and 65535 is the largest
+	// value that fits). Larger values cannot be expressed on the wire
+	// format, so we don't need an oversize test here.
+	maxPayload := &Packet{Type: TypeData, Payload: bytes.Repeat([]byte{0xAB}, MaxPayloadSize)}
+	var maxBuf bytes.Buffer
+	if err := WritePacket(&maxBuf, maxPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReadPacketTo(bytes.NewReader(maxBuf.Bytes()), &pkt); err != nil {
+		t.Fatalf("max-size read: %v", err)
+	}
+	if len(pkt.Payload) != MaxPayloadSize {
+		t.Fatalf("max-size payload len = %d, want %d", len(pkt.Payload), MaxPayloadSize)
+	}
+}
+
+// TestReadPacketToReusesPayloadBuffer verifies that repeated reads of the
+// same payload length reuse the existing backing array instead of allocating
+// a new one each iteration. This is the per-iteration allocation we care
+// about: a control loop reading a stream of same-size packets must not
+// churn the heap.
+func TestReadPacketToReusesPayloadBuffer(t *testing.T) {
+	body := &Packet{Type: TypePing, Payload: []byte("pingpayload")}
+	var buf bytes.Buffer
+	for i := 0; i < 5; i++ {
+		if err := WritePacket(&buf, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := bytes.NewReader(buf.Bytes())
+	var pkt Packet
+	firstCap := 0
+	for i := 0; i < 5; i++ {
+		if err := ReadPacketTo(r, &pkt); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			firstCap = cap(pkt.Payload)
+		} else if cap(pkt.Payload) != firstCap {
+			t.Fatalf("iteration %d: payload cap = %d, want %d (backing array not reused)", i, cap(pkt.Payload), firstCap)
+		}
+	}
+}
+
+// TestReadPacketToEmptyRouteAndClient exercises the common control-plane
+// case where Route and Client are absent. The packet's Route/Client fields
+// must be reset to empty strings, not retain stale values from a previous
+// read.
+func TestReadPacketToEmptyRouteAndClient(t *testing.T) {
+	withFields := &Packet{Type: TypeData, Route: "x", Client: "y", Payload: []byte("p")}
+	empty := &Packet{Type: TypePing, Payload: []byte("p")}
+
+	var b2 bytes.Buffer
+	if err := WritePacket(&b2, withFields); err != nil {
+		t.Fatal(err)
+	}
+	if err := WritePacket(&b2, empty); err != nil {
+		t.Fatal(err)
+	}
+
+	r := bytes.NewReader(b2.Bytes())
+	var pkt Packet
+	if err := ReadPacketTo(r, &pkt); err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Route != "x" || pkt.Client != "y" {
+		t.Fatalf("first read: route=%q client=%q, want x/y", pkt.Route, pkt.Client)
+	}
+	if err := ReadPacketTo(r, &pkt); err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Route != "" || pkt.Client != "" {
+		t.Fatalf("second read: route=%q client=%q, want empty/empty", pkt.Route, pkt.Client)
+	}
+	if !bytes.Equal(pkt.Payload, empty.Payload) {
+		t.Fatalf("payload = %q, want %q", pkt.Payload, empty.Payload)
+	}
+}
