@@ -59,6 +59,11 @@ const (
 	nettestTimeout         = 2 * time.Second
 	bwTestTimeout          = 5 * time.Second
 	emailProbeAllowTTL     = time.Minute
+	// dashBatchInterval is the cadence at which accumulated byte counters
+	// (countingConn on TCP, pendingBytes on UDP) are flushed to the
+	// dashboard. A single value keeps the three hot paths reporting on the
+	// same boundary.
+	dashBatchInterval = 100 * time.Millisecond
 )
 
 type agentSession struct {
@@ -201,6 +206,8 @@ type Server struct {
 
 	agentUDPAddr atomic.Value // stores netip.AddrPort
 	agentUDPTime atomic.Int64 // unix nano
+
+	counters counterRegistry
 }
 
 type pendingTCPKey struct {
@@ -1861,6 +1868,22 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
+	// Shared flusher for byte counters; avoids a goroutine per connection.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ticker := time.NewTicker(dashBatchInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				s.flushCounters()
+			}
+		}
+	}()
+
 	var controlLn net.Listener
 	var dataLn net.Listener
 	var err error
@@ -2149,6 +2172,9 @@ func (s *Server) acceptControl(ln net.Listener) {
 			}()
 
 			connStart := time.Now()
+			var pkt protocol.Packet
+			deadlineAt := time.Now().Add(readDeadlineStandard)
+			c.SetReadDeadline(deadlineAt)
 			for {
 				select {
 				case <-sessionCtx.Done():
@@ -2161,10 +2187,12 @@ func (s *Server) acceptControl(ln net.Listener) {
 					break
 				}
 
-				c.SetReadDeadline(time.Now().Add(readDeadlineStandard))
-				pkt, err := protocol.ReadPacket(c)
-				if err != nil {
+				if err := protocol.ReadPacketTo(c, &pkt); err != nil {
 					break
+				}
+				if time.Until(deadlineAt) < pingInterval {
+					deadlineAt = time.Now().Add(readDeadlineStandard)
+					c.SetReadDeadline(deadlineAt)
 				}
 				if pkt.Type == protocol.TypePing {
 					session.writeMu.Lock()
@@ -2455,10 +2483,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 				s.dash.incActive(routeName)
 				defer s.dash.decActive(routeName)
 
-				countBytes := func(n int) {
-					s.dash.addBytes(time.Now(), int64(n))
-				}
-				relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, proxyIdleTimeout)
+				s.runCountedRelay(routeName, c, agentConn)
 
 			case <-timer.C:
 				// Race: delivery may have landed at the same moment the
@@ -2470,10 +2495,7 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 					s.dash.incActive(routeName)
 					defer s.dash.decActive(routeName)
 
-					countBytes := func(n int) {
-						s.dash.addBytes(time.Now(), int64(n))
-					}
-					relay.ProxyWithIdleTimeout(&countingConn{Conn: c, onRead: countBytes}, &countingConn{Conn: agentConn, onRead: countBytes}, proxyIdleTimeout)
+					s.runCountedRelay(routeName, c, agentConn)
 					return
 				}
 				logging.Global().Warnf(logging.CatTCP, "pair timeout route=%s client=%s", routeName, clientID)
@@ -2487,17 +2509,83 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 	}
 }
 
+// runCountedRelay wraps the public + agent leg in countingConns and runs
+// the relay. The shared flusher goroutine on the Server periodically
+// drains the byte counters into the dashboard, so the per-connection
+// overhead is just the atomic adds inside each Read.
+func (s *Server) runCountedRelay(routeName string, publicConn, agentConn net.Conn) {
+	pubCounter := &countingConn{Conn: publicConn}
+	agtCounter := &countingConn{Conn: agentConn}
+	s.registerCounters(pubCounter, agtCounter)
+	defer s.unregisterCounters(pubCounter, agtCounter)
+	relay.ProxyWithIdleTimeout(pubCounter, agtCounter, proxyIdleTimeout)
+	now := time.Now()
+	if n := pubCounter.Flush(); n > 0 {
+		s.dash.addBytes(now, n)
+	}
+	if n := agtCounter.Flush(); n > 0 {
+		s.dash.addBytes(now, n)
+	}
+}
+
+type counterRegistry struct {
+	mu     sync.Mutex
+	active map[*countingConn]struct{}
+}
+
+func (s *Server) registerCounters(pub, agt *countingConn) {
+	s.counters.mu.Lock()
+	if s.counters.active == nil {
+		s.counters.active = make(map[*countingConn]struct{}, 64)
+	}
+	s.counters.active[pub] = struct{}{}
+	s.counters.active[agt] = struct{}{}
+	s.counters.mu.Unlock()
+}
+
+func (s *Server) unregisterCounters(pub, agt *countingConn) {
+	s.counters.mu.Lock()
+	delete(s.counters.active, pub)
+	delete(s.counters.active, agt)
+	s.counters.mu.Unlock()
+}
+
+func (s *Server) flushCounters() {
+	s.counters.mu.Lock()
+	counters := make([]*countingConn, 0, len(s.counters.active))
+	for c := range s.counters.active {
+		counters = append(counters, c)
+	}
+	s.counters.mu.Unlock()
+	if len(counters) == 0 {
+		return
+	}
+	now := time.Now()
+	for _, c := range counters {
+		if n := c.Flush(); n > 0 {
+			s.dash.addBytes(now, n)
+		}
+	}
+}
+
+// countingConn atomically accumulates bytes that flow through Read. The
+// per-Read cost is a single atomic add; the shared flusher calls Flush
+// periodically to push totals to the dashboard.
 type countingConn struct {
 	net.Conn
-	onRead func(int)
+	pending atomic.Int64
 }
 
 func (c *countingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
-	if n > 0 && c.onRead != nil {
-		c.onRead(n)
+	if n > 0 {
+		c.pending.Add(int64(n))
 	}
 	return n, err
+}
+
+func (c *countingConn) Flush() int64 {
+	return c.pending.Swap(0)
 }
 
 func (c *countingConn) CloseRead() error {
@@ -2524,7 +2612,6 @@ func (s *Server) acceptAgentUDP() {
 
 	var pendingBytes int64
 	var pendingBytesTime time.Time
-	const dashBatchInterval = 100 * time.Millisecond
 
 	for {
 		n, addr, err := s.udpDataConn.ReadFromUDPAddrPort(buf)
@@ -2540,8 +2627,8 @@ func (s *Server) acceptAgentUDP() {
 			continue
 		}
 
-		routeName := string([]byte(pkt.Route))
-		clientID := string([]byte(pkt.Client))
+		routeName := pkt.Route
+		clientID := pkt.Client
 
 		currentAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
 		if pkt.Type == protocol.TypeRegister {
@@ -2573,14 +2660,13 @@ func (s *Server) acceptAgentUDP() {
 			s.mu.RLock()
 			pubConn, ok := s.publicUDP[routeName]
 			s.mu.RUnlock()
-
 			if !ok {
 				continue
 			}
 
-			cache := s.routeCache.Load().(map[string]routeConfig)
+			cache, _ := s.routeCache.Load().(map[string]routeConfig)
 			rc, ok := cache[routeName]
-			if !ok {
+			if !ok || !rc.enabled {
 				continue
 			}
 
@@ -2625,10 +2711,12 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 	addrStrCache := make(map[netip.AddrPort]string)
 	const maxAddrStrCache = 10000
 	var pkt protocol.Packet
+	// pkt.Type and pkt.Route are stable for the lifetime of this listener.
+	pkt.Type = protocol.TypeData
+	pkt.Route = routeName
 
 	var pendingBytes int64
 	var pendingBytesTime time.Time
-	const dashBatchInterval = 100 * time.Millisecond
 
 	for {
 		n, addr, err := conn.ReadFromUDPAddrPort(buf)
@@ -2643,8 +2731,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		if !ok {
 			clientStr = addr.String()
 			if len(addrStrCache) >= maxAddrStrCache {
-				// Evict one entry to stay bounded without the O(n)
-				// repopulation spike a full flush would cause.
+				// Evict one entry to stay bounded.
 				for k := range addrStrCache {
 					delete(addrStrCache, k)
 					break
@@ -2660,19 +2747,26 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			continue
 		}
 
-		if !agentUDPAt.IsZero() && time.Since(agentUDPAt) > udpRegisterTimeout {
-			s.mu.Lock()
-			if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > udpRegisterTimeout {
-				logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
-				s.agentUDP = netip.AddrPort{}
+		// Check the agent-UDP address only when it could plausibly have
+		// expired. agentUDPAt starts at zero and is set on the first
+		// register packet, so the IsZero check skips the time.Now() call
+		// in the common steady-state case.
+		if !agentUDPAt.IsZero() {
+			now := time.Now()
+			if now.Sub(agentUDPAt) > udpRegisterTimeout {
+				s.mu.Lock()
+				if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > udpRegisterTimeout {
+					logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
+					s.agentUDP = netip.AddrPort{}
+				}
+				s.mu.Unlock()
+				continue
 			}
-			s.mu.Unlock()
-			continue
 		}
 
-		cache := s.routeCache.Load().(map[string]routeConfig)
+		cache, _ := s.routeCache.Load().(map[string]routeConfig)
 		rc, ok := cache[routeName]
-		if !ok || !agentAddr.IsValid() || !rc.enabled {
+		if !ok || !rc.enabled {
 			continue
 		}
 
@@ -2688,8 +2782,8 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			payload = encrypted
 		}
 
-		pkt.Type = protocol.TypeData
-		pkt.Route = routeName
+		// pkt.Client and pkt.Payload change per packet; Type and Route
+		// were set once above.
 		pkt.Client = clientStr
 		pkt.Payload = payload
 
@@ -2698,7 +2792,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			continue
 		}
 
-		pendingBytes += int64(len(pkt.Payload))
+		pendingBytes += int64(len(payload))
 		if pendingBytesTime.IsZero() {
 			pendingBytesTime = time.Now()
 		} else if time.Since(pendingBytesTime) > dashBatchInterval {
