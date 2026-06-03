@@ -560,6 +560,9 @@ func (a *Agent) EmailConfig() emailcfg.Config {
 
 func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connTracker) error {
 	helloSeen := false
+	var pkt protocol.Packet
+	deadlineAt := time.Now().Add(30 * time.Second)
+	conn.SetReadDeadline(deadlineAt)
 	for {
 		select {
 		case <-ctx.Done():
@@ -567,13 +570,15 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		pkt, err := protocol.ReadPacket(conn)
-		if err != nil {
+		if err := protocol.ReadPacketTo(conn, &pkt); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			return fmt.Errorf("control read error: %w", err)
+		}
+		if time.Until(deadlineAt) < 15*time.Second {
+			deadlineAt = time.Now().Add(30 * time.Second)
+			conn.SetReadDeadline(deadlineAt)
 		}
 
 		if pkt.Type == protocol.TypePing {
@@ -838,12 +843,8 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				default:
 				}
 
-				if tcpConn, ok := localConn.(*net.TCPConn); ok {
-					tcpConn.SetKeepAlive(true)
-					tcpConn.SetKeepAlivePeriod(15 * time.Second)
-					tcpConn.SetNoDelay(true)
-				}
-				netutil.TuneDeadPeerDetection(localConn)
+			// dialLocalTCP already sets TCP keepalive and NoDelay.
+			netutil.TuneDeadPeerDetection(localConn)
 
 				if rt.Encrypted {
 					if rt.DerivedKey == nil {
@@ -1074,8 +1075,8 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 		}
 
 		if pkt.Type == protocol.TypeData {
-			routeName := string([]byte(pkt.Route))
-			clientID := string([]byte(pkt.Client))
+			routeName := pkt.Route
+			clientID := pkt.Client
 
 			rcVal, ok := routeCache.Load(routeName)
 			var rc routeConfig
@@ -1151,6 +1152,9 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 						marshalBuf := make([]byte, 65536)
 						encryptBuf := make([]byte, 65536)
 						var respPkt protocol.Packet
+						respPkt.Type = protocol.TypeData
+						respPkt.Route = key.route
+						respPkt.Client = key.client
 						for {
 							c.SetReadDeadline(time.Now().Add(2 * time.Minute))
 							rn, err := c.Read(respBuf)
@@ -1177,9 +1181,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 								payload = encrypted
 							}
 
-							respPkt.Type = protocol.TypeData
-							respPkt.Route = key.route
-							respPkt.Client = key.client
 							respPkt.Payload = payload
 
 							data, err := protocol.MarshalUDP(&respPkt, marshalBuf)
@@ -1195,7 +1196,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 			if sessVal != nil {
 				if s, ok := sessVal.(*agentUDPSession); ok && s.conn != nil {
-					atomic.StoreInt64(&s.lastSeen, time.Now().UnixNano())
 					_, _ = s.conn.Write(payload)
 				}
 			}
