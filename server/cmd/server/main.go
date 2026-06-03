@@ -100,6 +100,12 @@ func main() {
 	if strings.TrimSpace(tlsKey) != "" {
 		cfg.TLSKeyFile = tlsKey
 	}
+	// Encryption-algorithm default. Fresh installs default to aes-128
+	// (~14% faster than aes-256 on AES-NI hardware, still considered
+	// cryptographically strong). Existing installs default to "none"
+	// so a post-upgrade deployment is not silently opted in to
+	// encryption; the operator must set this field explicitly when
+	// adding an encrypted route.
 	if cfg.EncryptionAlgorithm == "" {
 		if !loaded {
 			cfg.EncryptionAlgorithm = "aes-128"
