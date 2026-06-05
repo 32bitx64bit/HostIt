@@ -2631,20 +2631,18 @@ func (s *Server) acceptAgentUDP() {
 		clientID := pkt.Client
 
 		currentAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
-		if pkt.Type == protocol.TypeRegister {
-			if !currentAddr.IsValid() || currentAddr != addr {
-				s.agentUDPAddr.Store(addr)
-				logging.Global().Infof(logging.CatUDP, "Agent UDP address registered: %s", addr.String())
-			}
-			now := time.Now().UnixNano()
-			s.agentUDPTime.Store(now)
-			s.mu.Lock()
-			s.agentUDP = addr
-			s.agentUDPAt = time.Unix(0, now)
-			s.mu.Unlock()
-		} else if !currentAddr.IsValid() || currentAddr != addr {
+		if !currentAddr.IsValid() || currentAddr != addr {
 			s.agentUDPAddr.Store(addr)
-			now := time.Now().UnixNano()
+			if pkt.Type == protocol.TypeRegister {
+				logging.Global().Infof(logging.CatUDP, "Agent UDP address registered: %s", addr.String())
+			} else {
+				logging.Global().Infof(logging.CatUDP, "Agent UDP address updated: %s", addr.String())
+			}
+		}
+		// Refresh the liveness timestamp on any agent packet, not just
+		// Register frames, so that active data flow prevents timeout.
+		now := time.Now().UnixNano()
+		if now-s.agentUDPTime.Load() > int64(500*time.Millisecond) {
 			s.agentUDPTime.Store(now)
 			s.mu.Lock()
 			s.agentUDP = addr
@@ -2751,18 +2749,21 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		// expired. agentUDPAt starts at zero and is set on the first
 		// register packet, so the IsZero check skips the time.Now() call
 		// in the common steady-state case.
-		if !agentUDPAt.IsZero() {
-			now := time.Now()
-			if now.Sub(agentUDPAt) > udpRegisterTimeout {
-				s.mu.Lock()
-				if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > udpRegisterTimeout {
-					logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
-					s.agentUDP = netip.AddrPort{}
+			if !agentUDPAt.IsZero() {
+				now := time.Now()
+				if now.Sub(agentUDPAt) > udpRegisterTimeout {
+					s.mu.Lock()
+					if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > udpRegisterTimeout {
+						logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
+						s.agentUDP = netip.AddrPort{}
+						s.agentUDPAt = time.Time{}
+						s.agentUDPAddr.Store(netip.AddrPort{})
+						s.agentUDPTime.Store(0)
+					}
+					s.mu.Unlock()
+					continue
 				}
-				s.mu.Unlock()
-				continue
 			}
-		}
 
 		cache, _ := s.routeCache.Load().(map[string]routeConfig)
 		rc, ok := cache[routeName]

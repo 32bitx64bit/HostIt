@@ -415,3 +415,76 @@ func TestPublicUDPDropsWithoutAgentAndWhenDisabled(t *testing.T) {
 		t.Fatalf("disabled UDP route was forwarded to agent %d times", got)
 	}
 }
+
+// TestAgentUDPDataRefreshesTimeout verifies that data packets from the agent
+// refresh the UDP registration timestamp, not just register packets. This
+// prevents silent UDP disconnects during active game streaming when small
+// register packets are dropped but data flow continues.
+func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	controlAddr := freeTCPAddr(t)
+	dataAddr := freeTCPAddr(t)
+	publicAddr := freeUDPAddr(t)
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "game", Proto: "udp", PublicAddr: publicAddr}},
+		Token:       "testtoken",
+		PairTimeout: 5 * time.Second,
+		DisableTLS:  true,
+	}, nil)
+	go func() { _ = srv.Run(ctx) }()
+	waitPublicUDPRoute(t, srv, "game")
+
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", dataAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentConn.Close()
+
+	// Send initial register so the server learns our address.
+	reg, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agentConn.WriteToUDP(reg, serverUDPAddr); err != nil {
+		t.Fatal(err)
+	}
+	waitTunnelCondition(t, 2*time.Second, "agent did not register", func() bool {
+		return srv.agentUDPTime.Load() != 0
+	})
+
+	// Record the timestamp after registration.
+	regTime := srv.agentUDPTime.Load()
+
+	// Wait longer than the 500ms throttle so the data packet must update.
+	time.Sleep(600 * time.Millisecond)
+
+	// Send a data packet from the agent (not a register).
+	dataPkt, err := protocol.MarshalUDP(&protocol.Packet{
+		Type:    protocol.TypeData,
+		Route:   "game",
+		Client:  "1.2.3.4:9999",
+		Payload: []byte("hello"),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agentConn.WriteToUDP(dataPkt, serverUDPAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait briefly for the server to process it.
+	time.Sleep(50 * time.Millisecond)
+
+	dataTime := srv.agentUDPTime.Load()
+	if dataTime <= regTime {
+		t.Fatalf("data packet did not refresh agentUDPTime: regTime=%d dataTime=%d", regTime, dataTime)
+	}
+}
