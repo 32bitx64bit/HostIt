@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/cipher"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -487,4 +488,66 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 	if dataTime <= regTime {
 		t.Fatalf("data packet did not refresh agentUDPTime: regTime=%d dataTime=%d", regTime, dataTime)
 	}
+}
+
+func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	controlAddr := freeTCPAddr(t)
+	dataAddr := freeTCPAddr(t)
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "game", Proto: "udp", PublicAddr: freeUDPAddr(t)}},
+		Token:       "testtoken",
+		PairTimeout: 5 * time.Second,
+		DisableTLS:  true,
+	}, nil)
+	go func() { _ = srv.Run(ctx) }()
+	waitPublicUDPRoute(t, srv, "game")
+
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", dataAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentConn.Close()
+
+	reg, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitTunnelCondition(t, 2*time.Second, "agent UDP registration did not reach server", func() bool {
+		_, _ = agentConn.WriteToUDP(reg, serverUDPAddr)
+		return srv.agentUDPTime.Load() != 0
+	})
+	addr, _ := srv.agentUDPAddr.Load().(netip.AddrPort)
+	if !addr.IsValid() {
+		t.Fatal("agent UDP address was not stored before control connect")
+	}
+
+	conn := dialTCPForLifecycleTest(t, controlAddr)
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+		t.Fatal(err)
+	}
+	pkt, err := protocol.ReadPacket(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Type != protocol.TypeHello {
+		t.Fatalf("first control packet type = %d, want HELLO", pkt.Type)
+	}
+
+	waitTunnelCondition(t, 2*time.Second, "agent UDP atomics were not cleared on control connect", func() bool {
+		addr, _ := srv.agentUDPAddr.Load().(netip.AddrPort)
+		return srv.agentUDPTime.Load() == 0 && !addr.IsValid()
+	})
 }

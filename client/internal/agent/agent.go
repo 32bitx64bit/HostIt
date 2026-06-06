@@ -8,11 +8,13 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"hostit/shared/apitypes"
@@ -24,15 +26,23 @@ import (
 	"hostit/shared/relay"
 )
 
+const (
+	agentControlPingInterval  = 5 * time.Second
+	agentControlReadDeadline  = 45 * time.Second
+	agentControlWriteDeadline = 5 * time.Second
+	udpRegisterInterval       = 2 * time.Second
+	udpSessionIdleTimeout     = 2 * time.Minute
+)
+
 type Hooks struct {
 	OnConnected        func()
 	OnEmailConfig      func(cfg emailcfg.Config)
 	OnEmailProbe       func(context.Context, protocol.EmailProbeRequest) (protocol.EmailProbeResult, error)
 	OnRoutes           func(routes []RemoteRoute)
 	OnRouteResponse    func(apitypes.RouteResponse)
-	OnRouteAck        func(apitypes.RouteAck)
-	OnRouteRemoveAck  func(apitypes.RouteRemoveAck)
-	OnDisconnected    func(err error)
+	OnRouteAck         func(apitypes.RouteAck)
+	OnRouteRemoveAck   func(apitypes.RouteRemoveAck)
+	OnDisconnected     func(err error)
 	OnError            func(err error)
 	OnTLSPinDiscovered func(pin string)
 }
@@ -59,10 +69,10 @@ type Agent struct {
 	controlWriteMu sync.Mutex
 	routeCacheGen  atomic.Uint64
 
-	pendingRouteReqs   map[string]chan *apitypes.RouteResponse
-	pendingRouteAcks   map[string]chan *apitypes.RouteAck
-	pendingRemoveAcks  map[string]chan *apitypes.RouteRemoveAck
-	pendingUpdateAcks  map[string]chan *apitypes.RouteUpdateAck
+	pendingRouteReqs  map[string]chan *apitypes.RouteResponse
+	pendingRouteAcks  map[string]chan *apitypes.RouteAck
+	pendingRemoveAcks map[string]chan *apitypes.RouteRemoveAck
+	pendingUpdateAcks map[string]chan *apitypes.RouteUpdateAck
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -110,11 +120,11 @@ func (ct *connTracker) closeAll() {
 
 func NewAgent(cfg Config) *Agent {
 	return &Agent{
-		cfg:                cfg,
-		pendingRouteReqs:   make(map[string]chan *apitypes.RouteResponse),
-		pendingRouteAcks:   make(map[string]chan *apitypes.RouteAck),
-		pendingRemoveAcks:  make(map[string]chan *apitypes.RouteRemoveAck),
-		pendingUpdateAcks:  make(map[string]chan *apitypes.RouteUpdateAck),
+		cfg:               cfg,
+		pendingRouteReqs:  make(map[string]chan *apitypes.RouteResponse),
+		pendingRouteAcks:  make(map[string]chan *apitypes.RouteAck),
+		pendingRemoveAcks: make(map[string]chan *apitypes.RouteRemoveAck),
+		pendingUpdateAcks: make(map[string]chan *apitypes.RouteUpdateAck),
 	}
 }
 
@@ -327,6 +337,10 @@ func tlsConfigWithPin(cfg Config) (*tls.Config, error) {
 
 func (a *Agent) Run(ctx context.Context) error {
 	a.ctx, a.cancel = context.WithCancel(ctx)
+	if err := a.startUDPData(a.ctx); err != nil {
+		return err
+	}
+	defer a.closeUDPDataConn()
 
 	backoff := 250 * time.Millisecond
 	const maxBackoff = 2 * time.Second
@@ -359,6 +373,106 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (a *Agent) startUDPData(ctx context.Context) error {
+	serverAddr, err := net.ResolveUDPAddr("udp", a.cfg.DataAddr())
+	if err != nil {
+		return fmt.Errorf("resolve udp data addr failed: %w", err)
+	}
+
+	localAddr, err := net.ResolveUDPAddr("udp", ":0")
+	if err != nil {
+		return fmt.Errorf("resolve local udp addr failed: %w", err)
+	}
+
+	udpConn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		return fmt.Errorf("udp data listen failed: %w", err)
+	}
+	udpConn.SetReadBuffer(8 * 1024 * 1024)
+	udpConn.SetWriteBuffer(8 * 1024 * 1024)
+
+	a.mu.Lock()
+	a.serverUDP = serverAddr
+	a.udpDataConn = udpConn
+	a.mu.Unlock()
+
+	registerData, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
+	if err != nil {
+		udpConn.Close()
+		return fmt.Errorf("failed to marshal register packet: %w", err)
+	}
+	a.writeUDPRegister(udpConn, registerData)
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		ticker := time.NewTicker(udpRegisterInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.writeUDPRegister(udpConn, registerData)
+			}
+		}
+	}()
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		if err := a.handleUDPData(ctx, udpConn); err != nil && err != context.Canceled {
+			logging.Global().Errorf(logging.CatUDP, "udp data loop stopped: %v", err)
+		}
+	}()
+
+	return nil
+}
+
+func (a *Agent) closeUDPDataConn() {
+	a.mu.Lock()
+	udpConn := a.udpDataConn
+	if udpConn != nil {
+		a.udpDataConn = nil
+	}
+	a.mu.Unlock()
+	if udpConn != nil {
+		udpConn.Close()
+	}
+}
+
+func (a *Agent) writeUDPRegister(udpConn *net.UDPConn, data []byte) {
+	a.mu.RLock()
+	serverUDP := a.serverUDP
+	a.mu.RUnlock()
+	if serverUDP == nil {
+		return
+	}
+	n, err := udpConn.WriteToUDP(data, serverUDP)
+	if err != nil {
+		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-write", fmt.Sprintf("failed to send UDP register: %v", err))
+		return
+	}
+	if n != len(data) {
+		logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-register-short-write", fmt.Sprintf("short UDP register write: wrote=%d want=%d", n, len(data)))
+	}
+}
+
+func (a *Agent) refreshUDPRegistration() {
+	a.mu.RLock()
+	udpConn := a.udpDataConn
+	a.mu.RUnlock()
+	if udpConn == nil {
+		return
+	}
+	data, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
+	if err != nil {
+		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-marshal", fmt.Sprintf("failed to marshal UDP register: %v", err))
+		return
+	}
+	a.writeUDPRegister(udpConn, data)
 }
 
 func (a *Agent) connectAndRun() error {
@@ -403,65 +517,29 @@ func (a *Agent) connectAndRun() error {
 	a.mu.Lock()
 	a.controlConn = conn
 	a.mu.Unlock()
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		a.mu.Lock()
+		if a.controlConn == conn {
+			a.controlConn = nil
+		}
+		a.mu.Unlock()
+	}()
 
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	conn.SetDeadline(time.Now().Add(agentControlWriteDeadline))
 	if err := crypto.AuthenticateClient(conn, a.cfg.Token); err != nil {
 		return fmt.Errorf("control auth failed: %w", err)
 	}
 	conn.SetDeadline(time.Time{})
+	a.refreshUDPRegistration()
 
-	serverAddr, err := net.ResolveUDPAddr("udp", a.cfg.DataAddr())
-	if err != nil {
-		return fmt.Errorf("resolve udp data addr failed: %w", err)
-	}
-	a.serverUDP = serverAddr
-
-	localAddr, err := net.ResolveUDPAddr("udp", ":0")
-	if err != nil {
-		return fmt.Errorf("resolve local udp addr failed: %w", err)
-	}
-
-	udpConn, err := net.ListenUDP("udp", localAddr)
-	if err != nil {
-		return fmt.Errorf("udp data listen failed: %w", err)
-	}
-	a.mu.Lock()
-	a.udpDataConn = udpConn
-	a.mu.Unlock()
-	udpConn.SetReadBuffer(8 * 1024 * 1024)
-	udpConn.SetWriteBuffer(8 * 1024 * 1024)
-	defer udpConn.Close()
-
-	pkt := &protocol.Packet{
-		Type: protocol.TypeRegister,
-	}
-	data, err := protocol.MarshalUDP(pkt, nil)
-	if err != nil {
-		return fmt.Errorf("failed to marshal register packet: %w", err)
-	}
-	udpConn.WriteToUDP(data, a.serverUDP)
-
-	logging.Global().Infof(logging.CatSystem, "Agent started on control=%s data=%s", a.cfg.ControlAddr(), a.cfg.DataAddr())
+	logging.Global().Infof(logging.CatSystem, "Agent control connected on %s data=%s", a.cfg.ControlAddr(), a.cfg.DataAddr())
 
 	connCtx, connCancel := context.WithCancel(a.ctx)
 	defer connCancel()
 
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-connCtx.Done():
-				return
-			case <-ticker.C:
-				udpConn.WriteToUDP(data, a.serverUDP)
-			}
-		}
-	}()
-
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
+		ticker := time.NewTicker(agentControlPingInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -469,7 +547,7 @@ func (a *Agent) connectAndRun() error {
 				return
 			case <-ticker.C:
 				a.controlWriteMu.Lock()
-				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				conn.SetWriteDeadline(time.Now().Add(agentControlWriteDeadline))
 				if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypePing}); err != nil {
 					a.controlWriteMu.Unlock()
 					conn.Close()
@@ -484,7 +562,6 @@ func (a *Agent) connectAndRun() error {
 	go func() {
 		<-connCtx.Done()
 		conn.Close()
-		udpConn.Close()
 	}()
 
 	tracker := &connTracker{}
@@ -494,7 +571,7 @@ func (a *Agent) connectAndRun() error {
 	}()
 
 	var (
-		errCh = make(chan error, 2)
+		errCh = make(chan error, 1)
 		wg    sync.WaitGroup
 	)
 
@@ -505,20 +582,6 @@ func (a *Agent) connectAndRun() error {
 		defer wg.Done()
 		defer connCancel()
 		if err := a.handleControl(connCtx, conn, tracker); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
-	}()
-
-	wg.Add(1)
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		defer wg.Done()
-		defer connCancel()
-		if err := a.handleUDPData(connCtx, udpConn); err != nil {
 			select {
 			case errCh <- err:
 			default:
@@ -561,7 +624,7 @@ func (a *Agent) EmailConfig() emailcfg.Config {
 func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connTracker) error {
 	helloSeen := false
 	var pkt protocol.Packet
-	deadlineAt := time.Now().Add(30 * time.Second)
+	deadlineAt := time.Now().Add(agentControlReadDeadline)
 	conn.SetReadDeadline(deadlineAt)
 	for {
 		select {
@@ -576,10 +639,8 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 			}
 			return fmt.Errorf("control read error: %w", err)
 		}
-		if time.Until(deadlineAt) < 15*time.Second {
-			deadlineAt = time.Now().Add(30 * time.Second)
-			conn.SetReadDeadline(deadlineAt)
-		}
+		deadlineAt = time.Now().Add(agentControlReadDeadline)
+		conn.SetReadDeadline(deadlineAt)
 
 		if pkt.Type == protocol.TypePing {
 			a.controlWriteMu.Lock()
@@ -843,8 +904,8 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				default:
 				}
 
-			// dialLocalTCP already sets TCP keepalive and NoDelay.
-			netutil.TuneDeadPeerDetection(localConn)
+				// dialLocalTCP already sets TCP keepalive and NoDelay.
+				netutil.TuneDeadPeerDetection(localConn)
 
 				if rt.Encrypted {
 					if rt.DerivedKey == nil {
@@ -987,6 +1048,28 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 type agentUDPSession struct {
 	conn     *net.UDPConn
 	lastSeen int64 // atomic, unix nano
+}
+
+func shouldRetireUDPReadSession(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return !isTransientUDPReadError(err)
+}
+
+func isTransientUDPReadError(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENOBUFS)
 }
 
 func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
@@ -1142,10 +1225,10 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 				} else {
 					sessVal = newSess
 
-					go func(key sessionKey, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
+					go func(key sessionKey, sess *agentUDPSession, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
 						defer func() {
 							c.Close()
-							sessions.Delete(key)
+							sessions.CompareAndDelete(key, sess)
 						}()
 
 						respBuf := make([]byte, 65536)
@@ -1162,7 +1245,12 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 								if ctx.Err() != nil {
 									return
 								}
-								return
+								if shouldRetireUDPReadSession(err) {
+									logging.Global().Debugf(logging.CatUDP, "retiring UDP session route=%s client=%s err=%v", key.route, key.client, err)
+									return
+								}
+								logging.Global().RateLimitedWarn(logging.CatUDP, "agent-local-udp-transient-"+key.route, fmt.Sprintf("transient local UDP read error route=%s client=%s err=%v", key.route, key.client, err))
+								continue
 							}
 
 							if sessVal, ok := sessions.Load(key); ok {
@@ -1185,20 +1273,43 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 							data, err := protocol.MarshalUDP(&respPkt, marshalBuf)
 							if err != nil {
+								logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-marshal-"+key.route, fmt.Sprintf("failed to marshal UDP response route=%s client=%s payload=%d err=%v", key.route, key.client, len(payload), err))
 								continue
 							}
 
-							udpConn.WriteToUDP(data, a.serverUDP)
+							warnLargeTunneledUDPDatagram("agent-to-server", key.route, key.client, len(data))
+							n, err := udpConn.WriteToUDP(data, a.serverUDP)
+							if err != nil {
+								logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-write-server-"+key.route, fmt.Sprintf("failed to write UDP response to server route=%s client=%s bytes=%d err=%v", key.route, key.client, len(data), err))
+								continue
+							}
+							if n != len(data) {
+								logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-short-write-server-"+key.route, fmt.Sprintf("short UDP response write to server route=%s client=%s wrote=%d want=%d", key.route, key.client, n, len(data)))
+							}
 						}
-					}(key, localConn, rc.isEncrypted, rc.udpCipher)
+					}(key, newSess, localConn, rc.isEncrypted, rc.udpCipher)
 				}
 			}
 
 			if sessVal != nil {
 				if s, ok := sessVal.(*agentUDPSession); ok && s.conn != nil {
-					_, _ = s.conn.Write(payload)
+					n, err := s.conn.Write(payload)
+					if err != nil {
+						logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-write-local-"+routeName, fmt.Sprintf("failed to write UDP payload to local route=%s client=%s bytes=%d err=%v", routeName, clientID, len(payload), err))
+						continue
+					}
+					if n != len(payload) {
+						logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-short-write-local-"+routeName, fmt.Sprintf("short UDP payload write to local route=%s client=%s wrote=%d want=%d", routeName, clientID, n, len(payload)))
+					}
 				}
 			}
 		}
 	}
+}
+
+func warnLargeTunneledUDPDatagram(direction, routeName, clientID string, frameLen int) {
+	if !protocol.UDPFrameExceedsRecommendedSize(frameLen) {
+		return
+	}
+	logging.Global().RateLimitedWarn(logging.CatUDP, "udp-mtu-"+direction+"-"+routeName, fmt.Sprintf("large tunneled UDP datagram direction=%s route=%s client=%s bytes=%d recommended_max=%d", direction, routeName, clientID, frameLen, protocol.RecommendedMaxUDPDatagramSize))
 }

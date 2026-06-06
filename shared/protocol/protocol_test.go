@@ -199,6 +199,21 @@ func TestMaxPayloadSizeEnforcement(t *testing.T) {
 	}
 }
 
+func TestUDPFrameSizeHelpers(t *testing.T) {
+	if got, want := UDPFrameLen("game", "127.0.0.1:40000", 1200), 1+1+len("game")+1+len("127.0.0.1:40000")+1200; got != want {
+		t.Fatalf("UDPFrameLen() = %d, want %d", got, want)
+	}
+	if UDPFrameLen("", "", -1) != 3 {
+		t.Fatal("UDPFrameLen should clamp negative payload lengths to zero")
+	}
+	if UDPFrameExceedsRecommendedSize(RecommendedMaxUDPDatagramSize) {
+		t.Fatal("recommended max size should not exceed itself")
+	}
+	if !UDPFrameExceedsRecommendedSize(RecommendedMaxUDPDatagramSize + 1) {
+		t.Fatal("frame above recommended max size should be reported")
+	}
+}
+
 func TestEmptyFieldsRoundTrip(t *testing.T) {
 	pkt := &Packet{Type: TypePing, Route: "", Client: "", Payload: nil}
 

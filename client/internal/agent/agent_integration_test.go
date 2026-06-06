@@ -11,11 +11,13 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -86,6 +88,7 @@ func (s *fakeTunnelServer) close() {
 	s.controlMu.Lock()
 	if s.controlConn != nil {
 		_ = s.controlConn.Close()
+		s.controlConn = nil
 	}
 	s.controlMu.Unlock()
 	if s.dataUDPConn != nil {
@@ -96,6 +99,19 @@ func (s *fakeTunnelServer) close() {
 	}
 	if s.controlLn != nil {
 		_ = s.controlLn.Close()
+	}
+}
+
+func (s *fakeTunnelServer) closeControlPlane() {
+	s.controlMu.Lock()
+	if s.controlConn != nil {
+		_ = s.controlConn.Close()
+		s.controlConn = nil
+	}
+	s.controlMu.Unlock()
+	if s.controlLn != nil {
+		_ = s.controlLn.Close()
+		s.controlLn = nil
 	}
 }
 
@@ -388,6 +404,36 @@ func waitForSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg 
 	}
 }
 
+type timeoutNetError struct{}
+
+func (timeoutNetError) Error() string   { return "timeout" }
+func (timeoutNetError) Timeout() bool   { return true }
+func (timeoutNetError) Temporary() bool { return true }
+
+func TestShouldRetireUDPReadSession(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "timeout", err: timeoutNetError{}, want: true},
+		{name: "closed", err: net.ErrClosed, want: true},
+		{name: "connection refused", err: &net.OpError{Op: "read", Net: "udp", Err: syscall.ECONNREFUSED}, want: false},
+		{name: "connection reset", err: &net.OpError{Op: "read", Net: "udp", Err: syscall.ECONNRESET}, want: false},
+		{name: "network unreachable", err: &net.OpError{Op: "read", Net: "udp", Err: syscall.ENETUNREACH}, want: false},
+		{name: "unknown", err: errors.New("boom"), want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRetireUDPReadSession(tt.err); got != tt.want {
+				t.Fatalf("shouldRetireUDPReadSession(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAgentUDPRouteCacheRefreshesOnHello(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -446,6 +492,57 @@ func TestAgentUDPRouteCacheRefreshesOnHello(t *testing.T) {
 	resp2 := server.readUDPData(t)
 	if got := string(resp2.Payload); got != "two:ping2" {
 		t.Fatalf("second UDP response = %q, want %q", got, "two:ping2")
+	}
+}
+
+func TestAgentUDPContinuesAfterControlDisconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := startFakeTunnelServer(t, "testtoken")
+	defer server.close()
+
+	backend, backendAddr := startUDPEcho(t, "udp:")
+	defer backend.Close()
+
+	connectedCh := make(chan struct{}, 1)
+	go func() {
+		_ = RunWithHooks(ctx, Config{
+			Server:     server.serverAddr(),
+			Token:      "testtoken",
+			DisableTLS: true,
+		}, &Hooks{OnConnected: func() {
+			select {
+			case connectedCh <- struct{}{}:
+			default:
+			}
+		}})
+	}()
+
+	server.sendHello(t, map[string]RemoteRoute{
+		"game": {
+			Name:       "game",
+			Proto:      "udp",
+			PublicAddr: ":47998",
+			LocalAddr:  backendAddr,
+		},
+	})
+	waitForSignal(t, connectedCh, 5*time.Second, "agent never processed HELLO")
+
+	agentUDPAddr := server.waitForAgentUDPAddr(t)
+	clientID := "127.0.0.1:40000"
+	server.sendUDPToAgent(t, agentUDPAddr, "game", clientID, []byte("before"))
+	before := server.readUDPData(t)
+	if got := string(before.Payload); got != "udp:before" {
+		t.Fatalf("UDP response before control close = %q, want %q", got, "udp:before")
+	}
+
+	server.closeControlPlane()
+
+	server.sendUDPToAgent(t, agentUDPAddr, "game", clientID, []byte("after"))
+	after := server.readUDPData(t)
+	if got := string(after.Payload); got != "udp:after" {
+		t.Fatalf("UDP response after control close = %q, want %q", got, "udp:after")
 	}
 }
 

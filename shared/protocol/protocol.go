@@ -39,6 +39,11 @@ var (
 
 const MaxPayloadSize = 64*1024 - 1 // Maximum payload frameable in uint16 length field.
 
+// RecommendedMaxUDPDatagramSize is a conservative outer UDP payload size that
+// usually avoids IP fragmentation across typical 1500-byte Ethernet paths after
+// IPv4/IPv6 and UDP headers are added.
+const RecommendedMaxUDPDatagramSize = 1400
+
 const maxPacketBufSize = 5 + 255 + 255 + MaxPayloadSize
 
 type Packet struct {
@@ -46,6 +51,17 @@ type Packet struct {
 	Route   string
 	Client  string
 	Payload []byte
+}
+
+func UDPFrameLen(route, client string, payloadLen int) int {
+	if payloadLen < 0 {
+		payloadLen = 0
+	}
+	return 1 + 1 + len(route) + 1 + len(client) + payloadLen
+}
+
+func UDPFrameExceedsRecommendedSize(frameLen int) bool {
+	return frameLen > RecommendedMaxUDPDatagramSize
 }
 
 var (
@@ -69,7 +85,7 @@ type UDPScratch struct {
 
 func (s *UDPScratch) resetFor(n int) {
 	if cap(s.buf) < n {
-		s.buf = make([]byte, n, n)
+		s.buf = make([]byte, n)
 	} else {
 		s.buf = s.buf[:n]
 	}

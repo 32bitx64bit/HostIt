@@ -46,12 +46,12 @@ const (
 	probeDefaultTTL        = 30 * time.Second
 	writeDeadlineShort     = 2 * time.Second
 	writeDeadlineStandard  = 5 * time.Second
-	readDeadlineStandard   = 30 * time.Second
+	readDeadlineStandard   = 45 * time.Second
 	authDeadline           = 5 * time.Second
 	handshakeDeadline      = 15 * time.Second
-	pingInterval           = 15 * time.Second
-	healthCheckInterval    = 30 * time.Second
-	healthCheckTimeout     = 35 * time.Second
+	pingInterval           = 5 * time.Second
+	healthCheckInterval    = 10 * time.Second
+	healthCheckTimeout     = 45 * time.Second
 	maxControlConnLifetime = 24 * time.Hour
 	proxyIdleTimeout       = 5 * time.Minute
 	udpRegisterTimeout     = 60 * time.Second
@@ -199,9 +199,9 @@ type Server struct {
 	lastAgentConnectAt    time.Time
 	lastAgentDisconnectAt time.Time
 
-	dynamicRoutes    map[string]dynamicRouteEntry
-	dynamicPortLow   int
-	dynamicPortHigh  int
+	dynamicRoutes     map[string]dynamicRouteEntry
+	dynamicPortLow    int
+	dynamicPortHigh   int
 	pendingUpdateAcks map[string]chan *apitypes.RouteUpdateAck
 
 	agentUDPAddr atomic.Value // stores netip.AddrPort
@@ -2075,6 +2075,8 @@ func (s *Server) acceptControl(ln net.Listener) {
 		s.agentTCP = conn
 		s.agentUDP = netip.AddrPort{}
 		s.agentUDPAt = time.Time{}
+		s.agentUDPAddr.Store(netip.AddrPort{})
+		s.agentUDPTime.Store(0)
 		s.lastAgentConnectAt = time.Now()
 		s.abortPendingTCPLocked()
 		s.mu.Unlock()
@@ -2190,10 +2192,8 @@ func (s *Server) acceptControl(ln net.Listener) {
 				if err := protocol.ReadPacketTo(c, &pkt); err != nil {
 					break
 				}
-				if time.Until(deadlineAt) < pingInterval {
-					deadlineAt = time.Now().Add(readDeadlineStandard)
-					c.SetReadDeadline(deadlineAt)
-				}
+				deadlineAt = time.Now().Add(readDeadlineStandard)
+				c.SetReadDeadline(deadlineAt)
 				if pkt.Type == protocol.TypePing {
 					session.writeMu.Lock()
 					c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
@@ -2245,15 +2245,15 @@ func (s *Server) acceptControl(ln net.Listener) {
 				}
 			}
 
-		s.mu.Lock()
-		if s.agentTCP == c && s.agentEpoch == epoch {
-			s.agentTCP = nil
-			s.lastAgentDisconnectAt = time.Now()
-			s.closeDomainProxyIdleConnections()
-			s.abortPendingTCPLocked()
-			logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
-		}
-		s.mu.Unlock()
+			s.mu.Lock()
+			if s.agentTCP == c && s.agentEpoch == epoch {
+				s.agentTCP = nil
+				s.lastAgentDisconnectAt = time.Now()
+				s.closeDomainProxyIdleConnections()
+				s.abortPendingTCPLocked()
+				logging.Global().Infof(logging.CatTCP, "Agent disconnected from control")
+			}
+			s.mu.Unlock()
 		}(conn, session, remoteAddr, currentEpoch)
 	}
 }
@@ -2693,7 +2693,14 @@ func (s *Server) acceptAgentUDP() {
 				pendingBytes = 0
 				pendingBytesTime = time.Time{}
 			}
-			pubConn.WriteToUDPAddrPort(payload, clientAddrPort)
+			written, err := pubConn.WriteToUDPAddrPort(payload, clientAddrPort)
+			if err != nil {
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-write-public-"+routeName, fmt.Sprintf("failed to write UDP payload to public client route=%s client=%s bytes=%d err=%v", routeName, clientID, len(payload), err))
+				continue
+			}
+			if written != len(payload) {
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-short-write-public-"+routeName, fmt.Sprintf("short UDP payload write to public client route=%s client=%s wrote=%d want=%d", routeName, clientID, written, len(payload)))
+			}
 		}
 	}
 }
@@ -2749,21 +2756,21 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		// expired. agentUDPAt starts at zero and is set on the first
 		// register packet, so the IsZero check skips the time.Now() call
 		// in the common steady-state case.
-			if !agentUDPAt.IsZero() {
-				now := time.Now()
-				if now.Sub(agentUDPAt) > udpRegisterTimeout {
-					s.mu.Lock()
-					if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > udpRegisterTimeout {
-						logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
-						s.agentUDP = netip.AddrPort{}
-						s.agentUDPAt = time.Time{}
-						s.agentUDPAddr.Store(netip.AddrPort{})
-						s.agentUDPTime.Store(0)
-					}
-					s.mu.Unlock()
-					continue
+		if !agentUDPAt.IsZero() {
+			now := time.Now()
+			if now.Sub(agentUDPAt) > udpRegisterTimeout {
+				s.mu.Lock()
+				if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > udpRegisterTimeout {
+					logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
+					s.agentUDP = netip.AddrPort{}
+					s.agentUDPAt = time.Time{}
+					s.agentUDPAddr.Store(netip.AddrPort{})
+					s.agentUDPTime.Store(0)
 				}
+				s.mu.Unlock()
+				continue
 			}
+		}
 
 		cache, _ := s.routeCache.Load().(map[string]routeConfig)
 		rc, ok := cache[routeName]
@@ -2790,8 +2797,10 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 
 		data, err := protocol.MarshalUDP(&pkt, marshalBuf)
 		if err != nil {
+			logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-marshal-"+routeName, fmt.Sprintf("failed to marshal UDP packet route=%s client=%s payload=%d err=%v", routeName, clientStr, len(payload), err))
 			continue
 		}
+		warnLargeTunneledUDPDatagram("server-to-agent", routeName, clientStr, len(data))
 
 		pendingBytes += int64(len(payload))
 		if pendingBytesTime.IsZero() {
@@ -2801,6 +2810,20 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			pendingBytes = 0
 			pendingBytesTime = time.Time{}
 		}
-		s.udpDataConn.WriteToUDPAddrPort(data, agentAddr)
+		written, err := s.udpDataConn.WriteToUDPAddrPort(data, agentAddr)
+		if err != nil {
+			logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-write-agent-"+routeName, fmt.Sprintf("failed to write UDP packet to agent route=%s client=%s bytes=%d err=%v", routeName, clientStr, len(data), err))
+			continue
+		}
+		if written != len(data) {
+			logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-short-write-agent-"+routeName, fmt.Sprintf("short UDP packet write to agent route=%s client=%s wrote=%d want=%d", routeName, clientStr, written, len(data)))
+		}
 	}
+}
+
+func warnLargeTunneledUDPDatagram(direction, routeName, clientID string, frameLen int) {
+	if !protocol.UDPFrameExceedsRecommendedSize(frameLen) {
+		return
+	}
+	logging.Global().RateLimitedWarn(logging.CatUDP, "udp-mtu-"+direction+"-"+routeName, fmt.Sprintf("large tunneled UDP datagram direction=%s route=%s client=%s bytes=%d recommended_max=%d", direction, routeName, clientID, frameLen, protocol.RecommendedMaxUDPDatagramSize))
 }
