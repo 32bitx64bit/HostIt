@@ -178,6 +178,213 @@ status, _ := client.Status(ctx)                     // agent connection status
 wsURL    := client.EventsURL()                      // WebSocket URL for live events
 ```
 
+### HTTP API Reference
+
+The SDK is a thin HTTP client over the agent's local API. You can reimplement it in any language by sending the requests below to the agent's base URL (default: `http://127.0.0.1:7003`).
+
+#### Response Envelope
+
+Every response is a JSON object with a `status` field:
+
+```json
+{"status": "ok", "data": {...}}
+{"status": "error", "message": "..."}
+```
+
+- On success the HTTP status is `2xx` and the payload is in `data`.
+- On failure the HTTP status is `4xx`/`5xx`, `status` is `"error"`, and `message` contains a human-readable description.
+
+#### Status Values
+
+| Value | Meaning |
+|-------|---------|
+| `ok` | Request succeeded (envelope level) |
+| `error` | Request failed (envelope level) |
+| `active` | Route is registered and forwarding |
+| `pending_domain` | Route is waiting for domain selection (see `ListDomains` + `SelectDomain`) |
+| `failed` | Server/agent rejected the route operation |
+| `updated` | Route update was applied successfully |
+
+#### Tunnel Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/register` | Register a new route |
+| `GET` | `/api/v1/routes` | List active routes |
+| `DELETE` | `/api/v1/routes/{name}` | Remove a route |
+| `POST` / `PATCH` | `/api/v1/routes/update` | Update an existing route |
+| `GET` | `/api/v1/route/stats?name={name}` | Get per-route status |
+| `GET` | `/api/v1/status` | Get agent connection status |
+| `GET` | `/api/v1/domains` | List available domains |
+| `POST` | `/api/v1/domains/select` | Confirm a domain choice |
+| `WebSocket` | `/api/v1/events` | Subscribe to live route events |
+
+#### Schemas
+
+**`RegisterRequest`** — `POST /api/v1/register`
+
+```json
+{
+  "name": "my-app",
+  "proto": "tcp",
+  "local_port": 3000,
+  "local_host": "127.0.0.1",
+  "public_port": 0,
+  "domain": "auto",
+  "encrypted": false
+}
+```
+
+- `proto`: `"tcp"` (default), `"udp"`, or `"both"`
+- `local_host`: defaults to `"127.0.0.1"`
+- `domain`: `""` for port-only, `"auto"` to auto-suggest, or an explicit FQDN
+- `public_port`: `0` means auto-assign
+
+**`RegisterResponse`** — returned by `/api/v1/register` and `/api/v1/domains/select`
+
+```json
+{
+  "status": "active",
+  "request_id": "...",
+  "route_name": "my-app",
+  "public_addr": "1.2.3.4:12345",
+  "local_addr": "127.0.0.1:3000",
+  "proto": "tcp",
+  "domain": "my-app.example.com",
+  "available_domains": [...]
+}
+```
+
+When `status` is `"pending_domain"`, `available_domains` contains:
+
+```json
+{
+  "host": "my-app.example.com",
+  "available": true,
+  "reason": "",
+  "used_by": ""
+}
+```
+
+**`DomainSelectRequest`** — `POST /api/v1/domains/select`
+
+```json
+{
+  "request_id": "...",
+  "route_name": "my-app",
+  "domain": "my-app.example.com"
+}
+```
+
+**`RouteUpdateRequest`** — `POST` / `PATCH` `/api/v1/routes/update`
+
+```json
+{
+  "name": "my-app",
+  "local_port": 4000,
+  "local_host": "127.0.0.1",
+  "public_port": 0,
+  "domain": "auto"
+}
+```
+
+Only include fields you want to change. The response `data` is `{"status":"updated","route_name":"my-app"}`.
+
+**`Route`** — returned by `GET /api/v1/routes`
+
+```json
+{
+  "name": "my-app",
+  "proto": "tcp",
+  "public_addr": "1.2.3.4:12345",
+  "local_addr": "127.0.0.1:3000"
+}
+```
+
+**`RouteStats`** — returned by `GET /api/v1/route/stats`
+
+```json
+{
+  "name": "my-app",
+  "proto": "tcp",
+  "public_addr": "1.2.3.4:12345",
+  "local_addr": "127.0.0.1:3000",
+  "connected": true,
+  "source": "dynamic"
+}
+```
+
+**`StatusResponse`** — returned by `GET /api/v1/status`
+
+```json
+{
+  "connected": true,
+  "server": "wss://host.example.com:7000",
+  "version": "3.1.1",
+  "routes_count": 2
+}
+```
+
+**`DomainsResponse`** — returned by `GET /api/v1/domains`
+
+```json
+{
+  "base": "example.com",
+  "available": [
+    {"host": "my-app.example.com", "available": true, ...}
+  ]
+}
+```
+
+**`AppEvent`** — sent over the `ws://127.0.0.1:7003/api/v1/events` WebSocket
+
+```json
+{
+  "type": "route_updated",
+  "timestamp": 1717660800000,
+  "route_name": "my-app",
+  "detail": ""
+}
+```
+
+Common event types: `connected`, `disconnected`, `routes_updated`, `route_updated`.
+
+#### Mail Endpoints
+
+| Method | Path | Body | Response `data` |
+|--------|------|------|-----------------|
+| `GET` | `/api/mail/accounts` | — | `MailAccount[]` |
+| `POST` | `/api/mail/accounts` | `{"username":"alice","password":"..."}` | `MailAccount` |
+| `PATCH` | `/api/mail/accounts/{username}` | `{"password":"..."}` | empty (`204`) |
+| `DELETE` | `/api/mail/accounts/{username}` | — | empty (`204`) |
+| `POST` | `/api/mail/login` | `{"username":"alice","password":"..."}` | `{"username":"alice","address":"alice@example.com"}` |
+| `POST` | `/api/mail/inbox` | `{"username":"alice","password":"..."}` | `MailMessage[]` |
+| `POST` | `/api/mail/message` | `{"username":"alice","password":"...","messageId":42}` | `MailMessageFull` |
+| `POST` | `/api/mail/delete` | `{"username":"alice","password":"...","messageId":42}` | empty (`204`) |
+| `POST` | `/api/mail/lock` | `{"locked":true}` | `{"locked":true,"enabled":false}` |
+
+Mail schemas:
+
+```json
+{
+  "MailAccount": {"username": "alice", "address": "alice@example.com"},
+  "MailMessage": {
+    "id": 42,
+    "mailbox": "INBOX",
+    "date": "2024-06-06T12:00:00Z",
+    "from": "bob@example.com",
+    "to": "alice@example.com",
+    "subject": "Hello",
+    "flags": ["\\Seen"],
+    "size": 1234
+  },
+  "MailMessageFull": {
+    /* all MailMessage fields */
+    "body": "..."
+  }
+}
+```
+
 ### Email Account Management
 
 When the agent's email service is enabled:
