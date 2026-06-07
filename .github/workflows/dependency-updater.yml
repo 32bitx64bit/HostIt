@@ -1,0 +1,40 @@
+name: Dependency Updater
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+jobs:
+  update-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Update dependencies
+        run: |
+          for dir in client server shared; do
+            if [ -f "$dir/go.mod" ]; then
+              cd $dir && go get -u ./... && go mod tidy && cd ..
+            fi
+          done
+
+      - name: Build test
+        run: |
+          cd client && go build ./cmd/agent && cd ..
+          cd server && go build ./... && cd ..
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore: update Go dependencies'
+          title: 'chore: weekly dependency update'
+          body: 'Automated weekly update of Go module dependencies.'
+          branch: dependency-updates
+          delete-branch: true
