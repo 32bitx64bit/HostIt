@@ -1562,7 +1562,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 						http.Error(w, err.Error(), http.StatusInternalServerError)
 						return
 					}
-					log.Printf("tunnel tls regenerated; cert sha256=%s", fp)
+					serverlog.Log.Infof(logging.CatSystem, "tunnel tls regenerated; cert sha256=%s", fp)
 					addMsg("Regenerated TLS cert/key; new cert sha256=" + fp)
 				}
 			} else if !cfg.DisableTLS {
@@ -1578,7 +1578,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				log.Printf("tunnel tls enabled; cert sha256=%s", fp)
+				serverlog.Log.Infof(logging.CatSystem, "tunnel tls enabled; cert sha256=%s", fp)
 			}
 
 			cfgDir := filepath.Dir(configPath)

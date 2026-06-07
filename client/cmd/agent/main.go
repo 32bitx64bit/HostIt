@@ -30,6 +30,7 @@ import (
 	"hostit/shared/apitypes"
 	"hostit/shared/configio"
 	"hostit/shared/emailcfg"
+	"hostit/shared/logging"
 	"hostit/shared/module"
 	"hostit/shared/protocol"
 	"hostit/shared/systemdutil"
@@ -209,38 +210,38 @@ func main() {
 	loaded, _ := configio.Load(configPath, &cfg)
 
 	if loaded {
-		log.Printf("Loaded configuration from: %s", configPath)
+		agentlog.Log.Infof(logging.CatSystem, "Loaded configuration from: %s", configPath)
 	} else {
-		log.Printf("No configuration file found at: %s (will create on save)", configPath)
+		agentlog.Log.Infof(logging.CatSystem, "No configuration file found at: %s (will create on save)", configPath)
 	}
 
 	if !loaded && strings.TrimSpace(cfg.Server) == "" {
 		cfg.Server = "127.0.0.1"
-		log.Printf("First run: using default server: %s", cfg.Server)
+		agentlog.Log.Infof(logging.CatSystem, "First run: using default server: %s", cfg.Server)
 	}
 
 	if strings.TrimSpace(token) != "" {
 		cfg.Token = token
-		log.Printf("Using token from command-line argument")
+		agentlog.Log.Infof(logging.CatSystem, "Using token from command-line argument")
 	}
 	if strings.TrimSpace(serverHost) != "" {
 		cfg.Server = serverHost
-		log.Printf("Using server from command-line argument: %s", serverHost)
+		agentlog.Log.Infof(logging.CatSystem, "Using server from command-line argument: %s", serverHost)
 	}
 
 	if strings.TrimSpace(cfg.Server) == "" {
 		if webAddr == "" {
-			log.Fatalf("ERROR: agent server is required (set -server or agent.json Server)")
+			agentlog.Log.Fatal(logging.CatSystem, "ERROR: agent server is required (set -server or agent.json Server)")
 		}
 		autostart = false
-		log.Printf("WARNING: agent server not configured; web UI is available to configure it")
+		agentlog.Log.Infof(logging.CatSystem, "WARNING: agent server not configured; web UI is available to configure it")
 	}
 	if strings.TrimSpace(cfg.Token) == "" {
 		if webAddr == "" {
-			log.Fatalf("ERROR: agent token is required (set -token or agent.json Token)")
+			agentlog.Log.Fatal(logging.CatSystem, "ERROR: agent token is required (set -token or agent.json Token)")
 		}
 		autostart = false
-		log.Printf("WARNING: agent token not configured; web UI is available to configure it")
+		agentlog.Log.Infof(logging.CatSystem, "WARNING: agent token not configured; web UI is available to configure it")
 	}
 
 	ctrl := newAgentController(ctx, cfg)
@@ -251,16 +252,16 @@ func main() {
 	appsConfigPath := filepath.Join(filepath.Dir(absCfg), "apps.json")
 	appsCfg := apitypes.AppsConfig{}
 	if loaded, _ := configio.Load(appsConfigPath, &appsCfg); loaded && len(appsCfg.Apps) > 0 {
-		log.Printf("Loaded %d app configs from %s", len(appsCfg.Apps), appsConfigPath)
+		agentlog.Log.Infof(logging.CatSystem, "Loaded %d app configs from %s", len(appsCfg.Apps), appsConfigPath)
 	}
 	ctrl.appsCfg = appsCfg
 	ctrl.appsPath = appsConfigPath
 	mailSvc, err := mail.NewService(filepath.Join(filepath.Dir(absCfg), "mail"))
 	if err != nil {
-		log.Printf("mail service init failed: %v", err)
+		agentlog.Log.Infof(logging.CatSystem, "mail service init failed: %v", err)
 	} else {
 		if err := mailSvc.Start(ctx); err != nil {
-			log.Printf("mail service start failed: %v", err)
+			agentlog.Log.Infof(logging.CatSystem, "mail service start failed: %v", err)
 		}
 		mailSvc.SetOutboundDialer(func(callCtx context.Context, remoteAddr string) (net.Conn, error) {
 			cfg, _, connected, _, _ := ctrl.Get()
@@ -272,7 +273,7 @@ func main() {
 		defer mailSvc.Close()
 		ctrl.onEmailConfig = func(cfg emailcfg.Config) {
 			if err := mailSvc.ApplyConfig(cfg); err != nil {
-				log.Printf("mail config apply failed: %v", err)
+				agentlog.Log.Infof(logging.CatSystem, "mail config apply failed: %v", err)
 			}
 		}
 		ctrl.onEmailProbe = func(callCtx context.Context, req protocol.EmailProbeRequest) (protocol.EmailProbeResult, error) {
@@ -284,23 +285,23 @@ func main() {
 		cfg.TLSPinSHA256 = pin
 		ctrl.SetConfig(cfg)
 		if err := configio.Save(configPath, cfg); err != nil {
-			log.Printf("failed to save auto-pinned TLS config: %v", err)
+			agentlog.Log.Infof(logging.CatSystem, "failed to save auto-pinned TLS config: %v", err)
 		} else {
-			log.Printf("Saved auto-pinned TLS certificate to config")
+			agentlog.Log.Infof(logging.CatSystem, "Saved auto-pinned TLS certificate to config")
 		}
 	}
 	if autostart {
-		log.Printf("=== Auto-starting agent ===")
-		log.Printf("Server: %s", cfg.Server)
-		log.Printf("Control address: %s", cfg.ControlAddr())
-		log.Printf("Data address: %s", cfg.DataAddr())
-		log.Printf("TLS enabled: %v", !cfg.DisableTLS)
+		agentlog.Log.Infof(logging.CatSystem, "=== Auto-starting agent ===")
+		agentlog.Log.Infof(logging.CatSystem, "Server: %s", cfg.Server)
+		agentlog.Log.Infof(logging.CatSystem, "Control address: %s", cfg.ControlAddr())
+		agentlog.Log.Infof(logging.CatSystem, "Data address: %s", cfg.DataAddr())
+		agentlog.Log.Infof(logging.CatSystem, "TLS enabled: %v", !cfg.DisableTLS)
 		ctrl.Start()
 	} else {
-		log.Printf("=== Agent not auto-started ===")
-		log.Printf("Reason: server or token not configured")
+		agentlog.Log.Infof(logging.CatSystem, "=== Agent not auto-started ===")
+		agentlog.Log.Infof(logging.CatSystem, "Reason: server or token not configured")
 		if webAddr != "" {
-			log.Printf("Configure via web UI at: http://%s", webAddr)
+			agentlog.Log.Infof(logging.CatSystem, "Configure via web UI at: http://%s", webAddr)
 		}
 	}
 
@@ -310,12 +311,12 @@ func main() {
 			if h, _, err := net.SplitHostPort(display); err == nil {
 				h = strings.TrimSpace(h)
 				if h == "" || h == "0.0.0.0" || h == "::" || h == "[::]" || h == "0:0:0:0:0:0:0:0" {
-					log.Printf("WARNING: agent web UI is unauthenticated; binding to all interfaces")
+					agentlog.Log.Infof(logging.CatSystem, "WARNING: agent web UI is unauthenticated; binding to all interfaces")
 				}
 			}
-			log.Printf("agent web: http://%s", display)
+			agentlog.Log.Infof(logging.CatSystem, "agent web: http://%s", display)
 			if err := serveAgentDashboard(ctx, webAddr, configPath, ctrl, mailSvc); err != nil {
-				log.Printf("agent web error: %v", err)
+				agentlog.Log.Infof(logging.CatSystem, "agent web error: %v", err)
 			}
 		}()
 	}
@@ -647,15 +648,15 @@ func registerAppsFromConfig(ctx context.Context, ctrl *agentController, apps []a
 		}
 		resp, err := ctrl.RequestRoute(ctx, req)
 		if err != nil {
-			log.Printf("auto-register app %q failed: %v", app.Name, err)
+			agentlog.Log.Infof(logging.CatSystem, "auto-register app %q failed: %v", app.Name, err)
 			continue
 		}
 		if resp.Status == "active" {
-			log.Printf("auto-registered app %q on %s", app.Name, resp.PublicAddr)
+			agentlog.Log.Infof(logging.CatSystem, "auto-registered app %q on %s", app.Name, resp.PublicAddr)
 		} else if resp.Status == "pending_domain" {
-			log.Printf("auto-registered app %q pending domain selection", app.Name)
+			agentlog.Log.Infof(logging.CatSystem, "auto-registered app %q pending domain selection", app.Name)
 		} else if resp.Status == "failed" {
-			log.Printf("auto-register app %q rejected: %s", app.Name, resp.Error)
+			agentlog.Log.Infof(logging.CatSystem, "auto-register app %q rejected: %s", app.Name, resp.Error)
 		}
 	}
 }
@@ -674,20 +675,20 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentClient, "client.zip", moduleDir, updStatePath)
 	upd.PreservePaths = []string{absCfg, filepath.Join(filepath.Dir(absCfg), "mail")}
 	upd.Restart = func() error {
-		log.Printf("=== Update complete, restarting agent ===")
+		agentlog.Log.Infof(logging.CatSystem, "=== Update complete, restarting agent ===")
 		ctrl.Stop()
 		bin := upd.BuiltBinaryPath()
 		if _, err := os.Stat(bin); err != nil {
-			log.Printf("ERROR: Built binary not found: %s", bin)
+			agentlog.Log.Infof(logging.CatSystem, "ERROR: Built binary not found: %s", bin)
 			return err
 		}
-		log.Printf("Built binary: %s", bin)
+		agentlog.Log.Infof(logging.CatSystem, "Built binary: %s", bin)
 
 		if systemdutil.RunningUnderSystemd() {
-			log.Printf("Running under systemd - restarting service")
+			agentlog.Log.Infof(logging.CatSystem, "Running under systemd - restarting service")
 			if systemdutil.SystemctlAvailable() {
 				if err := syncInstalledAgentSystemdUnit(moduleDir); err != nil {
-					log.Printf("Failed to refresh installed systemd unit: %v", err)
+					agentlog.Log.Infof(logging.CatSystem, "Failed to refresh installed systemd unit: %v", err)
 					// Continue even if we can't refresh the unit file
 					// (common when running as non-root without write
 					// access to /etc/systemd/system).
@@ -697,18 +698,18 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 				cmd := exec.CommandContext(ctx2, "systemctl", "restart", "--no-block", agentSystemdServiceName)
 				out, err := cmd.CombinedOutput()
 				if err == nil {
-					log.Printf("Systemd restart command sent successfully")
+					agentlog.Log.Infof(logging.CatSystem, "Systemd restart command sent successfully")
 					return nil
 				}
-				log.Printf("Systemctl restart failed: %v, output: %s", err, string(out))
+				agentlog.Log.Infof(logging.CatSystem, "Systemctl restart failed: %v, output: %s", err, string(out))
 			}
-			log.Printf("Sending SIGTERM to let systemd restart")
+			agentlog.Log.Infof(logging.CatSystem, "Sending SIGTERM to let systemd restart")
 			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 			return nil
 		}
 
-		log.Printf("Not running under systemd - executing binary replacement")
-		log.Printf("Agent will auto-reconnect using configuration from: %s", configPath)
+		agentlog.Log.Infof(logging.CatSystem, "Not running under systemd - executing binary replacement")
+		agentlog.Log.Infof(logging.CatSystem, "Agent will auto-reconnect using configuration from: %s", configPath)
 		return updater.ExecReplace(bin, os.Args)
 	}
 	upd.Start(ctx)
@@ -806,14 +807,14 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			out["data"] = data
 		}
 		if err := json.NewEncoder(w).Encode(out); err != nil {
-			log.Printf("json encode: %v", err)
+			agentlog.Log.Infof(logging.CatSystem, "json encode: %v", err)
 		}
 	}
 	writeError := func(w http.ResponseWriter, status int, message string) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		if err := json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": message}); err != nil {
-			log.Printf("json encode error: %v", err)
+			agentlog.Log.Infof(logging.CatSystem, "json encode error: %v", err)
 		}
 	}
 

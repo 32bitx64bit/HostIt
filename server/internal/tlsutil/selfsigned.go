@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"log"
 	"math/big"
 	"net"
 	"os"
@@ -33,7 +32,6 @@ func ensureSelfSignedCert(certFile, keyFile, commonName string, dnsNames []strin
 			return "", err
 		}
 		if selfSignedNeedsRenew(der) {
-			log.Printf("tlsutil: auto-rotating %s self-signed cert (expires within 30 days)", commonName)
 			return regenerateSelfSignedCert(certFile, keyFile, commonName, dnsNames, ipAddrs)
 		}
 		sum := sha256.Sum256(der)
