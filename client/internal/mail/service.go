@@ -139,15 +139,28 @@ func NewService(dataDir string) (*Service, error) {
 	db.SetMaxIdleConns(1)
 	s := &Service{dataDir: dataDir, db: db}
 	if err := s.migrate(context.Background()); err != nil {
-		_ = db.Close()
+		if closeErr := db.Close(); closeErr != nil {
+			logging.Global().Warnf(logging.CatEmail, "failed to close mail db after migration error: %v", closeErr)
+		}
 		return nil, err
 	}
 	if !dbExisted {
-		_ = os.Chmod(dbPath, 0o600)
+		if err := os.Chmod(dbPath, 0o600); err != nil {
+			logging.Global().Warnf(logging.CatEmail, "failed to chmod mail db: %v", err)
+		}
 	}
-	cfg, _ := s.loadConfig(context.Background())
+	cfg, err := s.loadConfig(context.Background())
+	if err != nil {
+		logging.Global().Warnf(logging.CatEmail, "failed to load mail config: %v", err)
+		cfg = emailcfg.Config{}
+	}
 	s.cfg = cfg
-	s.lockedBySDK, _ = s.loadSDKLock(context.Background())
+	lockedBySDK, err := s.loadSDKLock(context.Background())
+	if err != nil {
+		logging.Global().Warnf(logging.CatEmail, "failed to load mail SDK lock: %v", err)
+		lockedBySDK = false
+	}
+	s.lockedBySDK = lockedBySDK
 	if s.lockedBySDK {
 		s.cfg.Enabled = false
 	}
@@ -319,7 +332,9 @@ func (s *Service) GetMessage(username string, messageID int64) (*WebMessageFull,
 		return nil, err
 	}
 	m.InternalDate = time.Unix(internal, 0)
-	_ = json.Unmarshal([]byte(flagsRaw), &m.Flags)
+	if err := json.Unmarshal([]byte(flagsRaw), &m.Flags); err != nil {
+		logging.Global().Warnf(logging.CatEmail, "failed to unmarshal message flags for message %d: %v", m.ID, err)
+	}
 
 	wm := WebMessageFull{
 		WebMessage: WebMessage{
@@ -634,9 +649,18 @@ func (s *Service) reconcileAccountsLocked(cfg emailcfg.Config) error {
 }
 
 func (s *Service) refreshStatusLocked(lastErr string) {
-	accountCount, _ := s.countAccountsLocked()
-	messageCount, _ := s.countMessagesLocked()
-	storageUsed, _ := s.storageUsageLocked()
+	accountCount, err := s.countAccountsLocked()
+	if err != nil {
+		logging.Global().Warnf(logging.CatEmail, "failed to count mail accounts: %v", err)
+	}
+	messageCount, err := s.countMessagesLocked()
+	if err != nil {
+		logging.Global().Warnf(logging.CatEmail, "failed to count mail messages: %v", err)
+	}
+	storageUsed, err := s.storageUsageLocked()
+	if err != nil {
+		logging.Global().Warnf(logging.CatEmail, "failed to compute mail storage usage: %v", err)
+	}
 	s.status = Status{
 		Enabled:           s.cfg.Enabled,
 		LockedBySDK:       s.lockedBySDK,
@@ -670,6 +694,16 @@ func (s *Service) refreshStatusLocked(lastErr string) {
 	}
 }
 
+func (s *Service) setLastError(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.LastError = err.Error()
+	s.status.UpdatedAt = time.Now()
+}
+
 func (s *Service) loadSDKLock(ctx context.Context) (bool, error) {
 	var raw string
 	err := s.db.QueryRowContext(ctx, `SELECT value FROM config WHERE key = 'mail_sdk_lock'`).Scan(&raw)
@@ -689,8 +723,11 @@ func (s *Service) loadSDKLock(ctx context.Context) (bool, error) {
 func (s *Service) SetSDKLock(locked bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	payload, _ := json.Marshal(locked)
-	_, err := s.db.Exec(`INSERT INTO config(key, value) VALUES('mail_sdk_lock', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, string(payload))
+	payload, err := json.Marshal(locked)
+	if err != nil {
+		return fmt.Errorf("failed to marshal SDK lock: %w", err)
+	}
+	_, err = s.db.Exec(`INSERT INTO config(key, value) VALUES('mail_sdk_lock', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, string(payload))
 	if err != nil {
 		return err
 	}
@@ -815,6 +852,7 @@ func (s *Service) warmAutoTLSCertificate(setup *mailTLSSetup) {
 	defer cancel()
 	if err := setup.Warmup(warmCtx); err != nil {
 		logging.Global().Warnf(logging.CatEncryption, "mail automatic TLS warmup failed: %v", err)
+		s.setLastError(fmt.Errorf("TLS warmup failed: %w", err))
 		return
 	}
 	logging.Global().Infof(logging.CatEncryption, "mail automatic TLS certificate is ready")
@@ -853,7 +891,11 @@ func (s *Service) startACMEHTTPChallengeLocked(setup *mailTLSSetup) error {
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
-	go func() { _ = httpSrv.Serve(ln) }()
+	go func() {
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logging.Global().Warnf(logging.CatEmail, "ACME HTTP challenge server exited: %v", err)
+		}
+	}()
 	s.acmeHTTPLn = ln
 	s.acmeHTTPServer = httpSrv
 	return nil
@@ -926,7 +968,11 @@ func (s *Service) startSMTPServer(addr string, implicitTLS bool, submission bool
 	} else {
 		srv.TLSConfig = s.tlsCfg
 	}
-	go func() { _ = srv.Serve(serveLn) }()
+	go func() {
+		if err := srv.Serve(serveLn); err != nil && !errors.Is(err, smtp.ErrServerClosed) {
+			logging.Global().Warnf(logging.CatEmail, "SMTP server on %s exited: %v", addr, err)
+		}
+	}()
 	return ln, srv, nil
 }
 
@@ -982,7 +1028,11 @@ func (s *Service) startIMAPServer(addr string, implicitTLS bool) (net.Listener, 
 		opts.TLSConfig = s.tlsCfg
 	}
 	srv := imapserver.New(opts)
-	go func() { _ = srv.Serve(serveLn) }()
+	go func() {
+		if err := srv.Serve(serveLn); err != nil {
+			logging.Global().Warnf(logging.CatEmail, "IMAP server on %s exited: %v", addr, err)
+		}
+	}()
 	return ln, srv, nil
 }
 
@@ -1056,14 +1106,19 @@ func (s *Service) listMessages(username string) ([]storedMessage, error) {
 			return nil, err
 		}
 		msg.InternalDate = time.Unix(internal, 0)
-		_ = json.Unmarshal([]byte(flagsRaw), &msg.Flags)
+		if err := json.Unmarshal([]byte(flagsRaw), &msg.Flags); err != nil {
+			logging.Global().Warnf(logging.CatEmail, "failed to unmarshal message flags for message %d: %v", msg.ID, err)
+		}
 		out = append(out, msg)
 	}
 	return out, rows.Err()
 }
 
 func (s *Service) storeMessage(username, mailbox string, flags []string, raw []byte) error {
-	flagsJSON, _ := json.Marshal(flags)
+	flagsJSON, err := json.Marshal(flags)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message flags: %w", err)
+	}
 	s.mu.RLock()
 	limit := s.cfg.StorageLimitBytes
 	s.mu.RUnlock()
@@ -1078,7 +1133,9 @@ func (s *Service) storeMessage(username, mailbox string, flags []string, raw []b
 			return err
 		}
 		if used+int64(len(raw)) > limit {
-			return fmt.Errorf("mail storage limit exceeded")
+			err := fmt.Errorf("mail storage limit exceeded")
+			s.setLastError(err)
+			return err
 		}
 	}
 	if _, err := tx.Exec(`INSERT INTO messages(username, mailbox, internal_date, flags_json, raw, created_at) VALUES(?, ?, ?, ?, ?, ?)`, username, mailbox, time.Now().Unix(), string(flagsJSON), raw, time.Now().Unix()); err != nil {
@@ -1405,6 +1462,7 @@ func (s *smtpSession) Data(r io.Reader) error {
 			return err
 		}
 		if err := s.svc.sendOutboundSMTP(sendCtx, s.from, external, signedRaw); err != nil {
+			s.svc.setLastError(fmt.Errorf("outbound SMTP failed: %w", err))
 			return err
 		}
 	}

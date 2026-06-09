@@ -585,9 +585,11 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 				s.sessionsMu.Lock()
 				if session, ok := s.sessions[remoteAddr]; ok {
 					session.writeMu.Lock()
-					agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-					protocol.WritePacket(agent, helloPkt)
-					session.writeMu.Unlock()
+				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				if err := protocol.WritePacket(agent, helloPkt); err != nil {
+					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
+				}
+				session.writeMu.Unlock()
 				}
 				s.sessionsMu.Unlock()
 			}
@@ -710,7 +712,9 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 			if session, ok := s.sessions[remoteAddr]; ok {
 				session.writeMu.Lock()
 				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				protocol.WritePacket(agent, helloPkt)
+				if err := protocol.WritePacket(agent, helloPkt); err != nil {
+					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
+				}
 				session.writeMu.Unlock()
 			}
 			s.sessionsMu.Unlock()
@@ -761,7 +765,9 @@ func (s *Server) DeleteApp(label string) bool {
 			if session, ok := s.sessions[remoteAddr]; ok {
 				session.writeMu.Lock()
 				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				protocol.WritePacket(agent, helloPkt)
+				if err := protocol.WritePacket(agent, helloPkt); err != nil {
+					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
+				}
 				session.writeMu.Unlock()
 			}
 			s.sessionsMu.Unlock()
@@ -986,8 +992,10 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest) apitypes.R
 		key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
 		if err == nil {
 			s.derivedKeys[rt.Name] = key
-			aead, _ := crypto.NewUDPCipher(key)
-			if aead != nil {
+			aead, err := crypto.NewUDPCipher(key)
+			if err != nil {
+				logging.Global().Warnf(logging.CatTCP, "failed to create UDP cipher for route %s: %v", rt.Name, err)
+			} else if aead != nil {
 				s.udpCiphers[rt.Name] = aead
 			}
 		}
@@ -1036,7 +1044,9 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest) apitypes.R
 			if session, ok := s.sessions[remoteAddr]; ok {
 				session.writeMu.Lock()
 				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				protocol.WritePacket(agent, helloPkt)
+				if err := protocol.WritePacket(agent, helloPkt); err != nil {
+					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
+				}
 				session.writeMu.Unlock()
 			}
 			s.sessionsMu.Unlock()
@@ -1200,7 +1210,9 @@ func (s *Server) processRouteConfirmLocked(confirm apitypes.RouteConfirm) apityp
 			if session, ok := s.sessions[remoteAddr]; ok {
 				session.writeMu.Lock()
 				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				protocol.WritePacket(agent, helloPkt)
+				if err := protocol.WritePacket(agent, helloPkt); err != nil {
+					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
+				}
 				session.writeMu.Unlock()
 			}
 			s.sessionsMu.Unlock()
@@ -1283,7 +1295,9 @@ func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove) apitypes.
 			if session, ok := s.sessions[remoteAddr]; ok {
 				session.writeMu.Lock()
 				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				protocol.WritePacket(agent, helloPkt)
+				if err := protocol.WritePacket(agent, helloPkt); err != nil {
+					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
+				}
 				session.writeMu.Unlock()
 			}
 			s.sessionsMu.Unlock()
@@ -1399,8 +1413,10 @@ func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate) apitypes.Rou
 			key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
 			if err == nil {
 				s.derivedKeys[req.Name] = key
-				aead, _ := crypto.NewUDPCipher(key)
-				if aead != nil {
+				aead, err := crypto.NewUDPCipher(key)
+				if err != nil {
+					logging.Global().Warnf(logging.CatTCP, "failed to create UDP cipher for route %s: %v", req.Name, err)
+				} else if aead != nil {
 					s.udpCiphers[req.Name] = aead
 				}
 			}
@@ -1454,10 +1470,12 @@ func (s *Server) pushHelloToAgentLocked() {
 	remoteAddr := agent.RemoteAddr().String()
 	s.sessionsMu.Lock()
 	if session, ok := s.sessions[remoteAddr]; ok {
-		session.writeMu.Lock()
-		agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-		protocol.WritePacket(agent, helloPkt)
-		session.writeMu.Unlock()
+			session.writeMu.Lock()
+				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+				if err := protocol.WritePacket(agent, helloPkt); err != nil {
+					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
+				}
+				session.writeMu.Unlock()
 	}
 	s.sessionsMu.Unlock()
 }
@@ -1801,8 +1819,18 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 	if strings.TrimSpace(cfg.DynamicPortRange) != "" {
 		parts := strings.SplitN(strings.TrimSpace(cfg.DynamicPortRange), "-", 2)
 		if len(parts) == 2 {
-			s.dynamicPortLow, _ = strconv.Atoi(strings.TrimSpace(parts[0]))
-			s.dynamicPortHigh, _ = strconv.Atoi(strings.TrimSpace(parts[1]))
+			low, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+			if err != nil {
+				logging.Global().Warnf(logging.CatTCP, "invalid dynamic port range low %q: %v", parts[0], err)
+			} else {
+				s.dynamicPortLow = low
+			}
+			high, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if err != nil {
+				logging.Global().Warnf(logging.CatTCP, "invalid dynamic port range high %q: %v", parts[1], err)
+			} else {
+				s.dynamicPortHigh = high
+			}
 		}
 	}
 	if s.dynamicPortLow == 0 {
@@ -1818,8 +1846,12 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", rt.Name, err)
 			} else {
 				s.derivedKeys[rt.Name] = key
-				cipher, _ := crypto.NewUDPCipher(key)
-				s.udpCiphers[rt.Name] = cipher
+				cipher, err := crypto.NewUDPCipher(key)
+				if err != nil {
+					logging.Global().Warnf(logging.CatTCP, "failed to create UDP cipher for route %s: %v", rt.Name, err)
+				} else {
+					s.udpCiphers[rt.Name] = cipher
+				}
 			}
 		}
 	}
@@ -1851,8 +1883,10 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 						key, err := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
 						if err == nil {
 							s.derivedKeys[route.RouteName] = key
-							aead, _ := crypto.NewUDPCipher(key)
-							if aead != nil {
+							aead, err := crypto.NewUDPCipher(key)
+							if err != nil {
+								logging.Global().Warnf(logging.CatTCP, "failed to create UDP cipher for route %s: %v", route.RouteName, err)
+							} else if aead != nil {
 								s.udpCiphers[route.RouteName] = aead
 							}
 						}

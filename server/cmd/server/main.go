@@ -44,6 +44,13 @@ import (
 
 var startTime = time.Now()
 
+func writeJSON(w http.ResponseWriter, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		logging.Global().Warnf(logging.CatSystem, "failed to encode JSON response: %v", err)
+	}
+}
+
 func main() {
 	var controlAddr string
 	var dataAddr string
@@ -499,7 +506,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			_, st, _ := runner.Get()
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			writeJSON(w, map[string]any{
 				"status":          "ok",
 				"agent_connected": st.AgentConnected,
 				"version":         version.Current,
@@ -775,7 +782,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			writeJSON(w, map[string]any{
 				"app":     label,
 				"enabled": enabled,
 			})
@@ -805,7 +812,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			writeJSON(w, map[string]any{
 				"app":     label,
 				"deleted": true,
 			})
@@ -825,7 +832,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				apps = []appstore.Application{}
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(apps)
+			writeJSON(w, apps)
 		})))
 
 		// Metrics API (protected)
@@ -836,7 +843,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			cfg, _, snap, _ := runner.Dashboard(time.Now())
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			writeJSON(w, map[string]any{
 				"uptime_seconds":     int64(time.Since(startTime).Seconds()),
 				"agent_connected":    snap.AgentConnected,
 				"routes_count":       len(cfg.Routes),
@@ -892,7 +899,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				}(),
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(resp)
+			writeJSON(w, resp)
 		})))
 
 		mux.HandleFunc("/api/nettest/ping", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
@@ -901,7 +908,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"serverTimeUnixMs": time.Now().UnixMilli()})
+			writeJSON(w, map[string]any{"serverTimeUnixMs": time.Now().UnixMilli()})
 		})))
 
 		mux.HandleFunc("/api/nettest/direct-download", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
@@ -962,7 +969,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			mbps := (float64(n) * 8.0 / elapsed.Seconds()) / 1e6
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			writeJSON(w, map[string]any{
 				"bytes":      n,
 				"durationMs": elapsed.Milliseconds(),
 				"mbps":       mbps,
@@ -1013,7 +1020,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(result)
+			writeJSON(w, result)
 		})))
 
 		// Manual update check (protected)
@@ -1033,7 +1040,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			_ = upd.CheckNow(r.Context())
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(upd.Status())
+			writeJSON(w, upd.Status())
 		})))
 
 		// systemd status + control (protected)
@@ -1044,7 +1051,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			st := systemdutil.Status(r.Context(), "hostit-server.service")
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(st)
+			writeJSON(w, st)
 		})))
 		mux.HandleFunc("/api/systemd/restart", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -1096,7 +1103,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			upd.CheckIfDue(r.Context())
 			st := upd.Status()
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(st)
+			writeJSON(w, st)
 		})))
 		mux.HandleFunc("/api/update/remind", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -1401,7 +1408,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 			report := runEmailCheckReportWithLive(r.Context(), cfg.Email, runner)
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(report)
+			writeJSON(w, report)
 		})))
 
 		mux.HandleFunc("/domain-manager-info", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
@@ -1477,7 +1484,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				entries = serverlog.UILogs.Entries(level, limit)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			writeJSON(w, map[string]any{
 				"level":   level,
 				"limit":   limit,
 				"stats":   stats,
@@ -1713,7 +1720,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			writeJSON(w, map[string]any{
 				"route":   routeName,
 				"enabled": enabled,
 			})
