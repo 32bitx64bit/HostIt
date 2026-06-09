@@ -37,7 +37,6 @@ import (
 	"hostit/shared/updater"
 	"hostit/shared/version"
 
-	"github.com/coder/websocket"
 )
 
 var shutdownTimeout = 5 * time.Second
@@ -1724,14 +1723,17 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	})
 
 	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			OriginPatterns: []string{"localhost:*", "127.0.0.1:*"},
-		})
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "websocket upgrade failed")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "streaming not supported")
 			return
 		}
-		defer conn.Close(websocket.StatusNormalClosure, "")
+		flusher.Flush()
 
 		sub := ctrl.SubscribeEvents()
 		defer ctrl.UnsubscribeEvents(sub)
@@ -1743,16 +1745,14 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 				if err != nil {
 					continue
 				}
-				ctx2, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-				err = conn.Write(ctx2, websocket.MessageText, data)
-				cancel()
+				_, err = w.Write([]byte("data: " + string(data) + "\n\n"))
 				if err != nil {
 					return
 				}
+				flusher.Flush()
 			case <-r.Context().Done():
 				return
 			case <-time.After(5 * time.Minute):
-				conn.Close(websocket.StatusNormalClosure, "idle timeout")
 				return
 			}
 		}
@@ -2951,11 +2951,10 @@ const agentAppsHTML = `<!doctype html>
 		pollOnce();setInterval(pollOnce,3000);
 
 		try{
-			var ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/api/v1/events');
-			ws.onmessage=function(e){
+			var source=new EventSource('/api/v1/events');
+			source.onmessage=function(e){
 				try{var ev=JSON.parse(e.data);addEvent(ev);}catch(_){}
 			};
-			ws.onclose=function(){setTimeout(function(){location.reload();},5000);};
 		}catch(e){}
 	})();
 	</script>
