@@ -24,8 +24,10 @@ import (
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
-	"github.com/emersion/go-sasl"
+	emersionSasl "github.com/emersion/go-sasl"
 	smtp "github.com/emersion/go-smtp"
+
+	"hostit/shared/sasl"
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 
@@ -1309,7 +1311,7 @@ func (s *smtpSession) AuthMechanisms() []string {
 	return []string{"PLAIN"}
 }
 
-func (s *smtpSession) Auth(mech string) (sasl.Server, error) {
+func (s *smtpSession) Auth(mech string) (emersionSasl.Server, error) {
 	if !s.submission || strings.ToUpper(mech) != "PLAIN" {
 		return nil, fmt.Errorf("unsupported auth mechanism")
 	}
