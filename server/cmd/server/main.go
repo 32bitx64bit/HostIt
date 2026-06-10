@@ -17,12 +17,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"hostit/server/internal/appstore"
@@ -85,7 +83,7 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, serverlog.NewUILogWriter("stdio", serverlog.UILogs)))
 	slog := serverlog.Log
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := notifyContext(context.Background())
 	defer cancel()
 
 	cfg := tunnel.ServerConfig{
@@ -458,7 +456,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				// Fallback: SIGTERM triggers systemd restart.
 				_ = out
 			}
-			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+				_ = sendSIGTERM(os.Getpid())
 			return nil
 		}
 		// Non-systemd: replace the current process immediately.
@@ -1221,7 +1219,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			w.WriteHeader(http.StatusAccepted)
 			go func() {
 				time.Sleep(250 * time.Millisecond)
-				_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			_ = sendSIGTERM(os.Getpid())
 			}()
 		})))
 		mux.HandleFunc("/api/process/exit", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {

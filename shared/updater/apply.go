@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -757,6 +758,25 @@ func makeWritable(path string) error {
 }
 
 func runBuild(ctx context.Context, moduleDir string, logw io.Writer) error {
+	if runtime.GOOS == "windows" {
+		psPath := filepath.Join(moduleDir, "build.ps1")
+		if _, err := os.Stat(psPath); err == nil {
+			_, _ = fmt.Fprintf(logw, "Running build.ps1...\n")
+			cmd := execCommandContext(ctx, "powershell.exe", "-File", ".\\build.ps1")
+			cmd.Dir = moduleDir
+			cmd.Stdout = logw
+			cmd.Stderr = logw
+			cmd.Env = ensureGoBuildEnv(os.Environ(), moduleDir)
+			start := time.Now()
+			if err := cmd.Run(); err != nil {
+				_, _ = fmt.Fprintf(logw, "Build failed after %s\n", time.Since(start).Truncate(10*time.Millisecond))
+				return err
+			}
+			_, _ = fmt.Fprintf(logw, "Build succeeded in %s\n", time.Since(start).Truncate(10*time.Millisecond))
+			return nil
+		}
+	}
+
 	_, _ = fmt.Fprintf(logw, "Running build.sh...\n")
 	cmd := execCommandContext(ctx, "sh", "./build.sh")
 	cmd.Dir = moduleDir
