@@ -23,3 +23,16 @@ jobs:
           else
             cd server && go build ./...
           fi
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build client on Windows
+        run: cd client && go build ./cmd/agent
