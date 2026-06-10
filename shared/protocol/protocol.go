@@ -79,18 +79,6 @@ var (
 	}
 )
 
-type UDPScratch struct {
-	buf []byte
-}
-
-func (s *UDPScratch) resetFor(n int) {
-	if cap(s.buf) < n {
-		s.buf = make([]byte, n)
-	} else {
-		s.buf = s.buf[:n]
-	}
-}
-
 func WritePacket(w io.Writer, p *Packet) error {
 	if len(p.Payload) > MaxPayloadSize {
 		return ErrPayloadTooBig
