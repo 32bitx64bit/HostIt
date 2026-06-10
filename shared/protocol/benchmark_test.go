@@ -266,3 +266,23 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// BenchmarkUnmarshalUDPInterned is the hot receive path with string
+// interning: repeated route/client fields must not allocate.
+func BenchmarkUnmarshalUDPInterned(b *testing.B) {
+	pkt := &Packet{Type: TypeData, Route: "game-route", Client: "203.0.113.10:51820", Payload: make([]byte, 512)}
+	data, err := MarshalUDP(pkt, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	in := NewStringInterner(4096)
+	var p Packet
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := UnmarshalUDPToInterned(data, &p, in); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
