@@ -1,24 +1,53 @@
 package protocol
 
-import "hostit/shared/version"
+import (
+	"fmt"
+	"sort"
 
+	"hostit/shared/version"
+)
+
+// VersionPayload is sent during version negotiation after auth.
+// Error is set when the server rejects the peer so the agent
+// can report the reason.
 type VersionPayload struct {
-	Version string `json:"version"`
+	Version  string   `json:"version"`
+	Features []string `json:"features,omitempty"`
+	Error    string   `json:"error,omitempty"`
 }
 
+// ProtocolVersion is the tunnel wire-protocol version.
 const ProtocolVersion = "1.0.0"
 
 var ProtocolVersionParsed = version.MustParse(ProtocolVersion)
 
-// IsCompatibleWith returns true if the peer version is compatible with the
-// local version. Major versions must match exactly. The peer's minor version
-// must be >= the local minor version. Patch is informational and ignored.
+// SupportedFeatures are optional capabilities negotiated per connection.
+var SupportedFeatures = []string{}
+
 func IsCompatibleWith(local, peer version.Version) bool {
-	if local.Major != peer.Major {
-		return false
+	return local.Major == peer.Major
+}
+
+func IncompatibleVersionError(local, peer version.Version) string {
+	return fmt.Sprintf("protocol version %s is incompatible with %s: major versions must match (update the older side)", peer, local)
+}
+
+// NegotiateFeatures returns the sorted intersection of local and peer features.
+func NegotiateFeatures(local, peer []string) []string {
+	if len(local) == 0 || len(peer) == 0 {
+		return nil
 	}
-	if peer.Minor < local.Minor {
-		return false
+	set := make(map[string]struct{}, len(local))
+	for _, f := range local {
+		set[f] = struct{}{}
 	}
-	return true
+	var shared []string
+	for _, f := range peer {
+		if _, ok := set[f]; ok {
+			shared = append(shared, f)
+			delete(set, f) // dedupe
+		}
+	}
+	sort.Strings(shared)
+	return shared
 }
