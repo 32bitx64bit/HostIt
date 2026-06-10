@@ -55,6 +55,11 @@ const (
 	maxControlConnLifetime = 24 * time.Hour
 	proxyIdleTimeout       = 5 * time.Minute
 	udpRegisterTimeout     = 60 * time.Second
+	// udpRegisterAuthWindow bounds the clock skew / replay window for an
+	// authenticated UDP register (SEC-3). A register's timestamp must be
+	// within this window of the server clock, and its nonce is single-use
+	// within the window.
+	udpRegisterAuthWindow = 30 * time.Second
 	domainShutdownTimeout  = 5 * time.Second
 	nettestTimeout         = 2 * time.Second
 	bwTestTimeout          = 5 * time.Second
@@ -156,8 +161,6 @@ type Server struct {
 	mu            sync.RWMutex
 	agentTCP      net.Conn
 	agentEpoch    uint64
-	agentUDP      netip.AddrPort
-	agentUDPAt    time.Time
 	udpDataConn   *net.UDPConn
 	controlLn     net.Listener
 	dataLn        net.Listener
@@ -202,7 +205,6 @@ type Server struct {
 	dynamicRoutes     map[string]dynamicRouteEntry
 	dynamicPortLow    int
 	dynamicPortHigh   int
-	pendingUpdateAcks map[string]chan *apitypes.RouteUpdateAck
 
 	agentUDPAddr atomic.Value // stores netip.AddrPort
 	agentUDPTime atomic.Int64 // unix nano
@@ -321,17 +323,7 @@ type routeConfig struct {
 func (s *Server) updateRouteCache() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	newCache := make(map[string]routeConfig)
-	for _, rt := range effectiveRoutes(s.cfg, s.dynamicRoutes) {
-		newCache[rt.Name] = routeConfig{
-			enabled:     rt.IsEnabled(),
-			isEncrypted: rt.IsEncrypted(),
-			udpCipher:   s.udpCiphers[rt.Name],
-			derivedKey:  s.derivedKeys[rt.Name],
-		}
-	}
-	s.routeCache.Store(newCache)
+	s.updateRouteCacheLocked()
 }
 
 func (s *Server) updateRouteCacheLocked() {
@@ -568,31 +560,12 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 		if rt.Name == name {
 			val := enabled
 			s.cfg.Routes[i].Enabled = &val
-			cfg := s.cfg
-			dr := s.dynamicRoutes
 			agent := s.agentTCP
+			helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
 			s.mu.Unlock()
 
 			s.updateRouteCache()
-
-			if agent != nil {
-				payload, err := json.Marshal(buildHelloPayload(cfg, dr))
-				if err != nil {
-					return false
-				}
-				helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: payload}
-				remoteAddr := agent.RemoteAddr().String()
-				s.sessionsMu.Lock()
-				if session, ok := s.sessions[remoteAddr]; ok {
-					session.writeMu.Lock()
-				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				if err := protocol.WritePacket(agent, helloPkt); err != nil {
-					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
-				}
-				session.writeMu.Unlock()
-				}
-				s.sessionsMu.Unlock()
-			}
+			s.pushHelloBytes(agent, helloBytes)
 			return true
 		}
 	}
@@ -600,29 +573,12 @@ func (s *Server) SetRouteEnabled(name string, enabled bool) bool {
 		val := enabled
 		dr.Route.Enabled = &val
 		s.dynamicRoutes[name] = dr
-		cfg := s.cfg
-		drMap := s.dynamicRoutes
 		agent := s.agentTCP
+		helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
 		s.mu.Unlock()
 
 		s.updateRouteCache()
-
-		if agent != nil {
-			payload, err := json.Marshal(buildHelloPayload(cfg, drMap))
-			if err != nil {
-				return false
-			}
-			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: payload}
-			remoteAddr := agent.RemoteAddr().String()
-			s.sessionsMu.Lock()
-			if session, ok := s.sessions[remoteAddr]; ok {
-				session.writeMu.Lock()
-				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				protocol.WritePacket(agent, helloPkt)
-				session.writeMu.Unlock()
-			}
-			s.sessionsMu.Unlock()
-		}
+		s.pushHelloBytes(agent, helloBytes)
 		return true
 	}
 	s.mu.Unlock()
@@ -648,12 +604,21 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 	if err := s.appStore.SetApplicationEnabled(context.Background(), label, enabled); err != nil {
 		return false
 	}
+
+	// Read apps and mutate in-memory state under the lock, but do NOT
+	// hold the lock across net.Listen or the hello push (BUG-3).
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	apps, err := s.appStore.ListApplications(context.Background())
 	if err != nil {
+		s.mu.Unlock()
 		return true
 	}
+	type listenerNeed struct {
+		name string
+		addr string
+		proto string
+	}
+	var tcpNeeds, udpNeeds []listenerNeed
 	for _, app := range apps {
 		for _, route := range app.Routes {
 			if dr, ok := s.dynamicRoutes[route.RouteName]; ok {
@@ -670,56 +635,57 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 				}
 				if val {
 					if _, hasLn := s.publicTCP[route.RouteName]; !hasLn && (dr.Route.Proto == routeProtoTCP || dr.Route.Proto == routeProtoBoth) && strings.TrimSpace(dr.Route.PublicAddr) != "" {
-						ln, err := net.Listen("tcp", dr.Route.PublicAddr)
-						if err == nil {
-							s.publicTCP[route.RouteName] = ln
-							if s.ctx != nil {
-								s.wg.Add(1)
-								go s.acceptPublicTCP(ln, route.RouteName)
-							}
-						}
+						tcpNeeds = append(tcpNeeds, listenerNeed{name: route.RouteName, addr: dr.Route.PublicAddr, proto: dr.Route.Proto})
 					}
 					if _, hasConn := s.publicUDP[route.RouteName]; !hasConn && (dr.Route.Proto == routeProtoUDP || dr.Route.Proto == routeProtoBoth) && strings.TrimSpace(dr.Route.PublicAddr) != "" {
-						addr, err := net.ResolveUDPAddr("udp", dr.Route.PublicAddr)
-						if err == nil {
-							conn, err := net.ListenUDP("udp", addr)
-							if err == nil {
-								conn.SetReadBuffer(8 * 1024 * 1024)
-								conn.SetWriteBuffer(8 * 1024 * 1024)
-								s.publicUDP[route.RouteName] = conn
-								if s.ctx != nil {
-									s.wg.Add(1)
-									go s.acceptPublicUDP(conn, route.RouteName)
-								}
-							}
-						}
+						udpNeeds = append(udpNeeds, listenerNeed{name: route.RouteName, addr: dr.Route.PublicAddr, proto: dr.Route.Proto})
 					}
 				}
 			}
 		}
 	}
 	s.updateRouteCacheLocked()
-	cfg := s.cfg
-	dr := s.dynamicRoutes
 	agent := s.agentTCP
-	if agent != nil {
-		helloPayload := buildHelloPayload(cfg, dr)
-		helloPayloadBytes, err := json.Marshal(helloPayload)
+	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
+	s.mu.Unlock()
+
+	// Open new listeners after unlock so slow net.Listen does not freeze
+	// all public accepts, UDP cache rebuilds, and status calls.
+	for _, need := range tcpNeeds {
+		ln, err := net.Listen("tcp", need.addr)
 		if err == nil {
-			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
-			remoteAddr := agent.RemoteAddr().String()
-			s.sessionsMu.Lock()
-			if session, ok := s.sessions[remoteAddr]; ok {
-				session.writeMu.Lock()
-				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				if err := protocol.WritePacket(agent, helloPkt); err != nil {
-					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
-				}
-				session.writeMu.Unlock()
+			s.mu.Lock()
+			if s.ctx != nil {
+				s.publicTCP[need.name] = ln
+				s.wg.Add(1)
+				go s.acceptPublicTCP(ln, need.name)
+			} else {
+				ln.Close()
 			}
-			s.sessionsMu.Unlock()
+			s.mu.Unlock()
 		}
 	}
+	for _, need := range udpNeeds {
+		addr, err := net.ResolveUDPAddr("udp", need.addr)
+		if err == nil {
+			conn, err := net.ListenUDP("udp", addr)
+			if err == nil {
+				conn.SetReadBuffer(8 * 1024 * 1024)
+				conn.SetWriteBuffer(8 * 1024 * 1024)
+				s.mu.Lock()
+				if s.ctx != nil {
+					s.publicUDP[need.name] = conn
+					s.wg.Add(1)
+					go s.acceptPublicUDP(conn, need.name)
+				} else {
+					conn.Close()
+				}
+				s.mu.Unlock()
+			}
+		}
+	}
+
+	s.pushHelloBytes(agent, helloBytes)
 	return true
 }
 
@@ -747,32 +713,14 @@ func (s *Server) DeleteApp(label string) bool {
 	}
 	s.updateRouteCacheLocked()
 	agent := s.agentTCP
-	cfg := s.cfg
-	dr := s.dynamicRoutes
+	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
 	s.mu.Unlock()
 
 	if err := s.appStore.DeleteApplication(context.Background(), label); err != nil {
 		return false
 	}
 
-	if agent != nil {
-		helloPayload := buildHelloPayload(cfg, dr)
-		helloPayloadBytes, err := json.Marshal(helloPayload)
-		if err == nil {
-			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
-			remoteAddr := agent.RemoteAddr().String()
-			s.sessionsMu.Lock()
-			if session, ok := s.sessions[remoteAddr]; ok {
-				session.writeMu.Lock()
-				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				if err := protocol.WritePacket(agent, helloPkt); err != nil {
-					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
-				}
-				session.writeMu.Unlock()
-			}
-			s.sessionsMu.Unlock()
-		}
-	}
+	s.pushHelloBytes(agent, helloBytes)
 	return true
 }
 
@@ -788,9 +736,17 @@ func (s *Server) handleRouteRequest(conn net.Conn, session *agentSession, payloa
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	resp := s.processRouteRequestLocked(req)
+	agent := s.agentTCP
+	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
+	s.mu.Unlock()
+
+	// Persist to SQLite after unlock so a slow disk does not freeze the
+	// entire server (BUG-3). Errors are logged but do not fail the
+	// in-memory route.
+	if resp.Status != "failed" && resp.Status != "pending_domain" && s.appStore != nil {
+		s.persistRouteToStore(context.Background(), req, resp)
+	}
 
 	respPayload, err := json.Marshal(resp)
 	if err != nil {
@@ -805,6 +761,61 @@ func (s *Server) handleRouteRequest(conn net.Conn, session *agentSession, payloa
 	}
 	conn.SetWriteDeadline(time.Time{})
 	session.writeMu.Unlock()
+
+	s.pushHelloBytes(agent, helloBytes)
+}
+
+func (s *Server) persistRouteToStore(ctx context.Context, req apitypes.RouteRequest, resp apitypes.RouteResponse) {
+	rt := appstore.AppRoute{
+		RouteName:     resp.Name,
+		Proto:         resp.Proto,
+		PublicAddr:    resp.PublicAddr,
+		LocalAddr:     resp.LocalAddr,
+		Encrypted:     req.Encrypted,
+		Domain:        resp.Domain,
+		DomainEnabled: resp.Domain != "" && resp.Status != "failed",
+		Enabled:       true,
+	}
+	if req.Source == "api" {
+		app, err := s.appStore.GetApplication(ctx, req.Name)
+		if err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to get application %s: %v", req.Name, err)
+		} else if app == nil {
+			app, err = s.appStore.CreateApplication(ctx, req.Name, "")
+			if err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to create application %s: %v", req.Name, err)
+			}
+		}
+		if app != nil {
+			if _, err := s.appStore.AddRoute(ctx, app.ID, rt); err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", resp.Name, err)
+			}
+		}
+	} else {
+		routes, err := s.appStore.ListRoutes(ctx)
+		if err == nil {
+			var appID int64
+			for _, r := range routes {
+				if r.RouteName == resp.Name {
+					appID = r.AppID
+					break
+				}
+			}
+			if appID == 0 {
+				app, aerr := s.appStore.CreateApplication(ctx, resp.Name, "")
+				if aerr != nil {
+					logging.Global().Errorf(logging.CatTCP, "failed to create application for non-api route %s: %v", resp.Name, aerr)
+				} else {
+					appID = app.ID
+				}
+			}
+			if appID != 0 {
+				if _, err := s.appStore.AddRoute(ctx, appID, rt); err != nil {
+					logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", resp.Name, err)
+				}
+			}
+		}
+	}
 }
 
 func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest) apitypes.RouteResponse {
@@ -925,69 +936,6 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest) apitypes.R
 		Source:    req.Source,
 	}
 
-	if s.appStore != nil {
-		if req.Source == "api" {
-			app, err := s.appStore.GetApplication(context.Background(), req.Name)
-			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to get application %s: %v", req.Name, err)
-			} else if app == nil {
-				app, err = s.appStore.CreateApplication(context.Background(), req.Name, "")
-				if err != nil {
-					logging.Global().Errorf(logging.CatTCP, "failed to create application %s: %v", req.Name, err)
-				}
-			}
-			if app != nil {
-				_, err := s.appStore.AddRoute(context.Background(), app.ID, appstore.AppRoute{
-					RouteName:     rt.Name,
-					Proto:         rt.Proto,
-					PublicAddr:    rt.PublicAddr,
-					LocalAddr:     rt.LocalAddr,
-					Encrypted:     rt.IsEncrypted(),
-					Domain:        rt.Domain,
-					DomainEnabled: rt.IsDomainEnabled(),
-					Enabled:       rt.IsEnabled(),
-				})
-				if err != nil {
-					logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", rt.Name, err)
-				}
-			}
-		} else {
-			routes, err := s.appStore.ListRoutes(context.Background())
-			if err == nil {
-				var appID int64
-				for _, r := range routes {
-					if r.RouteName == rt.Name {
-						appID = r.AppID
-						break
-					}
-				}
-				if appID == 0 {
-					app, aerr := s.appStore.CreateApplication(context.Background(), rt.Name, "")
-					if aerr != nil {
-						logging.Global().Errorf(logging.CatTCP, "failed to create application for non-api route %s: %v", rt.Name, aerr)
-					} else {
-						appID = app.ID
-					}
-				}
-				if appID != 0 {
-					_, err = s.appStore.AddRoute(context.Background(), appID, appstore.AppRoute{
-						RouteName:     rt.Name,
-						Proto:         rt.Proto,
-						PublicAddr:    rt.PublicAddr,
-						LocalAddr:     rt.LocalAddr,
-						Encrypted:     rt.IsEncrypted(),
-						Domain:        rt.Domain,
-						DomainEnabled: rt.IsDomainEnabled(),
-						Enabled:       rt.IsEnabled(),
-					})
-					if err != nil {
-						logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", rt.Name, err)
-					}
-				}
-			}
-		}
-	}
-
 	if rt.IsEncrypted() {
 		key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
 		if err == nil {
@@ -1030,28 +978,6 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest) apitypes.R
 	}
 
 	s.updateRouteCacheLocked()
-
-	cfg := s.cfg
-	dr := s.dynamicRoutes
-	agent := s.agentTCP
-	if agent != nil {
-		helloPayload := buildHelloPayload(cfg, dr)
-		helloPayloadBytes, err := json.Marshal(helloPayload)
-		if err == nil {
-			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
-			remoteAddr := agent.RemoteAddr().String()
-			s.sessionsMu.Lock()
-			if session, ok := s.sessions[remoteAddr]; ok {
-				session.writeMu.Lock()
-				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				if err := protocol.WritePacket(agent, helloPkt); err != nil {
-					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
-				}
-				session.writeMu.Unlock()
-			}
-			s.sessionsMu.Unlock()
-		}
-	}
 
 	status := "active"
 	if domain == "auto" && len(availableDomains) > 0 {
@@ -1129,9 +1055,44 @@ func (s *Server) handleRouteConfirm(conn net.Conn, session *agentSession, payloa
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	ack := s.processRouteConfirmLocked(confirm)
+	var drProto, drLocalAddr, drDomain string
+	var drEncrypted, drEnabled bool
+	if dr, ok := s.dynamicRoutes[confirm.Name]; ok {
+		drProto = dr.Route.Proto
+		drLocalAddr = dr.Route.LocalAddr
+		drEncrypted = dr.Route.IsEncrypted()
+		drEnabled = dr.Route.IsEnabled()
+		drDomain = dr.Route.Domain
+	}
+	agent := s.agentTCP
+	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
+	s.mu.Unlock()
+
+	// Persist domain confirmation to SQLite after unlock (BUG-3).
+	if ack.Status != "failed" && s.appStore != nil {
+		if err := s.appStore.RemoveRoute(context.Background(), confirm.Name); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to remove old persisted route %s for confirm: %v", confirm.Name, err)
+		}
+		app, aerr := s.appStore.FindApplicationByRouteName(context.Background(), confirm.Name)
+		if aerr != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to find application for confirmed route %s: %v", confirm.Name, aerr)
+		} else if app != nil {
+			_, err := s.appStore.AddRoute(context.Background(), app.ID, appstore.AppRoute{
+				RouteName:     confirm.Name,
+				Proto:         drProto,
+				PublicAddr:    ack.PublicAddr,
+				LocalAddr:     drLocalAddr,
+				Encrypted:     drEncrypted,
+				Domain:        drDomain,
+				DomainEnabled: true,
+				Enabled:       drEnabled,
+			})
+			if err != nil {
+				logging.Global().Errorf(logging.CatTCP, "failed to persist confirmed route %s: %v", confirm.Name, err)
+			}
+		}
+	}
 
 	ackPayload, err := json.Marshal(ack)
 	if err != nil {
@@ -1146,6 +1107,8 @@ func (s *Server) handleRouteConfirm(conn net.Conn, session *agentSession, payloa
 	}
 	conn.SetWriteDeadline(time.Time{})
 	session.writeMu.Unlock()
+
+	s.pushHelloBytes(agent, helloBytes)
 }
 
 func (s *Server) processRouteConfirmLocked(confirm apitypes.RouteConfirm) apitypes.RouteAck {
@@ -1171,53 +1134,7 @@ func (s *Server) processRouteConfirmLocked(confirm apitypes.RouteConfirm) apityp
 	dr.Route.DomainEnabled = &domainEnabled
 	s.dynamicRoutes[confirm.Name] = dr
 
-	if s.appStore != nil {
-		if err := s.appStore.RemoveRoute(context.Background(), confirm.Name); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to remove old persisted route %s for confirm: %v", confirm.Name, err)
-		}
-		app, aerr := s.appStore.FindApplicationByRouteName(context.Background(), confirm.Name)
-		if aerr != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to find application for confirmed route %s: %v", confirm.Name, aerr)
-		} else if app != nil {
-			_, err := s.appStore.AddRoute(context.Background(), app.ID, appstore.AppRoute{
-				RouteName:     dr.Route.Name,
-				Proto:         dr.Route.Proto,
-				PublicAddr:    dr.Route.PublicAddr,
-				LocalAddr:     dr.Route.LocalAddr,
-				Encrypted:     dr.Route.IsEncrypted(),
-				Domain:        domain,
-				DomainEnabled: true,
-				Enabled:       dr.Route.IsEnabled(),
-			})
-			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to persist confirmed route %s: %v", confirm.Name, err)
-			}
-		}
-	}
-
 	s.updateRouteCacheLocked()
-
-	cfg := s.cfg
-	drMap := s.dynamicRoutes
-	agent := s.agentTCP
-	if agent != nil {
-		helloPayload := buildHelloPayload(cfg, drMap)
-		helloPayloadBytes, err := json.Marshal(helloPayload)
-		if err == nil {
-			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
-			remoteAddr := agent.RemoteAddr().String()
-			s.sessionsMu.Lock()
-			if session, ok := s.sessions[remoteAddr]; ok {
-				session.writeMu.Lock()
-				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				if err := protocol.WritePacket(agent, helloPkt); err != nil {
-					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
-				}
-				session.writeMu.Unlock()
-			}
-			s.sessionsMu.Unlock()
-		}
-	}
 
 	return apitypes.RouteAck{
 		RequestID:  confirm.RequestID,
@@ -1236,9 +1153,16 @@ func (s *Server) handleRouteRemove(conn net.Conn, session *agentSession, payload
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	ack := s.processRouteRemoveLocked(remove)
+	agent := s.agentTCP
+	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
+	s.mu.Unlock()
+
+	if ack.OK && s.appStore != nil {
+		if err := s.appStore.RemoveRoute(context.Background(), remove.Name); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to remove persisted route %s: %v", remove.Name, err)
+		}
+	}
 
 	ackPayload, err := json.Marshal(ack)
 	if err != nil {
@@ -1253,6 +1177,8 @@ func (s *Server) handleRouteRemove(conn net.Conn, session *agentSession, payload
 	}
 	conn.SetWriteDeadline(time.Time{})
 	session.writeMu.Unlock()
+
+	s.pushHelloBytes(agent, helloBytes)
 }
 
 func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove) apitypes.RouteRemoveAck {
@@ -1274,35 +1200,7 @@ func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove) apitypes.
 	delete(s.derivedKeys, remove.Name)
 	delete(s.udpCiphers, remove.Name)
 
-	if s.appStore != nil {
-		if err := s.appStore.RemoveRoute(context.Background(), remove.Name); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to remove persisted route %s: %v", remove.Name, err)
-		}
-	}
-
 	s.updateRouteCacheLocked()
-
-	cfg := s.cfg
-	dr := s.dynamicRoutes
-	agent := s.agentTCP
-	if agent != nil {
-		helloPayload := buildHelloPayload(cfg, dr)
-		helloPayloadBytes, err := json.Marshal(helloPayload)
-		if err == nil {
-			helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
-			remoteAddr := agent.RemoteAddr().String()
-			s.sessionsMu.Lock()
-			if session, ok := s.sessions[remoteAddr]; ok {
-				session.writeMu.Lock()
-				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				if err := protocol.WritePacket(agent, helloPkt); err != nil {
-					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
-				}
-				session.writeMu.Unlock()
-			}
-			s.sessionsMu.Unlock()
-		}
-	}
 
 	return apitypes.RouteRemoveAck{Name: remove.Name, OK: true}
 }
@@ -1315,9 +1213,41 @@ func (s *Server) handleRouteUpdate(conn net.Conn, session *agentSession, payload
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	ack := s.processRouteUpdateLocked(req)
+	var updProto, updPublicAddr, updLocalAddr, updDomain string
+	var updEncrypted, updDomainEnabled, updEnabled bool
+	if dr, ok := s.dynamicRoutes[req.Name]; ok {
+		updProto = dr.Route.Proto
+		updPublicAddr = dr.Route.PublicAddr
+		updLocalAddr = dr.Route.LocalAddr
+		updEncrypted = dr.Route.IsEncrypted()
+		updDomain = dr.Route.Domain
+		updDomainEnabled = dr.Route.IsDomainEnabled()
+		updEnabled = dr.Route.IsEnabled()
+	}
+	agent := s.agentTCP
+	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
+	s.mu.Unlock()
+
+	if ack.Status != "failed" && s.appStore != nil {
+		ctx := context.Background()
+		if existing, err := s.appStore.GetRouteByRouteName(ctx, req.Name); err == nil && existing != nil {
+			ar := appstore.AppRoute{
+				AppID:         existing.AppID,
+				RouteName:     req.Name,
+				Proto:         updProto,
+				PublicAddr:    updPublicAddr,
+				LocalAddr:     updLocalAddr,
+				Encrypted:     updEncrypted,
+				Domain:        updDomain,
+				DomainEnabled: updDomainEnabled,
+				Enabled:       updEnabled,
+				CreatedAt:     existing.CreatedAt,
+			}
+			s.appStore.RemoveRoute(ctx, req.Name)
+			s.appStore.AddRoute(ctx, existing.AppID, ar)
+		}
+	}
 
 	ackPayload, err := json.Marshal(ack)
 	if err != nil {
@@ -1332,6 +1262,8 @@ func (s *Server) handleRouteUpdate(conn net.Conn, session *agentSession, payload
 	}
 	conn.SetWriteDeadline(time.Time{})
 	session.writeMu.Unlock()
+
+	s.pushHelloBytes(agent, helloBytes)
 }
 
 func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate) apitypes.RouteUpdateAck {
@@ -1429,29 +1361,11 @@ func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate) apitypes.Rou
 	s.dynamicRoutes[req.Name] = dr
 	s.updateRouteCacheLocked()
 
-	if s.appStore != nil {
-		ctx := context.Background()
-		if existing, err := s.appStore.GetRouteByRouteName(ctx, req.Name); err == nil && existing != nil {
-			ar := appstore.AppRoute{
-				AppID:         existing.AppID,
-				RouteName:     dr.Route.Name,
-				Proto:         dr.Route.Proto,
-				PublicAddr:    dr.Route.PublicAddr,
-				LocalAddr:     dr.Route.LocalAddr,
-				Encrypted:     dr.Route.IsEncrypted(),
-				Domain:        dr.Route.Domain,
-				DomainEnabled: dr.Route.IsDomainEnabled(),
-				Enabled:       dr.Route.IsEnabled(),
-				CreatedAt:     existing.CreatedAt,
-			}
-			s.appStore.RemoveRoute(ctx, req.Name)
-			s.appStore.AddRoute(ctx, existing.AppID, ar)
-		}
+	return apitypes.RouteUpdateAck{
+		RequestID: req.RequestID,
+		Status:    "updated",
+		Name:      req.Name,
 	}
-
-	s.pushHelloToAgentLocked()
-
-	return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "updated", Name: req.Name}
 }
 
 func (s *Server) pushHelloToAgentLocked() {
@@ -1466,16 +1380,27 @@ func (s *Server) pushHelloToAgentLocked() {
 	if err != nil {
 		return
 	}
-	helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloPayloadBytes}
+	s.pushHelloBytes(agent, helloPayloadBytes)
+}
+
+// pushHelloBytes sends a pre-marshaled HELLO packet to the given agent
+// connection using only sessionsMu + writeMu locking (no s.mu).
+// Callers must marshal the payload while holding s.mu to avoid the
+// dynamicRoutes map-read-after-unlock race (BUG-4).
+func (s *Server) pushHelloBytes(agent net.Conn, helloBytes []byte) {
+	if agent == nil {
+		return
+	}
 	remoteAddr := agent.RemoteAddr().String()
+	helloPkt := &protocol.Packet{Type: protocol.TypeHello, Payload: helloBytes}
 	s.sessionsMu.Lock()
 	if session, ok := s.sessions[remoteAddr]; ok {
-			session.writeMu.Lock()
-				agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-				if err := protocol.WritePacket(agent, helloPkt); err != nil {
-					logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
-				}
-				session.writeMu.Unlock()
+		session.writeMu.Lock()
+		agent.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+		if err := protocol.WritePacket(agent, helloPkt); err != nil {
+			logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %s: %v", remoteAddr, err)
+		}
+		session.writeMu.Unlock()
 	}
 	s.sessionsMu.Unlock()
 }
@@ -1812,7 +1737,6 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 		probeOutboundTargets: make(map[string]time.Time),
 		maxConnsPerRoute:     defaultMaxConnsPerRoute,
 		dynamicRoutes:        make(map[string]dynamicRouteEntry),
-		pendingUpdateAcks:    make(map[string]chan *apitypes.RouteUpdateAck),
 	}
 	s.agentUDPAddr.Store(netip.AddrPort{})
 	s.domains = newDomainManager(s)
@@ -2012,6 +1936,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	logging.Global().Infof(logging.CatSystem, "Server started on control=%s data=%s", s.cfg.ControlAddr, s.cfg.DataAddr)
+	if s.cfg.DisableTLS {
+		logging.Global().Warnf(logging.CatEncryption, "TLS is disabled (DisableTLS=true). The control channel and authentication handshake run in plaintext. This is only safe on fully trusted networks. Combine with per-session WrapTCP after SEC-1/SEC-2.")
+	}
 	return nil
 }
 
@@ -2069,7 +1996,8 @@ func (s *Server) acceptControl(ln net.Listener) {
 		netutil.SetTCPNoDelay(conn)
 
 		conn.SetDeadline(time.Now().Add(authDeadline))
-		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
+		_, _, err = crypto.AuthenticateServer(conn, s.cfg.Token)
+		if err != nil {
 			logging.Global().Errorf(logging.CatTCP, "control auth failed from %s: %v", conn.RemoteAddr(), err)
 			conn.Close()
 			continue
@@ -2107,13 +2035,12 @@ func (s *Server) acceptControl(ln net.Listener) {
 		currentEpoch := s.agentEpoch + 1
 		s.agentEpoch = currentEpoch
 		s.agentTCP = conn
-		s.agentUDP = netip.AddrPort{}
-		s.agentUDPAt = time.Time{}
-		s.agentUDPAddr.Store(netip.AddrPort{})
-		s.agentUDPTime.Store(0)
 		s.lastAgentConnectAt = time.Now()
 		s.abortPendingTCPLocked()
 		s.mu.Unlock()
+
+		s.agentUDPAddr.Store(netip.AddrPort{})
+		s.agentUDPTime.Store(0)
 
 		logging.Global().Infof(logging.CatTCP, "Agent connected to control from %s", remoteAddr)
 
@@ -2310,7 +2237,8 @@ func (s *Server) acceptData(ln net.Listener) {
 
 		handshakeDL := time.Now().Add(handshakeDeadline)
 		conn.SetDeadline(handshakeDL)
-		if err := crypto.AuthenticateServer(conn, s.cfg.Token); err != nil {
+		clientNonce, serverNonce, err := crypto.AuthenticateServer(conn, s.cfg.Token)
+		if err != nil {
 			logging.Global().Errorf(logging.CatTCP, "data auth failed from %s: %v", conn.RemoteAddr(), err)
 			conn.Close()
 			continue
@@ -2358,7 +2286,7 @@ func (s *Server) acceptData(ln net.Listener) {
 				conn.Close()
 				continue
 			}
-			conn, err = crypto.WrapTCP(conn, key, false)
+			conn, err = crypto.WrapTCP(conn, key, clientNonce, serverNonce, false)
 			if err != nil {
 				logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
 				conn.Close()
@@ -2646,6 +2574,17 @@ func (s *Server) acceptAgentUDP() {
 
 	var pendingBytes int64
 	var pendingBytesTime time.Time
+	defer func() {
+		if pendingBytes > 0 {
+			s.dash.addBytes(pendingBytesTime, pendingBytes)
+		}
+	}()
+
+	// seenRegisters dedupes authenticated register nonces within the auth
+	// window to block replays. Only this goroutine touches it, so it needs
+	// no lock. It stays small (one fresh register every ~2s, 30s window).
+	seenRegisters := make(map[crypto.UDPRegisterKey]int64)
+	const maxSeenRegisters = 256
 
 	for {
 		n, addr, err := s.udpDataConn.ReadFromUDPAddrPort(buf)
@@ -2661,34 +2600,59 @@ func (s *Server) acceptAgentUDP() {
 			continue
 		}
 
-		routeName := pkt.Route
-		clientID := pkt.Client
+		if pkt.Type == protocol.TypeRegister {
+			// The agent UDP address is adopted/refreshed only from a
+			// register whose token-keyed authenticator verifies and whose
+			// nonce has not been seen, so a spoofed datagram cannot hijack
+			// or blackhole the UDP data plane (SEC-3).
+			nowT := time.Now()
+			key, ok := crypto.VerifyUDPRegister(s.cfg.Token, pkt.Payload, nowT, udpRegisterAuthWindow)
+			if !ok {
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-reject", fmt.Sprintf("rejected unauthenticated/forged UDP register from %s", addr))
+				continue
+			}
+			nowNano := nowT.UnixNano()
+			if exp, dup := seenRegisters[key]; dup && exp > nowNano {
+				continue // replayed register within the freshness window
+			}
+			seenRegisters[key] = nowNano + int64(udpRegisterAuthWindow)
+			if len(seenRegisters) > maxSeenRegisters {
+				for k, exp := range seenRegisters {
+					if exp <= nowNano {
+						delete(seenRegisters, k)
+					}
+				}
+			}
 
-		currentAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
-		if !currentAddr.IsValid() || currentAddr != addr {
-			s.agentUDPAddr.Store(addr)
-			if pkt.Type == protocol.TypeRegister {
+			currentAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
+			if !currentAddr.IsValid() {
 				logging.Global().Infof(logging.CatUDP, "Agent UDP address registered: %s", addr.String())
-			} else {
+			} else if currentAddr != addr {
 				logging.Global().Infof(logging.CatUDP, "Agent UDP address updated: %s", addr.String())
 			}
-		}
-		// Refresh the liveness timestamp on any agent packet, not just
-		// Register frames, so that active data flow prevents timeout.
-		now := time.Now().UnixNano()
-		if now-s.agentUDPTime.Load() > int64(500*time.Millisecond) {
-			s.agentUDPTime.Store(now)
-			s.mu.Lock()
-			s.agentUDP = addr
-			s.agentUDPAt = time.Unix(0, now)
-			s.mu.Unlock()
-		}
-
-		if pkt.Type == protocol.TypeRegister {
+			s.agentUDPAddr.Store(addr)
+			s.agentUDPTime.Store(nowNano)
 			continue
 		}
 
 		if pkt.Type == protocol.TypeData {
+			// Tunneled data is honored only from the currently registered
+			// agent address; otherwise a spoofed source could inject into
+			// public clients (SEC-3).
+			regAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
+			if !regAddr.IsValid() || regAddr != addr {
+				continue
+			}
+			// Active data flow from the agent refreshes liveness (throttled)
+			// so a steady stream prevents the registration from timing out.
+			now := time.Now().UnixNano()
+			if now-s.agentUDPTime.Load() > int64(500*time.Millisecond) {
+				s.agentUDPTime.Store(now)
+			}
+
+			routeName := pkt.Route
+			clientID := pkt.Client
+
 			s.mu.RLock()
 			pubConn, ok := s.publicUDP[routeName]
 			s.mu.RUnlock()
@@ -2756,6 +2720,11 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 
 	var pendingBytes int64
 	var pendingBytesTime time.Time
+	defer func() {
+		if pendingBytes > 0 {
+			s.dash.addBytes(pendingBytesTime, pendingBytes)
+		}
+	}()
 
 	for {
 		n, addr, err := conn.ReadFromUDPAddrPort(buf)
@@ -2787,21 +2756,20 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		}
 
 		// Check the agent-UDP address only when it could plausibly have
-		// expired. agentUDPAt starts at zero and is set on the first
+		// expired. agentUDPTime starts at zero and is set on the first
 		// register packet, so the IsZero check skips the time.Now() call
 		// in the common steady-state case.
 		if !agentUDPAt.IsZero() {
 			now := time.Now()
 			if now.Sub(agentUDPAt) > udpRegisterTimeout {
-				s.mu.Lock()
-				if !s.agentUDPAt.IsZero() && time.Since(s.agentUDPAt) > udpRegisterTimeout {
+				// Double-check with a fresh atomic read to avoid racing
+				// with a refresh from acceptAgentUDP.
+				lastSeen := time.Unix(0, s.agentUDPTime.Load())
+				if !lastSeen.IsZero() && now.Sub(lastSeen) > udpRegisterTimeout {
 					logging.Global().Infof(logging.CatUDP, "Agent UDP address timed out after 60s inactivity")
-					s.agentUDP = netip.AddrPort{}
-					s.agentUDPAt = time.Time{}
 					s.agentUDPAddr.Store(netip.AddrPort{})
 					s.agentUDPTime.Store(0)
 				}
-				s.mu.Unlock()
 				continue
 			}
 		}
