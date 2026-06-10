@@ -14,6 +14,7 @@ import (
 	"hostit/shared/crypto"
 	"hostit/shared/emailcfg"
 	"hostit/shared/protocol"
+	"hostit/shared/relay"
 )
 
 func negotiateVersion(t *testing.T, conn net.Conn) {
@@ -851,20 +852,20 @@ func TestServerRapidReconnectWithStaleControlSession(t *testing.T) {
 				continue
 			}
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
-			_ = conn.Close()
-			t.Fatal(err)
-		}
-		negotiateVersion(t, conn)
-		pkt, err := protocol.ReadPacket(conn)
-		if err != nil {
-			_ = conn.Close()
-			t.Fatal(err)
-		}
-		if pkt.Type != protocol.TypeHello {
-			_ = conn.Close()
-			t.Fatalf("first packet type = %d, want HELLO", pkt.Type)
-		}
+			if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+				_ = conn.Close()
+				t.Fatal(err)
+			}
+			negotiateVersion(t, conn)
+			pkt, err := protocol.ReadPacket(conn)
+			if err != nil {
+				_ = conn.Close()
+				t.Fatal(err)
+			}
+			if pkt.Type != protocol.TypeHello {
+				_ = conn.Close()
+				t.Fatalf("first packet type = %d, want HELLO", pkt.Type)
+			}
 			_ = conn.SetDeadline(time.Time{})
 			return conn
 		}
@@ -1503,21 +1504,12 @@ func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAdd
 				if err != nil {
 					return
 				}
-				defer localConn.Close()
 
-				var wg sync.WaitGroup
-				wg.Add(2)
-				go func() {
-					defer wg.Done()
-					io.Copy(localConn, dataConn)
-				}()
-				go func() {
-					defer wg.Done()
-					io.Copy(dataConn, localConn)
-				}()
-				wg.Wait()
-				localConn.Close()
-				dataConn.Close()
+				// relay.Proxy propagates half-close like the real agent;
+				// plain io.Copy pairs would leave the server-side relay
+				// (and its per-route connection slot) hanging until the
+				// idle timeout after a public client disconnects.
+				relay.Proxy(dataConn, localConn)
 			}()
 		}
 	}

@@ -2,7 +2,6 @@ package tunnel
 
 import (
 	"context"
-	"crypto/cipher"
 	"encoding/json"
 	"net"
 	"net/netip"
@@ -47,15 +46,25 @@ type fakeUDPAgent struct {
 // authedUDPRegister builds a fresh token-authenticated register packet.
 // It must be called per send (the authenticator is single-use within the
 // server's freshness window), so callers must not cache the result.
-func authedUDPRegister(token string) ([]byte, error) {
-	payload, err := crypto.BuildUDPRegister(token)
+func authedUDPRegister(token string, sessionID crypto.UDPSessionID) ([]byte, error) {
+	payload, err := crypto.BuildUDPRegister(token, sessionID)
 	if err != nil {
 		return nil, err
 	}
 	return protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister, Payload: payload}, nil)
 }
 
-func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr, token string, prefixes map[string]string, ciphers map[string]cipher.AEAD) *fakeUDPAgent {
+// newTestSessionID generates a session ID for fake agents.
+func newTestSessionID(t *testing.T) crypto.UDPSessionID {
+	t.Helper()
+	id, err := crypto.NewUDPSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr, token string, prefixes map[string]string, sessionID crypto.UDPSessionID, encryptedRoutes map[string]bool, sessionCrypto *crypto.UDPSessionCrypto) *fakeUDPAgent {
 	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", dataAddr)
 	if err != nil {
@@ -68,7 +77,7 @@ func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr, token string
 	agent := &fakeUDPAgent{conn: conn, seen: make(map[string]int)}
 
 	sendRegister := func() {
-		data, err := authedUDPRegister(token)
+		data, err := authedUDPRegister(token, sessionID)
 		if err == nil {
 			_, _ = conn.WriteToUDP(data, serverAddr)
 		}
@@ -120,17 +129,18 @@ func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr, token string
 			agent.mu.Unlock()
 
 			payload := pkt.Payload
-			routeCipher := ciphers[pkt.Route]
-			if routeCipher != nil {
-				payload, err = crypto.DecryptUDP(routeCipher, decryptBuf, payload)
+			encryptedRoute := encryptedRoutes[pkt.Route] && sessionCrypto != nil
+			aad := crypto.AppendUDPDataAAD(nil, pkt.Route, pkt.Client)
+			if encryptedRoute {
+				payload, err = sessionCrypto.Dec.Open(decryptBuf, payload, aad)
 				if err != nil {
 					continue
 				}
 			}
 
 			responsePayload := append([]byte(prefix), payload...)
-			if routeCipher != nil {
-				responsePayload, err = crypto.EncryptUDP(routeCipher, encryptBuf, responsePayload)
+			if encryptedRoute {
+				responsePayload, err = sessionCrypto.Enc.Seal(encryptBuf, responsePayload, aad)
 				if err != nil {
 					continue
 				}
@@ -231,7 +241,7 @@ func TestEndToEndUDP(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "udp:"}, nil)
+	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "udp:"}, newTestSessionID(t), nil, nil)
 
 	client := dialPublicUDP(t, publicAddr)
 	defer client.Close()
@@ -261,7 +271,7 @@ func TestEndToEndUDPConcurrentClients(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "udp:"}, nil)
+	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "udp:"}, newTestSessionID(t), nil, nil)
 
 	const clients = 12
 	errCh := make(chan error, clients)
@@ -326,7 +336,7 @@ func TestEndToEndUDPMultiRoute(t *testing.T) {
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "route-a")
 	waitPublicUDPRoute(t, srv, "route-b")
-	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"route-a": "a:", "route-b": "b:"}, nil)
+	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"route-a": "a:", "route-b": "b:"}, newTestSessionID(t), nil, nil)
 
 	clientA := dialPublicUDP(t, publicAAddr)
 	defer clientA.Close()
@@ -357,7 +367,12 @@ func TestEndToEndUDPEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	udpCipher, err := crypto.NewUDPCipher(key)
+	sessionID, err := crypto.NewUDPSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fake agent encrypts c2s and decrypts s2c, mirroring the real one.
+	sessionCrypto, err := crypto.NewUDPSessionCrypto(key, sessionID[:], crypto.UDPDirClientToServer, crypto.UDPDirServerToClient)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +391,7 @@ func TestEndToEndUDPEncrypted(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "secure:"}, map[string]cipher.AEAD{"game": udpCipher})
+	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "secure:"}, sessionID, map[string]bool{"game": true}, sessionCrypto)
 
 	client := dialPublicUDP(t, publicAddr)
 	defer client.Close()
@@ -417,7 +432,7 @@ func TestPublicUDPDropsWithoutAgentAndWhenDisabled(t *testing.T) {
 	defer noAgentClient.Close()
 	assertNoUDPResponse(t, noAgentClient, []byte("drop"), 250*time.Millisecond)
 
-	agent := startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"disabled": "disabled:"}, nil)
+	agent := startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"disabled": "disabled:"}, newTestSessionID(t), nil, nil)
 	waitTunnelCondition(t, 2*time.Second, "fake UDP agent did not register", func() bool {
 		return srv.agentUDPTime.Load() != 0
 	})
@@ -461,7 +476,7 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 	}
 	defer agentConn.Close()
 
-	reg, err := authedUDPRegister("testtoken")
+	reg, err := authedUDPRegister("testtoken", newTestSessionID(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,7 +541,7 @@ func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
 	defer agentConn.Close()
 
 	waitTunnelCondition(t, 2*time.Second, "agent UDP registration did not reach server", func() bool {
-		reg, err := authedUDPRegister("testtoken")
+		reg, err := authedUDPRegister("testtoken", newTestSessionID(t))
 		if err != nil {
 			t.Fatal(err)
 		}
