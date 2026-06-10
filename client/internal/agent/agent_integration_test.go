@@ -125,7 +125,7 @@ func (s *fakeTunnelServer) acceptControl() {
 		close(s.controlReadyCh)
 		return
 	}
-	if err := sharedcrypto.AuthenticateServer(conn, s.token); err != nil {
+	if _, _, err := sharedcrypto.AuthenticateServer(conn, s.token); err != nil {
 		_ = conn.Close()
 		close(s.controlReadyCh)
 		return
@@ -247,7 +247,7 @@ func (s *fakeTunnelServer) acceptDataConn(t *testing.T) (net.Conn, string, strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sharedcrypto.AuthenticateServer(conn, s.token); err != nil {
+	if _, _, err := sharedcrypto.AuthenticateServer(conn, s.token); err != nil {
 		_ = conn.Close()
 		t.Fatal(err)
 	}

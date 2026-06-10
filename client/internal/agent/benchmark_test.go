@@ -100,7 +100,7 @@ func (s *fakeBenchServer) acceptControl() {
 		close(s.controlReady)
 		return
 	}
-	if err := crypto.AuthenticateServer(conn, s.token); err != nil {
+	if _, _, err := crypto.AuthenticateServer(conn, s.token); err != nil {
 		_ = conn.Close()
 		close(s.controlReady)
 		return
@@ -397,7 +397,7 @@ func (s *fakeBenchServer) acceptDataConnBench(b *testing.B) (net.Conn, string, s
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := crypto.AuthenticateServer(conn, s.token); err != nil {
+	if _, _, err := crypto.AuthenticateServer(conn, s.token); err != nil {
 		_ = conn.Close()
 		b.Fatal(err)
 	}

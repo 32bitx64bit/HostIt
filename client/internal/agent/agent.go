@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -138,31 +139,33 @@ func (a *Agent) ControlConn() net.Conn {
 	return a.controlConn
 }
 
-func (a *Agent) SendRouteRequest(ctx context.Context, req apitypes.RouteRequest) (*apitypes.RouteResponse, error) {
-	ch := make(chan *apitypes.RouteResponse, 1)
+// sendAndWait marshals payload, sends a control packet, and waits up to
+// 30s for a response on the pending channel. It handles map registration,
+// cleanup, write deadlines, and context cancellation. Used by all
+// SendRoute* methods to eliminate the duplicated marshal+lock+write+select
+// boilerplate (CLEAN-5).
+func sendAndWait[Resp any](ctx context.Context, a *Agent,
+	pending map[string]chan *Resp, key string,
+	pktType byte, payload []byte, timeoutMsg string) (*Resp, error) {
+
+	ch := make(chan *Resp, 1)
 	a.mu.Lock()
-	a.pendingRouteReqs[req.RequestID] = ch
+	pending[key] = ch
 	a.mu.Unlock()
 	defer func() {
 		a.mu.Lock()
-		delete(a.pendingRouteReqs, req.RequestID)
+		delete(pending, key)
 		a.mu.Unlock()
 	}()
 
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	a.mu.RLock()
-	conn := a.controlConn
-	a.mu.RUnlock()
 	a.controlWriteMu.Lock()
+	conn := a.controlConn
 	if conn == nil {
 		a.controlWriteMu.Unlock()
 		return nil, fmt.Errorf("not connected to server")
 	}
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteRequest, Payload: payload}); err != nil {
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: pktType, Payload: payload}); err != nil {
 		conn.SetWriteDeadline(time.Time{})
 		a.controlWriteMu.Unlock()
 		return nil, err
@@ -176,135 +179,40 @@ func (a *Agent) SendRouteRequest(ctx context.Context, req apitypes.RouteRequest)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("route request timed out")
+		return nil, fmt.Errorf("%s", timeoutMsg)
 	}
 }
 
-func (a *Agent) SendRouteConfirm(ctx context.Context, confirm apitypes.RouteConfirm) (*apitypes.RouteAck, error) {
-	ch := make(chan *apitypes.RouteAck, 1)
-	a.mu.Lock()
-	a.pendingRouteAcks[confirm.RequestID] = ch
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		delete(a.pendingRouteAcks, confirm.RequestID)
-		a.mu.Unlock()
-	}()
+func (a *Agent) SendRouteRequest(ctx context.Context, req apitypes.RouteRequest) (*apitypes.RouteResponse, error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	return sendAndWait(ctx, a, a.pendingRouteReqs, req.RequestID, protocol.TypeRouteRequest, payload, "route request timed out")
+}
 
+func (a *Agent) SendRouteConfirm(ctx context.Context, confirm apitypes.RouteConfirm) (*apitypes.RouteAck, error) {
 	payload, err := json.Marshal(confirm)
 	if err != nil {
 		return nil, err
 	}
-	a.mu.RLock()
-	conn := a.controlConn
-	a.mu.RUnlock()
-	a.controlWriteMu.Lock()
-	if conn == nil {
-		a.controlWriteMu.Unlock()
-		return nil, fmt.Errorf("not connected to server")
-	}
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteConfirm, Payload: payload}); err != nil {
-		conn.SetWriteDeadline(time.Time{})
-		a.controlWriteMu.Unlock()
-		return nil, err
-	}
-	conn.SetWriteDeadline(time.Time{})
-	a.controlWriteMu.Unlock()
-
-	select {
-	case ack := <-ch:
-		return ack, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("route confirm timed out")
-	}
+	return sendAndWait(ctx, a, a.pendingRouteAcks, confirm.RequestID, protocol.TypeRouteConfirm, payload, "route confirm timed out")
 }
 
 func (a *Agent) SendRouteRemove(ctx context.Context, remove apitypes.RouteRemove) (*apitypes.RouteRemoveAck, error) {
-	ch := make(chan *apitypes.RouteRemoveAck, 1)
-	a.mu.Lock()
-	a.pendingRemoveAcks[remove.Name] = ch
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		delete(a.pendingRemoveAcks, remove.Name)
-		a.mu.Unlock()
-	}()
-
 	payload, err := json.Marshal(remove)
 	if err != nil {
 		return nil, err
 	}
-	a.mu.RLock()
-	conn := a.controlConn
-	a.mu.RUnlock()
-	a.controlWriteMu.Lock()
-	if conn == nil {
-		a.controlWriteMu.Unlock()
-		return nil, fmt.Errorf("not connected to server")
-	}
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteRemove, Payload: payload}); err != nil {
-		conn.SetWriteDeadline(time.Time{})
-		a.controlWriteMu.Unlock()
-		return nil, err
-	}
-	conn.SetWriteDeadline(time.Time{})
-	a.controlWriteMu.Unlock()
-
-	select {
-	case ack := <-ch:
-		return ack, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("route remove timed out")
-	}
+	return sendAndWait(ctx, a, a.pendingRemoveAcks, remove.Name, protocol.TypeRouteRemove, payload, "route remove timed out")
 }
 
 func (a *Agent) SendRouteUpdate(ctx context.Context, update apitypes.RouteUpdate) (*apitypes.RouteUpdateAck, error) {
-	ch := make(chan *apitypes.RouteUpdateAck, 1)
-	a.mu.Lock()
-	if a.pendingUpdateAcks == nil {
-		a.pendingUpdateAcks = make(map[string]chan *apitypes.RouteUpdateAck)
-	}
-	a.pendingUpdateAcks[update.RequestID] = ch
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		delete(a.pendingUpdateAcks, update.RequestID)
-		a.mu.Unlock()
-	}()
-
 	payload, err := json.Marshal(update)
 	if err != nil {
 		return nil, err
 	}
-	a.controlWriteMu.Lock()
-	conn := a.controlConn
-	if conn == nil {
-		a.controlWriteMu.Unlock()
-		return nil, fmt.Errorf("not connected to server")
-	}
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteUpdate, Payload: payload}); err != nil {
-		conn.SetWriteDeadline(time.Time{})
-		a.controlWriteMu.Unlock()
-		return nil, err
-	}
-	conn.SetWriteDeadline(time.Time{})
-	a.controlWriteMu.Unlock()
-
-	select {
-	case ack := <-ch:
-		return ack, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("route update timed out")
-	}
+	return sendAndWait(ctx, a, a.pendingUpdateAcks, update.RequestID, protocol.TypeRouteUpdate, payload, "route update timed out")
 }
 
 // tlsConfigWithPin returns a TLS config that performs certificate pinning
@@ -398,12 +306,7 @@ func (a *Agent) startUDPData(ctx context.Context) error {
 	a.udpDataConn = udpConn
 	a.mu.Unlock()
 
-	registerData, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
-	if err != nil {
-		udpConn.Close()
-		return fmt.Errorf("failed to marshal register packet: %w", err)
-	}
-	a.writeUDPRegister(udpConn, registerData)
+	a.sendUDPRegister(udpConn)
 
 	a.wg.Add(1)
 	go func() {
@@ -415,7 +318,7 @@ func (a *Agent) startUDPData(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				a.writeUDPRegister(udpConn, registerData)
+				a.sendUDPRegister(udpConn)
 			}
 		}
 	}()
@@ -443,11 +346,26 @@ func (a *Agent) closeUDPDataConn() {
 	}
 }
 
-func (a *Agent) writeUDPRegister(udpConn *net.UDPConn, data []byte) {
+// sendUDPRegister builds a fresh token-authenticated register payload and
+// sends it to the server. A new payload is generated on every call (the
+// authenticator binds a fresh timestamp + nonce), so it must not be cached
+// across sends (SEC-3).
+func (a *Agent) sendUDPRegister(udpConn *net.UDPConn) {
 	a.mu.RLock()
 	serverUDP := a.serverUDP
+	token := a.cfg.Token
 	a.mu.RUnlock()
 	if serverUDP == nil {
+		return
+	}
+	authPayload, err := crypto.BuildUDPRegister(token)
+	if err != nil {
+		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-auth", fmt.Sprintf("failed to build UDP register auth: %v", err))
+		return
+	}
+	data, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister, Payload: authPayload}, nil)
+	if err != nil {
+		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-marshal", fmt.Sprintf("failed to marshal UDP register: %v", err))
 		return
 	}
 	n, err := udpConn.WriteToUDP(data, serverUDP)
@@ -467,12 +385,7 @@ func (a *Agent) refreshUDPRegistration() {
 	if udpConn == nil {
 		return
 	}
-	data, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
-	if err != nil {
-		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-marshal", fmt.Sprintf("failed to marshal UDP register: %v", err))
-		return
-	}
-	a.writeUDPRegister(udpConn, data)
+	a.sendUDPRegister(udpConn)
 }
 
 func (a *Agent) connectAndRun() error {
@@ -527,7 +440,8 @@ func (a *Agent) connectAndRun() error {
 	}()
 
 	conn.SetDeadline(time.Now().Add(agentControlWriteDeadline))
-	if err := crypto.AuthenticateClient(conn, a.cfg.Token); err != nil {
+	_, _, err = crypto.AuthenticateClient(conn, a.cfg.Token)
+	if err != nil {
 		return fmt.Errorf("control auth failed: %w", err)
 	}
 	conn.SetDeadline(time.Time{})
@@ -601,7 +515,9 @@ func (a *Agent) connectAndRun() error {
 }
 
 func (a *Agent) Stop() {
-	a.cancel()
+	if a.cancel != nil {
+		a.cancel()
+	}
 	a.mu.Lock()
 	if a.controlConn != nil {
 		a.controlConn.Close()
@@ -858,7 +774,8 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				netutil.TuneDeadPeerDetection(dataConn)
 
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
-				if err := crypto.AuthenticateClient(dataConn, a.cfg.Token); err != nil {
+				clientNonce, serverNonce, err := crypto.AuthenticateClient(dataConn, a.cfg.Token)
+				if err != nil {
 					logging.Global().Errorf(logging.CatTCP, "data auth failed: %v", err)
 					dataConn.Close()
 					return
@@ -914,7 +831,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 						localConn.Close()
 						return
 					}
-					dataConn, err = crypto.WrapTCP(dataConn, rt.DerivedKey, true)
+					dataConn, err = crypto.WrapTCP(dataConn, rt.DerivedKey, clientNonce, serverNonce, true)
 					if err != nil {
 						logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
 						dataConn.Close()
@@ -985,28 +902,16 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 	if cfg.DisableTLS {
 		dataConn, err = dialer.DialContext(ctx, "tcp", cfg.DataAddr())
 	} else {
-		var tlsCfg *tls.Config
-		if cfg.TLSPinSHA256 == "" && !cfg.InsecureTLS {
-			tlsCfg = &tls.Config{InsecureSkipVerify: true}
-		} else {
-			var tlsErr error
-			tlsCfg, tlsErr = tlsConfigWithPin(cfg)
-			if tlsErr != nil {
-				return nil, fmt.Errorf("tls config failed: %w", tlsErr)
-			}
+		// Require a verified TLS configuration. Unlike the control channel,
+		// this path runs without an Agent to persist a discovered pin, so a
+		// trust-on-first-use here would silently run unverified forever (the
+		// pin was only ever written to a by-value cfg copy). Demand that the
+		// pin has already been established via the control connection (SEC-6).
+		tlsCfg, tlsErr := tlsConfigWithPin(cfg)
+		if tlsErr != nil {
+			return nil, fmt.Errorf("tls config failed: %w", tlsErr)
 		}
 		dataConn, err = tls.DialWithDialer(dialer, "tcp", cfg.DataAddr(), tlsCfg)
-		if err == nil && cfg.TLSPinSHA256 == "" && !cfg.InsecureTLS {
-			if tlsConn, ok := dataConn.(*tls.Conn); ok {
-				state := tlsConn.ConnectionState()
-				if len(state.PeerCertificates) > 0 {
-					pin := sha256.Sum256(state.PeerCertificates[0].Raw)
-					pinHex := hex.EncodeToString(pin[:])
-					cfg.TLSPinSHA256 = pinHex
-					logging.Global().Infof(logging.CatEncryption, "Auto-pinned server TLS certificate SHA-256 (data): %s", pinHex)
-				}
-			}
-		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("dial data server %s: %w", cfg.DataAddr(), err)
@@ -1018,7 +923,7 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 		dataConn.Close()
 		return nil, err
 	}
-	if err := crypto.AuthenticateClient(dataConn, cfg.Token); err != nil {
+	if _, _, err := crypto.AuthenticateClient(dataConn, cfg.Token); err != nil {
 		dataConn.Close()
 		return nil, fmt.Errorf("data auth failed: %w", err)
 	}
@@ -1072,10 +977,29 @@ func isTransientUDPReadError(err error) bool {
 		errors.Is(err, syscall.ENOBUFS)
 }
 
+// normalizeAddrPort unmaps IPv4-in-IPv6 addresses so that addresses obtained
+// from net.ResolveUDPAddr and from ReadFromUDPAddrPort compare equal when they
+// refer to the same endpoint.
+func normalizeAddrPort(ap netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+}
+
 func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	buf := make([]byte, 65536)
 	decryptBuf := make([]byte, 65536)
 	var pkt protocol.Packet
+
+	// Only datagrams originating from the server's data address are honored;
+	// anything else on this socket is a spoof/injection attempt against local
+	// services and is dropped (SEC-4). serverUDP is set once before this loop
+	// starts and is stable for the agent's lifetime.
+	a.mu.RLock()
+	serverUDP := a.serverUDP
+	a.mu.RUnlock()
+	var serverAP netip.AddrPort
+	if serverUDP != nil {
+		serverAP = normalizeAddrPort(serverUDP.AddrPort())
+	}
 
 	type sessionKey struct {
 		route  string
@@ -1141,12 +1065,17 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	rebuildRouteCache()
 
 	for {
-		n, _, err := udpConn.ReadFromUDPAddrPort(buf)
+		n, from, err := udpConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			logging.Global().Errorf(logging.CatUDP, "udp data read error: %v", err)
+			continue
+		}
+
+		if serverAP.IsValid() && normalizeAddrPort(from) != serverAP {
+			logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-foreign-source", fmt.Sprintf("dropping UDP datagram from non-server source %s", from))
 			continue
 		}
 
