@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"hostit/shared/netutil"
 )
 
 type closeWriter interface {
@@ -64,6 +66,15 @@ func (c *idleTimeoutConn) refresh() {
 		c.Conn.SetDeadline(now.Add(c.timeout))
 	}
 }
+
+// CloseWrite / CloseRead / NetConn forward through to the wrapped conn.
+// Without these, *idleTimeoutConn would only expose the net.Conn method set
+// (which lacks CloseWrite/CloseRead), so the relay's half-close path would
+// fail its type assertion and tear down both directions on the first EOF
+// instead of half-closing (BUG-1).
+func (c *idleTimeoutConn) CloseWrite() error { return netutil.CloseWrite(c.Conn) }
+func (c *idleTimeoutConn) CloseRead() error  { return netutil.CloseRead(c.Conn) }
+func (c *idleTimeoutConn) NetConn() net.Conn { return c.Conn }
 
 func (c *idleTimeoutConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
