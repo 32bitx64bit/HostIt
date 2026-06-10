@@ -2,7 +2,6 @@ package tunnel
 
 import (
 	"context"
-	"crypto/cipher"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -58,10 +57,10 @@ const (
 	udpRegisterTimeout     = 60 * time.Second
 	// Clock-skew/replay window for authenticated UDP registers.
 	udpRegisterAuthWindow = 30 * time.Second
-	domainShutdownTimeout  = 5 * time.Second
-	nettestTimeout         = 2 * time.Second
-	bwTestTimeout          = 5 * time.Second
-	emailProbeAllowTTL     = time.Minute
+	domainShutdownTimeout = 5 * time.Second
+	nettestTimeout        = 2 * time.Second
+	bwTestTimeout         = 5 * time.Second
+	emailProbeAllowTTL    = time.Minute
 	// Byte-counter flush cadence for dashboard hot paths.
 	dashBatchInterval = 100 * time.Millisecond
 )
@@ -71,7 +70,9 @@ type agentSession struct {
 	cancel      context.CancelFunc
 	remoteAddr  string
 	connectTime time.Time
-	writeMu     sync.Mutex
+	// features is the negotiated capability intersection for this session.
+	features []string
+	writeMu  sync.Mutex
 }
 
 type pendingTCPEntry struct {
@@ -151,7 +152,15 @@ type Server struct {
 	appStore *appstore.Store
 
 	derivedKeys map[string][]byte
-	udpCiphers  map[string]cipher.AEAD
+
+	// baseKey is the deployment-wide encryption key (PBKDF2 of the token);
+	// derived at most once instead of per route/HELLO.
+	baseKeyOnce sync.Once
+	baseKey     []byte
+
+	// udpCrypto holds the per-agent-session directional UDP ciphers,
+	// rebuilt when a register carries a new session ID.
+	udpCrypto atomic.Pointer[agentUDPCrypto]
 
 	mu            sync.RWMutex
 	agentTCP      net.Conn
@@ -197,14 +206,39 @@ type Server struct {
 	lastAgentConnectAt    time.Time
 	lastAgentDisconnectAt time.Time
 
-	dynamicRoutes     map[string]dynamicRouteEntry
-	dynamicPortLow    int
-	dynamicPortHigh   int
+	dynamicRoutes   map[string]dynamicRouteEntry
+	dynamicPortLow  int
+	dynamicPortHigh int
 
 	agentUDPAddr atomic.Value // stores netip.AddrPort
 	agentUDPTime atomic.Int64 // unix nano
 
 	counters counterRegistry
+}
+
+// agentUDPCrypto is the server's view of one agent UDP session: it seals
+// server->agent traffic and opens agent->server traffic with keys derived
+// from the agent's per-run session ID. dec is only touched by the single
+// acceptAgentUDP goroutine; enc is concurrency-safe.
+type agentUDPCrypto struct {
+	sessionID crypto.UDPSessionID
+	enc       *crypto.UDPEncryptor
+	dec       *crypto.UDPDecryptor
+}
+
+// encryptionBaseKey derives (once) the deployment-wide key used for TCP
+// wrapping and UDP session-key derivation. Returns nil when encryption is
+// not configured or derivation fails.
+func (s *Server) encryptionBaseKey() []byte {
+	s.baseKeyOnce.Do(func() {
+		key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
+		if err != nil {
+			logging.Global().Errorf(logging.CatEncryption, "failed to derive encryption key: %v", err)
+			return
+		}
+		s.baseKey = key
+	})
+	return s.baseKey
 }
 
 type pendingTCPKey struct {
@@ -312,7 +346,6 @@ func (s *Server) Dashboard(now time.Time) DashboardSnapshot {
 type routeConfig struct {
 	enabled     bool
 	isEncrypted bool
-	udpCipher   cipher.AEAD
 	derivedKey  []byte
 }
 
@@ -328,7 +361,6 @@ func (s *Server) updateRouteCacheLocked() {
 		newCache[rt.Name] = routeConfig{
 			enabled:     rt.IsEnabled(),
 			isEncrypted: rt.IsEncrypted(),
-			udpCipher:   s.udpCiphers[rt.Name],
 			derivedKey:  s.derivedKeys[rt.Name],
 		}
 	}
@@ -608,8 +640,8 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 		return true
 	}
 	type listenerNeed struct {
-		name string
-		addr string
+		name  string
+		addr  string
 		proto string
 	}
 	var tcpNeeds, udpNeeds []listenerNeed
@@ -702,7 +734,6 @@ func (s *Server) DeleteApp(label string) bool {
 		}
 		delete(s.dynamicRoutes, route.RouteName)
 		delete(s.derivedKeys, route.RouteName)
-		delete(s.udpCiphers, route.RouteName)
 	}
 	s.updateRouteCacheLocked()
 	agent := s.agentTCP
@@ -928,15 +959,8 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest) apitypes.R
 	}
 
 	if rt.IsEncrypted() {
-		key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
-		if err == nil {
+		if key := s.encryptionBaseKey(); key != nil {
 			s.derivedKeys[rt.Name] = key
-			aead, err := crypto.NewUDPCipher(key)
-			if err != nil {
-				logging.Global().Warnf(logging.CatTCP, "failed to create UDP cipher for route %s: %v", rt.Name, err)
-			} else if aead != nil {
-				s.udpCiphers[rt.Name] = aead
-			}
 		}
 	}
 
@@ -1189,7 +1213,6 @@ func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove) apitypes.
 
 	delete(s.dynamicRoutes, remove.Name)
 	delete(s.derivedKeys, remove.Name)
-	delete(s.udpCiphers, remove.Name)
 
 	s.updateRouteCacheLocked()
 
@@ -1333,19 +1356,11 @@ func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate) apitypes.Rou
 	if req.Encrypted != nil {
 		dr.Route.Encrypted = req.Encrypted
 		if *req.Encrypted {
-			key, err := crypto.DeriveKey(s.cfg.Token, s.cfg.EncryptionAlgorithm)
-			if err == nil {
+			if key := s.encryptionBaseKey(); key != nil {
 				s.derivedKeys[req.Name] = key
-				aead, err := crypto.NewUDPCipher(key)
-				if err != nil {
-					logging.Global().Warnf(logging.CatTCP, "failed to create UDP cipher for route %s: %v", req.Name, err)
-				} else if aead != nil {
-					s.udpCiphers[req.Name] = aead
-				}
 			}
 		} else {
 			delete(s.derivedKeys, req.Name)
-			delete(s.udpCiphers, req.Name)
 		}
 	}
 
@@ -1717,7 +1732,6 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 		cfg:                  cfg,
 		appStore:             appStore,
 		derivedKeys:          make(map[string][]byte),
-		udpCiphers:           make(map[string]cipher.AEAD),
 		publicTCP:            make(map[string]net.Listener),
 		publicUDP:            make(map[string]*net.UDPConn),
 		pendingTCP:           make(map[pendingTCPKey]*pendingTCPEntry),
@@ -1754,17 +1768,8 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 	}
 	for _, rt := range effectiveRoutes(cfg, s.dynamicRoutes) {
 		if rt.IsEncrypted() {
-			key, err := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
-			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", rt.Name, err)
-			} else {
+			if key := s.encryptionBaseKey(); key != nil {
 				s.derivedKeys[rt.Name] = key
-				cipher, err := crypto.NewUDPCipher(key)
-				if err != nil {
-					logging.Global().Warnf(logging.CatTCP, "failed to create UDP cipher for route %s: %v", rt.Name, err)
-				} else {
-					s.udpCiphers[rt.Name] = cipher
-				}
 			}
 		}
 	}
@@ -1793,15 +1798,8 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 						Source:    "api",
 					}
 					if enc {
-						key, err := crypto.DeriveKey(cfg.Token, cfg.EncryptionAlgorithm)
-						if err == nil {
+						if key := s.encryptionBaseKey(); key != nil {
 							s.derivedKeys[route.RouteName] = key
-							aead, err := crypto.NewUDPCipher(key)
-							if err != nil {
-								logging.Global().Warnf(logging.CatTCP, "failed to create UDP cipher for route %s: %v", route.RouteName, err)
-							} else if aead != nil {
-								s.udpCiphers[route.RouteName] = aead
-							}
 						}
 					}
 				}
@@ -1968,6 +1966,18 @@ func (s *Server) Stop() {
 	s.wg.Wait()
 }
 
+// rejectVersion tells an authenticated peer why its negotiation failed
+// (best effort) before closing, so the agent reports the precise reason
+// instead of a bare connection reset.
+func (s *Server) rejectVersion(conn net.Conn, reason string) {
+	payload, err := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Error: reason})
+	if err == nil {
+		conn.SetWriteDeadline(time.Now().Add(writeDeadlineShort))
+		_ = protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: payload})
+	}
+	conn.Close()
+}
+
 func (s *Server) acceptControl(ln net.Listener) {
 	defer s.wg.Done()
 	defer ln.Close()
@@ -1995,6 +2005,66 @@ func (s *Server) acceptControl(ln net.Listener) {
 
 		remoteAddr := conn.RemoteAddr().String()
 
+		// Version negotiation runs BEFORE this connection touches any agent
+		// state: a peer that fails it must not bump the epoch, abort pending
+		// pairs, or displace a healthy connected agent (an old-version agent
+		// stuck in a reconnect loop would otherwise take the tunnel down
+		// every retry).
+		conn.SetReadDeadline(time.Now().Add(authDeadline))
+		var verPkt protocol.Packet
+		if err := protocol.ReadPacketTo(conn, &verPkt); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "version negotiate read failed from %s: %v", remoteAddr, err)
+			conn.Close()
+			continue
+		}
+		conn.SetReadDeadline(time.Time{})
+		if verPkt.Type != protocol.TypeVersionNegotiate {
+			logging.Global().Errorf(logging.CatTCP, "expected version negotiate from %s, got type %d", remoteAddr, verPkt.Type)
+			s.rejectVersion(conn, "first packet after auth must be version negotiation")
+			continue
+		}
+		var vp protocol.VersionPayload
+		if err := json.Unmarshal(verPkt.Payload, &vp); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to parse version negotiate from %s: %v", remoteAddr, err)
+			s.rejectVersion(conn, "malformed version negotiation payload")
+			continue
+		}
+		agentVer, ok := version.Parse(vp.Version)
+		if !ok {
+			logging.Global().Errorf(logging.CatTCP, "agent sent invalid version from %s: %s", remoteAddr, vp.Version)
+			s.rejectVersion(conn, fmt.Sprintf("invalid protocol version %q", vp.Version))
+			continue
+		}
+		if !protocol.IsCompatibleWith(protocol.ProtocolVersionParsed, agentVer) {
+			reason := protocol.IncompatibleVersionError(protocol.ProtocolVersionParsed, agentVer)
+			logging.Global().Errorf(logging.CatTCP, "rejecting agent from %s: %s", remoteAddr, reason)
+			s.rejectVersion(conn, reason)
+			continue
+		}
+		features := protocol.NegotiateFeatures(protocol.SupportedFeatures, vp.Features)
+		logging.Global().Infof(logging.CatTCP, "Agent version negotiated from %s: %s features=%v", remoteAddr, agentVer, features)
+
+		verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures})
+		helloPkt, err := s.buildHelloPacket()
+		if err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to build HELLO packet: %v", err)
+			conn.Close()
+			continue
+		}
+		conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+		if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to send version negotiate to %s: %v", remoteAddr, err)
+			conn.Close()
+			continue
+		}
+		if err := protocol.WritePacket(conn, helloPkt); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
+			conn.Close()
+			continue
+		}
+		conn.SetWriteDeadline(time.Time{})
+
+		// Negotiation succeeded — adopt this connection as the active agent.
 		var oldSession *agentSession
 		s.sessionsMu.Lock()
 		if existing := s.sessions[remoteAddr]; existing != nil {
@@ -2006,6 +2076,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			cancel:      sessionCancel,
 			remoteAddr:  remoteAddr,
 			connectTime: time.Now(),
+			features:    features,
 		}
 		s.sessions[remoteAddr] = session
 		s.sessionsMu.Unlock()
@@ -2032,79 +2103,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 		s.agentUDPTime.Store(0)
 
 		logging.Global().Infof(logging.CatTCP, "Agent connected to control from %s", remoteAddr)
-
-		// Version negotiation: agent must send its version immediately after auth.
-		conn.SetReadDeadline(time.Now().Add(authDeadline))
-		var verPkt protocol.Packet
-		if err := protocol.ReadPacketTo(conn, &verPkt); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "version negotiate read failed from %s: %v", remoteAddr, err)
-			conn.Close()
-			continue
-		}
-		conn.SetReadDeadline(time.Time{})
-		if verPkt.Type != protocol.TypeVersionNegotiate {
-			logging.Global().Errorf(logging.CatTCP, "expected version negotiate from %s, got type %d", remoteAddr, verPkt.Type)
-			conn.Close()
-			continue
-		}
-		var vp protocol.VersionPayload
-		if err := json.Unmarshal(verPkt.Payload, &vp); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to parse version negotiate from %s: %v", remoteAddr, err)
-			conn.Close()
-			continue
-		}
-		agentVer, ok := version.Parse(vp.Version)
-		if !ok {
-			logging.Global().Errorf(logging.CatTCP, "agent sent invalid version from %s: %s", remoteAddr, vp.Version)
-			conn.Close()
-			continue
-		}
-		if !protocol.IsCompatibleWith(protocol.ProtocolVersionParsed, agentVer) {
-			logging.Global().Errorf(logging.CatTCP, "agent version %s from %s is incompatible with server %s", agentVer, remoteAddr, protocol.ProtocolVersionParsed)
-			conn.Close()
-			continue
-		}
-		logging.Global().Infof(logging.CatTCP, "Agent version negotiated from %s: %s", remoteAddr, agentVer)
-
-		verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
-		helloPkt, err := s.buildHelloPacket()
-		if err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to build HELLO packet: %v", err)
-			conn.Close()
-			continue
-		}
-		session.writeMu.Lock()
-		conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-		if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to send version negotiate to %s: %v", remoteAddr, err)
-			conn.Close()
-			session.writeMu.Unlock()
-			s.mu.Lock()
-			if s.agentTCP == conn && s.agentEpoch == currentEpoch {
-				s.agentTCP = nil
-			}
-			s.mu.Unlock()
-			s.sessionsMu.Lock()
-			delete(s.sessions, remoteAddr)
-			s.sessionsMu.Unlock()
-			continue
-		}
-		if err := protocol.WritePacket(conn, helloPkt); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
-			conn.Close()
-			session.writeMu.Unlock()
-			s.mu.Lock()
-			if s.agentTCP == conn && s.agentEpoch == currentEpoch {
-				s.agentTCP = nil
-			}
-			s.mu.Unlock()
-			s.sessionsMu.Lock()
-			delete(s.sessions, remoteAddr)
-			s.sessionsMu.Unlock()
-			continue
-		}
-		conn.SetWriteDeadline(time.Time{})
-		session.writeMu.Unlock()
 
 		s.wg.Add(1)
 		go func(c net.Conn, session *agentSession, remoteAddr string, epoch uint64) {
@@ -2608,6 +2606,10 @@ func (s *Server) acceptAgentUDP() {
 
 	buf := make([]byte, 65536)
 	decryptBuf := make([]byte, 65536)
+	aadBuf := make([]byte, 0, 512)
+	// Route/client strings repeat on every datagram of a flow; interning
+	// removes both per-packet string allocations.
+	interner := protocol.NewStringInterner(4096)
 	var pkt protocol.Packet
 
 	var pendingBytes int64
@@ -2633,7 +2635,7 @@ func (s *Server) acceptAgentUDP() {
 			continue
 		}
 
-		err = protocol.UnmarshalUDPTo(buf[:n], &pkt)
+		err = protocol.UnmarshalUDPToInterned(buf[:n], &pkt, interner)
 		if err != nil {
 			continue
 		}
@@ -2642,7 +2644,7 @@ func (s *Server) acceptAgentUDP() {
 			// The agent UDP address is adopted only from a verified register
 			// with an unseen nonce, so spoofed datagrams cannot hijack the UDP plane.
 			nowT := time.Now()
-			key, ok := crypto.VerifyUDPRegister(s.cfg.Token, pkt.Payload, nowT, udpRegisterAuthWindow)
+			key, sessionID, ok := crypto.VerifyUDPRegister(s.cfg.Token, pkt.Payload, nowT, udpRegisterAuthWindow)
 			if !ok {
 				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-reject", fmt.Sprintf("rejected unauthenticated/forged UDP register from %s", addr))
 				continue
@@ -2656,6 +2658,19 @@ func (s *Server) acceptAgentUDP() {
 				for k, exp := range seenRegisters {
 					if exp <= nowNano {
 						delete(seenRegisters, k)
+					}
+				}
+			}
+
+			// A new session ID (agent restart) rotates the UDP data keys.
+			if cur := s.udpCrypto.Load(); cur == nil || cur.sessionID != sessionID {
+				if baseKey := s.encryptionBaseKey(); baseKey != nil {
+					sc, err := crypto.NewUDPSessionCrypto(baseKey, sessionID[:], crypto.UDPDirServerToClient, crypto.UDPDirClientToServer)
+					if err != nil {
+						logging.Global().Errorf(logging.CatUDP, "failed to derive UDP session keys: %v", err)
+					} else {
+						s.udpCrypto.Store(&agentUDPCrypto{sessionID: sessionID, enc: sc.Enc, dec: sc.Dec})
+						logging.Global().Infof(logging.CatUDP, "UDP session keys rotated for agent session %x…", sessionID[:4])
 					}
 				}
 			}
@@ -2703,11 +2718,14 @@ func (s *Server) acceptAgentUDP() {
 
 			payload := pkt.Payload
 			if rc.isEncrypted {
-				if rc.udpCipher == nil {
+				uc := s.udpCrypto.Load()
+				if uc == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(rc.udpCipher, decryptBuf, payload)
+				aadBuf = crypto.AppendUDPDataAAD(aadBuf[:0], routeName, clientID)
+				decrypted, err := uc.dec.Open(decryptBuf, payload, aadBuf)
 				if err != nil {
+					logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-open-"+routeName, fmt.Sprintf("dropping undecryptable UDP packet route=%s client=%s err=%v", routeName, clientID, err))
 					continue
 				}
 				payload = decrypted
@@ -2745,9 +2763,14 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 	buf := make([]byte, 65536)
 	marshalBuf := make([]byte, 65536)
 	encryptBuf := make([]byte, 65536)
+	aadBuf := make([]byte, 0, 512)
 
-	addrStrCache := make(map[netip.AddrPort]string)
-	const maxAddrStrCache = 10000
+	// Two-generation addr->string cache: when the current generation fills,
+	// it becomes the previous one and live entries are promoted back on
+	// access. Bounded without the churn of evicting random hot entries.
+	const maxAddrStrCache = 10000 / 2
+	addrStrCur := make(map[netip.AddrPort]string)
+	var addrStrPrev map[netip.AddrPort]string
 	var pkt protocol.Packet
 	// pkt.Type and pkt.Route are stable for the lifetime of this listener.
 	pkt.Type = protocol.TypeData
@@ -2770,17 +2793,16 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			continue
 		}
 
-		clientStr, ok := addrStrCache[addr]
+		clientStr, ok := addrStrCur[addr]
 		if !ok {
-			clientStr = addr.String()
-			if len(addrStrCache) >= maxAddrStrCache {
-				// Evict one entry to stay bounded.
-				for k := range addrStrCache {
-					delete(addrStrCache, k)
-					break
-				}
+			if clientStr, ok = addrStrPrev[addr]; !ok {
+				clientStr = addr.String()
 			}
-			addrStrCache[addr] = clientStr
+			if len(addrStrCur) >= maxAddrStrCache {
+				addrStrPrev = addrStrCur
+				addrStrCur = make(map[netip.AddrPort]string, 64)
+			}
+			addrStrCur[addr] = clientStr
 		}
 
 		agentAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
@@ -2817,10 +2839,13 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 
 		payload := buf[:n]
 		if rc.isEncrypted {
-			if rc.udpCipher == nil {
+			uc := s.udpCrypto.Load()
+			if uc == nil {
+				// No registered agent session yet; nothing to encrypt for.
 				continue
 			}
-			encrypted, err := crypto.EncryptUDP(rc.udpCipher, encryptBuf, payload)
+			aadBuf = crypto.AppendUDPDataAAD(aadBuf[:0], routeName, clientStr)
+			encrypted, err := uc.enc.Seal(encryptBuf, payload, aadBuf)
 			if err != nil {
 				continue
 			}

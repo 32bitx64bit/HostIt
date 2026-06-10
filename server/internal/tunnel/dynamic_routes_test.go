@@ -562,14 +562,10 @@ func TestProcessRouteRemoveLocked_CleanupDerivedKeys(t *testing.T) {
 
 	s.mu.RLock()
 	_, keyExists := s.derivedKeys["encrypted-app"]
-	_, cipherExists := s.udpCiphers["encrypted-app"]
 	s.mu.RUnlock()
 
 	if keyExists {
 		t.Error("derived key should be cleaned up after route removal")
-	}
-	if cipherExists {
-		t.Error("udp cipher should be cleaned up after route removal")
 	}
 }
 
