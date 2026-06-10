@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 )
@@ -381,6 +380,7 @@ func TestCryptoConnWriteHandlesShortWrites(t *testing.T) {
 	raw := underlying.w.Bytes()
 	offset := 0
 	var decrypted []byte
+	var frameIdx uint64
 	for offset < len(raw) {
 		if offset+frameLenSize > len(raw) {
 			t.Fatalf("truncated frame header at offset %d", offset)
@@ -390,9 +390,10 @@ func TestCryptoConnWriteHandlesShortWrites(t *testing.T) {
 		if offset+frameLen > len(raw) {
 			t.Fatalf("truncated frame body at offset %d", offset)
 		}
-		nonce := raw[offset : offset+gcmNonceSize]
-		ciphertext := raw[offset+gcmNonceSize : offset+frameLen]
-		plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+		// Frames carry no nonce; the reader derives it from its counter.
+		nonce := buildNonce(&seed, frameIdx)
+		frameIdx++
+		plain, err := gcm.Open(nil, nonce[:], raw[offset:offset+frameLen], nil)
 		if err != nil {
 			t.Fatalf("GCM decrypt failed at offset %d: %v", offset, err)
 		}
@@ -429,275 +430,6 @@ func TestCryptoConnCloseReadFallsBackToClose(t *testing.T) {
 	}
 }
 
-func TestDeriveKeyAndUDPCipherEdgeCases(t *testing.T) {
-	key128, err := DeriveKey("test-token", AlgAES128)
-	if err != nil {
-		t.Fatalf("DeriveKey AES-128: %v", err)
-	}
-	if len(key128) != 16 {
-		t.Fatalf("AES-128 key length = %d, want 16", len(key128))
-	}
-
-	key256, err := DeriveKey("test-token", AlgAES256)
-	if err != nil {
-		t.Fatalf("DeriveKey AES-256: %v", err)
-	}
-	if len(key256) != 32 {
-		t.Fatalf("AES-256 key length = %d, want 32", len(key256))
-	}
-
-	noKey, err := DeriveKey("test-token", AlgNone)
-	if err != nil {
-		t.Fatalf("DeriveKey none: %v", err)
-	}
-	if noKey != nil {
-		t.Fatalf("DeriveKey none returned %d bytes, want nil", len(noKey))
-	}
-
-	defaultKey, err := DeriveKey("test-token", "")
-	if err != nil {
-		t.Fatalf("DeriveKey empty alg: %v", err)
-	}
-	if defaultKey != nil {
-		t.Fatalf("DeriveKey empty alg returned %d bytes, want nil", len(defaultKey))
-	}
-
-	if _, err := DeriveKey("test-token", "unsupported"); err == nil {
-		t.Fatal("DeriveKey unsupported algorithm error = nil")
-	}
-
-	udpCipher, err := NewUDPCipher(key128)
-	if err != nil {
-		t.Fatalf("NewUDPCipher valid key: %v", err)
-	}
-	if udpCipher == nil {
-		t.Fatal("NewUDPCipher valid key = nil")
-	}
-
-	nilCipher, err := NewUDPCipher(nil)
-	if err != nil {
-		t.Fatalf("NewUDPCipher nil key: %v", err)
-	}
-	if nilCipher != nil {
-		t.Fatal("NewUDPCipher nil key returned non-nil cipher")
-	}
-
-	if _, err := NewUDPCipher([]byte{1, 2, 3}); err == nil {
-		t.Fatal("NewUDPCipher invalid key error = nil")
-	}
-}
-
-func TestNoncePoolProducesUniqueNonces(t *testing.T) {
-	// Exercise the nonce pool's batch-exhausted and refilled paths.
-	// Each plaintext must round-trip and every nonce must be distinct.
-	const iters = 10_000
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		t.Fatal(err)
-	}
-	gcm, err := NewUDPCipher(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	seen := make(map[[gcmNonceSize]byte]struct{}, iters)
-	dst := make([]byte, 0, 64)
-	for i := 0; i < iters; i++ {
-		body := []byte{byte(i), byte(i >> 8)}
-		ct, err := EncryptUDP(gcm, dst[:0], body)
-		if err != nil {
-			t.Fatalf("iter %d: EncryptUDP: %v", i, err)
-		}
-		var nonce [gcmNonceSize]byte
-		copy(nonce[:], ct[:gcmNonceSize])
-		if _, dup := seen[nonce]; dup {
-			t.Fatalf("iter %d: duplicate nonce %x", i, nonce)
-		}
-		seen[nonce] = struct{}{}
-
-		pt, err := DecryptUDP(gcm, nil, ct)
-		if err != nil {
-			t.Fatalf("iter %d: DecryptUDP: %v", i, err)
-		}
-		if !bytes.Equal(pt, body) {
-			t.Fatalf("iter %d: round-trip mismatch: got %x, want %x", i, pt, body)
-		}
-	}
-}
-
-// TestNoncePoolConcurrentUniqueness confirms the pool's Get/Put dance
-// does not let two goroutines reuse the same nonce.
-func TestNoncePoolConcurrentUniqueness(t *testing.T) {
-	const goroutines = 8
-	const itersPerG = 2_000
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		t.Fatal(err)
-	}
-	gcm, err := NewUDPCipher(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var mu sync.Mutex
-	seen := make(map[[gcmNonceSize]byte]struct{}, goroutines*itersPerG)
-	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
-		wg.Add(1)
-		go func(gid int) {
-			defer wg.Done()
-			dst := make([]byte, 0, 64)
-			for i := 0; i < itersPerG; i++ {
-				body := []byte{byte(gid), byte(i)}
-				ct, err := EncryptUDP(gcm, dst[:0], body)
-				if err != nil {
-					t.Errorf("g%d iter %d: EncryptUDP: %v", gid, i, err)
-					return
-				}
-				var nonce [gcmNonceSize]byte
-				copy(nonce[:], ct[:gcmNonceSize])
-				mu.Lock()
-				if _, dup := seen[nonce]; dup {
-					mu.Unlock()
-					t.Errorf("g%d iter %d: duplicate nonce %x", gid, i, nonce)
-					return
-				}
-				seen[nonce] = struct{}{}
-				mu.Unlock()
-			}
-		}(g)
-	}
-	wg.Wait()
-}
-
-func TestUDPEncryptDecryptEdgeCases(t *testing.T) {
-	key := make([]byte, 16)
-	if _, err := rand.Read(key); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	udpCipher, err := NewUDPCipher(key)
-	if err != nil {
-		t.Fatalf("NewUDPCipher: %v", err)
-	}
-
-	for _, plaintext := range [][]byte{[]byte("hello"), nil} {
-		ciphertext, err := EncryptUDP(udpCipher, nil, plaintext)
-		if err != nil {
-			t.Fatalf("EncryptUDP(%q): %v", plaintext, err)
-		}
-		decrypted, err := DecryptUDP(udpCipher, nil, ciphertext)
-		if err != nil {
-			t.Fatalf("DecryptUDP(%q): %v", plaintext, err)
-		}
-		if !bytes.Equal(decrypted, plaintext) {
-			t.Fatalf("DecryptUDP = %q, want %q", decrypted, plaintext)
-		}
-	}
-
-	plaintext := []byte("plain passthrough")
-	passthrough, err := EncryptUDP(nil, nil, plaintext)
-	if err != nil {
-		t.Fatalf("EncryptUDP nil cipher: %v", err)
-	}
-	if !bytes.Equal(passthrough, plaintext) {
-		t.Fatalf("EncryptUDP nil cipher = %q, want %q", passthrough, plaintext)
-	}
-	decrypted, err := DecryptUDP(nil, nil, passthrough)
-	if err != nil {
-		t.Fatalf("DecryptUDP nil cipher: %v", err)
-	}
-	if !bytes.Equal(decrypted, plaintext) {
-		t.Fatalf("DecryptUDP nil cipher = %q, want %q", decrypted, plaintext)
-	}
-
-	if _, err := DecryptUDP(udpCipher, nil, []byte("short")); err == nil {
-		t.Fatal("DecryptUDP short ciphertext error = nil")
-	}
-
-	ciphertext, err := EncryptUDP(udpCipher, nil, []byte("tamper me"))
-	if err != nil {
-		t.Fatalf("EncryptUDP tamper fixture: %v", err)
-	}
-	ciphertext[len(ciphertext)-1] ^= 0x01
-	if _, err := DecryptUDP(udpCipher, nil, ciphertext); err == nil {
-		t.Fatal("DecryptUDP tampered ciphertext error = nil")
-	}
-}
-
-// TestStreamCipherByteCompatible pins wire-compatibility between the
-// StreamCipher fast path and the standard EncryptUDP/DecryptUDP path.
-// A ciphertext produced by one must decrypt cleanly under the other.
-func TestStreamCipherByteCompatible(t *testing.T) {
-	sizes := []int{0, 1, 64, 512, 1400, 8192, 32 * 1024}
-	keySizes := []int{16, 32} // AES-128, AES-256
-
-	for _, keyLen := range keySizes {
-		key := make([]byte, keyLen)
-		if _, err := rand.Read(key); err != nil {
-			t.Fatal(err)
-		}
-		aead, err := NewUDPCipher(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		sc := NewStreamCipher(aead)
-		if sc == nil {
-			t.Fatalf("keyLen=%d: NewStreamCipher returned nil", keyLen)
-		}
-		if sc.Aead() != aead {
-			t.Fatalf("keyLen=%d: Aead() did not return the original AEAD", keyLen)
-		}
-		if sc.NonceSize() != aead.NonceSize() {
-			t.Fatalf("keyLen=%d: NonceSize mismatch", keyLen)
-		}
-		if sc.Overhead() != aead.Overhead() {
-			t.Fatalf("keyLen=%d: Overhead mismatch", keyLen)
-		}
-
-		for _, n := range sizes {
-			plain := make([]byte, n)
-			rand.Read(plain)
-			dst := make([]byte, 0, n+64)
-
-			// Encrypt with the standard API, decrypt with the stream
-			// API. The result must equal the plaintext.
-			ct, err := EncryptUDP(aead, dst, plain)
-			if err != nil {
-				t.Fatalf("keyLen=%d size=%d: EncryptUDP: %v", keyLen, n, err)
-			}
-			pt, err := sc.Decrypt(nil, ct)
-			if err != nil {
-				t.Fatalf("keyLen=%d size=%d: StreamCipher.Decrypt: %v", keyLen, n, err)
-			}
-			if !bytes.Equal(pt, plain) {
-				t.Fatalf("keyLen=%d size=%d: round-trip mismatch", keyLen, n)
-			}
-
-			// Encrypt with the stream API, decrypt with the standard
-			// API. The result must equal the plaintext.
-			ct, err = sc.Encrypt(nil, plain)
-			if err != nil {
-				t.Fatalf("keyLen=%d size=%d: StreamCipher.Encrypt: %v", keyLen, n, err)
-			}
-			pt, err = DecryptUDP(aead, nil, ct)
-			if err != nil {
-				t.Fatalf("keyLen=%d size=%d: DecryptUDP: %v", keyLen, n, err)
-			}
-			if !bytes.Equal(pt, plain) {
-				t.Fatalf("keyLen=%d size=%d: reverse round-trip mismatch", keyLen, n)
-			}
-		}
-	}
-}
-
-// TestNewStreamCipherNilAEAD guards that NewStreamCipher returns nil
-// for a nil AEAD so production can fall back to the non-encrypted path.
-func TestNewStreamCipherNilAEAD(t *testing.T) {
-	if got := NewStreamCipher(nil); got != nil {
-		t.Fatalf("NewStreamCipher(nil) = %v, want nil", got)
-	}
-}
-
 func newCryptoConnReadFixture(t *testing.T, data []byte) *cryptoConn {
 	t.Helper()
 	key := bytes.Repeat([]byte{1}, 16)
@@ -722,7 +454,7 @@ func frameHeaderForTest(frameLen int) []byte {
 
 func TestCryptoConnReadRejectsMalformedFrames(t *testing.T) {
 	fixture := newCryptoConnReadFixture(t, nil)
-	minimumFrameBodyLen := gcmNonceSize + fixture.gcm.Overhead()
+	minimumFrameBodyLen := fixture.gcm.Overhead()
 
 	tests := []struct {
 		name string
@@ -793,5 +525,112 @@ func TestCryptoConnReadBuffersPlaintextAcrossSmallReads(t *testing.T) {
 	}
 	if err := <-writeErrCh; err != nil {
 		t.Fatalf("writer: %v", err)
+	}
+}
+
+// TestCryptoConnRejectsReplayedFrame guards the counter-nonce design: a
+// frame replayed (or delivered out of sequence) by an on-path attacker must
+// fail authentication instead of being silently accepted.
+func TestCryptoConnRejectsReplayedFrame(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	clientNonce := make([]byte, 32)
+	serverNonce := make([]byte, 32)
+	rand.Read(clientNonce)
+	rand.Read(serverNonce)
+
+	out := &bytes.Buffer{}
+	writer, err := WrapTCP(&mockConn{r: &bytes.Buffer{}, w: out}, key, clientNonce, serverNonce, true)
+	if err != nil {
+		t.Fatalf("WrapTCP writer: %v", err)
+	}
+	if _, err := writer.Write([]byte("frame-one")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	frame := append([]byte(nil), out.Bytes()...)
+
+	// Stream containing the same frame twice: first decrypts, replay fails.
+	replayed := append(append([]byte(nil), frame...), frame...)
+	reader, err := WrapTCP(&mockConn{r: bytes.NewBuffer(replayed), w: &bytes.Buffer{}}, key, clientNonce, serverNonce, false)
+	if err != nil {
+		t.Fatalf("WrapTCP reader: %v", err)
+	}
+	buf := make([]byte, 16)
+	if _, err := reader.Read(buf); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if _, err := reader.Read(buf); err == nil {
+		t.Fatal("replayed frame was accepted; counter nonces must reject it")
+	}
+}
+
+// TestCryptoConnRejectsDroppedFrame: losing a frame desynchronizes the
+// counter, so the next frame must fail closed rather than decrypt.
+func TestCryptoConnRejectsDroppedFrame(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	clientNonce := make([]byte, 32)
+	serverNonce := make([]byte, 32)
+	rand.Read(clientNonce)
+	rand.Read(serverNonce)
+
+	out := &bytes.Buffer{}
+	writer, err := WrapTCP(&mockConn{r: &bytes.Buffer{}, w: out}, key, clientNonce, serverNonce, true)
+	if err != nil {
+		t.Fatalf("WrapTCP writer: %v", err)
+	}
+	if _, err := writer.Write([]byte("frame-one")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	firstLen := out.Len()
+	if _, err := writer.Write([]byte("frame-two")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Deliver only the second frame.
+	stream := append([]byte(nil), out.Bytes()[firstLen:]...)
+	reader, err := WrapTCP(&mockConn{r: bytes.NewBuffer(stream), w: &bytes.Buffer{}}, key, clientNonce, serverNonce, false)
+	if err != nil {
+		t.Fatalf("WrapTCP reader: %v", err)
+	}
+	if _, err := reader.Read(make([]byte, 16)); err == nil {
+		t.Fatal("frame after a dropped frame was accepted; counter desync must fail closed")
+	}
+}
+
+func TestDeriveKeyEdgeCases(t *testing.T) {
+	key128, err := DeriveKey("test-token", AlgAES128)
+	if err != nil {
+		t.Fatalf("DeriveKey AES-128: %v", err)
+	}
+	if len(key128) != 16 {
+		t.Fatalf("AES-128 key length = %d, want 16", len(key128))
+	}
+
+	key256, err := DeriveKey("test-token", AlgAES256)
+	if err != nil {
+		t.Fatalf("DeriveKey AES-256: %v", err)
+	}
+	if len(key256) != 32 {
+		t.Fatalf("AES-256 key length = %d, want 32", len(key256))
+	}
+
+	noKey, err := DeriveKey("test-token", AlgNone)
+	if err != nil {
+		t.Fatalf("DeriveKey none: %v", err)
+	}
+	if noKey != nil {
+		t.Fatalf("DeriveKey none returned %d bytes, want nil", len(noKey))
+	}
+
+	defaultKey, err := DeriveKey("test-token", "")
+	if err != nil {
+		t.Fatalf("DeriveKey empty alg: %v", err)
+	}
+	if defaultKey != nil {
+		t.Fatalf("DeriveKey empty alg returned %d bytes, want nil", len(defaultKey))
+	}
+
+	if _, err := DeriveKey("test-token", "unsupported"); err == nil {
+		t.Fatal("DeriveKey unsupported algorithm error = nil")
 	}
 }
