@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"crypto/cipher"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -34,7 +33,15 @@ const (
 	agentControlWriteDeadline = 5 * time.Second
 	udpRegisterInterval       = 2 * time.Second
 	udpSessionIdleTimeout     = 2 * time.Minute
+	// versionMismatchBackoff replaces the normal reconnect backoff when the
+	// server rejected our protocol version: hammering every 2s cannot
+	// succeed until one side is updated.
+	versionMismatchBackoff = 30 * time.Second
 )
+
+// errVersionIncompatible marks connection failures caused by protocol
+// version negotiation, so the reconnect loop can back off much longer.
+var errVersionIncompatible = errors.New("protocol version incompatible")
 
 type Hooks struct {
 	OnConnected        func()
@@ -68,6 +75,16 @@ type Agent struct {
 	controlConn net.Conn
 	udpDataConn *net.UDPConn
 	serverUDP   *net.UDPAddr
+
+	// udpSessionID identifies this agent run; both ends derive the
+	// directional UDP data keys from it, so a restart rotates them.
+	udpSessionID crypto.UDPSessionID
+	// udpCryptoByAlg holds this run's UDP session ciphers per algorithm
+	// (guarded by mu; built when HELLO announces encrypted routes).
+	udpCryptoByAlg map[string]*crypto.UDPSessionCrypto
+	// baseKeyByAlg caches the expensive PBKDF2 derivation per algorithm so
+	// repeated HELLOs don't redo 600k hash iterations per route.
+	baseKeyByAlg map[string][]byte
 
 	controlWriteMu sync.Mutex
 	routeCacheGen  atomic.Uint64
@@ -146,6 +163,10 @@ func sendAndWait[Resp any](ctx context.Context, a *Agent,
 
 	ch := make(chan *Resp, 1)
 	a.mu.Lock()
+	if _, exists := pending[key]; exists {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("request %q is already in flight", key)
+	}
 	pending[key] = ch
 	a.mu.Unlock()
 	defer func() {
@@ -238,6 +259,19 @@ func tlsConfigWithPin(cfg Config) (*tls.Config, error) {
 
 func (a *Agent) Run(ctx context.Context) error {
 	a.ctx, a.cancel = context.WithCancel(ctx)
+
+	sessionID, err := crypto.NewUDPSessionID()
+	if err != nil {
+		return fmt.Errorf("failed to generate UDP session id: %w", err)
+	}
+	a.mu.Lock()
+	a.udpSessionID = sessionID
+	a.udpCryptoByAlg = make(map[string]*crypto.UDPSessionCrypto)
+	if a.baseKeyByAlg == nil {
+		a.baseKeyByAlg = make(map[string][]byte)
+	}
+	a.mu.Unlock()
+
 	if err := a.startUDPData(a.ctx); err != nil {
 		return err
 	}
@@ -261,10 +295,16 @@ func (a *Agent) Run(ctx context.Context) error {
 			logging.Global().Errorf(logging.CatSystem, "Agent error: %v", err)
 		}
 
+		wait := backoff
+		if errors.Is(err, errVersionIncompatible) {
+			// Reconnecting cannot succeed until one side is updated.
+			wait = versionMismatchBackoff
+		}
+
 		select {
 		case <-a.ctx.Done():
 			return nil
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
 
 		if backoff < maxBackoff {
@@ -344,11 +384,12 @@ func (a *Agent) sendUDPRegister(udpConn *net.UDPConn) {
 	a.mu.RLock()
 	serverUDP := a.serverUDP
 	token := a.cfg.Token
+	sessionID := a.udpSessionID
 	a.mu.RUnlock()
 	if serverUDP == nil {
 		return
 	}
-	authPayload, err := crypto.BuildUDPRegister(token)
+	authPayload, err := crypto.BuildUDPRegister(token, sessionID)
 	if err != nil {
 		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-auth", fmt.Sprintf("failed to build UDP register auth: %v", err))
 		return
@@ -436,12 +477,40 @@ func (a *Agent) connectAndRun() error {
 	}
 	conn.SetDeadline(time.Time{})
 
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	// Version negotiation is synchronous: send ours, then require the
+	// server's reply (or its rejection reason) before anything else.
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures})
 	conn.SetWriteDeadline(time.Now().Add(agentControlWriteDeadline))
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		return fmt.Errorf("failed to send version negotiate: %w", err)
 	}
 	conn.SetWriteDeadline(time.Time{})
+
+	conn.SetReadDeadline(time.Now().Add(agentControlReadDeadline))
+	var verPkt protocol.Packet
+	if err := protocol.ReadPacketTo(conn, &verPkt); err != nil {
+		return fmt.Errorf("failed to read version negotiate (server may predate protocol %s): %w", protocol.ProtocolVersion, err)
+	}
+	conn.SetReadDeadline(time.Time{})
+	if verPkt.Type != protocol.TypeVersionNegotiate {
+		return fmt.Errorf("expected version negotiate from server, got packet type %d", verPkt.Type)
+	}
+	var vp protocol.VersionPayload
+	if err := json.Unmarshal(verPkt.Payload, &vp); err != nil {
+		return fmt.Errorf("failed to parse version negotiate: %w", err)
+	}
+	if vp.Error != "" {
+		return fmt.Errorf("%w: server (protocol %s) rejected connection: %s", errVersionIncompatible, vp.Version, vp.Error)
+	}
+	serverVer, ok := version.Parse(vp.Version)
+	if !ok {
+		return fmt.Errorf("server sent invalid version: %s", vp.Version)
+	}
+	if !protocol.IsCompatibleWith(protocol.ProtocolVersionParsed, serverVer) {
+		return fmt.Errorf("%w: %s", errVersionIncompatible, protocol.IncompatibleVersionError(protocol.ProtocolVersionParsed, serverVer))
+	}
+	features := protocol.NegotiateFeatures(protocol.SupportedFeatures, vp.Features)
+	logging.Global().Infof(logging.CatSystem, "Server version negotiated: %s features=%v", serverVer, features)
 
 	a.refreshUDPRegistration()
 
@@ -529,6 +598,54 @@ func (a *Agent) Stop() {
 	a.wg.Wait()
 }
 
+// baseKeyForAlg returns the PBKDF2-derived base key for alg, caching the
+// result so repeated HELLOs don't redo 600k hash iterations per route.
+func (a *Agent) baseKeyForAlg(alg string) ([]byte, error) {
+	a.mu.RLock()
+	key, ok := a.baseKeyByAlg[alg]
+	a.mu.RUnlock()
+	if ok {
+		return key, nil
+	}
+	key, err := crypto.DeriveKey(a.cfg.Token, alg)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	if a.baseKeyByAlg == nil {
+		a.baseKeyByAlg = make(map[string][]byte)
+	}
+	a.baseKeyByAlg[alg] = key
+	a.mu.Unlock()
+	return key, nil
+}
+
+// ensureUDPSessionCrypto builds this run's directional UDP ciphers for alg
+// if they don't exist yet. Existing ciphers are kept: the session ID is
+// stable for the run, and replacing an encryptor would reset its counter.
+func (a *Agent) ensureUDPSessionCrypto(alg string, baseKey []byte) error {
+	a.mu.RLock()
+	_, ok := a.udpCryptoByAlg[alg]
+	a.mu.RUnlock()
+	if ok {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.udpCryptoByAlg[alg]; ok {
+		return nil
+	}
+	sc, err := crypto.NewUDPSessionCrypto(baseKey, a.udpSessionID[:], crypto.UDPDirClientToServer, crypto.UDPDirServerToClient)
+	if err != nil {
+		return err
+	}
+	if a.udpCryptoByAlg == nil {
+		a.udpCryptoByAlg = make(map[string]*crypto.UDPSessionCrypto)
+	}
+	a.udpCryptoByAlg[alg] = sc
+	return nil
+}
+
 func (a *Agent) EmailConfig() emailcfg.Config {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -573,18 +690,8 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 		}
 
 		if pkt.Type == protocol.TypeVersionNegotiate {
-			var vp protocol.VersionPayload
-			if err := json.Unmarshal(pkt.Payload, &vp); err != nil {
-				return fmt.Errorf("failed to parse version negotiate: %w", err)
-			}
-			serverVer, ok := version.Parse(vp.Version)
-			if !ok {
-				return fmt.Errorf("server sent invalid version: %s", vp.Version)
-			}
-			if !protocol.IsCompatibleWith(protocol.ProtocolVersionParsed, serverVer) {
-				return fmt.Errorf("server version %s is incompatible with agent %s", serverVer, protocol.ProtocolVersionParsed)
-			}
-			logging.Global().Infof(logging.CatSystem, "Server version negotiated: %s", serverVer)
+			// Negotiation already completed synchronously in connectAndRun;
+			// tolerate (and ignore) a stray re-announcement.
 			continue
 		}
 
@@ -636,18 +743,15 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 			}
 			for k, r := range routes {
 				if r.Encrypted {
-					key, err := crypto.DeriveKey(a.cfg.Token, r.Algorithm)
+					key, err := a.baseKeyForAlg(r.Algorithm)
 					if err != nil {
 						logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: %v", r.Name, err)
-					} else {
+					} else if key != nil {
 						r.DerivedKey = key
-						udpCipher, err := crypto.NewUDPCipher(key)
-						if err != nil {
-							logging.Global().Errorf(logging.CatTCP, "failed to create udp cipher for route %s: %v", r.Name, err)
-						} else {
-							r.UDPCipher = udpCipher
-						}
 						routes[k] = r
+						if err := a.ensureUDPSessionCrypto(r.Algorithm, key); err != nil {
+							logging.Global().Errorf(logging.CatUDP, "failed to build UDP session crypto for route %s: %v", r.Name, err)
+						}
 					}
 				}
 			}
@@ -1001,6 +1105,10 @@ func normalizeAddrPort(ap netip.AddrPort) netip.AddrPort {
 func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	buf := make([]byte, 65536)
 	decryptBuf := make([]byte, 65536)
+	aadBuf := make([]byte, 0, 512)
+	// Route/client strings repeat on every datagram of a flow; interning
+	// removes both per-packet string allocations.
+	interner := protocol.NewStringInterner(4096)
 	var pkt protocol.Packet
 
 	// Only datagrams from the server's data address are honored; spoofed traffic is dropped.
@@ -1047,7 +1155,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 	type routeConfig struct {
 		isEncrypted bool
-		udpCipher   cipher.AEAD
+		crypto      *crypto.UDPSessionCrypto
 		localAddr   string
 	}
 	var routeCache sync.Map
@@ -1060,7 +1168,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 		for _, rt := range a.cfg.Routes {
 			routeCache.Store(rt.Name, routeConfig{
 				isEncrypted: rt.Encrypted,
-				udpCipher:   rt.UDPCipher,
+				crypto:      a.udpCryptoByAlg[rt.Algorithm],
 				localAddr:   rt.EffectiveLocalAddr(),
 			})
 		}
@@ -1093,7 +1201,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 		refreshRouteCacheIfNeeded()
 
-		err = protocol.UnmarshalUDPTo(buf[:n], &pkt)
+		err = protocol.UnmarshalUDPToInterned(buf[:n], &pkt, interner)
 		if err != nil {
 			continue
 		}
@@ -1107,13 +1215,14 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 			if !ok {
 				a.mu.RLock()
 				rt, ok := a.cfg.Routes[routeName]
+				rtCrypto := a.udpCryptoByAlg[rt.Algorithm]
 				a.mu.RUnlock()
 				if !ok {
 					continue
 				}
 				rc = routeConfig{
 					isEncrypted: rt.Encrypted,
-					udpCipher:   rt.UDPCipher,
+					crypto:      rtCrypto,
 					localAddr:   rt.EffectiveLocalAddr(),
 				}
 				routeCache.Store(routeName, rc)
@@ -1123,12 +1232,13 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 			payload := pkt.Payload
 			if rc.isEncrypted {
-				udpCipher := rc.udpCipher
-				if udpCipher == nil {
+				if rc.crypto == nil {
 					continue
 				}
-				decrypted, err := crypto.DecryptUDP(udpCipher, decryptBuf, payload)
+				aadBuf = crypto.AppendUDPDataAAD(aadBuf[:0], routeName, clientID)
+				decrypted, err := rc.crypto.Dec.Open(decryptBuf, payload, aadBuf)
 				if err != nil {
+					logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-open-"+routeName, fmt.Sprintf("dropping undecryptable UDP packet route=%s client=%s err=%v", routeName, clientID, err))
 					continue
 				}
 				payload = decrypted
@@ -1166,7 +1276,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 				} else {
 					sessVal = newSess
 
-					go func(key sessionKey, sess *agentUDPSession, c *net.UDPConn, isEncrypted bool, udpCipher cipher.AEAD) {
+					go func(key sessionKey, sess *agentUDPSession, c *net.UDPConn, isEncrypted bool, sessionCrypto *crypto.UDPSessionCrypto) {
 						defer func() {
 							c.Close()
 							sessions.CompareAndDelete(key, sess)
@@ -1175,6 +1285,9 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 						respBuf := make([]byte, 65536)
 						marshalBuf := make([]byte, 65536)
 						encryptBuf := make([]byte, 65536)
+						// Route and client are fixed for the session, so the
+						// AAD is built once.
+						aad := crypto.AppendUDPDataAAD(nil, key.route, key.client)
 						var respPkt protocol.Packet
 						respPkt.Type = protocol.TypeData
 						respPkt.Route = key.route
@@ -1200,10 +1313,10 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 							payload := respBuf[:rn]
 							if isEncrypted {
-								if udpCipher == nil {
+								if sessionCrypto == nil {
 									continue
 								}
-								encrypted, err := crypto.EncryptUDP(udpCipher, encryptBuf, payload)
+								encrypted, err := sessionCrypto.Enc.Seal(encryptBuf, payload, aad)
 								if err != nil {
 									continue
 								}
@@ -1228,7 +1341,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 								logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-short-write-server-"+key.route, fmt.Sprintf("short UDP response write to server route=%s client=%s wrote=%d want=%d", key.route, key.client, n, len(data)))
 							}
 						}
-					}(key, newSess, localConn, rc.isEncrypted, rc.udpCipher)
+					}(key, newSess, localConn, rc.isEncrypted, rc.crypto)
 				}
 			}
 

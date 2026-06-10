@@ -35,6 +35,9 @@ type fakeTunnelServer struct {
 	controlConn    net.Conn
 	controlReadyCh chan struct{}
 	controlMu      sync.Mutex
+
+	agentSessionID sharedcrypto.UDPSessionID
+	agentSessionOK bool
 }
 
 func startFakeTunnelServer(t *testing.T, token string) *fakeTunnelServer {
@@ -316,11 +319,33 @@ func (s *fakeTunnelServer) waitForAgentUDPAddr(t *testing.T) *net.UDPAddr {
 			continue
 		}
 		if pkt.Type == protocol.TypeRegister {
+			if _, sessionID, ok := sharedcrypto.VerifyUDPRegister(s.token, pkt.Payload, time.Now(), time.Minute); ok {
+				s.agentSessionID = sessionID
+				s.agentSessionOK = true
+			}
 			return addr
 		}
 	}
 	t.Fatal("timed out waiting for agent UDP registration")
 	return nil
+}
+
+// agentSessionCrypto derives the server-side view of the agent's UDP
+// session keys (seal s2c, open c2s) from the captured register.
+func (s *fakeTunnelServer) agentSessionCrypto(t *testing.T, alg string) *sharedcrypto.UDPSessionCrypto {
+	t.Helper()
+	if !s.agentSessionOK {
+		t.Fatal("agent UDP session ID was not captured; call waitForAgentUDPAddr first")
+	}
+	key, err := sharedcrypto.DeriveKey(s.token, alg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := sharedcrypto.NewUDPSessionCrypto(key, s.agentSessionID[:], sharedcrypto.UDPDirServerToClient, sharedcrypto.UDPDirClientToServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sc
 }
 
 func (s *fakeTunnelServer) sendUDPToAgent(t *testing.T, agentAddr *net.UDPAddr, routeName, clientID string, payload []byte) {
@@ -596,22 +621,16 @@ func TestAgentUDPEncryptedRoundTrip(t *testing.T) {
 	waitForSignal(t, connectedCh, 5*time.Second, "agent never processed HELLO")
 	agentUDPAddr := server.waitForAgentUDPAddr(t)
 
-	key, err := sharedcrypto.DeriveKey("testtoken", sharedcrypto.AlgAES256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	udpCipher, err := sharedcrypto.NewUDPCipher(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encryptedPayload, err := sharedcrypto.EncryptUDP(udpCipher, nil, []byte("ping"))
+	sessionCrypto := server.agentSessionCrypto(t, sharedcrypto.AlgAES256)
+	aad := sharedcrypto.AppendUDPDataAAD(nil, "game", "127.0.0.1:40000")
+	encryptedPayload, err := sessionCrypto.Enc.Seal(nil, []byte("ping"), aad)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server.sendUDPToAgent(t, agentUDPAddr, "game", "127.0.0.1:40000", encryptedPayload)
 
 	resp := server.readUDPData(t)
-	decrypted, err := sharedcrypto.DecryptUDP(udpCipher, nil, resp.Payload)
+	decrypted, err := sessionCrypto.Dec.Open(nil, resp.Payload, aad)
 	if err != nil {
 		t.Fatal(err)
 	}

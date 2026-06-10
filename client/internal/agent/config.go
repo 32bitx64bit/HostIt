@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"crypto/cipher"
 	"fmt"
 	"net"
 	"strconv"
@@ -21,8 +20,7 @@ type RemoteRoute struct {
 	LocalAddr  string // agent-side target addr (host:port)
 	Encrypted  bool
 	Algorithm  string
-	DerivedKey []byte      `json:"-"`
-	UDPCipher  cipher.AEAD `json:"-"`
+	DerivedKey []byte `json:"-"`
 }
 
 func (r RemoteRoute) EffectiveLocalAddr() string {
