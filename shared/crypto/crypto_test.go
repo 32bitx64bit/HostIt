@@ -78,12 +78,17 @@ func BenchmarkCryptoConn_Write(b *testing.B) {
 
 	var wc1, wc2 net.Conn
 	var err1, err2 error
+	clientNonce := make([]byte, 32)
+	serverNonce := make([]byte, 32)
+	rand.Read(clientNonce)
+	rand.Read(serverNonce)
+
 	done2 := make(chan struct{})
 	go func() {
-		wc1, err1 = WrapTCP(c1, key, false)
+		wc1, err1 = WrapTCP(c1, key, clientNonce, serverNonce, false)
 		close(done2)
 	}()
-	wc2, err2 = WrapTCP(c2, key, true)
+	wc2, err2 = WrapTCP(c2, key, clientNonce, serverNonce, true)
 	<-done2
 
 	if err1 != nil {
@@ -130,14 +135,19 @@ func TestWrapTCP(t *testing.T) {
 	}
 	<-done
 
+	clientNonce := make([]byte, 32)
+	serverNonce := make([]byte, 32)
+	rand.Read(clientNonce)
+	rand.Read(serverNonce)
+
 	var wc1, wc2 net.Conn
 	var err1, err2 error
 	done2 := make(chan struct{})
 	go func() {
-		wc1, err1 = WrapTCP(c1, key, false)
+		wc1, err1 = WrapTCP(c1, key, clientNonce, serverNonce, false)
 		close(done2)
 	}()
-	wc2, err2 = WrapTCP(c2, key, true)
+	wc2, err2 = WrapTCP(c2, key, clientNonce, serverNonce, true)
 	<-done2
 
 	if err1 != nil {
@@ -205,13 +215,18 @@ func TestCryptoConnHalfClose(t *testing.T) {
 	}
 	rawServer := <-accepted
 
+	clientNonce := make([]byte, 32)
+	serverNonce := make([]byte, 32)
+	rand.Read(clientNonce)
+	rand.Read(serverNonce)
+
 	var wServer net.Conn
 	done := make(chan struct{})
 	go func() {
-		wServer, _ = WrapTCP(rawServer, key, false)
+		wServer, _ = WrapTCP(rawServer, key, clientNonce, serverNonce, false)
 		close(done)
 	}()
-	wClient, err := WrapTCP(rawClient, key, true)
+	wClient, err := WrapTCP(rawClient, key, clientNonce, serverNonce, true)
 	if err != nil {
 		t.Fatalf("WrapTCP client failed: %v", err)
 	}
@@ -273,12 +288,17 @@ func TestWrapTCPLargeData(t *testing.T) {
 	}
 	defer l.Close()
 
+	clientNonce := make([]byte, 32)
+	serverNonce := make([]byte, 32)
+	rand.Read(clientNonce)
+	rand.Read(serverNonce)
+
 	go func() {
 		c1, err := l.Accept()
 		if err != nil {
 			return
 		}
-		wc1, err := WrapTCP(c1, key, false)
+		wc1, err := WrapTCP(c1, key, clientNonce, serverNonce, false)
 		if err != nil {
 			c1.Close()
 			return
@@ -290,7 +310,7 @@ func TestWrapTCPLargeData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial failed: %v", err)
 	}
-	wc2, err := WrapTCP(c2, key, true)
+	wc2, err := WrapTCP(c2, key, clientNonce, serverNonce, true)
 	if err != nil {
 		t.Fatalf("WrapTCP c2 failed: %v", err)
 	}
@@ -707,9 +727,9 @@ func newCryptoConnReadFixture(t *testing.T, data []byte) *cryptoConn {
 		t.Fatalf("cipher.NewGCM: %v", err)
 	}
 	return &cryptoConn{
-		Conn:    &mockConn{r: bytes.NewBuffer(data), w: &bytes.Buffer{}},
-		gcm:     gcm,
-		readBuf: make([]byte, 0, maxPlaintextSize),
+		Conn: &mockConn{r: bytes.NewBuffer(data), w: &bytes.Buffer{}},
+		gcm:  gcm,
+		buf:  make([]byte, maxPlaintextSize),
 	}
 }
 
@@ -751,11 +771,16 @@ func TestCryptoConnReadBuffersPlaintextAcrossSmallReads(t *testing.T) {
 	defer rawClient.Close()
 	defer rawServer.Close()
 
-	client, err := WrapTCP(rawClient, key, true)
+	clientNonce := make([]byte, 32)
+	serverNonce := make([]byte, 32)
+	rand.Read(clientNonce)
+	rand.Read(serverNonce)
+
+	client, err := WrapTCP(rawClient, key, clientNonce, serverNonce, true)
 	if err != nil {
 		t.Fatalf("WrapTCP client: %v", err)
 	}
-	server, err := WrapTCP(rawServer, key, false)
+	server, err := WrapTCP(rawServer, key, clientNonce, serverNonce, false)
 	if err != nil {
 		t.Fatalf("WrapTCP server: %v", err)
 	}

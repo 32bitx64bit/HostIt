@@ -3,7 +3,9 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -12,8 +14,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-
-	"golang.org/x/crypto/pbkdf2"
 
 	"hostit/shared/netutil"
 )
@@ -31,9 +31,9 @@ func DeriveKey(token string, alg string) ([]byte, error) {
 
 	switch strings.ToLower(alg) {
 	case AlgAES128:
-		return pbkdf2.Key([]byte(token), salt, 600_000, 16, sha256.New), nil
+		return pbkdf2.Key(sha256.New, token, salt, 600_000, 16)
 	case AlgAES256:
-		return pbkdf2.Key([]byte(token), salt, 600_000, 32, sha256.New), nil
+		return pbkdf2.Key(sha256.New, token, salt, 600_000, 32)
 	case AlgNone, "":
 		return nil, nil
 	default:
@@ -60,12 +60,9 @@ var noncePool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, nonceBatchSize)
 		if _, err := io.ReadFull(rand.Reader, b); err != nil {
-			// rand.Reader should not fail on a healthy system. The zero
-			// fallback still produces nonces that are unique across the
-			// next refill, which the pool's New function will trigger.
-			for i := range b {
-				b[i] = 0
-			}
+			// rand.Reader should never fail on a healthy system. Encrypting
+			// with a broken RNG is catastrophic, so abort immediately (SEC-8).
+			panic(err)
 		}
 		return &b
 	},
@@ -74,7 +71,9 @@ var noncePool = sync.Pool{
 func fillNonceBatch(out []byte) {
 	batchPtr, ok := noncePool.Get().(*[]byte)
 	if !ok {
-		io.ReadFull(rand.Reader, out)
+		if _, err := io.ReadFull(rand.Reader, out); err != nil {
+			panic(err)
+		}
 		return
 	}
 	batch := *batchPtr
@@ -89,14 +88,8 @@ func fillNonceBatch(out []byte) {
 	noncePool.Put(batchPtr)
 }
 
-func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
-	if aesgcm == nil {
-		dst = dst[:0]
-		return append(dst, plaintext...), nil
-	}
-	nonceSize := aesgcm.NonceSize()
-
-	outLen := nonceSize + len(plaintext) + aesgcm.Overhead()
+func sealAEAD(aead cipher.AEAD, nonceSize, overhead int, dst, plaintext []byte) ([]byte, error) {
+	outLen := nonceSize + len(plaintext) + overhead
 	if cap(dst) < outLen {
 		dst = make([]byte, nonceSize, outLen)
 	} else {
@@ -105,7 +98,9 @@ func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 
 	batchPtr, ok := noncePool.Get().(*[]byte)
 	if !ok {
-		io.ReadFull(rand.Reader, dst[:nonceSize])
+		if _, err := io.ReadFull(rand.Reader, dst[:nonceSize]); err != nil {
+			panic(err)
+		}
 	} else {
 		batch := *batchPtr
 		if len(batch) < nonceSize {
@@ -117,7 +112,35 @@ func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 		}
 	}
 
-	return aesgcm.Seal(dst, dst[:nonceSize], plaintext, nil), nil
+	return aead.Seal(dst, dst[:nonceSize], plaintext, nil), nil
+}
+
+// openAEAD is the shared implementation for AEAD decryption; see sealAEAD.
+func openAEAD(aead cipher.AEAD, nonceSize, overhead int, dst, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) < nonceSize {
+		return nil, errors.New("ciphertext too short")
+	}
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+
+	outLen := len(ciphertext) - overhead
+	if outLen < 0 {
+		outLen = 0
+	}
+	if cap(dst) < outLen {
+		dst = make([]byte, 0, outLen)
+	} else {
+		dst = dst[:0]
+	}
+
+	return aead.Open(dst, nonce, ciphertext, nil)
+}
+
+func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
+	if aesgcm == nil {
+		dst = dst[:0]
+		return append(dst, plaintext...), nil
+	}
+	return sealAEAD(aesgcm, aesgcm.NonceSize(), aesgcm.Overhead(), dst, plaintext)
 }
 
 // StreamCipher caches NonceSize and Overhead so the per-packet hot
@@ -139,52 +162,24 @@ func NewStreamCipher(aesgcm cipher.AEAD) *StreamCipher {
 	}
 }
 
-func (c *StreamCipher) Aead() cipher.AEAD   { return c.aead }
-func (c *StreamCipher) NonceSize() int      { return c.nonceSize }
-func (c *StreamCipher) Overhead() int       { return c.overhead }
+func (c *StreamCipher) Aead() cipher.AEAD { return c.aead }
+func (c *StreamCipher) NonceSize() int    { return c.nonceSize }
+func (c *StreamCipher) Overhead() int     { return c.overhead }
 
 func (c *StreamCipher) Encrypt(dst, plaintext []byte) ([]byte, error) {
-	outLen := c.nonceSize + len(plaintext) + c.overhead
-	if cap(dst) < outLen {
-		dst = make([]byte, c.nonceSize, outLen)
-	} else {
-		dst = dst[:c.nonceSize]
+	if c == nil || c.aead == nil {
+		dst = dst[:0]
+		return append(dst, plaintext...), nil
 	}
-
-	batchPtr, ok := noncePool.Get().(*[]byte)
-	if !ok {
-		io.ReadFull(rand.Reader, dst[:c.nonceSize])
-	} else {
-		batch := *batchPtr
-		if len(batch) < c.nonceSize {
-			fillNonceBatch(dst[:c.nonceSize])
-		} else {
-			copy(dst[:c.nonceSize], batch[:c.nonceSize])
-			*batchPtr = batch[c.nonceSize:]
-			noncePool.Put(batchPtr)
-		}
-	}
-
-	return c.aead.Seal(dst, dst[:c.nonceSize], plaintext, nil), nil
+	return sealAEAD(c.aead, c.nonceSize, c.overhead, dst, plaintext)
 }
 
 func (c *StreamCipher) Decrypt(dst, ciphertext []byte) ([]byte, error) {
-	if len(ciphertext) < c.nonceSize {
-		return nil, errors.New("ciphertext too short")
-	}
-	nonce, ciphertext := ciphertext[:c.nonceSize], ciphertext[c.nonceSize:]
-
-	outLen := len(ciphertext) - c.overhead
-	if outLen < 0 {
-		outLen = 0
-	}
-	if cap(dst) < outLen {
-		dst = make([]byte, 0, outLen)
-	} else {
+	if c == nil || c.aead == nil {
 		dst = dst[:0]
+		return append(dst, ciphertext...), nil
 	}
-
-	return c.aead.Open(dst, nonce, ciphertext, nil)
+	return openAEAD(c.aead, c.nonceSize, c.overhead, dst, ciphertext)
 }
 
 func DecryptUDP(aesgcm cipher.AEAD, dst, ciphertext []byte) ([]byte, error) {
@@ -192,23 +187,7 @@ func DecryptUDP(aesgcm cipher.AEAD, dst, ciphertext []byte) ([]byte, error) {
 		dst = dst[:0]
 		return append(dst, ciphertext...), nil
 	}
-	nonceSize := aesgcm.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, errors.New("ciphertext too short")
-	}
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-
-	outLen := len(ciphertext) - aesgcm.Overhead()
-	if outLen < 0 {
-		outLen = 0
-	}
-	if cap(dst) < outLen {
-		dst = make([]byte, 0, outLen)
-	} else {
-		dst = dst[:0]
-	}
-
-	return aesgcm.Open(dst, nonce, ciphertext, nil)
+	return openAEAD(aesgcm, aesgcm.NonceSize(), aesgcm.Overhead(), dst, ciphertext)
 }
 
 const (
@@ -228,11 +207,20 @@ func deriveSeed(key []byte, label string) [gcmNonceSize]byte {
 	return seed
 }
 
-func WrapTCP(conn net.Conn, key []byte, isClient bool) (net.Conn, error) {
+func WrapTCP(conn net.Conn, key, clientNonce, serverNonce []byte, isClient bool) (net.Conn, error) {
 	if len(key) == 0 {
 		return conn, nil
 	}
-	block, err := aes.NewCipher(key)
+	// Derive a per-session key from the long-term route key and the
+	// freshly exchanged authentication nonces. This ensures every TCP
+	// session uses unique AEAD nonces even if the underlying route key
+	// is static, fixing AES-GCM nonce reuse across connections (SEC-1).
+	info := append(clientNonce, serverNonce...)
+	sessionKey, err := hkdf.Key(sha256.New, key, info, "hostit-session-key", len(key))
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(sessionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -251,9 +239,9 @@ func WrapTCP(conn net.Conn, key []byte, isClient bool) (net.Conn, error) {
 	return &cryptoConn{
 		Conn:      conn,
 		gcm:       gcm,
-		writeSeed: deriveSeed(key, writeLabel),
-		readSeed:  deriveSeed(key, readLabel),
-		readBuf:   make([]byte, 0, maxPlaintextSize),
+		writeSeed: deriveSeed(sessionKey, writeLabel),
+		readSeed:  deriveSeed(sessionKey, readLabel),
+		buf:       make([]byte, maxPlaintextSize),
 	}, nil
 }
 
@@ -263,7 +251,8 @@ type cryptoConn struct {
 	writeSeed  [gcmNonceSize]byte
 	writeNonce uint64
 	readSeed   [gcmNonceSize]byte
-	readBuf    []byte
+	buf        []byte
+	start, end int
 }
 
 func buildNonce(seed *[gcmNonceSize]byte, counter uint64) [gcmNonceSize]byte {
@@ -288,55 +277,59 @@ func (c *cryptoConn) NetConn() net.Conn {
 }
 
 func (c *cryptoConn) Read(b []byte) (int, error) {
-	if len(c.readBuf) > 0 {
-		n := copy(b, c.readBuf)
-		c.readBuf = c.readBuf[n:]
-		if len(c.readBuf) == 0 {
-			c.readBuf = c.readBuf[:0]
+	for {
+		if c.start < c.end {
+			n := copy(b, c.buf[c.start:c.end])
+			c.start += n
+			return n, nil
 		}
+
+		var header [frameLenSize]byte
+		if _, err := io.ReadFull(c.Conn, header[:]); err != nil {
+			return 0, err
+		}
+		frameLen := int(header[0])<<8 | int(header[1])
+		if frameLen < gcmNonceSize+c.gcm.Overhead() {
+			return 0, errors.New("encrypted frame too short")
+		}
+		if frameLen > maxFrameBodySize {
+			return 0, errors.New("encrypted frame too large")
+		}
+
+		framePtr := readFramePool.Get().(*[maxFrameBodySize]byte)
+		frame := framePtr[:frameLen]
+		if _, err := io.ReadFull(c.Conn, frame); err != nil {
+			readFramePool.Put(framePtr)
+			return 0, err
+		}
+
+		nonce := frame[:gcmNonceSize]
+		ciphertext := frame[gcmNonceSize:]
+
+		// Open into the fixed backing array. The returned plaintext shares
+		// c.buf, so we only need start/end offsets and never re-slice the
+		// head. This avoids the previous per-frame append that grew and
+		// reallocated readBuf (BUG-2).
+		plaintext, err := c.gcm.Open(c.buf[:0], nonce, ciphertext, nil)
+		readFramePool.Put(framePtr)
+		if err != nil {
+			c.start = 0
+			c.end = 0
+			return 0, fmt.Errorf("GCM decrypt failed: %w", err)
+		}
+
+		c.start = 0
+		c.end = len(plaintext)
+		if c.end == 0 {
+			// Empty frame: loop back and read the next frame instead of
+			// recursing, preventing stack growth on empty frames.
+			continue
+		}
+
+		n := copy(b, c.buf[c.start:c.end])
+		c.start += n
 		return n, nil
 	}
-
-	var header [frameLenSize]byte
-	if _, err := io.ReadFull(c.Conn, header[:]); err != nil {
-		return 0, err
-	}
-	frameLen := int(header[0])<<8 | int(header[1])
-	if frameLen < gcmNonceSize+c.gcm.Overhead() {
-		return 0, errors.New("encrypted frame too short")
-	}
-	if frameLen > maxFrameBodySize {
-		return 0, errors.New("encrypted frame too large")
-	}
-
-	framePtr := readFramePool.Get().(*[maxFrameBodySize]byte)
-	frame := framePtr[:frameLen]
-	if _, err := io.ReadFull(c.Conn, frame); err != nil {
-		readFramePool.Put(framePtr)
-		return 0, err
-	}
-
-	nonce := frame[:gcmNonceSize]
-	ciphertext := frame[gcmNonceSize:]
-
-	plaintext, err := c.gcm.Open(c.readBuf[:0], nonce, ciphertext, nil)
-	readFramePool.Put(framePtr)
-	if err != nil {
-		return 0, fmt.Errorf("GCM decrypt failed: %w", err)
-	}
-
-	if len(plaintext) == 0 {
-		c.readBuf = c.readBuf[:0]
-		return c.Read(b)
-	}
-
-	n := copy(b, plaintext)
-	if n < len(plaintext) {
-		c.readBuf = append(c.readBuf[:0], plaintext[n:]...)
-	} else {
-		c.readBuf = c.readBuf[:0]
-	}
-	return n, nil
 }
 
 var writeBufPool = sync.Pool{
