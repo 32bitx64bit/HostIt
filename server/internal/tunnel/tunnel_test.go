@@ -16,6 +16,21 @@ import (
 	"hostit/shared/protocol"
 )
 
+func negotiateVersion(t *testing.T, conn net.Conn) {
+	t.Helper()
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+		t.Fatal(err)
+	}
+	pkt, err := protocol.ReadPacket(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Type != protocol.TypeVersionNegotiate {
+		t.Fatalf("expected version negotiate, got type %d", pkt.Type)
+	}
+}
+
 func startEcho(t *testing.T) (net.Listener, string) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -461,6 +476,7 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 	if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
+	negotiateVersion(t, conn)
 	pkt, err := protocol.ReadPacket(conn)
 	if err != nil {
 		t.Fatal(err)
@@ -835,19 +851,20 @@ func TestServerRapidReconnectWithStaleControlSession(t *testing.T) {
 				continue
 			}
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
-				_ = conn.Close()
-				t.Fatal(err)
-			}
-			pkt, err := protocol.ReadPacket(conn)
-			if err != nil {
-				_ = conn.Close()
-				t.Fatal(err)
-			}
-			if pkt.Type != protocol.TypeHello {
-				_ = conn.Close()
-				t.Fatalf("first packet type = %d, want HELLO", pkt.Type)
-			}
+		if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		negotiateVersion(t, conn)
+		pkt, err := protocol.ReadPacket(conn)
+		if err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		if pkt.Type != protocol.TypeHello {
+			_ = conn.Close()
+			t.Fatalf("first packet type = %d, want HELLO", pkt.Type)
+		}
 			_ = conn.SetDeadline(time.Time{})
 			return conn
 		}
@@ -1416,6 +1433,19 @@ func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAdd
 		return
 	}
 	controlConn.SetDeadline(time.Time{})
+
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	controlConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WritePacket(controlConn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+		return
+	}
+	controlConn.SetWriteDeadline(time.Time{})
+	controlConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	verPkt, err := protocol.ReadPacket(controlConn)
+	controlConn.SetReadDeadline(time.Time{})
+	if err != nil || verPkt.Type != protocol.TypeVersionNegotiate {
+		return
+	}
 
 	controlConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	helloPkt, err := protocol.ReadPacket(controlConn)

@@ -27,6 +27,7 @@ const (
 	TypeRouteRemoveAck    byte = 14
 	TypeRouteUpdate       byte = 15
 	TypeRouteUpdateAck    byte = 16
+	TypeVersionNegotiate  byte = 17
 )
 
 const RouteMailOutboundTCP = "hostit_mail_outbound"
@@ -241,7 +242,7 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 	}
 
 	p.Type = data[0]
-	if p.Type < TypeRegister || p.Type > TypeRouteUpdateAck {
+	if p.Type < TypeRegister || p.Type > TypeVersionNegotiate {
 		return ErrInvalidPacket
 	}
 

@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"crypto/cipher"
+	"encoding/json"
 	"net"
 	"net/netip"
 	"sync"
@@ -545,7 +546,18 @@ func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
 	if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+		t.Fatal(err)
+	}
 	pkt, err := protocol.ReadPacket(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Type != protocol.TypeVersionNegotiate {
+		t.Fatalf("expected version negotiate, got type %d", pkt.Type)
+	}
+	pkt, err = protocol.ReadPacket(conn)
 	if err != nil {
 		t.Fatal(err)
 	}

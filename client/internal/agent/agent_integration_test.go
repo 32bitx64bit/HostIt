@@ -131,6 +131,19 @@ func (s *fakeTunnelServer) acceptControl() {
 		return
 	}
 
+	pkt, err := protocol.ReadPacket(conn)
+	if err != nil || pkt.Type != protocol.TypeVersionNegotiate {
+		_ = conn.Close()
+		close(s.controlReadyCh)
+		return
+	}
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+		_ = conn.Close()
+		close(s.controlReadyCh)
+		return
+	}
+
 	s.controlMu.Lock()
 	s.controlConn = conn
 	s.controlMu.Unlock()

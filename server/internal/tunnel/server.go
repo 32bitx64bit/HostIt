@@ -25,6 +25,7 @@ import (
 	"hostit/shared/netutil"
 	"hostit/shared/protocol"
 	"hostit/shared/relay"
+	"hostit/shared/version"
 )
 
 const (
@@ -243,8 +244,9 @@ type helloRoute struct {
 }
 
 type helloPayload struct {
-	Routes map[string]helloRoute `json:"routes"`
-	Email  emailcfg.Config       `json:"email,omitempty"`
+	Routes  map[string]helloRoute `json:"routes"`
+	Email   emailcfg.Config       `json:"email,omitempty"`
+	Version string                `json:"version,omitempty"`
 }
 
 type ServerStatus struct {
@@ -459,8 +461,9 @@ func buildHelloRoutes(cfg ServerConfig, dynamicRoutes map[string]dynamicRouteEnt
 
 func buildHelloPayload(cfg ServerConfig, dynamicRoutes map[string]dynamicRouteEntry) helloPayload {
 	return helloPayload{
-		Routes: buildHelloRoutes(cfg, dynamicRoutes),
-		Email:  emailcfg.Normalize(cfg.Email),
+		Routes:  buildHelloRoutes(cfg, dynamicRoutes),
+		Email:   emailcfg.Normalize(cfg.Email),
+		Version: protocol.ProtocolVersion,
 	}
 }
 
@@ -2030,6 +2033,40 @@ func (s *Server) acceptControl(ln net.Listener) {
 
 		logging.Global().Infof(logging.CatTCP, "Agent connected to control from %s", remoteAddr)
 
+		// Version negotiation: agent must send its version immediately after auth.
+		conn.SetReadDeadline(time.Now().Add(authDeadline))
+		var verPkt protocol.Packet
+		if err := protocol.ReadPacketTo(conn, &verPkt); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "version negotiate read failed from %s: %v", remoteAddr, err)
+			conn.Close()
+			continue
+		}
+		conn.SetReadDeadline(time.Time{})
+		if verPkt.Type != protocol.TypeVersionNegotiate {
+			logging.Global().Errorf(logging.CatTCP, "expected version negotiate from %s, got type %d", remoteAddr, verPkt.Type)
+			conn.Close()
+			continue
+		}
+		var vp protocol.VersionPayload
+		if err := json.Unmarshal(verPkt.Payload, &vp); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to parse version negotiate from %s: %v", remoteAddr, err)
+			conn.Close()
+			continue
+		}
+		agentVer, ok := version.Parse(vp.Version)
+		if !ok {
+			logging.Global().Errorf(logging.CatTCP, "agent sent invalid version from %s: %s", remoteAddr, vp.Version)
+			conn.Close()
+			continue
+		}
+		if !protocol.IsCompatibleWith(protocol.ProtocolVersionParsed, agentVer) {
+			logging.Global().Errorf(logging.CatTCP, "agent version %s from %s is incompatible with server %s", agentVer, remoteAddr, protocol.ProtocolVersionParsed)
+			conn.Close()
+			continue
+		}
+		logging.Global().Infof(logging.CatTCP, "Agent version negotiated from %s: %s", remoteAddr, agentVer)
+
+		verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
 		helloPkt, err := s.buildHelloPacket()
 		if err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to build HELLO packet: %v", err)
@@ -2038,6 +2075,20 @@ func (s *Server) acceptControl(ln net.Listener) {
 		}
 		session.writeMu.Lock()
 		conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+		if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to send version negotiate to %s: %v", remoteAddr, err)
+			conn.Close()
+			session.writeMu.Unlock()
+			s.mu.Lock()
+			if s.agentTCP == conn && s.agentEpoch == currentEpoch {
+				s.agentTCP = nil
+			}
+			s.mu.Unlock()
+			s.sessionsMu.Lock()
+			delete(s.sessions, remoteAddr)
+			s.sessionsMu.Unlock()
+			continue
+		}
 		if err := protocol.WritePacket(conn, helloPkt); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
 			conn.Close()
@@ -2052,6 +2103,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.sessionsMu.Unlock()
 			continue
 		}
+		conn.SetWriteDeadline(time.Time{})
 		session.writeMu.Unlock()
 
 		s.wg.Add(1)

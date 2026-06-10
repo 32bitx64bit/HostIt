@@ -333,7 +333,7 @@ func TestUnmarshalUDPToRejectsOutOfRangePacketType(t *testing.T) {
 		typeVal byte
 	}{
 		{"zero", 0},
-		{"too_high", 17},
+		{"too_high", 18},
 		{"way_too_high", 255},
 	}
 	for _, tc := range cases {

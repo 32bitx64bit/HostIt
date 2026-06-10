@@ -25,6 +25,7 @@ import (
 	"hostit/shared/netutil"
 	"hostit/shared/protocol"
 	"hostit/shared/relay"
+	"hostit/shared/version"
 )
 
 const (
@@ -49,8 +50,9 @@ type Hooks struct {
 }
 
 type helloPayload struct {
-	Routes map[string]RemoteRoute `json:"routes"`
-	Email  emailcfg.Config        `json:"email,omitempty"`
+	Routes  map[string]RemoteRoute `json:"routes"`
+	Email   emailcfg.Config        `json:"email,omitempty"`
+	Version string                 `json:"version,omitempty"`
 }
 
 func RunWithHooks(ctx context.Context, cfg Config, hooks *Hooks) error {
@@ -433,6 +435,14 @@ func (a *Agent) connectAndRun() error {
 		return fmt.Errorf("control auth failed: %w", err)
 	}
 	conn.SetDeadline(time.Time{})
+
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	conn.SetWriteDeadline(time.Now().Add(agentControlWriteDeadline))
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+		return fmt.Errorf("failed to send version negotiate: %w", err)
+	}
+	conn.SetWriteDeadline(time.Time{})
+
 	a.refreshUDPRegistration()
 
 	logging.Global().Infof(logging.CatSystem, "Agent control connected on %s data=%s", a.cfg.ControlAddr(), a.cfg.DataAddr())
@@ -559,6 +569,22 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 		}
 
 		if pkt.Type == protocol.TypePong {
+			continue
+		}
+
+		if pkt.Type == protocol.TypeVersionNegotiate {
+			var vp protocol.VersionPayload
+			if err := json.Unmarshal(pkt.Payload, &vp); err != nil {
+				return fmt.Errorf("failed to parse version negotiate: %w", err)
+			}
+			serverVer, ok := version.Parse(vp.Version)
+			if !ok {
+				return fmt.Errorf("server sent invalid version: %s", vp.Version)
+			}
+			if !protocol.IsCompatibleWith(protocol.ProtocolVersionParsed, serverVer) {
+				return fmt.Errorf("server version %s is incompatible with agent %s", serverVer, protocol.ProtocolVersionParsed)
+			}
+			logging.Global().Infof(logging.CatSystem, "Server version negotiated: %s", serverVer)
 			continue
 		}
 

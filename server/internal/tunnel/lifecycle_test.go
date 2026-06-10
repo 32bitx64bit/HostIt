@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"testing"
@@ -46,7 +47,21 @@ func dialControlForLifecycleTest(t *testing.T, controlAddr, token string) net.Co
 		_ = conn.Close()
 		t.Fatal(err)
 	}
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+		_ = conn.Close()
+		t.Fatal(err)
+	}
 	pkt, err := protocol.ReadPacket(conn)
+	if err != nil {
+		_ = conn.Close()
+		t.Fatal(err)
+	}
+	if pkt.Type != protocol.TypeVersionNegotiate {
+		_ = conn.Close()
+		t.Fatalf("expected version negotiate, got type %d", pkt.Type)
+	}
+	pkt, err = protocol.ReadPacket(conn)
 	if err != nil {
 		_ = conn.Close()
 		t.Fatal(err)

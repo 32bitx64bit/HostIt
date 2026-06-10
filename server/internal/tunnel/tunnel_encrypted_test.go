@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -46,6 +47,19 @@ func fakeEncryptedAgentRoutes(ctx context.Context, controlAddr, dataAddr string,
 		return
 	}
 	controlConn.SetDeadline(time.Time{})
+
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	controlConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WritePacket(controlConn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+		return
+	}
+	controlConn.SetWriteDeadline(time.Time{})
+	controlConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	verPkt, err := protocol.ReadPacket(controlConn)
+	controlConn.SetReadDeadline(time.Time{})
+	if err != nil || verPkt.Type != protocol.TypeVersionNegotiate {
+		return
+	}
 
 	controlConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	helloPkt, err := protocol.ReadPacket(controlConn)
