@@ -19,11 +19,11 @@ func TestAuthenticateClientServer(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		clientErr = AuthenticateClient(client, token)
+		_, _, clientErr = AuthenticateClient(client, token)
 	}()
 	go func() {
 		defer wg.Done()
-		serverErr = AuthenticateServer(server, token)
+		_, _, serverErr = AuthenticateServer(server, token)
 	}()
 	wg.Wait()
 
@@ -42,12 +42,12 @@ func TestAuthenticateMismatchedTokens(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		serverErr = AuthenticateServer(server, "server-token")
+		_, _, serverErr = AuthenticateServer(server, "server-token")
 		server.Close()
 		close(done)
 	}()
 
-	clientErr = AuthenticateClient(client, "client-token")
+	_, _, clientErr = AuthenticateClient(client, "client-token")
 	client.Close()
 	<-done
 
@@ -63,12 +63,12 @@ func TestAuthenticateEmptyToken(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		serverErr = AuthenticateServer(server, "")
+		_, _, serverErr = AuthenticateServer(server, "")
 		server.Close()
 		close(done)
 	}()
 
-	clientErr = AuthenticateClient(client, "")
+	_, _, clientErr = AuthenticateClient(client, "")
 	client.Close()
 	<-done
 
@@ -85,12 +85,12 @@ func TestAuthenticateEmptyToken(t *testing.T) {
 
 	done2 := make(chan struct{})
 	go func() {
-		serverErr2 = AuthenticateServer(mismatchServer, "non-empty")
+		_, _, serverErr2 = AuthenticateServer(mismatchServer, "non-empty")
 		mismatchServer.Close()
 		close(done2)
 	}()
 
-	clientErr2 = AuthenticateClient(mismatchClient, "")
+	_, _, clientErr2 = AuthenticateClient(mismatchClient, "")
 	mismatchClient.Close()
 	<-done2
 

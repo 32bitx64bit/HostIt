@@ -12,73 +12,90 @@ import (
 	"hostit/shared/netutil"
 )
 
-func AuthenticateClient(conn net.Conn, token string) error {
-	clientNonce := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, clientNonce); err != nil {
-		return fmt.Errorf("failed to generate client nonce: %w", err)
+// AuthenticateClient performs the client side of a 3-message challenge-
+// response handshake. The server begins by sending a random 32-byte nonce.
+// The client replies with its own 32-byte nonce and an HMAC proving knowledge
+// of the token bound to both nonces. The server finally returns an HMAC that
+// the client verifies. Both sides return the exchanged nonces so callers can
+// feed them into WrapTCP to derive a per-session key (SEC-1/SEC-2).
+func AuthenticateClient(conn net.Conn, token string) (clientNonce, serverNonce []byte, err error) {
+	serverNonce = make([]byte, 32)
+	if _, err = io.ReadFull(conn, serverNonce); err != nil {
+		return nil, nil, fmt.Errorf("failed to read server nonce: %w", err)
 	}
 
-	clientMac := computeHMAC(token, clientNonce)
+	clientNonce = make([]byte, 32)
+	if _, err = io.ReadFull(rand.Reader, clientNonce); err != nil {
+		return nil, nil, fmt.Errorf("failed to generate client nonce: %w", err)
+	}
+
+	clientMac := computeClientHMAC(token, serverNonce, clientNonce)
 	buf := make([]byte, 64)
 	copy(buf[:32], clientNonce)
 	copy(buf[32:], clientMac)
-	if _, err := netutil.WriteAll(conn, buf); err != nil {
-		return fmt.Errorf("failed to write client auth: %w", err)
+	if _, err = netutil.WriteAll(conn, buf); err != nil {
+		return nil, nil, fmt.Errorf("failed to write client auth: %w", err)
 	}
 
-	respBuf := make([]byte, 64)
-	if _, err := io.ReadFull(conn, respBuf); err != nil {
-		return fmt.Errorf("failed to read server response: %w", err)
+	serverMac := make([]byte, 32)
+	if _, err = io.ReadFull(conn, serverMac); err != nil {
+		return nil, nil, fmt.Errorf("failed to read server auth: %w", err)
 	}
-	serverNonce := respBuf[:32]
-	serverMac := respBuf[32:]
 
-	macData := make([]byte, 0, 64)
-	macData = append(macData, serverNonce...)
-	macData = append(macData, clientNonce...)
-	expectedServerMac := computeHMAC(token, macData)
+	expectedServerMac := computeServerHMAC(token, clientNonce, serverNonce)
 	if !hmac.Equal(serverMac, expectedServerMac) {
-		return errors.New("server authentication failed: invalid MAC")
+		return nil, nil, errors.New("server authentication failed: invalid MAC")
 	}
 
-	return nil
+	return clientNonce, serverNonce, nil
 }
 
-func AuthenticateServer(conn net.Conn, token string) error {
-	buf := make([]byte, 64)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return fmt.Errorf("failed to read client auth: %w", err)
+// AuthenticateServer performs the server side of the 3-message challenge-
+// response handshake. It sends a random nonce first, verifies the client's
+// response, and finally returns an HMAC bound to both nonces with a distinct
+// label so reflection attacks are impossible (SEC-2).
+func AuthenticateServer(conn net.Conn, token string) (clientNonce, serverNonce []byte, err error) {
+	serverNonce = make([]byte, 32)
+	if _, err = io.ReadFull(rand.Reader, serverNonce); err != nil {
+		return nil, nil, fmt.Errorf("failed to generate server nonce: %w", err)
 	}
-	clientNonce := buf[:32]
+
+	if _, err = netutil.WriteAll(conn, serverNonce); err != nil {
+		return nil, nil, fmt.Errorf("failed to write server nonce: %w", err)
+	}
+
+	buf := make([]byte, 64)
+	if _, err = io.ReadFull(conn, buf); err != nil {
+		return nil, nil, fmt.Errorf("failed to read client auth: %w", err)
+	}
+	clientNonce = buf[:32]
 	clientMac := buf[32:]
 
-	expectedClientMac := computeHMAC(token, clientNonce)
+	expectedClientMac := computeClientHMAC(token, serverNonce, clientNonce)
 	if !hmac.Equal(clientMac, expectedClientMac) {
-		return errors.New("client authentication failed: invalid MAC")
+		return nil, nil, errors.New("client authentication failed: invalid MAC")
 	}
 
-	serverNonce := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, serverNonce); err != nil {
-		return fmt.Errorf("failed to generate server nonce: %w", err)
+	serverMac := computeServerHMAC(token, clientNonce, serverNonce)
+	if _, err = netutil.WriteAll(conn, serverMac); err != nil {
+		return nil, nil, fmt.Errorf("failed to write server auth: %w", err)
 	}
 
-	macData := make([]byte, 0, 64)
-	macData = append(macData, serverNonce...)
-	macData = append(macData, clientNonce...)
-	serverMac := computeHMAC(token, macData)
-
-	respBuf := make([]byte, 64)
-	copy(respBuf[:32], serverNonce)
-	copy(respBuf[32:], serverMac)
-	if _, err := netutil.WriteAll(conn, respBuf); err != nil {
-		return fmt.Errorf("failed to write server response: %w", err)
-	}
-
-	return nil
+	return clientNonce, serverNonce, nil
 }
 
-func computeHMAC(token string, data []byte) []byte {
+func computeClientHMAC(token string, serverNonce, clientNonce []byte) []byte {
 	mac := hmac.New(sha256.New, []byte(token))
-	mac.Write(data)
+	mac.Write([]byte("client-auth"))
+	mac.Write(serverNonce)
+	mac.Write(clientNonce)
+	return mac.Sum(nil)
+}
+
+func computeServerHMAC(token string, clientNonce, serverNonce []byte) []byte {
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write([]byte("server-auth"))
+	mac.Write(clientNonce)
+	mac.Write(serverNonce)
 	return mac.Sum(nil)
 }
