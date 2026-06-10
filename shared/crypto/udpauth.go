@@ -9,30 +9,33 @@ import (
 	"time"
 )
 
-// The UDP data plane is connectionless and otherwise unauthenticated, so the
-// server would adopt the source address of any datagram as "the agent" — a
-// single spoofed packet could hijack or blackhole all tunneled UDP.
-// Register packets therefore carry a token-keyed authenticator over a fresh
-// timestamp and random nonce. The server only adopts/refreshes the agent
-// address from a register whose MAC verifies and whose timestamp is recent,
-// and dedupes the nonce to block replays within the freshness window.
+// UDP register packets carry a token-keyed authenticator with timestamp,
+// nonce, and session ID to prevent spoofing and replay attacks.
 const (
-	udpRegisterLabel = "udp-register"
+	udpRegisterLabel  = "udp-register-v2"
 	udpRegisterMACLen = 16
-	// UDPRegisterPayloadLen is the wire size of an authenticated register
-	// payload: timestamp(8) || random(8) || truncated HMAC(16).
-	UDPRegisterPayloadLen = 8 + 8 + udpRegisterMACLen
+	UDPSessionIDLen = 16
+	// UDPRegisterPayloadLen = timestamp(8) || random(8) || sessionID(16) || mac(16)
+	UDPRegisterPayloadLen = 8 + 8 + UDPSessionIDLen + udpRegisterMACLen
 )
 
-// UDPRegisterKey is the freshness identifier (timestamp||random) the server
-// tracks to reject replayed register payloads.
+// UDPRegisterKey is the timestamp||random freshness identifier.
 type UDPRegisterKey [16]byte
 
-// BuildUDPRegister constructs a fresh authenticated register payload bound to
-// token. A new timestamp and random nonce are generated on every call, so
-// callers must build a new payload per send rather than caching one. It
-// returns (nil, nil) when token is empty (no shared secret to authenticate).
-func BuildUDPRegister(token string) ([]byte, error) {
+type UDPSessionID [UDPSessionIDLen]byte
+
+// NewUDPSessionID generates a fresh random session ID.
+func NewUDPSessionID() (UDPSessionID, error) {
+	var id UDPSessionID
+	if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
+		return id, err
+	}
+	return id, nil
+}
+
+// BuildUDPRegister builds an authenticated register payload for token.
+// Returns nil when token is empty.
+func BuildUDPRegister(token string, sessionID UDPSessionID) ([]byte, error) {
 	if token == "" {
 		return nil, nil
 	}
@@ -41,23 +44,23 @@ func BuildUDPRegister(token string) ([]byte, error) {
 	if _, err := io.ReadFull(rand.Reader, buf[8:16]); err != nil {
 		return nil, err
 	}
-	mac := udpRegisterMAC(token, buf[0:16])
-	copy(buf[16:UDPRegisterPayloadLen], mac)
+	copy(buf[16:32], sessionID[:])
+	mac := udpRegisterMAC(token, buf[0:32])
+	copy(buf[32:UDPRegisterPayloadLen], mac)
 	return buf, nil
 }
 
-// VerifyUDPRegister validates a register payload against token within
-// [now-window, now+window]. On success it returns the freshness key (for
-// replay tracking) and true. It performs the constant-time MAC comparison
-// before the timestamp check so a forged payload cannot probe the window.
-func VerifyUDPRegister(token string, payload []byte, now time.Time, window time.Duration) (UDPRegisterKey, bool) {
+// VerifyUDPRegister checks payload validity within the time window.
+// Returns the freshness key, session ID, and ok.
+func VerifyUDPRegister(token string, payload []byte, now time.Time, window time.Duration) (UDPRegisterKey, UDPSessionID, bool) {
 	var key UDPRegisterKey
+	var sessionID UDPSessionID
 	if token == "" || len(payload) != UDPRegisterPayloadLen {
-		return key, false
+		return key, sessionID, false
 	}
-	expected := udpRegisterMAC(token, payload[0:16])
-	if !hmac.Equal(payload[16:UDPRegisterPayloadLen], expected) {
-		return key, false
+	expected := udpRegisterMAC(token, payload[0:32])
+	if !hmac.Equal(payload[32:UDPRegisterPayloadLen], expected) {
+		return key, sessionID, false
 	}
 	ts := int64(binary.BigEndian.Uint64(payload[0:8]))
 	delta := now.UnixMilli() - ts
@@ -65,10 +68,11 @@ func VerifyUDPRegister(token string, payload []byte, now time.Time, window time.
 		delta = -delta
 	}
 	if delta > window.Milliseconds() {
-		return key, false
+		return key, sessionID, false
 	}
 	copy(key[:], payload[0:16])
-	return key, true
+	copy(sessionID[:], payload[16:32])
+	return key, sessionID, true
 }
 
 func udpRegisterMAC(token string, data []byte) []byte {

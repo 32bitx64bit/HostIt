@@ -1,26 +1,45 @@
 package crypto
 
 import (
-	"crypto/cipher"
 	"crypto/rand"
 	"testing"
 )
 
-// BenchmarkEncryptUDP measures the per-datagram AES-GCM encryption cost.
-// The result bounds the per-packet cost on acceptPublicUDP.
-func BenchmarkEncryptUDP(b *testing.B) {
+func mustSessionCrypto(b *testing.B) (*UDPEncryptor, *UDPDecryptor) {
+	b.Helper()
+	baseKey := make([]byte, 32)
+	if _, err := rand.Read(baseKey); err != nil {
+		b.Fatal(err)
+	}
+	sessionID, err := NewUDPSessionID()
+	if err != nil {
+		b.Fatal(err)
+	}
+	sc, err := NewUDPSessionCrypto(baseKey, sessionID[:], UDPDirClientToServer, UDPDirClientToServer)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return sc.Enc, sc.Dec
+}
+
+var benchAAD = AppendUDPDataAAD(nil, "bench-route", "203.0.113.10:51820")
+
+// BenchmarkUDPSeal measures the per-datagram seal cost (deterministic
+// nonce + AES-GCM + AAD). The result bounds the per-packet cost on
+// acceptPublicUDP. No RNG is touched per packet.
+func BenchmarkUDPSeal(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
 	for _, n := range sizes {
 		b.Run(payloadName(n), func(b *testing.B) {
-			aead := mustAEAD(b, 32)
+			enc, _ := mustSessionCrypto(b)
 			plain := make([]byte, n)
 			rand.Read(plain)
-			out := make([]byte, 0, n+32)
+			out := make([]byte, 0, n+64)
 			b.SetBytes(int64(n))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := EncryptUDP(aead, out[:0], plain); err != nil {
+				if _, err := enc.Seal(out[:0], plain, benchAAD); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -28,25 +47,38 @@ func BenchmarkEncryptUDP(b *testing.B) {
 	}
 }
 
-// BenchmarkDecryptUDP measures AES-GCM decryption, paid for every inbound
-// datagram on acceptAgentUDP.
-func BenchmarkDecryptUDP(b *testing.B) {
+// BenchmarkUDPOpen measures decryption plus the anti-replay window check,
+// paid for every inbound datagram on acceptAgentUDP.
+func BenchmarkUDPOpen(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
 	for _, n := range sizes {
 		b.Run(payloadName(n), func(b *testing.B) {
-			aead := mustAEAD(b, 32)
+			enc, dec := mustSessionCrypto(b)
 			plain := make([]byte, n)
 			rand.Read(plain)
-			ciphertext, err := EncryptUDP(aead, make([]byte, 0, n+32), plain)
-			if err != nil {
-				b.Fatal(err)
+			// The replay window rejects duplicate counters, so a single
+			// pre-sealed packet cannot be opened twice. Pre-seal a bounded
+			// batch and reset the window when it wraps; the reset cost is
+			// amortized to nothing.
+			const batch = 1024
+			packets := make([][]byte, batch)
+			for i := range packets {
+				ct, err := enc.Seal(nil, plain, benchAAD)
+				if err != nil {
+					b.Fatal(err)
+				}
+				packets[i] = ct
 			}
 			out := make([]byte, 0, n)
 			b.SetBytes(int64(n))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := DecryptUDP(aead, out[:0], ciphertext); err != nil {
+				j := i % batch
+				if j == 0 && i > 0 {
+					dec.windows = make(map[uint32]*replayState, 2)
+				}
+				if _, err := dec.Open(out[:0], packets[j], benchAAD); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -54,25 +86,25 @@ func BenchmarkDecryptUDP(b *testing.B) {
 	}
 }
 
-// BenchmarkUDPCipherRoundTrip covers encrypt+decrypt for a single datagram,
-// the realistic cost for a public UDP packet traversing the tunnel.
-func BenchmarkUDPCipherRoundTrip(b *testing.B) {
+// BenchmarkUDPRoundTrip covers seal+open for a single datagram, the
+// realistic cost for a public UDP packet traversing the tunnel.
+func BenchmarkUDPRoundTrip(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192}
 	for _, n := range sizes {
 		b.Run(payloadName(n), func(b *testing.B) {
-			aead := mustAEAD(b, 32)
+			enc, dec := mustSessionCrypto(b)
 			plain := make([]byte, n)
-			encBuf := make([]byte, 0, n+32)
+			encBuf := make([]byte, 0, n+64)
 			decBuf := make([]byte, 0, n)
 			b.SetBytes(int64(n))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				ct, err := EncryptUDP(aead, encBuf[:0], plain)
+				ct, err := enc.Seal(encBuf[:0], plain, benchAAD)
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, err := DecryptUDP(aead, decBuf[:0], ct); err != nil {
+				if _, err := dec.Open(decBuf[:0], ct, benchAAD); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -80,40 +112,10 @@ func BenchmarkUDPCipherRoundTrip(b *testing.B) {
 	}
 }
 
-func mustAEAD(b *testing.B, keyLen int) cipher.AEAD {
-	b.Helper()
-	key := make([]byte, keyLen)
-	if _, err := rand.Read(key); err != nil {
-		b.Fatal(err)
-	}
-	aead, err := NewUDPCipher(key)
-	if err != nil {
-		b.Fatal(err)
-	}
-	return aead
-}
-
-// BenchmarkEncryptUDPNoncePool exercises the amortized getrandom() path.
-// Run at a small size so the 12-byte nonce copy is visible.
-func BenchmarkEncryptUDPNoncePool(b *testing.B) {
-	aead := mustAEAD(b, 32)
-	plain := make([]byte, 64)
-	rand.Read(plain)
-	out := make([]byte, 0, 128)
-	b.SetBytes(int64(len(plain)))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, err := EncryptUDP(aead, out[:0], plain); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// BenchmarkEncryptUDPNoncePoolConcurrent is the multi-goroutine view.
-// Surfaces contention on the pool's internal lock.
-func BenchmarkEncryptUDPNoncePoolConcurrent(b *testing.B) {
-	aead := mustAEAD(b, 32)
+// BenchmarkUDPSealConcurrent is the multi-goroutine view of the shared
+// encryptor (atomic counter contention).
+func BenchmarkUDPSealConcurrent(b *testing.B) {
+	enc, _ := mustSessionCrypto(b)
 	plain := make([]byte, 64)
 	rand.Read(plain)
 	b.SetBytes(int64(len(plain)))
@@ -122,59 +124,22 @@ func BenchmarkEncryptUDPNoncePoolConcurrent(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		out := make([]byte, 0, 128)
 		for pb.Next() {
-			if _, err := EncryptUDP(aead, out[:0], plain); err != nil {
+			if _, err := enc.Seal(out[:0], plain, benchAAD); err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
 }
 
-// BenchmarkStreamCipherEncrypt is the cached-metadata fast path, skipping
-// two cipher.AEAD interface dispatches per packet. Compare against
-// BenchmarkEncryptUDP to measure wrapper overhead.
-func BenchmarkStreamCipherEncrypt(b *testing.B) {
-	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
-	aead := mustAEAD(b, 32)
-	cipher := NewStreamCipher(aead)
-	for _, n := range sizes {
-		b.Run(payloadName(n), func(b *testing.B) {
-			plain := make([]byte, n)
-			rand.Read(plain)
-			out := make([]byte, 0, n+64)
-			b.SetBytes(int64(n))
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if _, err := cipher.Encrypt(out[:0], plain); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-}
-
-// BenchmarkStreamCipherDecrypt is the matching fast path for decrypt.
-func BenchmarkStreamCipherDecrypt(b *testing.B) {
-	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
-	aead := mustAEAD(b, 32)
-	cipher := NewStreamCipher(aead)
-	for _, n := range sizes {
-		b.Run(payloadName(n), func(b *testing.B) {
-			plain := make([]byte, n)
-			ct, err := cipher.Encrypt(make([]byte, 0, n+64), plain)
-			if err != nil {
-				b.Fatal(err)
-			}
-			out := make([]byte, 0, n)
-			b.SetBytes(int64(n))
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if _, err := cipher.Decrypt(out[:0], ct); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
+// BenchmarkReplayWindowAccept isolates the sliding-window bookkeeping.
+func BenchmarkReplayWindowAccept(b *testing.B) {
+	var w replayState
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !w.accept(uint64(i + 1)) {
+			b.Fatal("fresh counter rejected")
+		}
 	}
 }
 
