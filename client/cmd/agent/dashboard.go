@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"hostit/client/internal/agent"
@@ -83,7 +82,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 				agentlog.Log.Infof(logging.CatSystem, "Systemctl restart failed: %v, output: %s", err, string(out))
 			}
 			agentlog.Log.Infof(logging.CatSystem, "Sending SIGTERM to let systemd restart")
-			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			_ = sendSIGTERM(os.Getpid())
 			return nil
 		}
 
@@ -300,7 +299,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.WriteHeader(http.StatusAccepted)
 		go func() {
 			time.Sleep(250 * time.Millisecond)
-			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			_ = sendSIGTERM(os.Getpid())
 		}()
 	}))
 	mux.HandleFunc("/api/process/exit", requireCSRF(func(w http.ResponseWriter, r *http.Request) {
