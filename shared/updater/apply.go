@@ -47,6 +47,9 @@ func ApplyZipUpdate(ctx context.Context, opts ApplyOptions, logw io.Writer) erro
 	if err := downloadToFile(ctx, opts.AssetURL, zipPath, logw); err != nil {
 		return err
 	}
+	if err := verifyZipSignature(ctx, zipPath, opts.AssetURL, logw); err != nil {
+		return fmt.Errorf("signature verification failed: %w", err)
+	}
 
 	extractDir := filepath.Join(tmpDir, "unzipped")
 	if err := unzip(zipPath, extractDir); err != nil {
@@ -169,6 +172,9 @@ func ApplySharedZipUpdate(ctx context.Context, assetURL string, sharedDestDir st
 	zipPath := filepath.Join(tmpDir, "shared.zip")
 	if err := downloadToFile(ctx, assetURL, zipPath, logw); err != nil {
 		return err
+	}
+	if err := verifyZipSignature(ctx, zipPath, assetURL, logw); err != nil {
+		return fmt.Errorf("signature verification failed: %w", err)
 	}
 
 	extractDir := filepath.Join(tmpDir, "unzipped")
