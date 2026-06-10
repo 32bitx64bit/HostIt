@@ -42,7 +42,7 @@ func dialControlForLifecycleTest(t *testing.T, controlAddr, token string) net.Co
 	t.Helper()
 	conn := dialTCPForLifecycleTest(t, controlAddr)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := crypto.AuthenticateClient(conn, token); err != nil {
+	if _, _, err := crypto.AuthenticateClient(conn, token); err != nil {
 		_ = conn.Close()
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestDataHandshakeUnknownPairClosesConnectionWithoutPendingLeak(t *testing.T
 	conn := dialTCPForLifecycleTest(t, dataAddr)
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+	if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
 	writeDataHandshakeForLifecycleTest(t, conn, "missing-route", "client-1")
@@ -341,7 +341,7 @@ func TestLateDataHandshakeAfterPairTimeoutIsClosed(t *testing.T) {
 	dataConn := dialTCPForLifecycleTest(t, dataAddr)
 	defer dataConn.Close()
 	_ = dataConn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
+	if _, _, err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
 	writeDataHandshakeForLifecycleTest(t, dataConn, req.Route, req.Client)
@@ -420,7 +420,7 @@ func TestDataHandshakeDeliveredConnPairsWithWaitingPublicClient(t *testing.T) {
 	dataConn := dialTCPForLifecycleTest(t, dataAddr)
 	defer dataConn.Close()
 	_ = dataConn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
+	if _, _, err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
 	writeDataHandshakeForLifecycleTest(t, dataConn, req.Route, req.Client)

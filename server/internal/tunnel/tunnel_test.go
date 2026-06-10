@@ -458,7 +458,7 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+	if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
 	pkt, err := protocol.ReadPacket(conn)
@@ -520,7 +520,7 @@ func TestMailOutboundRelayRejectsLoopbackTarget(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	defer dataConn.Close()
-	if err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
+	if _, _, err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
 	routeBytes := []byte(protocol.RouteMailOutboundTCP)
@@ -578,7 +578,7 @@ func TestMailOutboundRelayAllowsTemporarilyWhitelistedProbeTarget(t *testing.T) 
 		time.Sleep(25 * time.Millisecond)
 	}
 	defer dataConn.Close()
-	if err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
+	if _, _, err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
 	routeBytes := []byte(protocol.RouteMailOutboundTCP)
@@ -835,7 +835,7 @@ func TestServerRapidReconnectWithStaleControlSession(t *testing.T) {
 				continue
 			}
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			if err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+			if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
 				_ = conn.Close()
 				t.Fatal(err)
 			}
@@ -880,7 +880,7 @@ func TestServerRapidReconnectWithStaleControlSession(t *testing.T) {
 					}
 
 					_ = dataConn.SetDeadline(time.Now().Add(5 * time.Second))
-					if err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
+					if _, _, err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
 						_ = dataConn.Close()
 						errCh <- err
 						return
@@ -1415,7 +1415,7 @@ func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAdd
 	defer controlConn.Close()
 
 	controlConn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := crypto.AuthenticateClient(controlConn, token); err != nil {
+	if _, _, err := crypto.AuthenticateClient(controlConn, token); err != nil {
 		return
 	}
 	controlConn.SetDeadline(time.Time{})
@@ -1453,7 +1453,7 @@ func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAdd
 				defer dataConn.Close()
 
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
-				if err := crypto.AuthenticateClient(dataConn, token); err != nil {
+				if _, _, err := crypto.AuthenticateClient(dataConn, token); err != nil {
 					return
 				}
 				dataConn.SetDeadline(time.Time{})

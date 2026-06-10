@@ -41,7 +41,8 @@ func fakeEncryptedAgentRoutes(ctx context.Context, controlAddr, dataAddr string,
 	defer controlConn.Close()
 
 	controlConn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := crypto.AuthenticateClient(controlConn, token); err != nil {
+	_, _, err := crypto.AuthenticateClient(controlConn, token)
+	if err != nil {
 		return
 	}
 	controlConn.SetDeadline(time.Time{})
@@ -79,7 +80,8 @@ func fakeEncryptedAgentRoutes(ctx context.Context, controlAddr, dataAddr string,
 				defer dataConn.Close()
 
 				dataConn.SetDeadline(time.Now().Add(5 * time.Second))
-				if err := crypto.AuthenticateClient(dataConn, token); err != nil {
+				clientNonce, serverNonce, err := crypto.AuthenticateClient(dataConn, token)
+				if err != nil {
 					return
 				}
 				dataConn.SetDeadline(time.Time{})
@@ -98,7 +100,7 @@ func fakeEncryptedAgentRoutes(ctx context.Context, controlAddr, dataAddr string,
 				}
 				dataConn.SetWriteDeadline(time.Time{})
 
-				dataConn, err = crypto.WrapTCP(dataConn, key, true)
+				dataConn, err = crypto.WrapTCP(dataConn, key, clientNonce, serverNonce, true)
 				if err != nil {
 					return
 				}

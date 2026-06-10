@@ -43,7 +43,18 @@ type fakeUDPAgent struct {
 	seen map[string]int
 }
 
-func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr string, prefixes map[string]string, ciphers map[string]cipher.AEAD) *fakeUDPAgent {
+// authedUDPRegister builds a fresh token-authenticated register packet.
+// It must be called per send (the authenticator is single-use within the
+// server's freshness window), so callers must not cache the result.
+func authedUDPRegister(token string) ([]byte, error) {
+	payload, err := crypto.BuildUDPRegister(token)
+	if err != nil {
+		return nil, err
+	}
+	return protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister, Payload: payload}, nil)
+}
+
+func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr, token string, prefixes map[string]string, ciphers map[string]cipher.AEAD) *fakeUDPAgent {
 	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", dataAddr)
 	if err != nil {
@@ -56,7 +67,7 @@ func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr string, prefi
 	agent := &fakeUDPAgent{conn: conn, seen: make(map[string]int)}
 
 	sendRegister := func() {
-		data, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
+		data, err := authedUDPRegister(token)
 		if err == nil {
 			_, _ = conn.WriteToUDP(data, serverAddr)
 		}
@@ -219,7 +230,7 @@ func TestEndToEndUDP(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, map[string]string{"game": "udp:"}, nil)
+	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "udp:"}, nil)
 
 	client := dialPublicUDP(t, publicAddr)
 	defer client.Close()
@@ -249,7 +260,7 @@ func TestEndToEndUDPConcurrentClients(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, map[string]string{"game": "udp:"}, nil)
+	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "udp:"}, nil)
 
 	const clients = 12
 	errCh := make(chan error, clients)
@@ -314,7 +325,7 @@ func TestEndToEndUDPMultiRoute(t *testing.T) {
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "route-a")
 	waitPublicUDPRoute(t, srv, "route-b")
-	startFakeUDPAgent(t, ctx, dataAddr, map[string]string{"route-a": "a:", "route-b": "b:"}, nil)
+	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"route-a": "a:", "route-b": "b:"}, nil)
 
 	clientA := dialPublicUDP(t, publicAAddr)
 	defer clientA.Close()
@@ -364,7 +375,7 @@ func TestEndToEndUDPEncrypted(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, map[string]string{"game": "secure:"}, map[string]cipher.AEAD{"game": udpCipher})
+	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "secure:"}, map[string]cipher.AEAD{"game": udpCipher})
 
 	client := dialPublicUDP(t, publicAddr)
 	defer client.Close()
@@ -405,7 +416,7 @@ func TestPublicUDPDropsWithoutAgentAndWhenDisabled(t *testing.T) {
 	defer noAgentClient.Close()
 	assertNoUDPResponse(t, noAgentClient, []byte("drop"), 250*time.Millisecond)
 
-	agent := startFakeUDPAgent(t, ctx, dataAddr, map[string]string{"disabled": "disabled:"}, nil)
+	agent := startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"disabled": "disabled:"}, nil)
 	waitTunnelCondition(t, 2*time.Second, "fake UDP agent did not register", func() bool {
 		return srv.agentUDPTime.Load() != 0
 	})
@@ -450,7 +461,7 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 	defer agentConn.Close()
 
 	// Send initial register so the server learns our address.
-	reg, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
+	reg, err := authedUDPRegister("testtoken")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,11 +528,11 @@ func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
 	}
 	defer agentConn.Close()
 
-	reg, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	waitTunnelCondition(t, 2*time.Second, "agent UDP registration did not reach server", func() bool {
+		reg, err := authedUDPRegister("testtoken")
+		if err != nil {
+			t.Fatal(err)
+		}
 		_, _ = agentConn.WriteToUDP(reg, serverUDPAddr)
 		return srv.agentUDPTime.Load() != 0
 	})
@@ -535,7 +546,7 @@ func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+	if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
 	pkt, err := protocol.ReadPacket(conn)
