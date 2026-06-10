@@ -8,10 +8,9 @@ import (
 	"time"
 )
 
-// TestSetTCPUserTimeoutAppliesValueLinux verifies the TCP_USER_TIMEOUT socket
-// option is actually written to the kernel by reading it back with getsockopt.
-// This is the regression guard ensuring dead-peer reaping is wired through to
-// the OS, not just silently dropped.
+// TestSetTCPUserTimeoutAppliesValueLinux verifies TCP_USER_TIMEOUT is written
+// to the kernel by reading it back. Regression guard ensuring dead-peer
+// reaping is wired through to the OS.
 func TestSetTCPUserTimeoutAppliesValueLinux(t *testing.T) {
 	client, _ := tcpConnPair(t)
 
@@ -50,8 +49,7 @@ func TestSetTCPUserTimeoutAppliesValueLinux(t *testing.T) {
 }
 
 // TestTuneDeadPeerDetectionSetsUserTimeoutLinux verifies the bundled tuning
-// helper applies a non-zero TCP_USER_TIMEOUT, so callers using the convenience
-// wrapper get the same protection.
+// helper applies a non-zero TCP_USER_TIMEOUT.
 func TestTuneDeadPeerDetectionSetsUserTimeoutLinux(t *testing.T) {
 	client, _ := tcpConnPair(t)
 	TuneDeadPeerDetection(client)

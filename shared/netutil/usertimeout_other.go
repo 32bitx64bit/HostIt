@@ -7,9 +7,8 @@ import (
 	"time"
 )
 
-// SetTCPUserTimeout is a no-op on platforms without TCP_USER_TIMEOUT. Dead-peer
-// detection on those platforms relies on the keepalive configuration applied by
-// SetTCPKeepAliveConfig.
+// SetTCPUserTimeout is a no-op on platforms without TCP_USER_TIMEOUT.
+// Dead-peer detection falls back to SetTCPKeepAliveConfig.
 func SetTCPUserTimeout(conn net.Conn, timeout time.Duration) error {
 	_ = conn
 	_ = timeout

@@ -184,7 +184,6 @@ func TestProxyIdleTimeoutStaysAliveWhileActive(t *testing.T) {
 	}
 	defer backendLn.Close()
 
-	// Backend echoes every byte it receives.
 	go func() {
 		conn, err := backendLn.Accept()
 		if err != nil {
@@ -248,7 +247,6 @@ func TestProxyIdleTimeoutStaysAliveWhileActive(t *testing.T) {
 		time.Sleep(idleTimeout / 4)
 	}
 
-	// Now stop sending; the relay should close the idle connection.
 	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := io.ReadFull(client, buf); err == nil {
 		t.Fatal("expected connection to close after going idle, but read succeeded")
@@ -341,7 +339,6 @@ func TestProxyReapsStalledPeerAndClosesBothLegs(t *testing.T) {
 		ProxyWithIdleTimeout(frontRelay, backRelay, idleTimeout)
 	}()
 
-	// Backend continuously pushes data toward the dead client.
 	go func() {
 		payload := make([]byte, 32*1024)
 		for {
@@ -364,7 +361,6 @@ func TestProxyReapsStalledPeerAndClosesBothLegs(t *testing.T) {
 		t.Fatal("backend leg still open after stalled peer was reaped")
 	}
 
-	// Front leg must be closed too.
 	_ = frontPeer.SetDeadline(time.Now().Add(time.Second))
 	if _, err := frontPeer.Read(make([]byte, 1)); err == nil {
 		t.Fatal("front leg still open after stalled peer was reaped")

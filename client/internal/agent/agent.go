@@ -80,8 +80,6 @@ type Agent struct {
 	wg     sync.WaitGroup
 }
 
-// connTracker keeps track of all TCP relay connections for the current
-// control session so they can be forcibly closed when the session ends.
 type connTracker struct {
 	mu     sync.Mutex
 	conns  map[net.Conn]struct{}
@@ -139,11 +137,7 @@ func (a *Agent) ControlConn() net.Conn {
 	return a.controlConn
 }
 
-// sendAndWait marshals payload, sends a control packet, and waits up to
-// 30s for a response on the pending channel. It handles map registration,
-// cleanup, write deadlines, and context cancellation. Used by all
-// SendRoute* methods to eliminate the duplicated marshal+lock+write+select
-// boilerplate (CLEAN-5).
+// sendAndWait sends a control packet and waits for a response (CLEAN-5).
 func sendAndWait[Resp any](ctx context.Context, a *Agent,
 	pending map[string]chan *Resp, key string,
 	pktType byte, payload []byte, timeoutMsg string) (*Resp, error) {
@@ -215,9 +209,6 @@ func (a *Agent) SendRouteUpdate(ctx context.Context, update apitypes.RouteUpdate
 	return sendAndWait(ctx, a, a.pendingUpdateAcks, update.RequestID, protocol.TypeRouteUpdate, payload, "route update timed out")
 }
 
-// tlsConfigWithPin returns a TLS config that performs certificate pinning
-// when a SHA-256 pin is configured. When no pin is configured, the agent
-// requires InsecureTLS to be explicitly set, or it returns an error.
 func tlsConfigWithPin(cfg Config) (*tls.Config, error) {
 	if pin := strings.TrimSpace(cfg.TLSPinSHA256); pin != "" {
 		expectedPin := pin
@@ -346,10 +337,7 @@ func (a *Agent) closeUDPDataConn() {
 	}
 }
 
-// sendUDPRegister builds a fresh token-authenticated register payload and
-// sends it to the server. A new payload is generated on every call (the
-// authenticator binds a fresh timestamp + nonce), so it must not be cached
-// across sends (SEC-3).
+// sendUDPRegister sends a fresh UDP register payload; do not cache.
 func (a *Agent) sendUDPRegister(udpConn *net.UDPConn) {
 	a.mu.RLock()
 	serverUDP := a.serverUDP
@@ -906,7 +894,7 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 		// this path runs without an Agent to persist a discovered pin, so a
 		// trust-on-first-use here would silently run unverified forever (the
 		// pin was only ever written to a by-value cfg copy). Demand that the
-		// pin has already been established via the control connection (SEC-6).
+		// pin has already been established via the control connection.
 		tlsCfg, tlsErr := tlsConfigWithPin(cfg)
 		if tlsErr != nil {
 			return nil, fmt.Errorf("tls config failed: %w", tlsErr)
@@ -989,10 +977,8 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	decryptBuf := make([]byte, 65536)
 	var pkt protocol.Packet
 
-	// Only datagrams originating from the server's data address are honored;
-	// anything else on this socket is a spoof/injection attempt against local
-	// services and is dropped (SEC-4). serverUDP is set once before this loop
-	// starts and is stable for the agent's lifetime.
+	// Only datagrams from the server's data address are honored; spoofed traffic is dropped.
+	// serverUDP is set once before this loop starts and is stable for the agent's lifetime.
 	a.mu.RLock()
 	serverUDP := a.serverUDP
 	a.mu.RUnlock()

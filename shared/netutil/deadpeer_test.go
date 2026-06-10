@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// tcpConnPair returns a connected client/server *net.TCPConn pair bound to the
-// loopback interface. Both connections and the listener are closed via t.Cleanup.
+// tcpConnPair returns a connected client/server *net.TCPConn pair on loopback.
+// Both connections and the listener are closed via t.Cleanup.
 func tcpConnPair(t *testing.T) (client, server net.Conn) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -67,20 +67,17 @@ func TestSetTCPUserTimeoutNonTCPIsNoOp(t *testing.T) {
 
 func TestSetTCPKeepAliveConfigOnTCPConn(t *testing.T) {
 	client, _ := tcpConnPair(t)
-	// Should not panic and should leave the connection usable.
 	SetTCPKeepAliveConfig(client, 10*time.Second, 5*time.Second, 3)
 	_ = client.SetDeadline(time.Now().Add(time.Second))
 }
 
 func TestSetTCPKeepAliveConfigNonTCPIsNoOp(t *testing.T) {
-	// Non-TCP connections must be ignored without panicking.
 	SetTCPKeepAliveConfig(dummyConn{}, 10*time.Second, 5*time.Second, 3)
 	SetTCPKeepAliveConfig(nil, 10*time.Second, 5*time.Second, 3)
 }
 
 func TestTuneDeadPeerDetectionOnTCPConn(t *testing.T) {
 	client, _ := tcpConnPair(t)
-	// Applies keepalive + user timeout. Must not error or disturb the conn.
 	TuneDeadPeerDetection(client)
 	if _, err := client.Write([]byte("ping")); err != nil {
 		t.Fatalf("write after tuning failed: %v", err)
@@ -89,13 +86,11 @@ func TestTuneDeadPeerDetectionOnTCPConn(t *testing.T) {
 
 func TestTuneDeadPeerDetectionThroughWrappedConn(t *testing.T) {
 	client, _ := tcpConnPair(t)
-	// A wrapper that exposes the underlying conn via NetConn() must still be
-	// tuned (the helpers unwrap to the *net.TCPConn).
+	// Wrappers that expose NetConn() must still be tuned.
 	TuneDeadPeerDetection(wrappedConn{Conn: client})
 }
 
 func TestTuneDeadPeerDetectionNonTCPIsNoOp(t *testing.T) {
-	// Pipe connections are not TCP; tuning must be a silent no-op.
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()

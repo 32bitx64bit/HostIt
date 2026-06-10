@@ -136,8 +136,6 @@ func (s *fakeBenchServer) sendHello(b *testing.B, routes map[string]RemoteRoute)
 	}
 }
 
-// startBenchEcho starts a loopback TCP echo listener for the agent's local
-// service.
 func startBenchEcho(b *testing.B) (net.Listener, string) {
 	b.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -163,13 +161,8 @@ func startBenchEcho(b *testing.B) (net.Listener, string) {
 // drive the agent directly via sendHello + waitControl, so any helper would
 // just add indirection.
 
-// startBenchEcho starts a loopback TCP echo listener for the agent's local
-// service.// BenchmarkAgentEndToEnd measures the full agent round-trip: the benchmark
-// side dials the server's control port, exchanges HELLO, fires TypeConnect,
-// and the agent dials the data port, dials the local service, and starts the
-// relay. A write+read completes the round-trip and the byte count is what
-// every tunneled packet will cost. The benchmark drives b.N tunneled
-// connections through a single agent.
+// BenchmarkAgentEndToEnd measures the full agent round-trip: control handshake,
+// data connect, local dial, and relay.
 func BenchmarkAgentEndToEnd(b *testing.B) {
 	sizes := []int{1 << 10, 4 << 10, 32 << 10}
 	for _, size := range sizes {
@@ -245,11 +238,8 @@ func BenchmarkAgentEndToEnd(b *testing.B) {
 	}
 }
 
-// BenchmarkAgentControlPlane measures the per-packet cost of the agent's
-// control-plane receive loop. The control channel is mostly idle but
-// periodically processes HELLO updates and PING/PONG frames; this benchmark
-// pins the steady-state cost of a single control-packet read/parse cycle so
-// any regression in the read path or mutex discipline is visible immediately.
+// BenchmarkAgentControlPlane measures the steady-state cost of a single
+// control-packet read/parse cycle.
 func BenchmarkAgentControlPlane(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -294,10 +284,8 @@ func BenchmarkAgentControlPlane(b *testing.B) {
 	}
 }
 
-// BenchmarkAgentConcurrentConnections measures the agent's per-connection
-// relay throughput with many parallel public clients. This is the realistic
-// case for an agent hosting a popular service and exercises the data-plane
-// goroutine spawn, dialLocalTCP, and the wrapping relay path.
+// BenchmarkAgentConcurrentConnections measures per-connection relay throughput
+// with many parallel public clients.
 func BenchmarkAgentConcurrentConnections(b *testing.B) {
 	const (
 		payloadSize = 32 * 1024
@@ -385,9 +373,6 @@ func BenchmarkAgentConcurrentConnections(b *testing.B) {
 	}
 }
 
-// acceptDataConnBench is the *testing.B counterpart of fakeTunnelServer's
-// acceptDataConn. It returns the data conn plus the route/client IDs the
-// agent wrote.
 func (s *fakeBenchServer) acceptDataConnBench(b *testing.B) (net.Conn, string, string) {
 	b.Helper()
 	if err := s.dataTCPLn.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second)); err != nil {

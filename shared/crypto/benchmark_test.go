@@ -6,9 +6,8 @@ import (
 	"testing"
 )
 
-// BenchmarkEncryptUDP measures the per-datagram AES-GCM cost for UDP payload
-// encryption. Run with realistic sizes (small for game/DNS packets, large
-// for full MTU). The result bounds the per-packet cost on acceptPublicUDP.
+// BenchmarkEncryptUDP measures the per-datagram AES-GCM encryption cost.
+// The result bounds the per-packet cost on acceptPublicUDP.
 func BenchmarkEncryptUDP(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
 	for _, n := range sizes {
@@ -29,9 +28,8 @@ func BenchmarkEncryptUDP(b *testing.B) {
 	}
 }
 
-// BenchmarkDecryptUDP measures the inverse. DecryptUDP runs on every inbound
-// datagram on acceptAgentUDP, so this cost is paid for every public packet
-// received.
+// BenchmarkDecryptUDP measures AES-GCM decryption, paid for every inbound
+// datagram on acceptAgentUDP.
 func BenchmarkDecryptUDP(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
 	for _, n := range sizes {
@@ -56,9 +54,8 @@ func BenchmarkDecryptUDP(b *testing.B) {
 	}
 }
 
-// BenchmarkUDPCipherRoundTrip covers the encrypt+decrypt pair over a single
-// datagram. This is the realistic cost on a public UDP packet that traverses
-// the tunnel, and the result directly limits the tunnel's per-packet budget.
+// BenchmarkUDPCipherRoundTrip covers encrypt+decrypt for a single datagram,
+// the realistic cost for a public UDP packet traversing the tunnel.
 func BenchmarkUDPCipherRoundTrip(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192}
 	for _, n := range sizes {
@@ -97,9 +94,7 @@ func mustAEAD(b *testing.B, keyLen int) cipher.AEAD {
 }
 
 // BenchmarkEncryptUDPNoncePool exercises the amortized getrandom() path.
-// The first calls pay the syscall to fill the batch; subsequent calls
-// borrow from the pool. Run at a small size so the 12-byte nonce copy
-// is visible in the per-op time.
+// Run at a small size so the 12-byte nonce copy is visible.
 func BenchmarkEncryptUDPNoncePool(b *testing.B) {
 	aead := mustAEAD(b, 32)
 	plain := make([]byte, 64)
@@ -115,11 +110,8 @@ func BenchmarkEncryptUDPNoncePool(b *testing.B) {
 	}
 }
 
-// BenchmarkEncryptUDPNoncePoolConcurrent is the multi-goroutine view of
-// the nonce pool. With many goroutines the pool's LIFO behavior means
-// each goroutine tends to hold its own batch slice, so the amortized
-// getrandom() rate stays low. This benchmark surfaces contention on the
-// pool's internal lock.
+// BenchmarkEncryptUDPNoncePoolConcurrent is the multi-goroutine view.
+// Surfaces contention on the pool's internal lock.
 func BenchmarkEncryptUDPNoncePoolConcurrent(b *testing.B) {
 	aead := mustAEAD(b, 32)
 	plain := make([]byte, 64)
@@ -137,11 +129,9 @@ func BenchmarkEncryptUDPNoncePoolConcurrent(b *testing.B) {
 	})
 }
 
-// BenchmarkStreamCipherEncrypt is the cached-metadata fast path. It
-// skips the two cipher.AEAD interface dispatches that the standard
-// EncryptUDP path performs on every packet, so the measured time is
-// closer to the underlying Seal floor. Compare against
-// BenchmarkEncryptUDP to see the per-call overhead the wrapper saves.
+// BenchmarkStreamCipherEncrypt is the cached-metadata fast path, skipping
+// two cipher.AEAD interface dispatches per packet. Compare against
+// BenchmarkEncryptUDP to measure wrapper overhead.
 func BenchmarkStreamCipherEncrypt(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
 	aead := mustAEAD(b, 32)

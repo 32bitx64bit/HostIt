@@ -144,9 +144,8 @@ func (m *domainCertManager) ensureFresh(host string) error {
 	return err
 }
 
-// acmeCertNeedsRenew reads the cert from the ACME cache directly and
-// returns true only when the cert is missing, unparseable, or expires
-// within m.renewBefore.
+// acmeCertNeedsRenew returns true when the cached cert is missing, invalid,
+// or expires within m.renewBefore.
 func (m *domainCertManager) acmeCertNeedsRenew(host string) bool {
 	if m.autocert == nil || m.autocert.Cache == nil {
 		return true

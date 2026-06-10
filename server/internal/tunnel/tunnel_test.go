@@ -1333,7 +1333,6 @@ func TestSameSourceIPConnectionsDoNotBlock(t *testing.T) {
 
 	waitEchoReady(t, publicAddr)
 
-	// roundTrip dials the public addr, sends a probe, and confirms the echo.
 	roundTrip := func(c net.Conn, payload string) error {
 		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 		if _, err := c.Write([]byte(payload)); err != nil {
@@ -1369,8 +1368,6 @@ func TestSameSourceIPConnectionsDoNotBlock(t *testing.T) {
 		holdConns = append(holdConns, c)
 	}
 
-	// A fresh connection from the same loopback IP must still be served
-	// quickly while the previous ones remain open.
 	done := make(chan error, 1)
 	go func() {
 		c, err := net.Dial("tcp", publicAddr)

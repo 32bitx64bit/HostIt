@@ -159,7 +159,6 @@ func TestWrapTCP(t *testing.T) {
 
 	payload := []byte("hello world")
 
-	// Test write from wc1 to wc2.
 	if _, err := wc1.Write(payload); err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
@@ -173,7 +172,6 @@ func TestWrapTCP(t *testing.T) {
 		t.Fatalf("Expected %q, got %q", payload, buf)
 	}
 
-	// Test write from wc2 to wc1.
 	if _, err := wc2.Write(payload); err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
@@ -373,14 +371,13 @@ func TestCryptoConnWriteHandlesShortWrites(t *testing.T) {
 		writeSeed: seed,
 	}
 
-	payload := bytes.Repeat([]byte("abcdef0123456789"), 128) // 2048 bytes
+	payload := bytes.Repeat([]byte("abcdef0123456789"), 128)
 	if n, err := conn.Write(payload); err != nil {
 		t.Fatalf("Write error: %v", err)
 	} else if n != len(payload) {
 		t.Fatalf("expected %d bytes written, got %d", len(payload), n)
 	}
 
-	// Verify by reading back frames and decrypting.
 	raw := underlying.w.Bytes()
 	offset := 0
 	var decrypted []byte
@@ -491,13 +488,8 @@ func TestDeriveKeyAndUDPCipherEdgeCases(t *testing.T) {
 }
 
 func TestNoncePoolProducesUniqueNonces(t *testing.T) {
-	// Encrypt many small payloads back-to-back. The nonce pool reuses a
-	// single 4096-byte random batch across calls, so the test exercises
-	// the batch-exhausted and refilled paths. After decryption each
-	// plaintext must round-trip exactly, and the 12-byte nonces at the
-	// head of every ciphertext must be pairwise distinct. A regression
-	// in either the copy or the rotation logic would show up as a
-	// duplicate nonce or a corrupted plaintext.
+	// Exercise the nonce pool's batch-exhausted and refilled paths.
+	// Each plaintext must round-trip and every nonce must be distinct.
 	const iters = 10_000
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
@@ -533,11 +525,8 @@ func TestNoncePoolProducesUniqueNonces(t *testing.T) {
 	}
 }
 
-// TestNoncePoolConcurrentUniqueness is the multi-goroutine counterpart to
-// TestNoncePoolProducesUniqueNonces. The pool is shared across goroutines,
-// so the test confirms the Get/Put dance does not let two encryptions
-// accidentally reuse the same nonce (which would silently corrupt the
-// AEAD authentication tag).
+// TestNoncePoolConcurrentUniqueness confirms the pool's Get/Put dance
+// does not let two goroutines reuse the same nonce.
 func TestNoncePoolConcurrentUniqueness(t *testing.T) {
 	const goroutines = 8
 	const itersPerG = 2_000
@@ -635,13 +624,9 @@ func TestUDPEncryptDecryptEdgeCases(t *testing.T) {
 	}
 }
 
-// TestStreamCipherByteCompatible pins the StreamCipher fast path as
-// wire-compatible with the standard EncryptUDP/DecryptUDP path. Both
-// read and write the same 12-byte-nonce-then-ciphertext frame, and a
-// ciphertext produced by one must decrypt cleanly under the other.
-// This is the contract the production code relies on if it ever
-// switches from cipher.AEAD to *StreamCipher on the per-packet hot
-// path; the test catches a future change that breaks it.
+// TestStreamCipherByteCompatible pins wire-compatibility between the
+// StreamCipher fast path and the standard EncryptUDP/DecryptUDP path.
+// A ciphertext produced by one must decrypt cleanly under the other.
 func TestStreamCipherByteCompatible(t *testing.T) {
 	sizes := []int{0, 1, 64, 512, 1400, 8192, 32 * 1024}
 	keySizes := []int{16, 32} // AES-128, AES-256
@@ -705,10 +690,8 @@ func TestStreamCipherByteCompatible(t *testing.T) {
 	}
 }
 
-// TestNewStreamCipherNilAEAD guards the contract that NewStreamCipher
-// returns nil when given a nil AEAD. Production code that swaps in the
-// stream cipher relies on this nil check to fall back to the
-// non-encrypted path.
+// TestNewStreamCipherNilAEAD guards that NewStreamCipher returns nil
+// for a nil AEAD so production can fall back to the non-encrypted path.
 func TestNewStreamCipherNilAEAD(t *testing.T) {
 	if got := NewStreamCipher(nil); got != nil {
 		t.Fatalf("NewStreamCipher(nil) = %v, want nil", got)

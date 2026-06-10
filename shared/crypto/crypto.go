@@ -25,7 +25,7 @@ const (
 )
 
 func DeriveKey(token string, alg string) ([]byte, error) {
-	// Derive salt from token to prevent rainbow table attacks across deployments.
+	// Derive salt from token to prevent cross-deployment rainbow tables.
 	saltHash := sha256.Sum256([]byte("hostit-key-salt:" + token))
 	salt := saltHash[:]
 
@@ -60,8 +60,7 @@ var noncePool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, nonceBatchSize)
 		if _, err := io.ReadFull(rand.Reader, b); err != nil {
-			// rand.Reader should never fail on a healthy system. Encrypting
-			// with a broken RNG is catastrophic, so abort immediately (SEC-8).
+			// Abort on RNG failure; encrypting with a broken RNG is catastrophic.
 			panic(err)
 		}
 		return &b
@@ -78,8 +77,7 @@ func fillNonceBatch(out []byte) {
 	}
 	batch := *batchPtr
 	if len(batch) < len(out) {
-		// Drop the empty slice instead of returning it; the pool's New
-		// function will allocate a fresh batch on the next Get.
+		// Drop empty slice so the pool allocates fresh on next Get.
 		fillNonceBatch(out)
 		return
 	}
@@ -115,7 +113,7 @@ func sealAEAD(aead cipher.AEAD, nonceSize, overhead int, dst, plaintext []byte) 
 	return aead.Seal(dst, dst[:nonceSize], plaintext, nil), nil
 }
 
-// openAEAD is the shared implementation for AEAD decryption; see sealAEAD.
+// shared AEAD decryption impl; see sealAEAD.
 func openAEAD(aead cipher.AEAD, nonceSize, overhead int, dst, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < nonceSize {
 		return nil, errors.New("ciphertext too short")
@@ -143,8 +141,7 @@ func EncryptUDP(aesgcm cipher.AEAD, dst, plaintext []byte) ([]byte, error) {
 	return sealAEAD(aesgcm, aesgcm.NonceSize(), aesgcm.Overhead(), dst, plaintext)
 }
 
-// StreamCipher caches NonceSize and Overhead so the per-packet hot
-// path skips two cipher.AEAD interface dispatches.
+// Caches NonceSize/Overhead to skip two interface dispatches per packet.
 type StreamCipher struct {
 	aead      cipher.AEAD
 	nonceSize int
@@ -211,10 +208,8 @@ func WrapTCP(conn net.Conn, key, clientNonce, serverNonce []byte, isClient bool)
 	if len(key) == 0 {
 		return conn, nil
 	}
-	// Derive a per-session key from the long-term route key and the
-	// freshly exchanged authentication nonces. This ensures every TCP
-	// session uses unique AEAD nonces even if the underlying route key
-	// is static, fixing AES-GCM nonce reuse across connections (SEC-1).
+	// Derive a per-session key from the route key and auth nonces to
+	// fix AES-GCM nonce reuse across connections.
 	info := append(clientNonce, serverNonce...)
 	sessionKey, err := hkdf.Key(sha256.New, key, info, "hostit-session-key", len(key))
 	if err != nil {
@@ -306,10 +301,7 @@ func (c *cryptoConn) Read(b []byte) (int, error) {
 		nonce := frame[:gcmNonceSize]
 		ciphertext := frame[gcmNonceSize:]
 
-		// Open into the fixed backing array. The returned plaintext shares
-		// c.buf, so we only need start/end offsets and never re-slice the
-		// head. This avoids the previous per-frame append that grew and
-		// reallocated readBuf (BUG-2).
+		// Open into the fixed backing array to avoid per-frame reallocations.
 		plaintext, err := c.gcm.Open(c.buf[:0], nonce, ciphertext, nil)
 		readFramePool.Put(framePtr)
 		if err != nil {
@@ -321,8 +313,7 @@ func (c *cryptoConn) Read(b []byte) (int, error) {
 		c.start = 0
 		c.end = len(plaintext)
 		if c.end == 0 {
-			// Empty frame: loop back and read the next frame instead of
-			// recursing, preventing stack growth on empty frames.
+			// Avoid recursing on empty frames to prevent stack growth.
 			continue
 		}
 

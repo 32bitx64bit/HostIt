@@ -240,13 +240,11 @@ func (s *Service) Config() emailcfg.Config {
 	return s.cfg
 }
 
-// WebAccount is a minimal account view for the web email viewer.
 type WebAccount struct {
 	Username string `json:"username"`
 	Address  string `json:"address"`
 }
 
-// WebMessage is a message summary for the web email viewer.
 type WebMessage struct {
 	ID      int64     `json:"id"`
 	Mailbox string    `json:"mailbox"`
@@ -258,13 +256,11 @@ type WebMessage struct {
 	Size    int       `json:"size"`
 }
 
-// WebMessageFull is a full message for the web email viewer.
 type WebMessageFull struct {
 	WebMessage
 	Body string `json:"body"`
 }
 
-// ListAccounts returns all enabled email accounts.
 func (s *Service) ListAccounts() ([]WebAccount, error) {
 	rows, err := s.db.Query(`SELECT username, address FROM accounts WHERE enabled = 1 ORDER BY username`)
 	if err != nil {
@@ -282,7 +278,6 @@ func (s *Service) ListAccounts() ([]WebAccount, error) {
 	return out, rows.Err()
 }
 
-// Authenticate validates username/password and returns the account address.
 func (s *Service) Authenticate(username, password string) (string, error) {
 	rec, err := s.authenticate(username, password)
 	if err != nil {
@@ -291,7 +286,6 @@ func (s *Service) Authenticate(username, password string) (string, error) {
 	return rec.Address, nil
 }
 
-// ListInbox returns message summaries for the given username.
 func (s *Service) ListInbox(username string) ([]WebMessage, error) {
 	msgs, err := s.listMessages(username)
 	if err != nil {
@@ -322,7 +316,6 @@ func (s *Service) ListInbox(username string) ([]WebMessage, error) {
 	return out, nil
 }
 
-// GetMessage returns a single full message by ID, only if it belongs to the given username.
 func (s *Service) GetMessage(username string, messageID int64) (*WebMessageFull, error) {
 	var m storedMessage
 	var internal int64
@@ -357,7 +350,6 @@ func (s *Service) GetMessage(username string, messageID int64) (*WebMessageFull,
 	return &wm, nil
 }
 
-// DeleteMessage deletes a single message by ID, only if it belongs to the given username.
 func (s *Service) DeleteMessage(username string, messageID int64) error {
 	res, err := s.db.Exec(`DELETE FROM messages WHERE id = ? AND username = ?`, messageID, username)
 	if err != nil {
@@ -374,7 +366,6 @@ func (s *Service) DeleteMessage(username string, messageID int64) error {
 	return nil
 }
 
-// CreateAccount creates a new email account with the given username and plaintext password.
 func (s *Service) CreateAccount(username, password string) (*WebAccount, error) {
 	username = strings.TrimSpace(strings.ToLower(username))
 	if username == "" {
@@ -409,7 +400,6 @@ func (s *Service) CreateAccount(username, password string) (*WebAccount, error) 
 	return &WebAccount{Username: username, Address: address}, nil
 }
 
-// UpdateAccountPassword updates the password for an existing account.
 func (s *Service) UpdateAccountPassword(username, password string) error {
 	username = strings.TrimSpace(strings.ToLower(username))
 	if username == "" {
@@ -436,7 +426,6 @@ func (s *Service) UpdateAccountPassword(username, password string) error {
 	return nil
 }
 
-// DeleteAccount deletes an account and all of its messages.
 func (s *Service) DeleteAccount(username string) error {
 	username = strings.TrimSpace(strings.ToLower(username))
 	if username == "" {

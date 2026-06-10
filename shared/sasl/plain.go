@@ -5,10 +5,8 @@ import (
 	"fmt"
 )
 
-// PlainAuthenticator is the signature for a PLAIN SASL authenticator.
 type PlainAuthenticator func(identity, username, password string) error
 
-// NewPlainServer creates a new SASL PLAIN server.
 func NewPlainServer(authenticate PlainAuthenticator) Server {
 	return &plainServer{authenticate: authenticate}
 }

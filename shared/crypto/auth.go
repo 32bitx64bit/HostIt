@@ -17,7 +17,7 @@ import (
 // The client replies with its own 32-byte nonce and an HMAC proving knowledge
 // of the token bound to both nonces. The server finally returns an HMAC that
 // the client verifies. Both sides return the exchanged nonces so callers can
-// feed them into WrapTCP to derive a per-session key (SEC-1/SEC-2).
+// feed them into WrapTCP to derive a per-session key.
 func AuthenticateClient(conn net.Conn, token string) (clientNonce, serverNonce []byte, err error) {
 	serverNonce = make([]byte, 32)
 	if _, err = io.ReadFull(conn, serverNonce); err != nil {
@@ -53,7 +53,7 @@ func AuthenticateClient(conn net.Conn, token string) (clientNonce, serverNonce [
 // AuthenticateServer performs the server side of the 3-message challenge-
 // response handshake. It sends a random nonce first, verifies the client's
 // response, and finally returns an HMAC bound to both nonces with a distinct
-// label so reflection attacks are impossible (SEC-2).
+// label so reflection attacks are impossible.
 func AuthenticateServer(conn net.Conn, token string) (clientNonce, serverNonce []byte, err error) {
 	serverNonce = make([]byte, 32)
 	if _, err = io.ReadFull(rand.Reader, serverNonce); err != nil {

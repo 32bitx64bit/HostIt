@@ -11,11 +11,8 @@ import (
 )
 
 // BenchmarkProxyThroughput measures end-to-end byte throughput of a single
-// proxy pair over a real loopback TCP socket. This is the canonical data path
-// for every tunneled TCP connection: public client <-> server <-> agent <-> local
-// service, so a single Proxy invocation here stands in for the full relay hop.
-// Run with a representative payload size and a fixed b.N to get stable
-// numbers across runs; -benchtime=2s is usually enough.
+// proxy pair over loopback TCP. A single Proxy invocation stands in for the
+// full relay hop (public client <-> server <-> agent <-> local service).
 func BenchmarkProxyThroughput(b *testing.B) {
 	sizes := []int{1 << 10, 4 << 10, 32 << 10, 256 << 10}
 	for _, size := range sizes {
@@ -25,11 +22,9 @@ func BenchmarkProxyThroughput(b *testing.B) {
 	}
 }
 
-// BenchmarkProxyWithIdleTimeout is the same path with the idle-timeout
-// wrapper enabled (the default configuration in production). Idle-timeout
-// refresh throttling should keep per-byte overhead negligible versus plain
-// Proxy; this benchmark confirms that and detects any regression in the
-// refresh fast path.
+// BenchmarkProxyWithIdleTimeout is the same path with idle-timeout enabled
+// (the production default). Confirms that refresh throttling keeps overhead
+// negligible and detects regressions in the fast path.
 func BenchmarkProxyWithIdleTimeout(b *testing.B) {
 	sizes := []int{1 << 10, 4 << 10, 32 << 10, 256 << 10}
 	for _, size := range sizes {
@@ -40,12 +35,8 @@ func BenchmarkProxyWithIdleTimeout(b *testing.B) {
 }
 
 // BenchmarkProxyConcurrent measures aggregate throughput with many parallel
-// proxy pairs running simultaneously. This is the realistic case for a server
-// hosting many concurrent tunneled connections, and the workload where
-// contention on the per-connection goroutine pair, the buffer pool, and the
-// OS scheduler becomes visible. We stand up `concurrency` independent pairs
-// per iteration and wait for them all to finish, so the per-iteration cost
-// reflects the aggregate work and the throughput is reported correctly.
+// proxy pairs. Stand up `concurrency` independent pairs per iteration and
+// wait for them all to finish so reported throughput reflects aggregate work.
 func BenchmarkProxyConcurrent(b *testing.B) {
 	const (
 		payloadSize  = 32 * 1024
@@ -104,18 +95,11 @@ func BenchmarkProxyConcurrent(b *testing.B) {
 	}
 }
 
-// benchmarkProxyLoop sets up a pair of TCP loopback connections and pushes
-// many payloads through Proxy using the same connections. The per-iter
-// connect/teardown noise is paid once and amortized over the loop, so the
-// measured time is the steady-state relay cost (read + write + per-RTT
-// overhead) and not the cost of repeatedly dialing new sockets. The
-// topology mirrors the real data path: the front (client) side dials a
-// listener, the back (local-service) side is a separate dial into a
-// loopback echo listener. The echo listener does NOT share a connection
-// with the proxy because that would have two goroutines reading from the
-// same socket and split the bytes between them, which is not what
-// production traffic looks like. We use the first sample to warm the
-// socket buffers and discard it.
+// benchmarkProxyLoop pushes payloads through Proxy over loopback TCP.
+// Connections are reused per iteration to amortize connect/teardown noise.
+// The echo listener uses separate connections so two goroutines don't
+// read from the same socket, matching production. The first sample
+// warms buffers and is discarded.
 func benchmarkProxyLoop(b *testing.B, payloadSize int, idleTimeout time.Duration) {
 	b.Helper()
 	payload := make([]byte, payloadSize)
@@ -167,9 +151,8 @@ func benchmarkProxyLoop(b *testing.B, payloadSize int, idleTimeout time.Duration
 	}
 }
 
-// loopbackPipe dials two loopback TCP sockets and returns the client side and
-// server side of the connection. We use real TCP rather than net.Pipe so the
-// benchmark exercises the same socket/syscall path as production traffic.
+// loopbackPipe returns a client/server TCP loopback pair. Uses real TCP
+// instead of net.Pipe to exercise the production socket/syscall path.
 func loopbackPipe(b *testing.B) (net.Conn, net.Conn) {
 	b.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -199,14 +182,9 @@ func loopbackPipe(b *testing.B) (net.Conn, net.Conn) {
 	return client, server.conn
 }
 
-// BenchmarkCountingConn is a regression check for the per-byte closure cost
-// introduced by wrapping the public-side Conn in a countingConn for dashboard
-// stats. The wrapper is on the public-TCP hot path: every byte counted is one
-// extra virtual call. Run with a representative size; a regression here shows
-// up immediately in interactive tunneling latency. The new API uses an
-// atomic.Int64 that accumulates in the hot path and is drained by an explicit
-// Flush, so this benchmark also covers the atomic-add cost to confirm it is
-// cheaper than the old closure path.
+// BenchmarkCountingConnRead checks the per-byte cost of countingConn,
+// which wraps the public-side hot path. The new atomic.Int64 + Flush
+// path should be cheaper than the old closure-based approach.
 func BenchmarkCountingConnRead(b *testing.B) {
 	payload := make([]byte, 16<<10)
 	if _, err := rand.Read(payload); err != nil {
@@ -241,10 +219,8 @@ func BenchmarkCountingConnRead(b *testing.B) {
 	pending.Store(0)
 }
 
-// countingBenchConn mirrors server's countingConn: it intercepts Read to
-// count bytes, but otherwise is a passthrough. The atomic counter pattern
-// matches the production code so the benchmark's reported per-read cost is
-// the cost real traffic will pay.
+// countingBenchConn mirrors production countingConn: intercepts Read to
+// count bytes via an atomic counter.
 type countingBenchConn struct {
 	net.Conn
 	pending *atomic.Int64

@@ -126,8 +126,7 @@ func (s *Store) CreateUser(ctx context.Context, username string, password string
 	return nil
 }
 
-// CreateFirstUser creates the first admin user atomically. If any user already
-// exists, it returns an error without creating a new user.
+// CreateFirstUser creates the first admin user atomically.
 func (s *Store) CreateFirstUser(ctx context.Context, username string, password string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

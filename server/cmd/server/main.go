@@ -107,12 +107,8 @@ func main() {
 	if strings.TrimSpace(tlsKey) != "" {
 		cfg.TLSKeyFile = tlsKey
 	}
-	// Encryption-algorithm default. Fresh installs default to aes-128
-	// (~14% faster than aes-256 on AES-NI hardware, still considered
-	// cryptographically strong). Existing installs default to "none"
-	// so a post-upgrade deployment is not silently opted in to
-	// encryption; the operator must set this field explicitly when
-	// adding an encrypted route.
+	// Default encryption: aes-128 for fresh installs (~14% faster than aes-256 on AES-NI),
+	// "none" for existing installs so upgrades are not silently opted-in.
 	if cfg.EncryptionAlgorithm == "" {
 		if !loaded {
 			cfg.EncryptionAlgorithm = "aes-128"
@@ -147,8 +143,7 @@ func main() {
 		slog.Info(logging.CatEncryption, "tunnel TLS enabled", serverlog.F("cert_sha256", fp))
 	}
 
-	// Enable WebHTTPS by default for new configurations and generate the
-	// dashboard TLS cert.
+	// Enable WebHTTPS by default for new configs.
 	cfgDir := filepath.Dir(configPath)
 	if cfg.DomainRenewBefore <= 0 {
 		cfg.DomainRenewBefore = 7 * 24 * time.Hour
@@ -168,7 +163,7 @@ func main() {
 		cfg.Routes[i].Domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.Routes[i].Domain)), ".")
 	}
 	if !cfg.WebHTTPS {
-		// Fresh config (no dashboard cert exists yet): enable HTTPS by default.
+		// Fresh config: enable HTTPS by default.
 		webCert := strings.TrimSpace(cfg.WebTLSCertFile)
 		if webCert == "" {
 			webCert = filepath.Join(cfgDir, "web.crt")
@@ -209,7 +204,7 @@ func main() {
 	))
 
 	if webAddr != "" {
-		// Warn if dashboard is bound to a non-loopback address without cookie-secure
+		// Warn if dashboard is bound to a public address without cookie-secure.
 		if !cookieSecure {
 			host, _, _ := net.SplitHostPort(webAddr)
 			if host != "127.0.0.1" && host != "::1" && host != "localhost" {
@@ -381,8 +376,6 @@ func (r *serverRunner) DeleteApp(label string) bool {
 	return srv.DeleteApp(label)
 }
 
-// SetRouteEnabled toggles a route's enabled state at runtime.
-// Returns false if the route doesn't exist.
 func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -407,7 +400,6 @@ func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
 	return true
 }
 
-// GetRouteEnabled returns the current enabled state of a route.
 func (r *serverRunner) GetRouteEnabled(routeName string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -453,7 +445,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		if _, err := os.Stat(bin); err != nil {
 			return err
 		}
-		// Under systemd, ask the unit to restart (or exit and let it restart us).
+			// systemd: ask the unit to restart.
 		if systemdutil.RunningUnderSystemd() {
 			if systemdutil.SystemctlAvailable() {
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -463,13 +455,13 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				if err == nil {
 					return nil
 				}
-				// Fall back to SIGTERM; unit has Restart=always.
+				// Fallback: SIGTERM triggers systemd restart.
 				_ = out
 			}
 			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 			return nil
 		}
-		// Non-systemd run: replace the current process so the restart is immediate.
+		// Non-systemd: replace the current process immediately.
 		return updater.ExecReplace(bin, os.Args)
 	}
 	upd.Start(ctx)
@@ -497,7 +489,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 
 	buildMux := func(cookieSecure bool, webHTTPS bool, webCertFile string, webKeyFile string, webFingerprint string) *http.ServeMux {
 		mux := http.NewServeMux()
-		lim := newIPRateLimiter(10, 30*time.Second) // 10 attempts per 30s per IP
+		lim := newIPRateLimiter(10, 30*time.Second)
 
 		mux.HandleFunc("/healthz", securityHeaders(cookieSecure, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
@@ -645,7 +637,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 					http.Redirect(w, r, "/login", http.StatusSeeOther)
 					return
 				}
-				// Invalidate all existing sessions for this user on login
+				// Invalidate existing sessions on login.
 				_ = store.DeleteSessionsByUserID(r.Context(), userID)
 				sid, err := store.CreateSession(r.Context(), userID, sessionTTL)
 				if err != nil {
@@ -835,7 +827,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			writeJSON(w, apps)
 		})))
 
-		// Metrics API (protected)
+		// Metrics
 		mux.HandleFunc("/metrics", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -853,7 +845,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			})
 		})))
 
-		// Live stats API (protected)
+		// Live stats
 		mux.HandleFunc("/api/stats", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1023,7 +1015,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			writeJSON(w, result)
 		})))
 
-		// Manual update check (protected)
+		// Update check
 		mux.HandleFunc("/api/update/check-now", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1043,7 +1035,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			writeJSON(w, upd.Status())
 		})))
 
-		// systemd status + control (protected)
+		// systemd
 		mux.HandleFunc("/api/systemd/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1094,7 +1086,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			w.WriteHeader(http.StatusNoContent)
 		})))
 
-		// Update APIs (protected)
+		// Updates
 		mux.HandleFunc("/api/update/status", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1211,7 +1203,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			w.WriteHeader(http.StatusAccepted)
 		})))
 
-		// Process control (protected): exits the whole server process.
+		// Process control
 		mux.HandleFunc("/api/process/restart", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

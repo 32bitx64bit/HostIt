@@ -8,15 +8,14 @@ import (
 	"time"
 )
 
-// tcpUserTimeout is the value of TCP_USER_TIMEOUT (see <netinet/tcp.h>). It
-// bounds how long transmitted data may remain unacknowledged before the
-// kernel forcibly resets the connection, reaping a peer that vanished
-// mid-stream far faster than the default retransmit budget.
+// tcpUserTimeout is the value of TCP_USER_TIMEOUT (see <netinet/tcp.h>).
+// It bounds how long transmitted data may remain unacknowledged before
+// the kernel resets the connection.
 const tcpUserTimeout = 0x12
 
-// SetTCPUserTimeout sets TCP_USER_TIMEOUT on the underlying TCP socket. A
-// non-positive timeout, a non-TCP connection, or a socket that has already been
-// closed results in a no-op. The timeout is rounded to whole milliseconds.
+// SetTCPUserTimeout sets TCP_USER_TIMEOUT on the underlying TCP socket.
+// A non-positive timeout, a non-TCP connection, or a closed socket is a
+// no-op. The timeout is rounded to whole milliseconds.
 func SetTCPUserTimeout(conn net.Conn, timeout time.Duration) error {
 	if timeout <= 0 {
 		return nil

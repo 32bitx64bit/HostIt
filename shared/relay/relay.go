@@ -26,11 +26,8 @@ var relayBufPool = sync.Pool{
 	},
 }
 
-// idleTimeoutConn refreshes a combined read/write deadline on activity so the
-// connection is torn down only after `timeout` of silence in either direction.
-// The refresh is throttled to at most once per `threshold` to avoid a
-// SetDeadline syscall on every Read/Write, keeping idle detection accurate
-// to within `threshold` without per-chunk syscall overhead.
+// Refreshes read/write deadline on activity, throttled to once per threshold
+// to avoid per-chunk syscalls.
 type idleTimeoutConn struct {
 	net.Conn
 	timeout         time.Duration
@@ -60,18 +57,13 @@ func (c *idleTimeoutConn) refresh() {
 	if nowNano-last < int64(c.threshold) {
 		return
 	}
-	// Only one goroutine wins the CAS and issues the syscall; the other
-	// direction's refresh in the same window is harmlessly skipped.
+	// CAS ensures one syscall per window; the other direction is skipped.
 	if atomic.CompareAndSwapInt64(&c.lastRefreshNano, last, nowNano) {
 		c.Conn.SetDeadline(now.Add(c.timeout))
 	}
 }
 
-// CloseWrite / CloseRead / NetConn forward through to the wrapped conn.
-// Without these, *idleTimeoutConn would only expose the net.Conn method set
-// (which lacks CloseWrite/CloseRead), so the relay's half-close path would
-// fail its type assertion and tear down both directions on the first EOF
-// instead of half-closing (BUG-1).
+// Expose CloseWrite/CloseRead so half-close works.
 func (c *idleTimeoutConn) CloseWrite() error { return netutil.CloseWrite(c.Conn) }
 func (c *idleTimeoutConn) CloseRead() error  { return netutil.CloseRead(c.Conn) }
 func (c *idleTimeoutConn) NetConn() net.Conn { return c.Conn }

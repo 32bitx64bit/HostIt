@@ -460,7 +460,6 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 	}
 	defer agentConn.Close()
 
-	// Send initial register so the server learns our address.
 	reg, err := authedUDPRegister("testtoken")
 	if err != nil {
 		t.Fatal(err)
@@ -472,13 +471,11 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 		return srv.agentUDPTime.Load() != 0
 	})
 
-	// Record the timestamp after registration.
 	regTime := srv.agentUDPTime.Load()
 
 	// Wait longer than the 500ms throttle so the data packet must update.
 	time.Sleep(600 * time.Millisecond)
 
-	// Send a data packet from the agent (not a register).
 	dataPkt, err := protocol.MarshalUDP(&protocol.Packet{
 		Type:    protocol.TypeData,
 		Route:   "game",
@@ -492,7 +489,6 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait briefly for the server to process it.
 	time.Sleep(50 * time.Millisecond)
 
 	dataTime := srv.agentUDPTime.Load()

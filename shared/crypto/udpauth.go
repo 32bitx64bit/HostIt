@@ -11,7 +11,7 @@ import (
 
 // The UDP data plane is connectionless and otherwise unauthenticated, so the
 // server would adopt the source address of any datagram as "the agent" — a
-// single spoofed packet could hijack or blackhole all tunneled UDP (SEC-3).
+// single spoofed packet could hijack or blackhole all tunneled UDP.
 // Register packets therefore carry a token-keyed authenticator over a fresh
 // timestamp and random nonce. The server only adopts/refreshes the agent
 // address from a register whose MAC verifies and whose timestamp is recent,

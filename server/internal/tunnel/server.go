@@ -55,19 +55,13 @@ const (
 	maxControlConnLifetime = 24 * time.Hour
 	proxyIdleTimeout       = 5 * time.Minute
 	udpRegisterTimeout     = 60 * time.Second
-	// udpRegisterAuthWindow bounds the clock skew / replay window for an
-	// authenticated UDP register (SEC-3). A register's timestamp must be
-	// within this window of the server clock, and its nonce is single-use
-	// within the window.
+	// Clock-skew/replay window for authenticated UDP registers.
 	udpRegisterAuthWindow = 30 * time.Second
 	domainShutdownTimeout  = 5 * time.Second
 	nettestTimeout         = 2 * time.Second
 	bwTestTimeout          = 5 * time.Second
 	emailProbeAllowTTL     = time.Minute
-	// dashBatchInterval is the cadence at which accumulated byte counters
-	// (countingConn on TCP, pendingBytes on UDP) are flushed to the
-	// dashboard. A single value keeps the three hot paths reporting on the
-	// same boundary.
+	// Byte-counter flush cadence for dashboard hot paths.
 	dashBatchInterval = 100 * time.Millisecond
 )
 
@@ -345,9 +339,7 @@ func (s *Server) getRouteConfig(name string) (routeConfig, bool) {
 	return rc, ok
 }
 
-// isAllowedOutboundSMTPTarget validates that the resolved address is a
-// permitted SMTP destination: standard SMTP ports only and no loopback,
-// private, or link-local addresses.
+// Permitted SMTP destinations: standard ports only, no private/loopback.
 func isAllowedOutboundSMTPTarget(addr *net.TCPAddr) bool {
 	switch addr.Port {
 	case smtpPortStandard, smtpPortSubmissionTLS, smtpPortSubmission:
@@ -605,8 +597,7 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 		return false
 	}
 
-	// Read apps and mutate in-memory state under the lock, but do NOT
-	// hold the lock across net.Listen or the hello push (BUG-3).
+	// Mutate under lock, but do NOT hold it across net.Listen or hello push.
 	s.mu.Lock()
 	apps, err := s.appStore.ListApplications(context.Background())
 	if err != nil {
@@ -649,8 +640,7 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
 	s.mu.Unlock()
 
-	// Open new listeners after unlock so slow net.Listen does not freeze
-	// all public accepts, UDP cache rebuilds, and status calls.
+	// Open listeners after unlock to avoid blocking public accepts.
 	for _, need := range tcpNeeds {
 		ln, err := net.Listen("tcp", need.addr)
 		if err == nil {
@@ -741,9 +731,7 @@ func (s *Server) handleRouteRequest(conn net.Conn, session *agentSession, payloa
 	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
 	s.mu.Unlock()
 
-	// Persist to SQLite after unlock so a slow disk does not freeze the
-	// entire server (BUG-3). Errors are logged but do not fail the
-	// in-memory route.
+	// Persist after unlock so slow disk does not freeze the server.
 	if resp.Status != "failed" && resp.Status != "pending_domain" && s.appStore != nil {
 		s.persistRouteToStore(context.Background(), req, resp)
 	}
@@ -1069,7 +1057,7 @@ func (s *Server) handleRouteConfirm(conn net.Conn, session *agentSession, payloa
 	helloBytes, _ := json.Marshal(buildHelloPayload(s.cfg, s.dynamicRoutes))
 	s.mu.Unlock()
 
-	// Persist domain confirmation to SQLite after unlock (BUG-3).
+	// Persist domain confirm after unlock.
 	if ack.Status != "failed" && s.appStore != nil {
 		if err := s.appStore.RemoveRoute(context.Background(), confirm.Name); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to remove old persisted route %s for confirm: %v", confirm.Name, err)
@@ -1383,10 +1371,8 @@ func (s *Server) pushHelloToAgentLocked() {
 	s.pushHelloBytes(agent, helloPayloadBytes)
 }
 
-// pushHelloBytes sends a pre-marshaled HELLO packet to the given agent
-// connection using only sessionsMu + writeMu locking (no s.mu).
-// Callers must marshal the payload while holding s.mu to avoid the
-// dynamicRoutes map-read-after-unlock race (BUG-4).
+// Send a pre-marshaled HELLO with only sessionsMu+writeMu (no s.mu).
+// Callers must marshal while holding s.mu to avoid map-read-after-unlock.
 func (s *Server) pushHelloBytes(agent net.Conn, helloBytes []byte) {
 	if agent == nil {
 		return
@@ -1937,7 +1923,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	logging.Global().Infof(logging.CatSystem, "Server started on control=%s data=%s", s.cfg.ControlAddr, s.cfg.DataAddr)
 	if s.cfg.DisableTLS {
-		logging.Global().Warnf(logging.CatEncryption, "TLS is disabled (DisableTLS=true). The control channel and authentication handshake run in plaintext. This is only safe on fully trusted networks. Combine with per-session WrapTCP after SEC-1/SEC-2.")
+		logging.Global().Warnf(logging.CatEncryption, "TLS is disabled (DisableTLS=true). The control channel and authentication handshake run in plaintext. This is only safe on fully trusted networks. Combine with per-session WrapTCP.")
 	}
 	return nil
 }
@@ -2601,10 +2587,8 @@ func (s *Server) acceptAgentUDP() {
 		}
 
 		if pkt.Type == protocol.TypeRegister {
-			// The agent UDP address is adopted/refreshed only from a
-			// register whose token-keyed authenticator verifies and whose
-			// nonce has not been seen, so a spoofed datagram cannot hijack
-			// or blackhole the UDP data plane (SEC-3).
+			// The agent UDP address is adopted only from a verified register
+			// with an unseen nonce, so spoofed datagrams cannot hijack the UDP plane.
 			nowT := time.Now()
 			key, ok := crypto.VerifyUDPRegister(s.cfg.Token, pkt.Payload, nowT, udpRegisterAuthWindow)
 			if !ok {
@@ -2636,9 +2620,8 @@ func (s *Server) acceptAgentUDP() {
 		}
 
 		if pkt.Type == protocol.TypeData {
-			// Tunneled data is honored only from the currently registered
-			// agent address; otherwise a spoofed source could inject into
-			// public clients (SEC-3).
+			// Tunneled data is honored only from the registered agent address
+			// to prevent spoofed injection into public clients.
 			regAddr, _ := s.agentUDPAddr.Load().(netip.AddrPort)
 			if !regAddr.IsValid() || regAddr != addr {
 				continue

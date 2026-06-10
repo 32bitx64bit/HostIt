@@ -347,15 +347,10 @@ func TestUnmarshalUDPToRejectsOutOfRangePacketType(t *testing.T) {
 	}
 }
 
-// TestUnmarshalUDPToStringsOutliveInputBuffer guards the contract that
-// p.Route and p.Client returned by UnmarshalUDPTo are independent of the
-// input buffer, even though they are stored in the Packet's own scratch
-// (not aliased to the caller's reused read buffer). The production UDP
-// hot path reuses its read buffer for every datagram, so the next
-// ReadFromUDPAddrPort must not invalidate strings from the previous
-// parse. This was the bug that broke UDP forwarding (Sunshine remote
-// desktop showed a black screen because the route cache lookups were
-// returning the wrong route and silently dropping packets).
+// TestUnmarshalUDPToStringsOutliveInputBuffer guards that Route and Client
+// are independent of the input buffer. The production UDP hot path reuses
+// its read buffer per datagram; a previous bug broke forwarding because
+// route cache lookups returned the wrong route and silently dropped packets.
 func TestUnmarshalUDPToStringsOutliveInputBuffer(t *testing.T) {
 	// Wire format: [type:1][routeLen:1][route][clientLen:1][client][payload]
 	first := []byte{TypeData, 5, 'r', 'o', 'u', 't', 'e', 1, 'A'}
@@ -372,10 +367,8 @@ func TestUnmarshalUDPToStringsOutliveInputBuffer(t *testing.T) {
 		t.Fatalf("first read: route=%q client=%q, want route/A", pkt.Route, pkt.Client)
 	}
 
-	// Capture the strings. After the buffer is overwritten and the
-	// next datagram is parsed, these captured strings must still hold
-	// the first packet's route and client — they are copies into the
-	// Packet's own scratch, not aliases of buf.
+	// Captured strings must remain valid after buffer reuse because
+	// UnmarshalUDPTo copies into Packet's scratch, not aliases buf.
 	routeA := pkt.Route
 	clientA := pkt.Client
 
@@ -441,15 +434,9 @@ func TestReadPacketReturnsErrorForTruncatedFrames(t *testing.T) {
 }
 
 // TestReadPacketToOverwritesInPlace guards the zero-allocation control-loop
-// API. ReadPacketTo must always overwrite every field of the destination
-// packet and must not retain references to the previous payload's backing
-// array in a way that would leak memory when the same packet is reused
-// across many iterations.
+// API. ReadPacketTo must overwrite every field and not retain references to
+// the previous payload's backing array.
 func TestReadPacketToOverwritesInPlace(t *testing.T) {
-	// Build two distinct packets and verify that the second ReadPacketTo
-	// call produces the second packet's contents even though we reuse the
-	// destination struct (i.e. previous Route/Client/Payload do not leak
-	// through).
 	first := &Packet{Type: TypeData, Route: "firstroute", Client: "firstclient", Payload: []byte("first payload")}
 	second := &Packet{Type: TypePing, Route: "second", Client: "sc", Payload: []byte("p")}
 
@@ -493,11 +480,8 @@ func TestReadPacketToOverwritesInPlace(t *testing.T) {
 	}
 }
 
-// TestReadPacketToReusesPayloadBuffer verifies that repeated reads of the
-// same payload length reuse the existing backing array instead of allocating
-// a new one each iteration. This is the per-iteration allocation we care
-// about: a control loop reading a stream of same-size packets must not
-// churn the heap.
+// TestReadPacketToReusesPayloadBuffer verifies that repeated reads reuse
+// the payload backing array, avoiding per-iteration heap churn.
 func TestReadPacketToReusesPayloadBuffer(t *testing.T) {
 	body := &Packet{Type: TypePing, Payload: []byte("pingpayload")}
 	var buf bytes.Buffer
@@ -521,10 +505,8 @@ func TestReadPacketToReusesPayloadBuffer(t *testing.T) {
 	}
 }
 
-// TestReadPacketToEmptyRouteAndClient exercises the common control-plane
-// case where Route and Client are absent. The packet's Route/Client fields
-// must be reset to empty strings, not retain stale values from a previous
-// read.
+// TestReadPacketToEmptyRouteAndClient checks that absent Route/Client
+// fields are reset to empty strings, not left stale from a previous read.
 func TestReadPacketToEmptyRouteAndClient(t *testing.T) {
 	withFields := &Packet{Type: TypeData, Route: "x", Client: "y", Payload: []byte("p")}
 	empty := &Packet{Type: TypePing, Payload: []byte("p")}

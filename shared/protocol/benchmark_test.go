@@ -7,9 +7,8 @@ import (
 	"testing"
 )
 
-// BenchmarkMarshalUDP measures the cost of serializing a UDP packet into a wire
-// frame for a range of payload sizes representative of real tunnel traffic
-// (small DNS replies, medium game packets, full MTU-sized datagrams).
+// BenchmarkMarshalUDP measures UDP packet serialization for a range of
+// payload sizes (small DNS/game packets up to full MTU).
 func BenchmarkMarshalUDP(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
 	for _, n := range sizes {
@@ -33,10 +32,8 @@ func BenchmarkMarshalUDP(b *testing.B) {
 	}
 }
 
-// BenchmarkUnmarshalUDP measures the inverse: parsing a UDP frame back into a
-// Packet struct. This runs on every incoming public UDP datagram on the server
-// and on every server-side datagram delivered to the agent, so the cost is
-// paid twice per packet.
+// BenchmarkUnmarshalUDP measures UDP frame parsing. The cost is paid twice
+// per packet (server ingress and egress to agent).
 func BenchmarkUnmarshalUDP(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
 	for _, n := range sizes {
@@ -64,10 +61,8 @@ func BenchmarkUnmarshalUDP(b *testing.B) {
 	}
 }
 
-// BenchmarkWritePacket measures the cost of framing a TCP packet (used on the
-// control channel and on per-route data sockets). The control channel runs
-// HELLO/Ping/Pong/route-management packets at high frequency and writes happen
-// under a session-level write mutex, so per-call cost directly throttles the
+// BenchmarkWritePacket measures TCP packet framing. The control channel runs
+// at high frequency under a write mutex, so per-call cost throttles the
 // control plane.
 func BenchmarkWritePacket(b *testing.B) {
 	sizes := []int{0, 64, 512, 4096, MaxPayloadSize}
@@ -94,10 +89,8 @@ func BenchmarkWritePacket(b *testing.B) {
 	}
 }
 
-// BenchmarkReadPacket measures the matching read path used by the control
-// channel receive loop. ReadPacket allocates per-packet (route/client/payload)
-// and is therefore a primary candidate for the per-allocation overhead seen on
-// high-rate control traffic.
+// BenchmarkReadPacket measures the control-channel read path. Per-packet
+// allocations make it a candidate for overhead on high-rate traffic.
 func BenchmarkReadPacket(b *testing.B) {
 	sizes := []int{0, 64, 512, 4096, MaxPayloadSize}
 	for _, n := range sizes {
@@ -126,12 +119,9 @@ func BenchmarkReadPacket(b *testing.B) {
 	}
 }
 
-// BenchmarkReadPacketTo measures the same path through the zero-allocation
-// ReadPacketTo API that the server and agent control loops now use. With a
-// destination Packet allocated once outside the loop, the only remaining
-// allocations are the route/client string conversions (unavoidable today
-// without unsafe) and the payload buffer on first read. Steady-state reads
-// of same-size packets should approach 0 allocs.
+// BenchmarkReadPacketTo measures the zero-allocation ReadPacketTo path
+// used by control loops. With a reused Packet, steady-state reads of
+// same-size packets should approach 0 allocs.
 func BenchmarkReadPacketTo(b *testing.B) {
 	sizes := []int{0, 64, 512, 4096, MaxPayloadSize}
 	for _, n := range sizes {
@@ -160,12 +150,9 @@ func BenchmarkReadPacketTo(b *testing.B) {
 	}
 }
 
-// BenchmarkUDPRoundTrip measures the full server-side path: read a datagram
-// from a real loopback UDP socket, unmarshal it, mutate it (re-marshal with
-// new client), and write it back out. This is the closest local reproduction
-// of acceptPublicUDP + acceptAgentUDP's per-packet work and surfaces any
-// encoding/decoding bottleneck that an in-memory benchmark would miss (e.g.
-// syscall overhead, GC pressure on socket buffers).
+// BenchmarkUDPRoundTrip measures the full server-side UDP path over real
+// loopback sockets, surfacing syscall/GC overhead missed by in-memory
+// benchmarks.
 func BenchmarkUDPRoundTrip(b *testing.B) {
 	sizes := []int{64, 512, 1400, 8192}
 	for _, n := range sizes {

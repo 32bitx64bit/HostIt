@@ -19,11 +19,9 @@ func SetTCPKeepAlive(conn net.Conn, period time.Duration) {
 }
 
 // Dead-peer detection defaults. A relayed connection whose remote peer
-// vanishes without a clean TCP shutdown (network drop, killed client,
-// half-open NAT entry) must be reaped quickly so the relay tears down
-// both legs and the downstream service frees the session. Without this,
-// such connections only die on the multi-minute relay idle timeout or
-// kernel retransmit budget, causing connections to "stack" until restart.
+// vanishes without a clean TCP shutdown must be reaped quickly so the
+// relay tears down both legs. Without this, connections "stack" until
+// restart.
 const (
 	deadPeerKeepAliveIdle     = 10 * time.Second
 	deadPeerKeepAliveInterval = 5 * time.Second
@@ -31,10 +29,9 @@ const (
 	deadPeerUserTimeout       = 20 * time.Second
 )
 
-// SetTCPKeepAliveConfig enables keepalive with an explicit idle/interval/count
-// so an unreachable peer is detected within roughly idle+interval*count rather
-// than the platform default (which can be hours). It is a no-op for non-TCP
-// connections or when the platform rejects the configuration.
+// SetTCPKeepAliveConfig enables keepalive with an explicit idle/interval/count.
+// It is a no-op for non-TCP connections or when the platform rejects the
+// configuration.
 func SetTCPKeepAliveConfig(conn net.Conn, idle, interval time.Duration, count int) {
 	tcpConn := UnwrapTCPConn(conn)
 	if tcpConn == nil {
@@ -48,22 +45,18 @@ func SetTCPKeepAliveConfig(conn net.Conn, idle, interval time.Duration, count in
 	})
 }
 
-// TuneDeadPeerDetection applies aggressive keepalive plus (on supported
-// platforms) TCP_USER_TIMEOUT so that a connection whose peer has silently
-// disappeared is reset within a bounded, short window rather than lingering
-// for minutes. Keepalive handles the idle-but-dead case; TCP_USER_TIMEOUT
-// handles the case where the relay is actively pushing data to a peer that
-// has stopped acknowledging. It is safe to call on any net.Conn; it is a
-// no-op for non-TCP connections.
+// TuneDeadPeerDetection applies aggressive keepalive plus TCP_USER_TIMEOUT
+// (on supported platforms) so a silently vanished peer is reset quickly.
+// Keepalive handles the idle-but-dead case; TCP_USER_TIMEOUT handles the
+// case where the relay is pushing to a peer that stopped acknowledging.
+// Safe to call on any net.Conn; no-op for non-TCP connections.
 func TuneDeadPeerDetection(conn net.Conn) {
 	SetTCPKeepAliveConfig(conn, deadPeerKeepAliveIdle, deadPeerKeepAliveInterval, deadPeerKeepAliveCount)
 	_ = SetTCPUserTimeout(conn, deadPeerUserTimeout)
 }
 
-// SetTCPNoDelay disables Nagle's algorithm on the underlying TCP connection so
-// small writes are sent immediately instead of being coalesced. This lowers
-// latency for interactive/relayed traffic without affecting bulk throughput.
-// It returns true when the option was applied to an underlying *net.TCPConn.
+// SetTCPNoDelay disables Nagle's algorithm so small writes are sent
+// immediately. It returns true when applied to an underlying *net.TCPConn.
 func SetTCPNoDelay(conn net.Conn) bool {
 	tcpConn := UnwrapTCPConn(conn)
 	if tcpConn == nil {
@@ -73,11 +66,9 @@ func SetTCPNoDelay(conn net.Conn) bool {
 	return true
 }
 
-// WriteAll writes all of b to w, looping over partial writes until the buffer
-// is fully drained or an error occurs. It returns io.ErrShortWrite if the
-// writer reports zero bytes written without an error. For *net.TCPConn and
-// related stdlib types, the standard library's Write already loops on
-// short writes, so we skip our outer loop and call Write once.
+// WriteAll writes all of b to w, looping over partial writes. For *net.TCPConn
+// and related stdlib types, the standard library already loops on short writes,
+// so we skip our outer loop and call Write once.
 func WriteAll(w io.Writer, b []byte) (int, error) {
 	switch w.(type) {
 	case *net.TCPConn, *net.UDPConn, *net.UnixConn, *net.IPConn:
@@ -100,9 +91,8 @@ func WriteAll(w io.Writer, b []byte) (int, error) {
 	return total, nil
 }
 
-// CloseWrite half-closes the write side of conn if the connection (or an
-// underlying connection reachable via NetConn) supports it. When no half-close
-// is available it falls back to closing the whole connection.
+// CloseWrite half-closes the write side of conn if supported. Falls back to
+// closing the whole connection when half-close is unavailable.
 func CloseWrite(conn net.Conn) error {
 	if conn == nil {
 		return nil
@@ -116,8 +106,8 @@ func CloseWrite(conn net.Conn) error {
 	return conn.Close()
 }
 
-// CloseRead half-closes the read side of conn if supported, otherwise closes
-// the whole connection.
+// CloseRead half-closes the read side of conn if supported. Falls back to
+// closing the whole connection.
 func CloseRead(conn net.Conn) error {
 	if conn == nil {
 		return nil
