@@ -17,9 +17,17 @@ import (
 	"hostit/shared/relay"
 )
 
-func negotiateVersion(t *testing.T, conn net.Conn) {
+// testIdentity returns a fresh keypair's public key and its signature over the
+// server's auth nonce, satisfying the control handshake's identity check.
+func testIdentity(serverNonce []byte) (pub, sig []byte) {
+	pk, priv, _ := crypto.GenerateAgentIdentity()
+	return pk, crypto.SignIdentityChallenge(priv, serverNonce)
+}
+
+func negotiateVersion(t *testing.T, conn net.Conn, serverNonce []byte) {
 	t.Helper()
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	pub, sig := testIdentity(serverNonce)
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub, IdentitySig: sig})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		t.Fatal(err)
 	}
@@ -474,10 +482,11 @@ func TestHelloIncludesLocalAddr(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+	_, serverNonce, err := crypto.AuthenticateClient(conn, "testtoken")
+	if err != nil {
 		t.Fatal(err)
 	}
-	negotiateVersion(t, conn)
+	negotiateVersion(t, conn, serverNonce)
 	pkt, err := protocol.ReadPacket(conn)
 	if err != nil {
 		t.Fatal(err)
@@ -852,11 +861,12 @@ func TestServerRapidReconnectWithStaleControlSession(t *testing.T) {
 				continue
 			}
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+			_, serverNonce, err := crypto.AuthenticateClient(conn, "testtoken")
+			if err != nil {
 				_ = conn.Close()
 				t.Fatal(err)
 			}
-			negotiateVersion(t, conn)
+			negotiateVersion(t, conn, serverNonce)
 			pkt, err := protocol.ReadPacket(conn)
 			if err != nil {
 				_ = conn.Close()
@@ -1408,6 +1418,11 @@ func TestSameSourceIPConnectionsDoNotBlock(t *testing.T) {
 }
 
 func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAddrs map[string]string, token string) {
+	fakeAgentRoutesAs(ctx, controlAddr, dataAddr, "", localAddrs, token)
+}
+
+// fakeAgentRoutesAs is fakeAgentRoutes that announces a specific agent ID.
+func fakeAgentRoutesAs(ctx context.Context, controlAddr, dataAddr, agentID string, localAddrs map[string]string, token string) {
 	var controlConn net.Conn
 	for {
 		select {
@@ -1430,12 +1445,14 @@ func fakeAgentRoutes(ctx context.Context, controlAddr, dataAddr string, localAdd
 	defer controlConn.Close()
 
 	controlConn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, _, err := crypto.AuthenticateClient(controlConn, token); err != nil {
+	_, serverNonce, err := crypto.AuthenticateClient(controlConn, token)
+	if err != nil {
 		return
 	}
 	controlConn.SetDeadline(time.Time{})
 
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	pub, sig := testIdentity(serverNonce)
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, AgentID: agentID, PublicKey: pub, IdentitySig: sig})
 	controlConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := protocol.WritePacket(controlConn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		return

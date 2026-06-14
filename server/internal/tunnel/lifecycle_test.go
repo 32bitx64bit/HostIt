@@ -43,11 +43,13 @@ func dialControlForLifecycleTest(t *testing.T, controlAddr, token string) net.Co
 	t.Helper()
 	conn := dialTCPForLifecycleTest(t, controlAddr)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, _, err := crypto.AuthenticateClient(conn, token); err != nil {
+	_, serverNonce, err := crypto.AuthenticateClient(conn, token)
+	if err != nil {
 		_ = conn.Close()
 		t.Fatal(err)
 	}
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	pub, sig := testIdentity(serverNonce)
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub, IdentitySig: sig})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		_ = conn.Close()
 		t.Fatal(err)

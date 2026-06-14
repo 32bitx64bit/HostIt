@@ -37,6 +37,10 @@ func emailSynthRoutes(cfg ServerConfig) []RouteConfig {
 	if rt, ok := emailACMEHTTPRoute(cfg); ok {
 		routes = append(routes, rt)
 	}
+	agent := cfg.EmailRouteAgent()
+	for i := range routes {
+		routes[i].Agent = agent
+	}
 	return routes
 }
 
@@ -129,6 +133,7 @@ func normalizeRoutes(cfg *ServerConfig) {
 		cfg.Routes[i].PublicAddr = strings.TrimSpace(cfg.Routes[i].PublicAddr)
 		cfg.Routes[i].LocalAddr = strings.TrimSpace(cfg.Routes[i].LocalAddr)
 		cfg.Routes[i].Domain = normalizeHostname(cfg.Routes[i].Domain)
+		cfg.Routes[i].Agent = cfg.Routes[i].OwnerAgent()
 	}
 
 	cfg.DomainHTTPAddr = strings.TrimSpace(cfg.DomainHTTPAddr)

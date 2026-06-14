@@ -294,6 +294,18 @@ func (s *Server) managedRoute(host string) (RouteConfig, bool) {
 	return RouteConfig{}, false
 }
 
+// domainEnabledForRoute reports whether the route's owning agent currently has
+// managed-domain routing turned on.
+func (s *Server) domainEnabledForRoute(routeName string) bool {
+	owner := protocol.DefaultAgentID
+	if rc, ok := s.getRouteConfig(routeName); ok && rc.owner != "" {
+		owner = rc.owner
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.DomainEnabledForAgent(owner)
+}
+
 func normalizeRequestHost(hostport string) string {
 	hostport = strings.TrimSpace(hostport)
 	if host, _, err := net.SplitHostPort(hostport); err == nil {
@@ -321,8 +333,13 @@ func (s *Server) domainRedirectHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		if _, ok := s.domains.lookupHTTPS(host); !ok {
+		entry, ok := s.domains.lookupHTTPS(host)
+		if !ok {
 			logging.Global().Warnf(logging.CatDashboard, "managed domain redirect miss host=%s raw_host=%s", host, r.Host)
+			http.NotFound(w, r)
+			return
+		}
+		if !s.domainEnabledForRoute(entry.HTTPSRouteName) {
 			http.NotFound(w, r)
 			return
 		}
@@ -361,6 +378,11 @@ func (s *Server) domainProxyHandler() http.Handler {
 		entry, ok := s.domains.lookupHTTPS(host)
 		if !ok {
 			logging.Global().Warnf(logging.CatDashboard, "managed domain proxy miss host=%s raw_host=%s", host, r.Host)
+			http.NotFound(w, r)
+			return
+		}
+		if !s.domainEnabledForRoute(entry.HTTPSRouteName) {
+			logging.Global().Warnf(logging.CatDashboard, "managed domain disabled for owner of route %s (host=%s)", entry.HTTPSRouteName, host)
 			http.NotFound(w, r)
 			return
 		}
@@ -502,29 +524,25 @@ func (s *Server) startDomainGateway() error {
 }
 
 func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, error) {
-	s.mu.RLock()
-	agent := s.agentTCP
-	epoch := s.agentEpoch
-	s.mu.RUnlock()
 	rc, ok := s.getRouteConfig(routeName)
 	enabled := ok && rc.enabled
 	if !enabled {
 		return nil, fmt.Errorf("route %s is disabled", routeName)
 	}
-	if agent == nil {
-		return nil, fmt.Errorf("agent not connected")
+	owner := rc.owner
+	if owner == "" {
+		owner = protocol.DefaultAgentID
+	}
+	session, ok := s.sessionForAgent(owner)
+	if !ok {
+		return nil, fmt.Errorf("agent %q not connected", owner)
 	}
 
-	remoteAddr := agent.RemoteAddr().String()
 	clientID := s.nextClientID()
 	pendingKey := makePendingTCPKey(routeName, clientID)
 	entry := newPendingTCPEntry()
 
 	s.mu.Lock()
-	if s.agentEpoch != epoch {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("agent reconnected, retry")
-	}
 	s.pendingTCP[pendingKey] = entry
 	s.mu.Unlock()
 	cleanup := func() {
@@ -535,18 +553,10 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 	}
 
 	reqPkt := &protocol.Packet{Type: protocol.TypeConnect, Route: routeName, Client: clientID}
-	s.sessionsMu.Lock()
-	session, ok := s.sessions[remoteAddr]
-	if !ok {
-		s.sessionsMu.Unlock()
-		cleanup()
-		return nil, fmt.Errorf("agent session not available")
-	}
 	session.writeMu.Lock()
 	session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	err := protocol.WritePacket(session.conn, reqPkt)
 	session.writeMu.Unlock()
-	s.sessionsMu.Unlock()
 	if err != nil {
 		cleanup()
 		return nil, err

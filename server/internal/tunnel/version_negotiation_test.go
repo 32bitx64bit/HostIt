@@ -29,11 +29,13 @@ func negotiateAsAgent(t *testing.T, controlAddr, token, agentVersion string) (ne
 		time.Sleep(25 * time.Millisecond)
 	}
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, _, err := crypto.AuthenticateClient(conn, token); err != nil {
+	_, serverNonce, err := crypto.AuthenticateClient(conn, token)
+	if err != nil {
 		conn.Close()
 		t.Fatalf("auth: %v", err)
 	}
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: agentVersion})
+	pub, sig := testIdentity(serverNonce)
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: agentVersion, PublicKey: pub, IdentitySig: sig})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		conn.Close()
 		t.Fatalf("write version: %v", err)
@@ -164,11 +166,9 @@ func TestIncompatibleAgentDoesNotDisruptActiveAgent(t *testing.T) {
 	go fakeAgent(ctx, controlAddr, dataAddr, echoAddr, "testtoken")
 	waitEchoReady(t, publicAddr)
 
-	srv.mu.RLock()
-	epochBefore := srv.agentEpoch
-	srv.mu.RUnlock()
 	srv.sessionsMu.Lock()
 	sessionsBefore := len(srv.sessions)
+	sessionBefore := srv.sessions[protocol.DefaultAgentID]
 	srv.sessionsMu.Unlock()
 
 	// Three rejected attempts, as a reconnect loop would produce.
@@ -181,19 +181,16 @@ func TestIncompatibleAgentDoesNotDisruptActiveAgent(t *testing.T) {
 		conn.Close()
 	}
 
-	srv.mu.RLock()
-	epochAfter := srv.agentEpoch
-	agentStillSet := srv.agentTCP != nil
-	srv.mu.RUnlock()
-	if epochAfter != epochBefore {
-		t.Errorf("agent epoch changed %d -> %d after rejected negotiations", epochBefore, epochAfter)
-	}
-	if !agentStillSet {
-		t.Error("healthy agent was displaced by a rejected peer")
-	}
 	srv.sessionsMu.Lock()
 	sessionsAfter := len(srv.sessions)
+	sessionAfter := srv.sessions[protocol.DefaultAgentID]
 	srv.sessionsMu.Unlock()
+	if sessionAfter == nil {
+		t.Error("healthy agent was displaced by a rejected peer")
+	}
+	if sessionAfter != sessionBefore {
+		t.Error("healthy agent session was replaced after rejected negotiations")
+	}
 	if sessionsAfter != sessionsBefore {
 		t.Errorf("sessions leaked: %d -> %d", sessionsBefore, sessionsAfter)
 	}

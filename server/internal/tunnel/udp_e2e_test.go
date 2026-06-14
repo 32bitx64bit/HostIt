@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net"
-	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -46,12 +45,24 @@ type fakeUDPAgent struct {
 // authedUDPRegister builds a fresh token-authenticated register packet.
 // It must be called per send (the authenticator is single-use within the
 // server's freshness window), so callers must not cache the result.
-func authedUDPRegister(token string, sessionID crypto.UDPSessionID) ([]byte, error) {
-	payload, err := crypto.BuildUDPRegister(token, sessionID)
+func authedUDPRegister(token string, sessionID crypto.UDPSessionID, agentID string) ([]byte, error) {
+	payload, err := crypto.BuildUDPRegister(token, sessionID, agentID)
 	if err != nil {
 		return nil, err
 	}
 	return protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister, Payload: payload}, nil)
+}
+
+func (s *Server) testUDPLastSeen(agentID string) int64 {
+	if st := s.loadUDPAgents()[agentID]; st != nil {
+		return st.lastSeen.Load()
+	}
+	return 0
+}
+
+func (s *Server) testUDPAddrValid(agentID string) bool {
+	st := s.loadUDPAgents()[agentID]
+	return st != nil && st.addr.IsValid()
 }
 
 // newTestSessionID generates a session ID for fake agents.
@@ -66,6 +77,11 @@ func newTestSessionID(t *testing.T) crypto.UDPSessionID {
 
 func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr, token string, prefixes map[string]string, sessionID crypto.UDPSessionID, encryptedRoutes map[string]bool, sessionCrypto *crypto.UDPSessionCrypto) *fakeUDPAgent {
 	t.Helper()
+	return startFakeUDPAgentAs(t, ctx, dataAddr, token, protocol.DefaultAgentID, prefixes, sessionID, encryptedRoutes, sessionCrypto)
+}
+
+func startFakeUDPAgentAs(t *testing.T, ctx context.Context, dataAddr, token, agentID string, prefixes map[string]string, sessionID crypto.UDPSessionID, encryptedRoutes map[string]bool, sessionCrypto *crypto.UDPSessionCrypto) *fakeUDPAgent {
+	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", dataAddr)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +93,7 @@ func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr, token string
 	agent := &fakeUDPAgent{conn: conn, seen: make(map[string]int)}
 
 	sendRegister := func() {
-		data, err := authedUDPRegister(token, sessionID)
+		data, err := authedUDPRegister(token, sessionID, agentID)
 		if err == nil {
 			_, _ = conn.WriteToUDP(data, serverAddr)
 		}
@@ -434,7 +450,7 @@ func TestPublicUDPDropsWithoutAgentAndWhenDisabled(t *testing.T) {
 
 	agent := startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"disabled": "disabled:"}, newTestSessionID(t), nil, nil)
 	waitTunnelCondition(t, 2*time.Second, "fake UDP agent did not register", func() bool {
-		return srv.agentUDPTime.Load() != 0
+		return srv.testUDPLastSeen(protocol.DefaultAgentID) != 0
 	})
 	disabledClient := dialPublicUDP(t, disabledAddr)
 	defer disabledClient.Close()
@@ -476,7 +492,7 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 	}
 	defer agentConn.Close()
 
-	reg, err := authedUDPRegister("testtoken", newTestSessionID(t))
+	reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,10 +500,10 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitTunnelCondition(t, 2*time.Second, "agent did not register", func() bool {
-		return srv.agentUDPTime.Load() != 0
+		return srv.testUDPLastSeen(protocol.DefaultAgentID) != 0
 	})
 
-	regTime := srv.agentUDPTime.Load()
+	regTime := srv.testUDPLastSeen(protocol.DefaultAgentID)
 
 	// Wait longer than the 500ms throttle so the data packet must update.
 	time.Sleep(600 * time.Millisecond)
@@ -507,13 +523,13 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	dataTime := srv.agentUDPTime.Load()
+	dataTime := srv.testUDPLastSeen(protocol.DefaultAgentID)
 	if dataTime <= regTime {
 		t.Fatalf("data packet did not refresh agentUDPTime: regTime=%d dataTime=%d", regTime, dataTime)
 	}
 }
 
-func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
+func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -541,15 +557,14 @@ func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
 	defer agentConn.Close()
 
 	waitTunnelCondition(t, 2*time.Second, "agent UDP registration did not reach server", func() bool {
-		reg, err := authedUDPRegister("testtoken", newTestSessionID(t))
+		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_, _ = agentConn.WriteToUDP(reg, serverUDPAddr)
-		return srv.agentUDPTime.Load() != 0
+		return srv.testUDPLastSeen(protocol.DefaultAgentID) != 0
 	})
-	addr, _ := srv.agentUDPAddr.Load().(netip.AddrPort)
-	if !addr.IsValid() {
+	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
 		t.Fatal("agent UDP address was not stored before control connect")
 	}
 
@@ -558,10 +573,12 @@ func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
+	_, serverNonce, err := crypto.AuthenticateClient(conn, "testtoken")
+	if err != nil {
 		t.Fatal(err)
 	}
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	pub, sig := testIdentity(serverNonce)
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub, IdentitySig: sig})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		t.Fatal(err)
 	}
@@ -580,8 +597,8 @@ func TestAgentControlConnectClearsUDPAtomics(t *testing.T) {
 		t.Fatalf("first control packet type = %d, want HELLO", pkt.Type)
 	}
 
-	waitTunnelCondition(t, 2*time.Second, "agent UDP atomics were not cleared on control connect", func() bool {
-		addr, _ := srv.agentUDPAddr.Load().(netip.AddrPort)
-		return srv.agentUDPTime.Load() == 0 && !addr.IsValid()
-	})
+	// UDP state persists across a control (re)connect; only an agent restart rotates it.
+	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("agent UDP state should persist across control connect")
+	}
 }

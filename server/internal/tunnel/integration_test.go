@@ -57,7 +57,7 @@ func TestDynamicRouteRegisterConfirmRemove(t *testing.T) {
 
 	s.mu.Lock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-1", Name: "webapp", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", Source: "api",
 	})
@@ -115,7 +115,7 @@ func TestDynamicRouteUpdateLocalAddr(t *testing.T) {
 
 	s.mu.Lock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-2", Name: "myapp", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
@@ -176,7 +176,7 @@ func TestDynamicRoutePortConflictBetweenDynamic(t *testing.T) {
 
 	s.mu.Lock()
 
-	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-pc1", Name: "app1", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
@@ -184,7 +184,7 @@ func TestDynamicRoutePortConflictBetweenDynamic(t *testing.T) {
 		t.Fatalf("app1: Status = %q", r1.Status)
 	}
 
-	r2 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r2 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-pc2", Name: "app2", Proto: "tcp",
 		LocalAddr: "127.0.0.1:4000", PublicPort: port, Source: "api",
 	})
@@ -210,7 +210,7 @@ func TestDynamicRouteMultipleProtos(t *testing.T) {
 
 	for i, proto := range []string{"tcp", "udp", "both"} {
 		name := "app-" + proto
-		resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+		resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 			RequestID: "e2e-proto", Name: name, Proto: proto,
 			LocalAddr: "127.0.0.1:3000", PublicPort: ports[i], Source: "api",
 		})
@@ -234,7 +234,7 @@ func TestRouteStats(t *testing.T) {
 	}, nil)
 
 	s.mu.Lock()
-	s.processRouteRequestLocked(apitypes.RouteRequest{
+	s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-st", Name: "statapp", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
@@ -289,7 +289,7 @@ func TestDynamicRouteAutoDomainWithConfirm(t *testing.T) {
 
 	s.mu.Lock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-ad", Name: "mysite", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", Domain: "auto", Source: "api",
 	})
@@ -318,7 +318,7 @@ func TestEffectiveRoutesIncludesDynamic(t *testing.T) {
 	}, nil)
 
 	s.mu.Lock()
-	s.processRouteRequestLocked(apitypes.RouteRequest{
+	s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-er", Name: "dynamic-api", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
@@ -350,7 +350,7 @@ func TestBuildHelloIncludesDynamicRoutes(t *testing.T) {
 	}, nil)
 
 	s.mu.Lock()
-	s.processRouteRequestLocked(apitypes.RouteRequest{
+	s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-hi", Name: "hello-route", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: port, Source: "api",
 	})
@@ -376,7 +376,7 @@ func TestDynamicRouteUpdatePortChange(t *testing.T) {
 
 	s.mu.Lock()
 
-	s.processRouteRequestLocked(apitypes.RouteRequest{
+	s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "e2e-pu", Name: "portchange", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: ports[0], Source: "api",
 	})

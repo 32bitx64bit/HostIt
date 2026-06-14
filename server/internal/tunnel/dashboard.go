@@ -40,12 +40,26 @@ type DashboardSnapshot struct {
 	NowUnix        int64                     `json:"nowUnix"`
 	BucketSec      int                       `json:"bucketSec"`
 	AgentConnected bool                      `json:"agentConnected"`
+	Agents         []AgentStatus             `json:"agents,omitempty"`
 	ActiveClients  int64                     `json:"activeClients"`
 	BytesTotal     int64                     `json:"bytesTotal"`
 	Series         []DashboardPoint          `json:"series"`
 	Routes         map[string]DashboardRoute `json:"routes"`
 	UDP            *UDPStats                 `json:"udp,omitempty"`
 	Runtime        *DashboardRuntime         `json:"runtime,omitempty"`
+}
+
+type AgentStatus struct {
+	ID                 string `json:"id"`
+	Connected          bool   `json:"connected"`
+	Registered         bool   `json:"registered"`
+	RemoteAddr         string `json:"remoteAddr,omitempty"`
+	ConnectedSinceUnix int64  `json:"connectedSinceUnix,omitempty"`
+	FirstSeenUnix      int64  `json:"firstSeenUnix,omitempty"`
+	UDPRegistered      bool   `json:"udpRegistered"`
+	RouteCount         int    `json:"routeCount"`
+	DomainEnabled      bool   `json:"domainEnabled"`
+	EmailAgent         bool   `json:"emailAgent"`
 }
 
 type DashboardRuntime struct {

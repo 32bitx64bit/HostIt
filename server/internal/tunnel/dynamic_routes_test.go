@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"hostit/shared/apitypes"
+	"hostit/shared/protocol"
 )
 
 func newTestServerForDynamic() *Server {
@@ -19,12 +20,17 @@ func newTestServerForDynamic() *Server {
 	}, nil)
 }
 
+// testProcessRouteRequest calls processRouteRequestLocked owned by the default agent.
+func (s *Server) testProcessRouteRequest(req apitypes.RouteRequest) apitypes.RouteResponse {
+	return s.processRouteRequestLocked(req, protocol.DefaultAgentID)
+}
+
 func TestProcessRouteRequestLocked_BasicRegistration(t *testing.T) {
 	s := newTestServerForDynamic()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID:  "req-1",
 		Name:       "myapp",
 		Proto:      "tcp",
@@ -63,7 +69,7 @@ func TestProcessRouteRequestLocked_EmptyName(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-2",
 		Name:      "",
 		Proto:     "tcp",
@@ -82,7 +88,7 @@ func TestProcessRouteRequestLocked_InvalidName(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-3",
 		Name:      "bad name!",
 		Proto:     "tcp",
@@ -98,7 +104,7 @@ func TestProcessRouteRequestLocked_InvalidProto(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-4",
 		Name:      "app",
 		Proto:     "icmp",
@@ -125,7 +131,7 @@ func TestProcessRouteRequestLocked_StaticNameConflict(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID:  "req-5",
 		Name:       "existing",
 		Proto:      "tcp",
@@ -143,7 +149,7 @@ func TestProcessRouteRequestLocked_DuplicateDynamicName(t *testing.T) {
 	s := newTestServerForDynamic()
 	s.mu.Lock()
 
-	resp1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-1", Name: "myapp", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30001, Source: "api",
 	})
@@ -151,7 +157,7 @@ func TestProcessRouteRequestLocked_DuplicateDynamicName(t *testing.T) {
 		t.Fatalf("first registration: Status = %q, want active", resp1.Status)
 	}
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-2", Name: "myapp", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30002, Source: "api",
 	})
@@ -175,7 +181,7 @@ func TestProcessRouteRequestLocked_PortConflict(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID:  "req-6",
 		Name:       "conflict",
 		Proto:      "tcp",
@@ -201,7 +207,7 @@ func TestProcessRouteRequestLocked_AutoPortAssignment(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-7",
 		Name:      "auto-port",
 		Proto:     "tcp",
@@ -232,14 +238,14 @@ func TestProcessRouteRequestLocked_MaxDynamicRoutes(t *testing.T) {
 	}, nil)
 	s.mu.Lock()
 
-	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "r1", Name: "app1", Proto: "tcp",
 		LocalAddr: "127.0.0.1:1", PublicPort: 30030, Source: "api",
 	})
 	if r1.Status != "active" {
 		t.Fatalf("app1: Status = %q, want active", r1.Status)
 	}
-	r2 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r2 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "r2", Name: "app2", Proto: "tcp",
 		LocalAddr: "127.0.0.1:2", PublicPort: 30031, Source: "api",
 	})
@@ -247,7 +253,7 @@ func TestProcessRouteRequestLocked_MaxDynamicRoutes(t *testing.T) {
 		t.Fatalf("app2: Status = %q, want active", r2.Status)
 	}
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "r3", Name: "app3", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3", PublicPort: 30032, Source: "api",
 	})
@@ -273,7 +279,7 @@ func TestProcessRouteRequestLocked_DomainQuery(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-dq",
 		Name:      "myapp",
 		Proto:     "tcp",
@@ -302,7 +308,7 @@ func TestProcessRouteRequestLocked_UDPWithDomainRejected(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID:  "req-udp-domain",
 		Name:       "udp-app",
 		Proto:      "udp",
@@ -322,7 +328,7 @@ func TestProcessRouteRequestLocked_ReservedNameRejected(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID:  "req-reserved",
 		Name:       "system",
 		Proto:      "tcp",
@@ -343,7 +349,7 @@ func TestProcessRouteRequestLocked_ValidProtos(t *testing.T) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
 
-			resp := s.processRouteRequestLocked(apitypes.RouteRequest{
+			resp := s.testProcessRouteRequest(apitypes.RouteRequest{
 				RequestID:  "req-proto",
 				Name:       "app-" + proto,
 				Proto:      proto,
@@ -373,7 +379,7 @@ func TestProcessRouteConfirmLocked_BasicConfirm(t *testing.T) {
 	}, nil)
 	s.mu.Lock()
 
-	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-c1", Name: "app", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30100, Source: "api",
 	})
@@ -436,7 +442,7 @@ func TestProcessRouteConfirmLocked_DomainConflict(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-c3", Name: "newapp", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30200, Source: "api",
 	})
@@ -459,7 +465,7 @@ func TestProcessRouteConfirmLocked_InvalidDomain(t *testing.T) {
 	s := newTestServerForDynamic()
 	s.mu.Lock()
 
-	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-c4", Name: "app2", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30300, Source: "api",
 	})
@@ -490,7 +496,7 @@ func TestProcessRouteRemoveLocked_BasicRemoval(t *testing.T) {
 	}, nil)
 	s.mu.Lock()
 
-	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-rm1", Name: "removeme", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30400, Source: "api",
 	})
@@ -546,7 +552,7 @@ func TestProcessRouteRemoveLocked_CleanupDerivedKeys(t *testing.T) {
 	}, nil)
 	s.mu.Lock()
 
-	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-rk", Name: "encrypted-app", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30500,
 		Encrypted: true, Source: "api",
@@ -655,7 +661,7 @@ func TestBuildDomainOptionsLocked_WithDynamicRoutes(t *testing.T) {
 	}, nil)
 	s.mu.Lock()
 
-	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-do1", Name: "webapp", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30600, Source: "api",
 	})
@@ -704,7 +710,7 @@ func TestBuildDomainOptionsLocked_UsedDomain(t *testing.T) {
 	}, nil)
 	s.mu.Lock()
 
-	s.processRouteRequestLocked(apitypes.RouteRequest{
+	s.testProcessRouteRequest(apitypes.RouteRequest{
 		RequestID: "req-do2", Name: "taken", Proto: "tcp",
 		LocalAddr: "127.0.0.1:3000", PublicPort: 30700, Source: "api",
 	})

@@ -42,13 +42,14 @@ func fakeEncryptedAgentRoutes(ctx context.Context, controlAddr, dataAddr string,
 	defer controlConn.Close()
 
 	controlConn.SetDeadline(time.Now().Add(5 * time.Second))
-	_, _, err := crypto.AuthenticateClient(controlConn, token)
+	_, serverNonce, err := crypto.AuthenticateClient(controlConn, token)
 	if err != nil {
 		return
 	}
 	controlConn.SetDeadline(time.Time{})
 
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	pub, sig := testIdentity(serverNonce)
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub, IdentitySig: sig})
 	controlConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := protocol.WritePacket(controlConn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		return
