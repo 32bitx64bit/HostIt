@@ -81,48 +81,46 @@ type replayState struct {
 	lastUsed uint64
 }
 
+// accept reports whether ctr is fresh (>=1, within replayWindowBits of the
+// highest seen, and not previously accepted), recording it if so. It uses an
+// RFC 6479-style circular bitmap indexed by ctr mod the window size, so an
+// in-order packet only clears+sets one bit instead of shifting the whole
+// window. Counters reach here only after the AEAD tag is verified, so an
+// attacker cannot drive the counter; forward jumps are bounded by real loss.
 func (w *replayState) accept(ctr uint64) bool {
 	if ctr == 0 {
 		return false // counters start at 1
 	}
 	if ctr > w.highest {
-		w.shift(ctr - w.highest)
+		diff := ctr - w.highest
+		if diff >= replayWindowBits {
+			for i := range w.bits {
+				w.bits[i] = 0
+			}
+		} else {
+			// Positions newly slid into the window still hold bits from a
+			// counter replayWindowBits ago; clear them before reuse.
+			for i := w.highest + 1; i <= ctr; i++ {
+				idx := i & (replayWindowBits - 1)
+				w.bits[idx>>6] &^= uint64(1) << (idx & 63)
+			}
+		}
 		w.highest = ctr
-		w.bits[0] |= 1
+		idx := ctr & (replayWindowBits - 1)
+		w.bits[idx>>6] |= uint64(1) << (idx & 63)
 		return true
 	}
-	off := w.highest - ctr
-	if off >= replayWindowBits {
-		return false
+	if w.highest-ctr >= replayWindowBits {
+		return false // older than the window
 	}
-	word, bit := off/64, off%64
+	idx := ctr & (replayWindowBits - 1)
+	word, bit := idx>>6, idx&63
 	mask := uint64(1) << bit
 	if w.bits[word]&mask != 0 {
-		return false
+		return false // replayed
 	}
 	w.bits[word] |= mask
 	return true
-}
-
-func (w *replayState) shift(s uint64) {
-	if s >= replayWindowBits {
-		for i := range w.bits {
-			w.bits[i] = 0
-		}
-		return
-	}
-	wordShift := int(s / 64)
-	bitShift := uint(s % 64)
-	for i := replayWindowWords - 1; i >= 0; i-- {
-		var v uint64
-		if src := i - wordShift; src >= 0 {
-			v = w.bits[src] << bitShift
-			if bitShift > 0 && src-1 >= 0 {
-				v |= w.bits[src-1] >> (64 - bitShift)
-			}
-		}
-		w.bits[i] = v
-	}
 }
 
 // UDPDecryptor opens datagrams with anti-replay enforcement.
