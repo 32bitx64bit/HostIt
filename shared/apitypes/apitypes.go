@@ -120,6 +120,7 @@ type RouteStats struct {
 	PublicAddr string `json:"public_addr"`
 	LocalAddr  string `json:"local_addr"`
 	Domain     string `json:"domain,omitempty"`
+	Agent      string `json:"agent,omitempty"`
 	Connected  bool   `json:"connected"`
 	Source     string `json:"source"`
 }
