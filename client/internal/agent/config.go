@@ -8,6 +8,7 @@ import (
 
 	"hostit/shared/apitypes"
 	"hostit/shared/emailcfg"
+	"hostit/shared/protocol"
 )
 
 type AppsConfig = apitypes.AppsConfig
@@ -33,11 +34,20 @@ func (r RemoteRoute) EffectiveLocalAddr() string {
 type Config struct {
 	Server       string
 	Token        string
+	AgentID      string
 	DisableTLS   bool
 	InsecureTLS  bool
 	TLSPinSHA256 string
 	Email        emailcfg.Config        `json:"-"`
 	Routes       map[string]RemoteRoute `json:"-"`
+}
+
+// EffectiveAgentID is the ID announced to the server, or DefaultAgentID if unset.
+func (c Config) EffectiveAgentID() string {
+	if id := strings.TrimSpace(c.AgentID); id != "" {
+		return id
+	}
+	return protocol.DefaultAgentID
 }
 
 func (c Config) Validate() error {
@@ -49,6 +59,11 @@ func (c Config) Validate() error {
 
 	if strings.TrimSpace(c.Token) == "" {
 		errs = append(errs, "token is required")
+	}
+
+	// Bounded by the UDP register's 1-byte agent-ID length prefix.
+	if len(strings.TrimSpace(c.AgentID)) > 255 {
+		errs = append(errs, "agent_id must be at most 255 bytes")
 	}
 
 	if pin := strings.TrimSpace(c.TLSPinSHA256); pin != "" {

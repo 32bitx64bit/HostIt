@@ -43,6 +43,10 @@ const (
 // version negotiation, so the reconnect loop can back off much longer.
 var errVersionIncompatible = errors.New("protocol version incompatible")
 
+// errIdentityConflict means the server reported our Agent ID belongs to another
+// agent; we regenerated a new ID and should reconnect immediately to claim it.
+var errIdentityConflict = errors.New("agent id conflict")
+
 type Hooks struct {
 	OnConnected        func()
 	OnEmailConfig      func(cfg emailcfg.Config)
@@ -68,8 +72,9 @@ func RunWithHooks(ctx context.Context, cfg Config, hooks *Hooks) error {
 }
 
 type Agent struct {
-	cfg   Config
-	hooks *Hooks
+	cfg      Config
+	hooks    *Hooks
+	identity *Identity
 
 	mu          sync.RWMutex
 	controlConn net.Conn
@@ -148,6 +153,40 @@ func NewAgent(cfg Config) *Agent {
 
 func (a *Agent) SetHooks(hooks *Hooks) {
 	a.hooks = hooks
+}
+
+// SetIdentity installs the persistent keypair/Agent ID loaded by the caller.
+func (a *Agent) SetIdentity(id *Identity) {
+	a.mu.Lock()
+	a.identity = id
+	a.mu.Unlock()
+}
+
+// ensureIdentity returns the installed identity, lazily creating an ephemeral
+// one (tests / no state path) so the handshake always has a key to sign with.
+func (a *Agent) ensureIdentity() (*Identity, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.identity == nil {
+		id, err := newEphemeralIdentity(a.cfg.EffectiveAgentID())
+		if err != nil {
+			return nil, err
+		}
+		a.identity = id
+	}
+	return a.identity, nil
+}
+
+// EffectiveAgentID is the agent's current authoritative ID (identity-backed,
+// reflecting any server override), falling back to config.
+func (a *Agent) EffectiveAgentID() string {
+	a.mu.RLock()
+	id := a.identity
+	a.mu.RUnlock()
+	if id != nil {
+		return id.AgentID()
+	}
+	return a.cfg.EffectiveAgentID()
 }
 
 func (a *Agent) ControlConn() net.Conn {
@@ -296,9 +335,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 
 		wait := backoff
-		if errors.Is(err, errVersionIncompatible) {
+		switch {
+		case errors.Is(err, errVersionIncompatible):
 			// Reconnecting cannot succeed until one side is updated.
 			wait = versionMismatchBackoff
+		case errors.Is(err, errIdentityConflict):
+			// We already switched IDs; reconnect promptly to claim the new one.
+			wait = 100 * time.Millisecond
+			backoff = 250 * time.Millisecond
 		}
 
 		select {
@@ -385,11 +429,16 @@ func (a *Agent) sendUDPRegister(udpConn *net.UDPConn) {
 	serverUDP := a.serverUDP
 	token := a.cfg.Token
 	sessionID := a.udpSessionID
+	id := a.identity
 	a.mu.RUnlock()
+	agentID := a.cfg.EffectiveAgentID()
+	if id != nil {
+		agentID = id.AgentID()
+	}
 	if serverUDP == nil {
 		return
 	}
-	authPayload, err := crypto.BuildUDPRegister(token, sessionID)
+	authPayload, err := crypto.BuildUDPRegister(token, sessionID, agentID)
 	if err != nil {
 		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-auth", fmt.Sprintf("failed to build UDP register auth: %v", err))
 		return
@@ -471,15 +520,28 @@ func (a *Agent) connectAndRun() error {
 	}()
 
 	conn.SetDeadline(time.Now().Add(agentControlWriteDeadline))
-	_, _, err = crypto.AuthenticateClient(conn, a.cfg.Token)
+	_, serverNonce, err := crypto.AuthenticateClient(conn, a.cfg.Token)
 	if err != nil {
 		return fmt.Errorf("control auth failed: %w", err)
 	}
 	conn.SetDeadline(time.Time{})
 
+	id, err := a.ensureIdentity()
+	if err != nil {
+		return fmt.Errorf("agent identity: %w", err)
+	}
+	proposedID := id.AgentID()
+
 	// Version negotiation is synchronous: send ours, then require the
-	// server's reply (or its rejection reason) before anything else.
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures})
+	// server's reply (or its rejection reason) before anything else. We sign
+	// the auth server-nonce so the server can verify we hold this ID's key.
+	verPayload, _ := json.Marshal(protocol.VersionPayload{
+		Version:     protocol.ProtocolVersion,
+		AgentID:     proposedID,
+		Features:    protocol.SupportedFeatures,
+		PublicKey:   id.PublicKey(),
+		IdentitySig: id.Sign(serverNonce),
+	})
 	conn.SetWriteDeadline(time.Now().Add(agentControlWriteDeadline))
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		return fmt.Errorf("failed to send version negotiate: %w", err)
@@ -509,6 +571,21 @@ func (a *Agent) connectAndRun() error {
 	if !protocol.IsCompatibleWith(protocol.ProtocolVersionParsed, serverVer) {
 		return fmt.Errorf("%w: %s", errVersionIncompatible, protocol.IncompatibleVersionError(protocol.ProtocolVersionParsed, serverVer))
 	}
+	if vp.Conflict {
+		newID, regenErr := id.RegenerateAgentID()
+		if regenErr != nil {
+			return fmt.Errorf("agent id %q conflict, regeneration failed: %w", proposedID, regenErr)
+		}
+		logging.Global().Warnf(logging.CatSystem, "Server reported agent id %q already in use; reconnecting as %q", proposedID, newID)
+		return errIdentityConflict
+	}
+	if vp.AssignedAgentID != "" && vp.AssignedAgentID != proposedID {
+		if setErr := id.SetAgentID(vp.AssignedAgentID); setErr != nil {
+			return fmt.Errorf("failed to persist assigned agent id: %w", setErr)
+		}
+		logging.Global().Infof(logging.CatSystem, "Server assigned agent id %q (proposed %q)", vp.AssignedAgentID, proposedID)
+	}
+
 	features := protocol.NegotiateFeatures(protocol.SupportedFeatures, vp.Features)
 	logging.Global().Infof(logging.CatSystem, "Server version negotiated: %s features=%v", serverVer, features)
 

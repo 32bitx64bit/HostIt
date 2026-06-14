@@ -319,7 +319,7 @@ func (s *fakeTunnelServer) waitForAgentUDPAddr(t *testing.T) *net.UDPAddr {
 			continue
 		}
 		if pkt.Type == protocol.TypeRegister {
-			if _, sessionID, ok := sharedcrypto.VerifyUDPRegister(s.token, pkt.Payload, time.Now(), time.Minute); ok {
+			if _, sessionID, _, ok := sharedcrypto.VerifyUDPRegister(s.token, pkt.Payload, time.Now(), time.Minute); ok {
 				s.agentSessionID = sessionID
 				s.agentSessionOK = true
 			}
