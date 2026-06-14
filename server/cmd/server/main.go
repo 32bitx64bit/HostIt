@@ -29,6 +29,7 @@ import (
 	"hostit/server/internal/tlsutil"
 	"hostit/server/internal/tunnel"
 	"hostit/shared/configio"
+	"hostit/shared/crypto"
 	"hostit/shared/emailcfg"
 	"hostit/shared/logging"
 	"hostit/shared/module"
@@ -344,6 +345,78 @@ func (r *serverRunner) EmailStatus() tunnel.EmailRuntimeStatus {
 	return srv.EmailStatus()
 }
 
+func (r *serverRunner) OverrideAgentID(ctx context.Context, oldID, newID string) error {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return fmt.Errorf("server not running")
+	}
+	if err := srv.OverrideAgentID(ctx, oldID, newID); err != nil {
+		return err
+	}
+	// Mirror the static config route-owner change so a Save persists it.
+	r.mu.Lock()
+	for i := range r.cfg.Routes {
+		if r.cfg.Routes[i].OwnerAgent() == oldID {
+			r.cfg.Routes[i].Agent = newID
+		}
+	}
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *serverRunner) ForgetAgent(ctx context.Context, agentID string) error {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return fmt.Errorf("server not running")
+	}
+	return srv.ForgetAgent(ctx, agentID)
+}
+
+func (r *serverRunner) SetAgentDomainEnabled(agentID string, enabled bool) {
+	agentID = strings.TrimSpace(agentID)
+	r.mu.Lock()
+	srv := r.srv
+	filtered := make([]string, 0, len(r.cfg.DomainDisabledAgents))
+	for _, id := range r.cfg.DomainDisabledAgents {
+		if strings.TrimSpace(id) != agentID {
+			filtered = append(filtered, id)
+		}
+	}
+	if !enabled {
+		filtered = append(filtered, agentID)
+	}
+	r.cfg.DomainDisabledAgents = filtered
+	r.mu.Unlock()
+	if srv != nil {
+		srv.SetAgentDomainEnabled(agentID, enabled)
+	}
+}
+
+func (r *serverRunner) SetEmailAgent(agentID string) {
+	agentID = strings.TrimSpace(agentID)
+	r.mu.Lock()
+	srv := r.srv
+	r.cfg.EmailAgent = agentID
+	r.mu.Unlock()
+	if srv != nil {
+		srv.SetEmailAgent(agentID)
+	}
+}
+
+func (r *serverRunner) KnownAgentIDs() []string {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return []string{protocol.DefaultAgentID}
+	}
+	return srv.KnownAgentIDs()
+}
+
 func (r *serverRunner) ListApps(ctx context.Context) ([]appstore.Application, error) {
 	r.mu.Lock()
 	srv := r.srv
@@ -443,7 +516,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 		if _, err := os.Stat(bin); err != nil {
 			return err
 		}
-			// systemd: ask the unit to restart.
+		// systemd: ask the unit to restart.
 		if systemdutil.RunningUnderSystemd() {
 			if systemdutil.SystemctlAvailable() {
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -456,7 +529,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				// Fallback: SIGTERM triggers systemd restart.
 				_ = out
 			}
-				_ = sendSIGTERM(os.Getpid())
+			_ = sendSIGTERM(os.Getpid())
 			return nil
 		}
 		// Non-systemd: replace the current process immediately.
@@ -836,6 +909,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			writeJSON(w, map[string]any{
 				"uptime_seconds":     int64(time.Since(startTime).Seconds()),
 				"agent_connected":    snap.AgentConnected,
+				"agents":             snap.Agents,
 				"routes_count":       len(cfg.Routes),
 				"active_connections": snap.ActiveClients,
 				"bytes_total":        snap.BytesTotal,
@@ -854,6 +928,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				Name       string                  `json:"name"`
 				Proto      string                  `json:"proto"`
 				PublicAddr string                  `json:"publicAddr"`
+				Agent      string                  `json:"agent"`
 				Active     int64                   `json:"active"`
 				Enabled    bool                    `json:"enabled"`
 				Events     []tunnel.DashboardEvent `json:"events"`
@@ -865,6 +940,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 					Name:       rt.Name,
 					Proto:      rt.Proto,
 					PublicAddr: rt.PublicAddr,
+					Agent:      rt.OwnerAgent(),
 					Active:     rs.ActiveClients,
 					Enabled:    runner.GetRouteEnabled(rt.Name),
 					Events:     rs.Events,
@@ -874,6 +950,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"nowUnix":        snap.NowUnix,
 				"bucketSec":      snap.BucketSec,
 				"agentConnected": snap.AgentConnected,
+				"agents":         snap.Agents,
+				"domainManager":  cfg.DomainManagerEnabled,
+				"emailEnabled":   cfg.Email.Enabled,
 				"activeClients":  snap.ActiveClients,
 				"bytesTotal":     snap.BytesTotal,
 				"udp":            snap.UDP,
@@ -1219,7 +1298,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			w.WriteHeader(http.StatusAccepted)
 			go func() {
 				time.Sleep(250 * time.Millisecond)
-			_ = sendSIGTERM(os.Getpid())
+				_ = sendSIGTERM(os.Getpid())
 			}()
 		})))
 		mux.HandleFunc("/api/process/exit", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
@@ -1261,6 +1340,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				PublicAddr      string
 				LocalAddr       string
 				Domain          string
+				Agent           string
 				IsEncrypted     bool
 				IsDomainEnabled bool
 			}
@@ -1272,9 +1352,21 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 					PublicAddr:      rt.PublicAddr,
 					LocalAddr:       rt.LocalAddr,
 					Domain:          rt.Domain,
+					Agent:           rt.OwnerAgent(),
 					IsEncrypted:     rt.IsEncrypted(),
 					IsDomainEnabled: rt.IsDomainEnabled(),
 				})
+			}
+			agentOptions := runner.KnownAgentIDs()
+			seen := make(map[string]bool, len(agentOptions))
+			for _, id := range agentOptions {
+				seen[id] = true
+			}
+			for _, rv := range routeViews {
+				if !seen[rv.Agent] {
+					agentOptions = append(agentOptions, rv.Agent)
+					seen[rv.Agent] = true
+				}
 			}
 			data := map[string]any{
 				"Cfg":        cfg,
@@ -1286,6 +1378,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"Version":    version.Current,
 				"Routes":     routeViews,
 				"RouteCount": len(routeViews),
+				"Agents":     agentOptions,
 				"WebHTTPS":   webHTTPS,
 				"WebTLSCert": webCertFile,
 				"WebTLSKey":  webKeyFile,
@@ -1716,6 +1809,122 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			})
 		})))
 
+		mux.HandleFunc("/api/agents/override", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			oldID := strings.TrimSpace(r.Form.Get("agent"))
+			newID := strings.TrimSpace(r.Form.Get("newId"))
+			if oldID == "" || newID == "" {
+				http.Error(w, "agent and newId are required", http.StatusBadRequest)
+				return
+			}
+			if err := runner.OverrideAgentID(r.Context(), oldID, newID); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			cfg, _, _ := runner.Get()
+			if err := configio.Save(configPath, cfg); err != nil {
+				serverlog.Log.Error(logging.CatSystem, "failed to save config after agent override", serverlog.F("error", err))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(w, map[string]any{"agent": newID})
+		})))
+
+		mux.HandleFunc("/api/agents/forget", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			agentID := strings.TrimSpace(r.Form.Get("agent"))
+			if agentID == "" {
+				http.Error(w, "agent is required", http.StatusBadRequest)
+				return
+			}
+			if err := runner.ForgetAgent(r.Context(), agentID); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(w, map[string]any{"agent": agentID, "forgotten": true})
+		})))
+
+		mux.HandleFunc("/api/agents/domain", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			agentID := strings.TrimSpace(r.Form.Get("agent"))
+			if agentID == "" {
+				http.Error(w, "agent is required", http.StatusBadRequest)
+				return
+			}
+			enabled := strings.TrimSpace(r.Form.Get("enabled")) != ""
+			runner.SetAgentDomainEnabled(agentID, enabled)
+			cfg, _, _ := runner.Get()
+			if err := configio.Save(configPath, cfg); err != nil {
+				serverlog.Log.Error(logging.CatSystem, "failed to save config after domain toggle", serverlog.F("error", err))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(w, map[string]any{"agent": agentID, "domainEnabled": enabled})
+		})))
+
+		mux.HandleFunc("/api/agents/email", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !checkCSRF(r) {
+				http.Error(w, "csrf", http.StatusBadRequest)
+				return
+			}
+			agentID := strings.TrimSpace(r.Form.Get("agent"))
+			if agentID == "" {
+				http.Error(w, "agent is required", http.StatusBadRequest)
+				return
+			}
+			runner.SetEmailAgent(agentID)
+			cfg, _, _ := runner.Get()
+			if err := configio.Save(configPath, cfg); err != nil {
+				serverlog.Log.Error(logging.CatSystem, "failed to save config after email assignment", serverlog.F("error", err))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(w, map[string]any{"agent": agentID, "emailAgent": true})
+		})))
+
 		mux.HandleFunc("/api/dashboard/interval", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2005,7 +2214,11 @@ func parseServerRoutesForm(r *http.Request) []tunnel.RouteConfig {
 		if domainEnabled {
 			domainPtr = &domainEnabled
 		}
-		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, LocalAddr: local, Encrypted: encPtr, Domain: domain, DomainEnabled: domainPtr})
+		agent := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_agent"))
+		if len(agent) > crypto.MaxAgentIDLen {
+			agent = agent[:crypto.MaxAgentIDLen]
+		}
+		routes = append(routes, tunnel.RouteConfig{Name: name, Proto: proto, PublicAddr: pub, LocalAddr: local, Encrypted: encPtr, Domain: domain, DomainEnabled: domainPtr, Agent: agent})
 	}
 	return routes
 }
@@ -2343,6 +2556,11 @@ const serverStatsHTML = `<!doctype html>
 		</div>
 
     <div class="secHead">
+      <h2>Agents</h2>
+    </div>
+    <div id="agentsList" class="card"><div class="muted">No agents known yet.</div></div>
+
+    <div class="secHead">
       <h2>Routes</h2>
       <div class="liveIndicator"><span class="dot"></span><span id="liveText">Updating…</span></div>
     </div>
@@ -2358,6 +2576,7 @@ const serverStatsHTML = `<!doctype html>
           <span class="routeName">{{.Name}}</span>
           <span class="routeProto">{{.Proto}}</span>
           <span class="routeAddr">{{.PublicAddr}}</span>
+          <span class="routeAgent" title="Owning agent">{{.OwnerAgent}}</span>
           <button type="button" class="routeToggle on" data-route-toggle title="Click to enable/disable route">On</button>
           <span class="routeActive"><span data-route-active>0</span> active</span>
         </summary>
@@ -2403,6 +2622,7 @@ const serverStatsHTML = `<!doctype html>
       return (i===0?Math.round(n):n.toFixed(1))+' '+u[i];
     }
     function fmtNum(n){ return Number(n||0).toLocaleString(); }
+    function esc(v){return String(v||'').replace(/[&<>"']/g,function(ch){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];});}
     function setPill(el,ok,t){
       if(!el)return;
 			el.className='pill '+(ok==='warn'?'warn':(ok?'ok':'bad'));
@@ -2654,7 +2874,39 @@ const serverStatsHTML = `<!doctype html>
           var bl = $('bwChartLabel');  if(bl) bl.textContent = 'Bytes transferred per '+fmtIntervalLong(j.bucketSec)+' interval';
           var cl = $('connChartLabel'); if(cl) cl.textContent = 'New connections per '+fmtIntervalLong(j.bucketSec)+' interval (TCP + UDP)';
         }
-        setPill($('agentPill'),!!j.agentConnected,j.agentConnected?'Connected':'Disconnected');
+        var agents = j.agents || [];
+        var connectedCount = 0;
+        for(var ai=0; ai<agents.length; ai++){ if(agents[ai] && agents[ai].connected) connectedCount++; }
+        setPill($('agentPill'), connectedCount>0, connectedCount>0 ? (connectedCount+' connected') : 'None connected');
+        (function(){
+          var el = $('agentsList'); if(!el) return;
+          if(!agents.length){ el.innerHTML = '<div class="muted">No agents known yet.</div>'; return; }
+          var domainOn = !!j.domainManager, emailOn = !!j.emailEnabled;
+          el.innerHTML = agents.map(function(a){
+            var pill = a.connected ? '<span class="pill ok">Connected</span>' : '<span class="pill bad">Disconnected</span>';
+            var udp = a.udpRegistered ? '<span class="pill ok">UDP</span>' : '<span class="pill bad">no UDP</span>';
+            var addr = a.remoteAddr ? esc(a.remoteAddr) : '—';
+            var id = esc(a.id);
+            var feats = '';
+            if(domainOn){
+              feats += '<button type="button" class="btn sm '+(a.domainEnabled?'on':'off')+'" data-agent-domain="'+id+'" data-enabled="'+(a.domainEnabled?'1':'')+'" title="Managed-domain routing for this agent">Domain '+(a.domainEnabled?'on':'off')+'</button>';
+            }
+            if(emailOn){
+              feats += '<button type="button" class="btn sm '+(a.emailAgent?'on':'')+'" data-agent-email="'+id+'" title="Run the mail service on this agent">Email '+(a.emailAgent?'on':'off')+'</button>';
+            }
+            var ctrls = a.registered
+              ? '<button type="button" class="btn sm" data-agent-rename="'+id+'">Rename</button>'
+                + '<button type="button" class="btn sm warn" data-agent-forget="'+id+'">Forget</button>'
+              : '';
+            return '<div style="display:flex;gap:12px;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)">'
+              + '<b style="min-width:140px">'+id+'</b>'
+              + pill + ' ' + udp
+              + '<span class="muted">'+addr+'</span>'
+              + '<span class="muted">'+fmtNum(a.routeCount||0)+' routes</span>'
+              + '<span style="margin-left:auto;display:flex;gap:6px">'+feats+ctrls+'</span>'
+              + '</div>';
+          }).join('');
+        })();
         if($('activeClientsVal')) $('activeClientsVal').textContent = fmtNum(j.activeClients);
         if($('bw5mVal')) $('bw5mVal').textContent = fmtBytes(computeLastBucket(j.series));
         if($('bytesTotalVal')) $('bytesTotalVal').textContent = fmtBytes(j.bytesTotal||0);
@@ -2741,7 +2993,45 @@ const serverStatsHTML = `<!doctype html>
     // Route toggle click handler
     document.addEventListener('click', function(e){
       var t = e.target;
-      if(!t || !t.matches || !t.matches('[data-route-toggle]')) return;
+      if(!t || !t.matches) return;
+      var renameId = t.getAttribute('data-agent-rename');
+      if(renameId){
+        e.preventDefault();
+        var nv = (window.prompt('New ID for agent "'+renameId+'":', renameId)||'').trim();
+        if(!nv || nv===renameId) return;
+        var pr = new URLSearchParams(); pr.set('csrf', csrf); pr.set('agent', renameId); pr.set('newId', nv);
+        fetch('/api/agents/override', {method:'POST', body:pr, credentials:'include'})
+          .then(function(r){ if(!r.ok) return r.text().then(function(m){ alert('Rename failed: '+m); }); poll(); });
+        return;
+      }
+      var forgetId = t.getAttribute('data-agent-forget');
+      if(forgetId){
+        e.preventDefault();
+        if(!window.confirm('Forget agent "'+forgetId+'"? It will disconnect and can re-register.')) return;
+        var pf = new URLSearchParams(); pf.set('csrf', csrf); pf.set('agent', forgetId);
+        fetch('/api/agents/forget', {method:'POST', body:pf, credentials:'include'})
+          .then(function(r){ if(!r.ok) return r.text().then(function(m){ alert('Forget failed: '+m); }); poll(); });
+        return;
+      }
+      var domainId = t.getAttribute('data-agent-domain');
+      if(domainId){
+        e.preventDefault();
+        var pd = new URLSearchParams(); pd.set('csrf', csrf); pd.set('agent', domainId);
+        pd.set('enabled', t.getAttribute('data-enabled') ? '' : '1');
+        fetch('/api/agents/domain', {method:'POST', body:pd, credentials:'include'})
+          .then(function(r){ if(!r.ok) return r.text().then(function(m){ alert('Domain toggle failed: '+m); }); poll(); });
+        return;
+      }
+      var emailId = t.getAttribute('data-agent-email');
+      if(emailId){
+        e.preventDefault();
+        if(!window.confirm('Run the mail service on agent "'+emailId+'"? It moves email off any other agent.')) return;
+        var pe = new URLSearchParams(); pe.set('csrf', csrf); pe.set('agent', emailId);
+        fetch('/api/agents/email', {method:'POST', body:pe, credentials:'include'})
+          .then(function(r){ if(!r.ok) return r.text().then(function(m){ alert('Email assignment failed: '+m); }); poll(); });
+        return;
+      }
+      if(!t.matches('[data-route-toggle]')) return;
       e.preventDefault();
       var det = t.closest('details[data-route]');
       if(!det) return;
@@ -3025,6 +3315,14 @@ const serverConfigHTML = `<!doctype html>
 								<input name="route_{{$i}}_name" value="{{$r.Name}}" />
 							</div>
 							<div>
+								<label>Owning agent</label>
+								<select name="route_{{$i}}_agent">
+									{{$cur := $r.Agent}}
+									{{range $.Agents}}<option value="{{.}}" {{if eq . $cur}}selected{{end}}>{{.}}</option>{{end}}
+								</select>
+								<div class="help">Only this agent serves this route. Pick <code>default</code> for a single agent.</div>
+							</div>
+							<div>
 								<label>Protocol</label>
 								<select name="route_{{$i}}_proto">
 									<option value="tcp" {{if eq $r.Proto "tcp"}}selected{{end}}>tcp</option>
@@ -3080,6 +3378,7 @@ const serverConfigHTML = `<!doctype html>
 			<input type="hidden" name="route_IDX_delete" value="0" data-route-delete />
 			<div class="grid2" style="margin-top:10px">
 				<div><label>Name (optional)</label><input name="route_IDX_name" value="" /></div>
+				<div><label>Owning agent</label><select name="route_IDX_agent">{{range $.Agents}}<option value="{{.}}" {{if eq . "default"}}selected{{end}}>{{.}}</option>{{end}}</select><div class="help">Only this agent serves this route. Pick <code>default</code> for a single agent.</div></div>
 				<div><label>Protocol</label><select name="route_IDX_proto"><option value="tcp" selected>tcp</option><option value="udp">udp</option><option value="both">both</option></select></div>
 				<div><label>Port (e.g. :25565)</label><input name="route_IDX_public" value="" placeholder=":25565" /></div>
 				<div><label>Local target (optional)</label><input name="route_IDX_local" value="" placeholder="127.0.0.1:3000" /></div>
