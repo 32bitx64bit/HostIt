@@ -9,6 +9,8 @@
 **/*.asm
 **/tunnel-agent
 **/tunnel-server
+/client/agent
+/server/server
 
 # Runtime configs / local state
 **/*.json
