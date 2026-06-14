@@ -10,6 +10,7 @@ A high-performance, self-hosted tunneling service — an alternative to services
 ## Features
 
 - **TCP & UDP tunneling** — forward any local service through a single outbound connection
+- **Multiple agents per server** — run many local agents behind one server exit point, each with a persistent Ed25519 identity; routes, domains, and the mail service are attributed and addressed per agent
 - **Domain-based routing** — assign custom domains to tunnels with automatic Let's Encrypt TLS certificates
 - **Built-in email server** — SMTP, IMAP, and POP3 with DKIM signing and SQLite storage
 - **Web dashboard** — manage tunnels, domains, and email accounts from a browser
@@ -309,6 +310,7 @@ Only include fields you want to change. The response `data` is `{"status":"updat
   "proto": "tcp",
   "public_addr": "1.2.3.4:12345",
   "local_addr": "127.0.0.1:3000",
+  "agent": "default",
   "connected": true,
   "source": "dynamic"
 }
