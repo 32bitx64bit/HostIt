@@ -62,11 +62,11 @@ func requireLocalHost(next http.Handler, bindAddr string) http.Handler {
 	host, port, _ := net.SplitHostPort(bindAddr)
 	allowed := map[string]bool{
 		"127.0.0.1:" + port: true,
-		"localhost:" + port:  true,
-		"[::1]:" + port:      true,
-		"127.0.0.1":          true,
-		"localhost":          true,
-		"[::1]":              true,
+		"localhost:" + port: true,
+		"[::1]:" + port:     true,
+		"127.0.0.1":         true,
+		"localhost":         true,
+		"[::1]":             true,
 	}
 	host = strings.TrimSpace(host)
 	if host != "" && host != "0.0.0.0" && host != "::" && host != "[::]" {
@@ -108,15 +108,19 @@ func main() {
 
 	var serverHost string
 	var token string
+	var agentID string
 	var webAddr string
 	var configPath string
+	var identityFile string
 	var autostart bool
 	var shutdownTimeoutFlag time.Duration
 
 	flag.StringVar(&serverHost, "server", "", "tunnel server host/IP (optionally include control port, e.g. host:7000)")
 	flag.StringVar(&token, "token", "", "shared token (required)")
+	flag.StringVar(&agentID, "agent-id", "", "agent identity (default \"default\"); set a unique value per agent when running multiple against one server")
 	flag.StringVar(&webAddr, "web", defaultWebAddr, "agent web dashboard listen address (empty to disable)")
 	flag.StringVar(&configPath, "config", "agent.json", "path to agent config JSON")
+	flag.StringVar(&identityFile, "identity-file", "", "path to the agent identity keypair (default: agent-identity.json next to the config)")
 	flag.BoolVar(&autostart, "autostart", true, "start agent automatically")
 	flag.DurationVar(&shutdownTimeoutFlag, "shutdown-timeout", 0, "graceful shutdown timeout (e.g. 10s, 1m)")
 	flag.Parse()
@@ -150,6 +154,10 @@ func main() {
 		cfg.Server = serverHost
 		agentlog.Log.Infof(logging.CatSystem, "Using server from command-line argument: %s", serverHost)
 	}
+	if strings.TrimSpace(agentID) != "" {
+		cfg.AgentID = agentID
+		agentlog.Log.Infof(logging.CatSystem, "Using agent ID from command-line argument: %s", agentID)
+	}
 
 	if strings.TrimSpace(cfg.Server) == "" {
 		if webAddr == "" {
@@ -178,6 +186,17 @@ func main() {
 	}
 	ctrl.appsCfg = appsCfg
 	ctrl.appsPath = appsConfigPath
+
+	identityPath := strings.TrimSpace(identityFile)
+	if identityPath == "" {
+		identityPath = filepath.Join(filepath.Dir(absCfg), "agent-identity.json")
+	}
+	identity, err := agent.LoadOrCreateIdentity(identityPath, cfg.AgentID)
+	if err != nil {
+		agentlog.Log.Fatal(logging.CatSystem, fmt.Sprintf("ERROR: failed to load agent identity: %v", err))
+	}
+	ctrl.identity = identity
+	agentlog.Log.Infof(logging.CatSystem, "Agent identity %q loaded from %s", identity.AgentID(), identityPath)
 	mailSvc, err := mail.NewService(filepath.Join(filepath.Dir(absCfg), "mail"))
 	if err != nil {
 		agentlog.Log.Infof(logging.CatSystem, "mail service init failed: %v", err)
@@ -267,10 +286,24 @@ type agentController struct {
 	eventSubs []*eventSubscriber
 	appsCfg   apitypes.AppsConfig
 	appsPath  string
+	identity  *agent.Identity
 }
 
 func newAgentController(root context.Context, cfg agent.Config) *agentController {
 	return &agentController{root: root, cfg: cfg}
+}
+
+// EffectiveAgentID returns the identity-backed Agent ID (reflecting any server
+// override), falling back to config when no identity is loaded.
+func (a *agentController) EffectiveAgentID() string {
+	a.mu.Lock()
+	id := a.identity
+	cfg := a.cfg
+	a.mu.Unlock()
+	if id != nil {
+		return id.AgentID()
+	}
+	return cfg.EffectiveAgentID()
 }
 
 func (a *agentController) Get() (agent.Config, bool, bool, string, []agent.RemoteRoute) {
@@ -483,6 +516,9 @@ func (a *agentController) Start() {
 
 	ag := agent.NewAgent(cfg)
 	ag.SetHooks(hooks)
+	if a.identity != nil {
+		ag.SetIdentity(a.identity)
+	}
 	a.mu.Lock()
 	a.agentInst = ag
 	a.mu.Unlock()

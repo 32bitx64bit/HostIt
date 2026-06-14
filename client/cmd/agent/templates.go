@@ -1,4 +1,5 @@
 package main
+
 const agentHomeHTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -87,6 +88,10 @@ const agentHomeHTML = `<!doctype html>
 			<div class="sCard">
 				<div class="label">Connection</div>
 				<div class="val"><span id="ctlPill" class="pill {{if .Connected}}ok{{else}}bad{{end}}">{{if .Connected}}Connected{{else}}Disconnected{{end}}</span></div>
+			</div>
+			<div class="sCard">
+				<div class="label">Agent ID</div>
+				<div class="val" style="font-size:12px"><code id="agentIdVal">{{.AgentID}}</code></div>
 			</div>
 			<div class="sCard">
 				<div class="label">Token</div>

@@ -55,6 +55,13 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	moduleDir := module.DetectModuleDir(absCfg)
 	upd := updater.NewManager("32bitx64bit/HostIt", updater.ComponentClient, "client.zip", moduleDir, updStatePath)
 	upd.PreservePaths = []string{absCfg, filepath.Join(filepath.Dir(absCfg), "mail")}
+	// Keep the agent's identity keypair across updates; losing it makes the
+	// server see a new key and bump the agent to a conflict-renamed ID.
+	if ctrl.identity != nil {
+		if p := ctrl.identity.Path(); p != "" {
+			upd.PreservePaths = append(upd.PreservePaths, p)
+		}
+	}
 	upd.Restart = func() error {
 		agentlog.Log.Infof(logging.CatSystem, "=== Update complete, restarting agent ===")
 		ctrl.Stop()
@@ -131,6 +138,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"Cfg":              cfg,
 			"Running":          running,
 			"Connected":        connected,
+			"AgentID":          ctrl.EffectiveAgentID(),
 			"HasToken":         hasToken,
 			"TokenPlaceholder": tokenPlaceholder,
 			"LastErr":          lastErr,
@@ -196,6 +204,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"connected":  connected,
 			"lastErr":    lastErr,
 			"server":     cfg.Server,
+			"agentId":    ctrl.EffectiveAgentID(),
 			"tokenSet":   strings.TrimSpace(cfg.Token) != "",
 			"configPath": configPath,
 			"nowUnix":    time.Now().Unix(),
@@ -768,13 +777,13 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 		cfg, running, connected, lastErr, routes := ctrl.Get()
 		writeOK(w, map[string]any{
-			"uptime_seconds":  time.Since(startTime).Seconds(),
-			"running":         running,
-			"connected":       connected,
-			"routes_count":    len(routes),
-			"last_error":      lastErr,
-			"version":         version.Current,
-			"server":          cfg.Server,
+			"uptime_seconds": time.Since(startTime).Seconds(),
+			"running":        running,
+			"connected":      connected,
+			"routes_count":   len(routes),
+			"last_error":     lastErr,
+			"version":        version.Current,
+			"server":         cfg.Server,
 		})
 	})
 
