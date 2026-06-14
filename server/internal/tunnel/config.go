@@ -28,10 +28,19 @@ type RouteConfig struct {
 	Proto         string // "tcp", "udp", or "both"
 	PublicAddr    string // listen address (host:port)
 	LocalAddr     string // agent-side target address (host:port). Defaults to 127.0.0.1:<publicPort>.
+	Agent         string `json:",omitempty"` // owning agent ID; empty means the default agent.
 	Enabled       *bool
 	Encrypted     *bool
 	Domain        string `json:",omitempty"`
 	DomainEnabled *bool  `json:",omitempty"`
+}
+
+// OwnerAgent returns the route's owning agent ID, or DefaultAgentID if unset.
+func (r RouteConfig) OwnerAgent() string {
+	if a := strings.TrimSpace(r.Agent); a != "" {
+		return a
+	}
+	return protocol.DefaultAgentID
 }
 
 func (r RouteConfig) IsEnabled() bool {
@@ -205,8 +214,33 @@ type ServerConfig struct {
 	DashboardInterval        time.Duration   `json:",omitempty"`
 	EncryptionAlgorithm      string          `json:",omitempty"`
 	AppDBPath                string          `json:",omitempty"`
+	EmailAgent               string          `json:",omitempty"` // agent ID that serves synthetic mail routes; empty means the default agent.
+	DomainDisabledAgents     []string        `json:",omitempty"` // agents whose managed-domain routing is turned off
 	Email                    emailcfg.Config `json:"email,omitempty"`
 	Routes                   []RouteConfig
+}
+
+// EmailRouteAgent returns the agent ID that serves the synthetic mail routes.
+func (c ServerConfig) EmailRouteAgent() string {
+	if a := strings.TrimSpace(c.EmailAgent); a != "" {
+		return a
+	}
+	return protocol.DefaultAgentID
+}
+
+// DomainEnabledForAgent reports whether managed-domain routing is active for an
+// agent. It defaults to on; an operator can switch it off per agent.
+func (c ServerConfig) DomainEnabledForAgent(agentID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		agentID = protocol.DefaultAgentID
+	}
+	for _, disabled := range c.DomainDisabledAgents {
+		if strings.TrimSpace(disabled) == agentID {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *ServerConfig) Validate() error {
