@@ -10,69 +10,93 @@ func TestUDPRegisterRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := BuildUDPRegister("token", sessionID)
+	payload, err := BuildUDPRegister("token", sessionID, "agent-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(payload) != UDPRegisterPayloadLen {
-		t.Fatalf("payload length = %d, want %d", len(payload), UDPRegisterPayloadLen)
+	if len(payload) < UDPRegisterMinLen {
+		t.Fatalf("payload length = %d, want >= %d", len(payload), UDPRegisterMinLen)
 	}
 
 	now := time.Now()
-	key, gotSession, ok := VerifyUDPRegister("token", payload, now, 30*time.Second)
+	key, gotSession, gotAgent, ok := VerifyUDPRegister("token", payload, now, 30*time.Second)
 	if !ok {
 		t.Fatal("valid register rejected")
 	}
 	if gotSession != sessionID {
 		t.Fatalf("session ID mismatch: got %x want %x", gotSession, sessionID)
 	}
+	if gotAgent != "agent-a" {
+		t.Fatalf("agent ID mismatch: got %q want %q", gotAgent, "agent-a")
+	}
 	var zeroKey UDPRegisterKey
 	if key == zeroKey {
 		t.Fatal("freshness key is zero")
 	}
 
-	if _, _, ok := VerifyUDPRegister("wrong-token", payload, now, 30*time.Second); ok {
+	if _, _, _, ok := VerifyUDPRegister("wrong-token", payload, now, 30*time.Second); ok {
 		t.Fatal("register verified under wrong token")
 	}
-	if _, _, ok := VerifyUDPRegister("token", payload[:len(payload)-1], now, 30*time.Second); ok {
+	if _, _, _, ok := VerifyUDPRegister("token", payload[:len(payload)-1], now, 30*time.Second); ok {
 		t.Fatal("truncated register verified")
 	}
 	tampered := append([]byte(nil), payload...)
 	tampered[20] ^= 1 // flip a session ID bit
-	if _, _, ok := VerifyUDPRegister("token", tampered, now, 30*time.Second); ok {
+	if _, _, _, ok := VerifyUDPRegister("token", tampered, now, 30*time.Second); ok {
 		t.Fatal("tampered session ID verified")
 	}
-	if _, _, ok := VerifyUDPRegister("token", payload, now.Add(time.Minute), 30*time.Second); ok {
+	// Flip an agent ID byte: it is authenticated by the MAC, so it must fail.
+	tamperedAgent := append([]byte(nil), payload...)
+	tamperedAgent[udpRegisterPrefixLen+1] ^= 1
+	if _, _, _, ok := VerifyUDPRegister("token", tamperedAgent, now, 30*time.Second); ok {
+		t.Fatal("tampered agent ID verified")
+	}
+	if _, _, _, ok := VerifyUDPRegister("token", payload, now.Add(time.Minute), 30*time.Second); ok {
 		t.Fatal("stale register verified outside window")
+	}
+}
+
+func TestUDPRegisterEmptyAgentID(t *testing.T) {
+	sessionID, _ := NewUDPSessionID()
+	payload, err := BuildUDPRegister("token", sessionID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, gotAgent, ok := VerifyUDPRegister("token", payload, time.Now(), time.Minute)
+	if !ok {
+		t.Fatal("register with empty agent ID rejected")
+	}
+	if gotAgent != "" {
+		t.Fatalf("empty agent ID round-trip mismatch: got %q", gotAgent)
 	}
 }
 
 func TestUDPRegisterEmptyToken(t *testing.T) {
 	sessionID, _ := NewUDPSessionID()
-	payload, err := BuildUDPRegister("", sessionID)
+	payload, err := BuildUDPRegister("", sessionID, "agent-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if payload != nil {
 		t.Fatal("empty token must produce no register payload")
 	}
-	if _, _, ok := VerifyUDPRegister("", make([]byte, UDPRegisterPayloadLen), time.Now(), time.Minute); ok {
+	if _, _, _, ok := VerifyUDPRegister("", make([]byte, UDPRegisterMinLen), time.Now(), time.Minute); ok {
 		t.Fatal("empty token must never verify")
 	}
 }
 
 func TestUDPRegisterFreshPerCall(t *testing.T) {
 	sessionID, _ := NewUDPSessionID()
-	p1, err := BuildUDPRegister("token", sessionID)
+	p1, err := BuildUDPRegister("token", sessionID, "agent-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	p2, err := BuildUDPRegister("token", sessionID)
+	p2, err := BuildUDPRegister("token", sessionID, "agent-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	k1, _, ok1 := VerifyUDPRegister("token", p1, time.Now(), time.Minute)
-	k2, _, ok2 := VerifyUDPRegister("token", p2, time.Now(), time.Minute)
+	k1, _, _, ok1 := VerifyUDPRegister("token", p1, time.Now(), time.Minute)
+	k2, _, _, ok2 := VerifyUDPRegister("token", p2, time.Now(), time.Minute)
 	if !ok1 || !ok2 {
 		t.Fatal("fresh registers rejected")
 	}
