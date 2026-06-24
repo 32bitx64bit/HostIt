@@ -955,7 +955,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"emailEnabled":   cfg.Email.Enabled,
 				"activeClients":  snap.ActiveClients,
 				"bytesTotal":     snap.BytesTotal,
-				"udp":            snap.UDP,
 				"runtime":        snap.Runtime,
 				"series":         snap.Series,
 				"routes":         outRoutes,

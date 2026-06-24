@@ -171,8 +171,11 @@ type Server struct {
 	domainHTTPLn  net.Listener
 	domainHTTPSLn net.Listener
 
-	publicTCP         map[string]net.Listener
+	publicTCP map[string]net.Listener
+	// publicUDP is the mutable source of truth, guarded by s.mu. publicUDPSnap
+	// holds a copy-on-write snapshot for the lock-free downstream UDP read path.
 	publicUDP         map[string]*net.UDPConn
+	publicUDPSnap     atomic.Pointer[map[string]*net.UDPConn]
 	domainHTTPServer  *http.Server
 	domainHTTPSServer *http.Server
 	domainCerts       *domainCertManager
@@ -301,6 +304,24 @@ func (s *Server) loadUDPAgents() map[string]*agentUDPState {
 		return *m
 	}
 	return nil
+}
+
+// loadPublicUDP returns the lock-free snapshot of the public UDP listeners.
+func (s *Server) loadPublicUDP() map[string]*net.UDPConn {
+	if m := s.publicUDPSnap.Load(); m != nil {
+		return *m
+	}
+	return nil
+}
+
+// publishPublicUDPLocked republishes the copy-on-write snapshot from the
+// authoritative publicUDP map. Must be called while holding s.mu.
+func (s *Server) publishPublicUDPLocked() {
+	cp := make(map[string]*net.UDPConn, len(s.publicUDP))
+	for k, v := range s.publicUDP {
+		cp[k] = v
+	}
+	s.publicUDPSnap.Store(&cp)
 }
 
 // updateUDPAgentAddr is copy-on-write; only acceptAgentUDP calls it (single writer).
@@ -702,6 +723,7 @@ func (s *Server) updateRouteCacheLocked() {
 		}
 	}
 	s.routeCache.Store(newCache)
+	s.publishPublicUDPLocked()
 }
 
 func (s *Server) getRouteConfig(name string) (routeConfig, bool) {
@@ -1094,6 +1116,7 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 				s.mu.Lock()
 				if s.ctx != nil {
 					s.publicUDP[need.name] = conn
+					s.publishPublicUDPLocked()
 					s.wg.Add(1)
 					go s.acceptPublicUDP(conn, need.name)
 				} else {
@@ -2250,6 +2273,7 @@ func (s *Server) Start(ctx context.Context) error {
 			conn.SetWriteBuffer(8 * 1024 * 1024)
 			s.mu.Lock()
 			s.publicUDP[rt.Name] = conn
+			s.publishPublicUDPLocked()
 			s.mu.Unlock()
 			s.wg.Add(1)
 			go s.acceptPublicUDP(conn, rt.Name)
@@ -2652,23 +2676,22 @@ func (s *Server) acceptData(ln net.Listener) {
 		}
 		conn.SetReadDeadline(handshakeDL)
 
-		var routeLen byte
-		if err := binary.Read(conn, binary.BigEndian, &routeLen); err != nil {
+		var lenBuf [1]byte
+		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
 			conn.Close()
 			continue
 		}
-		routeBytes := make([]byte, routeLen)
+		routeBytes := make([]byte, lenBuf[0])
 		if _, err := io.ReadFull(conn, routeBytes); err != nil {
 			conn.Close()
 			continue
 		}
 
-		var clientLen byte
-		if err := binary.Read(conn, binary.BigEndian, &clientLen); err != nil {
+		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
 			conn.Close()
 			continue
 		}
-		clientBytes := make([]byte, clientLen)
+		clientBytes := make([]byte, lenBuf[0])
 		if _, err := io.ReadFull(conn, clientBytes); err != nil {
 			conn.Close()
 			continue
@@ -3049,9 +3072,7 @@ func (s *Server) acceptAgentUDP() {
 				st.lastSeen.Store(now)
 			}
 
-			s.mu.RLock()
-			pubConn, ok := s.publicUDP[routeName]
-			s.mu.RUnlock()
+			pubConn, ok := s.loadPublicUDP()[routeName]
 			if !ok {
 				continue
 			}

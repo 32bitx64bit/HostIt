@@ -1235,19 +1235,19 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 		crypto      *crypto.UDPSessionCrypto
 		localAddr   string
 	}
-	var routeCache sync.Map
+	routeCache := make(map[string]routeConfig)
 	var lastCacheGen uint64
 
 	rebuildRouteCache := func() {
-		routeCache = sync.Map{}
 		a.mu.RLock()
 		lastCacheGen = a.routeCacheGen.Load()
+		routeCache = make(map[string]routeConfig, len(a.cfg.Routes))
 		for _, rt := range a.cfg.Routes {
-			routeCache.Store(rt.Name, routeConfig{
+			routeCache[rt.Name] = routeConfig{
 				isEncrypted: rt.Encrypted,
 				crypto:      a.udpCryptoByAlg[rt.Algorithm],
 				localAddr:   rt.EffectiveLocalAddr(),
-			})
+			}
 		}
 		a.mu.RUnlock()
 	}
@@ -1287,8 +1287,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 			routeName := pkt.Route
 			clientID := pkt.Client
 
-			rcVal, ok := routeCache.Load(routeName)
-			var rc routeConfig
+			rc, ok := routeCache[routeName]
 			if !ok {
 				a.mu.RLock()
 				rt, ok := a.cfg.Routes[routeName]
@@ -1302,9 +1301,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 					crypto:      rtCrypto,
 					localAddr:   rt.EffectiveLocalAddr(),
 				}
-				routeCache.Store(routeName, rc)
-			} else {
-				rc = rcVal.(routeConfig)
+				routeCache[routeName] = rc
 			}
 
 			payload := pkt.Payload
@@ -1369,8 +1366,17 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 						respPkt.Type = protocol.TypeData
 						respPkt.Route = key.route
 						respPkt.Client = key.client
+						// Refresh the read deadline at most once per window instead
+						// of on every packet, to avoid a syscall per inbound datagram.
+						const udpReadTimeout = 2 * time.Minute
+						const udpReadRefresh = udpReadTimeout / 16
+						deadlineSet := time.Now()
+						c.SetReadDeadline(deadlineSet.Add(udpReadTimeout))
 						for {
-							c.SetReadDeadline(time.Now().Add(2 * time.Minute))
+							if now := time.Now(); now.Sub(deadlineSet) >= udpReadRefresh {
+								c.SetReadDeadline(now.Add(udpReadTimeout))
+								deadlineSet = now
+							}
 							rn, err := c.Read(respBuf)
 							if err != nil {
 								if ctx.Err() != nil {

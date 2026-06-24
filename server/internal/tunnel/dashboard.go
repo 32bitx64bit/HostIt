@@ -45,7 +45,6 @@ type DashboardSnapshot struct {
 	BytesTotal     int64                     `json:"bytesTotal"`
 	Series         []DashboardPoint          `json:"series"`
 	Routes         map[string]DashboardRoute `json:"routes"`
-	UDP            *UDPStats                 `json:"udp,omitempty"`
 	Runtime        *DashboardRuntime         `json:"runtime,omitempty"`
 }
 
@@ -72,31 +71,6 @@ type DashboardRuntime struct {
 	LastAgentDisconnectUnix int64 `json:"lastAgentDisconnectUnix"`
 }
 
-type UDPStats struct {
-	PacketsIn            int64   `json:"packetsIn"`
-	PacketsOut           int64   `json:"packetsOut"`
-	BytesIn              int64   `json:"bytesIn"`
-	BytesOut             int64   `json:"bytesOut"`
-	ActiveRoutes         int     `json:"activeRoutes"`
-	LossPercent          float64 `json:"lossPercent"`
-	TotalDrops           int64   `json:"totalDrops"`
-	PublicQueueDrops     int64   `json:"publicQueueDrops"`
-	AgentQueueDrops      int64   `json:"agentQueueDrops"`
-	PublicWorkerDrops    int64   `json:"publicWorkerDrops"`
-	AgentWorkerDrops     int64   `json:"agentWorkerDrops"`
-	ResolveDrops         int64   `json:"resolveDrops"`
-	DecodeDrops          int64   `json:"decodeDrops"`
-	NoAgentDrops         int64   `json:"noAgentDrops"`
-	RouteDisabledDrops   int64   `json:"routeDisabledDrops"`
-	PayloadTooLargeDrops int64   `json:"payloadTooLargeDrops"`
-	PublicWriteErrors    int64   `json:"publicWriteErrors"`
-	AgentWriteErrors     int64   `json:"agentWriteErrors"`
-	PublicQueueDepth     int64   `json:"publicQueueDepth"`
-	PublicQueueCapacity  int64   `json:"publicQueueCapacity"`
-	AgentQueueDepth      int64   `json:"agentQueueDepth"`
-	AgentQueueCapacity   int64   `json:"agentQueueCapacity"`
-}
-
 type bucket struct {
 	startUnix int64
 	bytes     int64
@@ -119,16 +93,6 @@ type dashState struct {
 	mu      sync.Mutex
 	buckets []bucket
 	routes  map[string]*routeDash
-
-	eventBatcher *dashEventBatcher
-}
-
-type dashEventBatcher struct {
-	mu     sync.Mutex
-	events map[string][]DashboardEvent
-	ticker *time.Ticker
-	done   chan struct{}
-	dash   *dashState
 }
 
 func dashBucketCount(dur time.Duration) int {
@@ -153,59 +117,7 @@ func newDashStateWithInterval(dur time.Duration) *dashState {
 		buckets:     make([]bucket, count),
 		routes:      map[string]*routeDash{},
 	}
-	d.eventBatcher = &dashEventBatcher{
-		events: make(map[string][]DashboardEvent),
-		ticker: time.NewTicker(50 * time.Millisecond),
-		done:   make(chan struct{}),
-		dash:   d,
-	}
-	go d.eventBatcher.start()
 	return d
-}
-
-func (b *dashEventBatcher) start() {
-	for {
-		select {
-		case <-b.done:
-			b.ticker.Stop()
-			return
-		case <-b.ticker.C:
-			b.flush()
-		}
-	}
-}
-
-func (b *dashEventBatcher) add(route string, ev DashboardEvent) {
-	b.mu.Lock()
-	b.events[route] = append(b.events[route], ev)
-	b.mu.Unlock()
-}
-
-func (b *dashEventBatcher) flush() {
-	b.mu.Lock()
-	if len(b.events) == 0 {
-		b.mu.Unlock()
-		return
-	}
-	snapshot := b.events
-	b.events = make(map[string][]DashboardEvent)
-	b.mu.Unlock()
-
-	var wg sync.WaitGroup
-	for route, events := range snapshot {
-		wg.Add(1)
-		go func(r string, evs []DashboardEvent) {
-			defer wg.Done()
-			rd := b.dash.route(r)
-			rd.mu.Lock()
-			rd.events = append(rd.events, evs...)
-			if len(rd.events) > maxRouteEvents {
-				rd.events = rd.events[len(rd.events)-maxRouteEvents:]
-			}
-			rd.mu.Unlock()
-		}(route, events)
-	}
-	wg.Wait()
 }
 
 func (d *dashState) route(name string) *routeDash {
@@ -265,17 +177,13 @@ func (d *dashState) addConn(at time.Time) {
 
 func (d *dashState) addEvent(routeName string, ev DashboardEvent) {
 	ev.Route = strings.TrimSpace(routeName)
-	if d.eventBatcher != nil {
-		d.eventBatcher.add(routeName, ev)
-	} else {
-		rd := d.route(routeName)
-		rd.mu.Lock()
-		rd.events = append(rd.events, ev)
-		if len(rd.events) > maxRouteEvents {
-			rd.events = append([]DashboardEvent(nil), rd.events[len(rd.events)-maxRouteEvents:]...)
-		}
-		rd.mu.Unlock()
+	rd := d.route(routeName)
+	rd.mu.Lock()
+	rd.events = append(rd.events, ev)
+	if len(rd.events) > maxRouteEvents {
+		rd.events = append([]DashboardEvent(nil), rd.events[len(rd.events)-maxRouteEvents:]...)
 	}
+	rd.mu.Unlock()
 }
 
 func (d *dashState) incActive(routeName string) {

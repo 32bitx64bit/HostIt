@@ -37,7 +37,8 @@ func (t *managedProxyTransport) RoundTrip(req *http.Request) (*http.Response, er
 	}
 
 	if requiresFreshTunnelConn(req) {
-		t.base.CloseIdleConnections()
+		// clone.Close = true prevents this request's connection from being
+		// reused; the rest of the pool stays available for other requests.
 		clone := req.Clone(req.Context())
 		clone.Close = true
 		req = clone
