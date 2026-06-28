@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{.CSRF}}">
+<title>HostIt // Server — Configuration</title>
+<script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<link rel="stylesheet" href="/static/theme.css">
+<style>
+.route-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px;}
+.route-card+.route-card{margin-top:12px;}
+.route-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;}
+.route-card-head b{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg4);}
+.btn-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px;}
+.note-box{font-size:12px;color:var(--fg4);padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg1);margin-bottom:14px;}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="logo">HostIt <span class="sub">server</span></div>
+  <nav class="nav">
+    <a class="tab" href="/">Dashboard</a>
+    <a class="tab active" href="/config">Config</a>
+    <a class="tab" href="/email">Email</a>
+    <a class="tab" href="/controls">Controls</a>
+    <a class="tab" href="/apps">Apps</a>
+    <a class="tab" href="/network-test">Network Test</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="online-dot"></span><span class="online-label">ONLINE</span>
+    <button class="theme-btn" id="themeBtn" aria-label="Toggle theme">dark</button>
+    <span class="ver">{{.Version}}</span>
+    <button class="theme-btn" id="logoutBtn">logout</button>
+  </div>
+</div>
+<main id="app"></main>
+<div class="statusbar">
+  <div class="sb-seg sb-l1">hostit</div>
+  <div class="sb-seg sb-l2"><span class="win-act">config</span></div>
+  <div class="sb-right">
+    <div class="sb-seg sb-r1" id="sbAgent">hostit-server</div>
+    <div class="sb-seg sb-r2">routes <span id="sbRoutes">0</span></div>
+    <div class="sb-seg sb-r3" id="sbClock">--:--:--</div>
+  </div>
+</div>
+<script src="/static/components.js"></script>
+<script src="/static/app.js"></script>
+<script>
+var CSRF = document.querySelector('meta[name="csrf-token"]').content;
+var reloadTimer;
+function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
+async function fetchJSON(url){
+  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},5000);
+  try{
+    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
+    clearTimeout(t);
+    if(res.redirected||!res.headers.get('content-type')||res.headers.get('content-type').indexOf('application/json')===-1){scheduleReload();return null;}
+    return await res.json();
+  }catch(e){clearTimeout(t);scheduleReload();return null;}
+}
+async function apiPost(url,data){
+  var body=new URLSearchParams();body.set('csrf',CSRF);
+  if(data)for(var k in data)body.set(k,data[k]);
+  var res=await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
+  return res;
+}
+function val(id){var el=$('#'+id);return el?el.value:'';}
+function chk(id){var el=$('#'+id);return el?el.checked:false;}
+
+var CFG = {
+  control: "{{.Cfg.ControlAddr}}",
+  data: "{{.Cfg.DataAddr}}",
+  pairTimeout: "{{.Cfg.PairTimeout}}",
+  token: "{{.Cfg.Token}}",
+  disableTLS: {{if .Cfg.DisableTLS}}true{{else}}false{{end}},
+  tlsCertFile: "{{.Cfg.TLSCertFile}}",
+  webHTTPS: {{if .Cfg.WebHTTPS}}true{{else}}false{{end}},
+  webTLSFP: "{{.WebTLSFP}}",
+  encryptionAlgorithm: "{{.Cfg.EncryptionAlgorithm}}",
+  domainManagerEnabled: {{if .Cfg.DomainManagerEnabled}}true{{else}}false{{end}},
+  domainBase: "{{.Cfg.DomainBase}}",
+  domainAutoTLS: {{if .Cfg.DomainAutoTLS}}true{{else}}false{{end}},
+  domainHTTPAddr: "{{.Cfg.DomainHTTPAddr}}",
+  domainHTTPSAddr: "{{.Cfg.DomainHTTPSAddr}}",
+  domainACMEEmail: "{{.Cfg.DomainACMEEmail}}"
+};
+var AGENTS = [{{range .Agents}}"{{.}}",{{end}}];
+var ROUTES = [
+{{range .Routes}}{name:"{{.Name}}",proto:"{{.Proto}}",pub:"{{.PublicAddr}}",local:"{{.LocalAddr}}",domain:"{{.Domain}}",agent:"{{.Agent}}",encrypted:{{if .IsEncrypted}}true{{else}}false{{end}},domainEnabled:{{if .IsDomainEnabled}}true{{else}}false{{end}}},{{end}}
+];
+
+function agentOptions(selected){
+  var opts=[],seen={};
+  AGENTS.forEach(function(a){if(a&&!seen[a]){seen[a]=true;opts.push({value:a,label:a,selected:a===selected});}});
+  if(selected&&!seen[selected]){opts.unshift({value:selected,label:selected,selected:true});}
+  if(!opts.length){opts.push({value:'default',label:'default',selected:true});}
+  return opts;
+}
+
+function renderRouteCard(i,r){
+  r=r||{};
+  var proto=r.proto||'tcp';
+  var agent=r.agent||'default';
+  return '<div class="route-card" data-idx="'+i+'">'+
+    '<div class="route-card-head"><b>Route #'+i+'</b>'+Ember.button({id:'rmRoute_'+i,text:'Remove',variant:'danger',cls:'sm'})+'</div>'+
+    '<div class="grid cols-2">'+
+    Ember.field({label:'Name (optional)',content:Ember.input({id:'rn_'+i,value:r.name,placeholder:'route-'+i})})+
+    Ember.field({label:'Owning agent',hint:'Only this agent serves this route. Pick default for a single agent.',content:Ember.select({id:'ra_'+i,options:agentOptions(agent)})})+
+    Ember.field({label:'Protocol',content:Ember.select({id:'rp_'+i,options:[
+      {value:'tcp',label:'tcp',selected:proto==='tcp'},
+      {value:'udp',label:'udp',selected:proto==='udp'},
+      {value:'both',label:'both',selected:proto==='both'}
+    ]})})+
+    Ember.field({label:'Port (e.g. :25565)',content:Ember.input({id:'rpub_'+i,value:r.pub,placeholder:':25565'})})+
+    Ember.field({label:'Local target (optional)',hint:'Defaults to 127.0.0.1 plus the public port.',content:Ember.input({id:'rloc_'+i,value:r.local,placeholder:'127.0.0.1:3000'})})+
+    Ember.field({label:'Managed Domain',hint:'No port. Use the route local target for the backend service.',content:Ember.input({id:'rdom_'+i,value:r.domain,placeholder:'app.example.com'})})+
+    Ember.field({label:'Encryption',content:Ember.toggle({id:'renc_'+i,labelId:'rencl_'+i,label:r.encrypted?'on':'off',checked:!!r.encrypted})})+
+    Ember.field({label:'Domain Routing',content:Ember.toggle({id:'rde_'+i,labelId:'rdel_'+i,label:r.domainEnabled?'on':'off',checked:!!r.domainEnabled})})+
+    '</div></div>';
+}
+
+function renderRoutes(){
+  var el=$('#routeList');if(!el)return;
+  if(!ROUTES.length){el.innerHTML='<div class="muted">No routes configured. Add one below.</div>';}
+  else{el.innerHTML=ROUTES.map(function(r,i){return renderRouteCard(i,r);}).join('');}
+  styleSelects(el);
+  ROUTES.forEach(function(r,i){
+    if($('#renc_'+i))bindToggleLabel('renc_'+i,'rencl_'+i,'on','off');
+    if($('#rde_'+i))bindToggleLabel('rde_'+i,'rdel_'+i,'on','off');
+    var rm=$('#rmRoute_'+i);if(rm)rm.addEventListener('click',function(){ROUTES.splice(i,1);renderRoutes();updateRouteCount();});
+  });
+  updateRouteCount();
+}
+
+function updateRouteCount(){
+  var n=ROUTES.length;
+  var sb=$('#sbRoutes');if(sb)sb.textContent=String(n);
+  var c=$('#cfgRouteCount');if(c)c.textContent=String(n);
+}
+
+function collectRoutes(){
+  var out=[];
+  ROUTES.forEach(function(r,i){
+    out.push({
+      name:val('rn_'+i),
+      agent:val('ra_'+i),
+      proto:val('rp_'+i),
+      pub:val('rpub_'+i),
+      local:val('rloc_'+i),
+      domain:val('rdom_'+i),
+      encrypted:chk('renc_'+i),
+      domainEnabled:chk('rde_'+i)
+    });
+  });
+  return out;
+}
+
+function collectConfig(){
+  var d={};
+  d.control=val('cfgControl');
+  d.data=val('cfgData');
+  d.pair_timeout=val('cfgPairTimeout');
+  d.token=CFG.token;
+  d.encryption_algorithm=val('cfgEnc');
+  d.web_https=chk('cfgWebHttps')?'1':'';
+  d.domain_manager_enabled=chk('cfgDomainEnabled')?'1':'';
+  d.domain_base=val('cfgDomainBase');
+  d.domain_auto_tls=chk('cfgDomainAutoTLS')?'1':'';
+  d.domain_http_addr=val('cfgDomainHTTP');
+  d.domain_https_addr=val('cfgDomainHTTPS');
+  d.domain_acme_email=val('cfgACMEEmail');
+  var routes=collectRoutes();
+  d.route_count=String(routes.length);
+  routes.forEach(function(r,i){
+    d['route_'+i+'_name']=r.name;
+    d['route_'+i+'_agent']=r.agent;
+    d['route_'+i+'_proto']=r.proto;
+    d['route_'+i+'_public']=r.pub;
+    d['route_'+i+'_local']=r.local;
+    d['route_'+i+'_domain']=r.domain;
+    d['route_'+i+'_encrypted']=r.encrypted?'1':'';
+    d['route_'+i+'_domain_enabled']=r.domainEnabled?'1':'';
+  });
+  return d;
+}
+
+async function saveConfig(extra){
+  var d=collectConfig();
+  if(extra)for(var k in extra)d[k]=extra[k];
+  setStatus('cfgStatus','saving + restarting...','ok');
+  try{
+    var res=await apiPost('/config/save',d);
+    if(res.ok){setStatus('cfgStatus','saved + restarted','ok');scheduleReload();}
+    else{var t=await res.text();setStatus('cfgStatus','error: '+t.slice(0,160),'err');}
+  }catch(e){setStatus('cfgStatus','error: '+e.message,'err');}
+}
+
+async function genToken(){
+  setStatus('cfgStatus','generating new token...','ok');
+  try{
+    var res=await apiPost('/gen-token',{});
+    if(res.ok){setStatus('cfgStatus','token generated + restarting','ok');scheduleReload();}
+    else{setStatus('cfgStatus','token generation failed','err');}
+  }catch(e){setStatus('cfgStatus','error: '+e.message,'err');}
+}
+
+function buildConfig(){
+  var encVal=CFG.encryptionAlgorithm||'none';
+  var h=Ember.sectionHead({title:'Configuration',crumb:'/ config'});
+  var status=Ember.statusline({id:'cfgStatus',text:'ready'});
+  var note='<div class="note-box">Every Save + restart submits the full server configuration (listeners, security, domain manager and all routes) so nothing is lost when a single panel is saved.</div>';
+
+  var listeners=Ember.panel({title:'Listeners',cls:'mt12',body:
+    Ember.field({label:'Control listen',hint:'Agent connects here for commands (e.g. :7000).',content:Ember.input({id:'cfgControl',value:CFG.control,placeholder:':7000'})})+
+    Ember.field({label:'Data listen',hint:'TCP pairing and UDP relay (same port).',content:Ember.input({id:'cfgData',value:CFG.data,placeholder:':7001'})})+
+    Ember.field({label:'Pair timeout',hint:'Max wait for agent to attach (e.g. 10s).',content:Ember.input({id:'cfgPairTimeout',value:CFG.pairTimeout,placeholder:'10s'})})+
+    '<div class="btn-row">'+Ember.button({id:'saveListeners',text:'Save + restart',variant:'primary'})+'</div>'
+  });
+
+  var tlsSection = CFG.disableTLS ?
+    Ember.field({label:'Tunnel TLS',hint:'TLS for agent/server TCP is disabled.',content:'<span class="muted">disabled</span>'}) :
+    Ember.field({label:'Tunnel TLS cert',hint:'Self-signed cert used for agent/server TLS.',content:Ember.input({id:'cfgTLSCert',value:CFG.tlsCertFile,readonly:true})})+
+    Ember.button({id:'regenTLSBtn',text:'Regenerate TLS cert + restart',variant:'danger',cls:'sm'});
+
+  var security=Ember.panel({title:'Security',cls:'mt12',body:
+    Ember.field({label:'Control token',hint:'Shared secret for agent authentication. Regenerate to rotate.',content:Ember.input({id:'cfgToken',value:CFG.token,readonly:true,spellcheck:false})})+
+    Ember.field({label:'Actions',hint:'Generate a new random token and restart the server.',content:Ember.button({id:'genTokenBtn',text:'Generate token + restart',variant:'primary'})})+
+    tlsSection+
+    Ember.field({label:'Dashboard HTTPS',hint:'Self-signed HTTPS for this dashboard.',content:Ember.toggle({id:'cfgWebHttps',labelId:'cfgWebHttpsLbl',label:CFG.webHTTPS?'on':'off',checked:CFG.webHTTPS})})+
+    Ember.field({label:'Dashboard cert',hint:CFG.webTLSFP?('Cert sha256: '+CFG.webTLSFP):'No dashboard cert generated yet.',content:Ember.button({id:'regenWebBtn',text:'Regen dashboard cert',variant:'danger',cls:'sm'})})+
+    Ember.field({label:'Encryption algorithm',hint:'Global encryption standard for tunnel traffic.',content:Ember.select({id:'cfgEnc',options:[
+      {value:'none',label:'None',selected:encVal==='none'},
+      {value:'aes-128',label:'AES-128',selected:encVal==='aes-128'},
+      {value:'aes-256',label:'AES-256',selected:encVal==='aes-256'}
+    ]})})+
+    '<div class="btn-row">'+Ember.button({id:'saveSecurity',text:'Save + restart',variant:'primary'})+'</div>'
+  });
+
+  var domain=Ember.panel({title:'Domain Manager',cls:'mt12',body:
+    Ember.field({label:'Enable Domain Manager',hint:'Serve web traffic by hostname and forward it through the encrypted tunnel to the agent.',content:Ember.toggle({id:'cfgDomainEnabled',labelId:'cfgDomainEnabledLbl',label:CFG.domainManagerEnabled?'on':'off',checked:CFG.domainManagerEnabled})})+
+    Ember.field({label:'Base domain',hint:'Routes must use this apex domain or one of its subdomains, e.g. example.com.',content:Ember.input({id:'cfgDomainBase',value:CFG.domainBase,placeholder:'example.com'})})+
+    Ember.field({label:'Automatic TLS',hint:'Issue and renew public certificates automatically.',content:Ember.toggle({id:'cfgDomainAutoTLS',labelId:'cfgDomainAutoTLSLbl',label:CFG.domainAutoTLS?'on':'off',checked:CFG.domainAutoTLS})})+
+    Ember.field({label:'HTTP bind',hint:'Plain HTTP listener for redirects and ACME HTTP-01 challenges.',content:Ember.input({id:'cfgDomainHTTP',value:CFG.domainHTTPAddr,placeholder:':80'})})+
+    Ember.field({label:'HTTPS bind',hint:'TLS listener for managed domains.',content:Ember.input({id:'cfgDomainHTTPS',value:CFG.domainHTTPSAddr,placeholder:':443'})})+
+    Ember.field({label:'ACME email',hint:'Used for certificate registration and expiry notices.',content:Ember.input({id:'cfgACMEEmail',value:CFG.domainACMEEmail,placeholder:'admin@example.com'})})+
+    '<div class="btn-row">'+Ember.button({id:'saveDomain',text:'Save + restart',variant:'primary'})+'<a class="btn" href="/domain-manager-info" style="text-decoration:none;">Domain setup guide &rarr;</a></div>'
+  });
+
+  var routes=Ember.panel({title:'Routes Builder',cls:'mt12',head:'<span class="pspacer"></span><span class="muted">count <span id="cfgRouteCount">'+ROUTES.length+'</span></span>',body:
+    '<div id="routeList"></div>'+
+    '<div class="btn-row">'+Ember.button({id:'addRouteBtn',text:'+ Add route'})+Ember.button({id:'saveRoutes',text:'Save + restart',variant:'primary'})+'</div>'
+  });
+
+  $('#app').innerHTML=h+status+note+listeners+security+domain+routes;
+
+  styleSelects($('#app'));
+  bindToggleLabel('cfgWebHttps','cfgWebHttpsLbl','on','off');
+  bindToggleLabel('cfgDomainEnabled','cfgDomainEnabledLbl','on','off');
+  bindToggleLabel('cfgDomainAutoTLS','cfgDomainAutoTLSLbl','on','off');
+  renderRoutes();
+
+  $('#saveListeners').addEventListener('click',function(){saveConfig();});
+  $('#saveSecurity').addEventListener('click',function(){saveConfig();});
+  $('#saveDomain').addEventListener('click',function(){saveConfig();});
+  $('#saveRoutes').addEventListener('click',function(){saveConfig();});
+  $('#genTokenBtn').addEventListener('click',genToken);
+  if($('#regenTLSBtn'))$('#regenTLSBtn').addEventListener('click',function(){saveConfig({tls_regen:'1'});});
+  $('#regenWebBtn').addEventListener('click',function(){saveConfig({web_tls_regen:'1'});});
+  $('#addRouteBtn').addEventListener('click',function(){ROUTES.push({name:'',proto:'tcp',pub:'',local:'',domain:'',agent:AGENTS[0]||'default',encrypted:false,domainEnabled:false});renderRoutes();});
+}
+
+buildConfig();
+initTheme('themeBtn','hostit-ember-theme');
+initClock('sbClock');
+$('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+</script>
+</body>
+</html>

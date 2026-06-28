@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{.CSRFToken}}">
+<title>HostIt // Agent</title>
+<script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<link rel="stylesheet" href="/static/theme.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="logo">HostIt <span class="sub">agent</span></div>
+  <nav class="nav">
+    <a class="tab active" href="/">Home</a>
+    <a class="tab" href="/controls">Controls</a>
+    <a class="tab" href="/apps">Apps</a>
+    <a class="tab" href="/mail">Mail</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="online-dot"></span><span class="online-label" id="onLabel">ONLINE</span>
+    <button class="theme-btn" id="themeBtn" aria-label="Toggle theme">dark</button>
+    <span class="ver">{{.Version}}</span>
+  </div>
+</div>
+<main id="app"></main>
+<div class="statusbar">
+  <div class="sb-seg sb-l1">hostit</div>
+  <div class="sb-seg sb-l2"><span class="win-act">home</span></div>
+  <div class="sb-right">
+    <div class="sb-seg sb-r1" id="sbAgent">agent</div>
+    <div class="sb-seg sb-r2">routes <span id="sbRoutes">0</span></div>
+    <div class="sb-seg sb-r3" id="sbClock">--:--:--</div>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+<div class="update-popup" id="updatePopup" style="display:none;"></div>
+<script src="/static/components.js"></script>
+<script src="/static/app.js"></script>
+<script>
+var INIT = {
+  server: "{{.Cfg.Server}}",
+  tokenPlaceholder: "{{.TokenPlaceholder}}",
+  tlsPin: "{{.Cfg.TLSPinSHA256}}",
+  agentId: "{{.AgentID}}",
+  hasToken: {{if .HasToken}}true{{else}}false{{end}},
+  version: "{{.Version}}"
+};
+var CSRF = document.querySelector('meta[name="csrf-token"]').content;
+
+function apiData(payload){
+  if(payload && payload.status==='ok' && payload.data!==undefined) return payload.data;
+  if(payload && payload.status==='error') throw new Error(payload.message||'API error');
+  return payload;
+}
+async function readAPI(res){
+  return apiData(await res.json());
+}
+var reloadTimer;
+function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
+async function fetchJSON(url){
+  var ctrl=new AbortController();
+  var t=setTimeout(function(){ctrl.abort();},5000);
+  try{
+    var res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'},signal:ctrl.signal});
+    var ct=res.headers.get('content-type')||'';
+    if(res.redirected||ct.indexOf('application/json')<0){scheduleReload();throw new Error('dashboard response changed');}
+    if(!res.ok)throw new Error('http '+res.status);
+    return await readAPI(res);
+  }finally{clearTimeout(t);}
+}
+async function pollJSON(url){
+  var ctrl=new AbortController();
+  var t=setTimeout(function(){ctrl.abort();},8000);
+  try{
+    var res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'},signal:ctrl.signal});
+    clearTimeout(t);
+    if(!res.ok||res.redirected)return null;
+    var ct=res.headers.get('content-type')||'';if(ct.indexOf('application/json')<0)return null;
+    return await readAPI(res);
+  }catch(e){clearTimeout(t);return null;}
+}
+function apiPost(url,data){
+  var body=new URLSearchParams();
+  if(data)for(var k in data)body.set(k,data[k]);
+  return fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
+}
+
+function buildHome(){
+  var head=Ember.sectionHead({title:'Agent Overview',crumb:'/ home'});
+  var tiles=Ember.grid({cols:3,children:
+    Ember.tile({label:'Service',value:'\u2014',id:'tileService'})+
+    Ember.tile({label:'Connection',value:'\u2014',id:'tileConn'})+
+    Ember.tile({label:'Agent ID',value:INIT.agentId||'\u2014',cls:'mono',id:'tileAgent'})+
+    Ember.tile({label:'Token',value:'\u2014',id:'tileToken'})+
+    Ember.tile({label:'Server',value:INIT.server||'\u2014',cls:'mono',id:'tileServer'})+
+    Ember.tile({label:'Email',value:'\u2014',id:'tileEmail'})
+  });
+  var actions=Ember.panel({title:'Actions',cls:'mt12',body:
+    '<div class="row">'+
+      Ember.button({id:'btnStart',text:'Start',variant:'primary'})+
+      Ember.button({id:'btnStop',text:'Stop',variant:'danger'})+
+      Ember.button({id:'btnRestart',text:'Restart'})+
+    '</div>'+
+    Ember.statusline({id:'actStatus',text:'ready'})+
+    Ember.statusline({id:'syncLine',text:'last sync \u2014'})+
+    '<div class="statusline err" id="errLine" style="display:none;"><span class="gt">&gt;</span> <span id="errText"></span></div>'
+  });
+  var config=Ember.panel({emph:true,title:'Connection Config',cls:'mt12',body:
+    '<div class="row">'+
+      Ember.field({label:'Server',labelFor:'serverInput',hint:'Tunnel server host/IP (defaults to ports 7000/7001).',content:Ember.input({id:'serverInput',value:INIT.server,placeholder:'wss://tunnel.example.com:7000'})})+
+      Ember.field({label:'Token',hint:'Required. Must match the server token. Leave blank to keep the current token.',content:'<input class="input" type="text" id="tokenInput" name="token" value="" placeholder="'+esc(INIT.tokenPlaceholder)+'" autocomplete="off">'})+
+      Ember.field({label:'TLS Pin SHA256',labelFor:'tlsPinInput',hint:'Optional. Hex fingerprint of the server certificate to prevent MITM.',content:Ember.input({id:'tlsPinInput',value:INIT.tlsPin,placeholder:'e.g. a1b2c3d4...',spellcheck:false})})+
+    '</div>'+
+    Ember.button({id:'btnSave',text:'Save + Restart',variant:'primary'})
+  });
+  var routes=Ember.panel({title:'Routes',cls:'mt12',body:Ember.table({id:'routesTable',headers:[{label:'name'},{label:'proto'},{label:'public \u2192 local'}]})});
+  var email=Ember.panel({title:'Email',cls:'mt12',body:'<div id="emailBox"></div>'});
+  var dkim=Ember.panel({id:'dkimPanel',title:'DKIM DNS Record',cls:'mt12',body:
+    Ember.field({label:'DNS Name',content:'<code id="dkimName" class="mono">\u2014</code>'})+
+    Ember.field({label:'TXT Value',content:Ember.textarea({id:'dkimValue',rows:4,readonly:true})+Ember.button({id:'btnCopyDkim',text:'Copy',cls:'sm'})})
+  });
+  $('#app').innerHTML=head+tiles+actions+config+routes+email+dkim;
+}
+
+function setTile(id,text,state){
+  var v=$('#'+id);if(!v)return;
+  v.textContent=text;
+  if(state)v.className='v '+state;
+}
+function setLine(id,text){
+  var el=$('#'+id);if(!el)return;var s=el.querySelector('span:last-child');if(s)s.textContent=text;
+}
+function renderRoutes(routes){
+  var tb=$('#routesTable tbody');if(!tb)return;
+  if(!routes||!routes.length){tb.innerHTML='<tr><td colspan="3" class="muted">No routes configured.</td></tr>';return;}
+  tb.innerHTML=routes.map(function(r){
+    return '<tr><td class="acc">'+esc(r.name)+'</td>'+
+      '<td>'+Ember.tag({proto:r.proto})+'</td>'+
+      '<td class="mono">'+esc(r.publicAddr)+' \u2192 '+esc(r.localTarget)+'</td></tr>';
+  }).join('');
+}
+function renderEmail(em){
+  var box=$('#emailBox');if(!box)return;
+  if(!em||!em.enabled){box.innerHTML='<div class="muted">Email is not enabled on the server.</div>';return;}
+  var storage=(em.storageUsedText||'0B')+' / '+(em.storageUnlimited?'unlimited':(em.storageLimitText||'0B'));
+  box.innerHTML=Ember.kv({pairs:[
+    {k:'Mail Host',v:em.mailHost||'\u2014'},
+    {k:'TLS',v:em.tlsReady?(em.tlsCertSource||'ready'):'unavailable',state:em.tlsReady?'good':'bad'},
+    {k:'DKIM',v:em.dkimReady?(em.dkimSelector||'ready'):'unavailable',state:em.dkimReady?'good':'bad'},
+    {k:'SMTP',v:em.submissionAddr||'\u2014'},
+    {k:'SMTPS',v:em.submissionTlsAddr||'\u2014'},
+    {k:'IMAP',v:em.imapAddr||'\u2014'},
+    {k:'IMAPS',v:em.imapTlsAddr||'\u2014'},
+    {k:'Storage',v:storage},
+    {k:'Accounts',v:''+(em.accountCount||0)},
+    {k:'Messages',v:''+(em.messageCount||0)}
+  ]});
+}
+function renderDKIM(em){
+  var panel=$('#dkimPanel');if(!panel)return;
+  if(!em||!em.dkimReady){panel.style.display='none';return;}
+  panel.style.display='';
+  var nm=$('#dkimName');if(nm)nm.textContent=em.dkimDNSName||'';
+  var val=$('#dkimValue');if(val)val.value=em.dkimTXTValue||'';
+}
+
+async function poll(){
+  try{
+    var j=await fetchJSON('/api/status');
+    var on=$('#onLabel');
+    if(on)on.textContent='ONLINE';
+    setTile('tileService',j.running?'[RUNNING]':'[STOPPED]',j.running?'good':'bad');
+    setTile('tileConn',j.connected?'[CONNECTED]':'[DISCONNECTED]',j.connected?'good':'bad');
+    setTile('tileToken',j.tokenSet?'[SET]':'[MISSING]',j.tokenSet?'good':'bad');
+    var em=j.email||{};
+    setTile('tileEmail',em.running?'[RUNNING]':'[STOPPED]',em.running?'good':(em.enabled?'warn':'bad'));
+    setTile('tileAgent',j.agentId||'\u2014');
+    setTile('tileServer',j.server||'\u2014');
+    var sb=$('#sbAgent');if(sb)sb.textContent=j.agentId||'agent';
+    var sr=$('#sbRoutes');if(sr)sr.textContent=''+(j.routeCount!=null?j.routeCount:(j.routes?j.routes.length:0));
+    var err=$('#errLine'),et=$('#errText');
+    if(j.lastErr){if(err)err.style.display='';if(et)et.textContent=j.lastErr;}else{if(err)err.style.display='none';}
+    renderRoutes(j.routes);
+    renderEmail(em);
+    renderDKIM(em);
+    setLine('syncLine','last sync '+new Date().toLocaleTimeString());
+  }catch(e){
+    var on=$('#onLabel');if(on)on.textContent='Syncing';
+    setTile('tileService','[SYNCING]','warn');
+    setTile('tileConn','[SYNCING]','warn');
+  }
+}
+
+function postAction(url,label){
+  setStatus('actStatus',label+' requested','ok');
+  apiPost(url).then(function(res){
+    if(res.ok){setStatus('actStatus',label+' ok','ok');poll();}
+    else{setStatus('actStatus',label+' failed','err');}
+  }).catch(function(){setStatus('actStatus',label+' error','err');});
+}
+
+function bindUpdateButtons(){
+  var p=$('#updatePopup');
+  var c=$('#updateClose');if(c)c.addEventListener('click',function(){p.classList.remove('show');p.style.display='none';});
+  var l=$('#updateLater');if(l)l.addEventListener('click',function(){apiPost('/api/update/remind');p.classList.remove('show');p.style.display='none';});
+  var s=$('#updateSkip');if(s)s.addEventListener('click',function(){apiPost('/api/update/skip');p.classList.remove('show');p.style.display='none';});
+  var d=$('#updateDo');if(d)d.addEventListener('click',function(){apiPost('/api/update/apply');var pr=$('#updateProgress');if(pr){pr.textContent='> starting update...';pr.style.display='';}pollUpdateDone();});
+}
+function renderUpdate(st){
+  var p=$('#updatePopup');if(!p||!st)return;
+  var job=st.job||{};
+  var show=(!!st.updateAvailable&&!st.suppressed&&!!st.showPopup)||(job.state==='running');
+  if(!show){p.classList.remove('show');p.style.display='none';return;}
+  if(!p.dataset.built){p.innerHTML=Ember.updatePopup({current:INIT.version,available:st.availableVersion});p.dataset.built='1';bindUpdateButtons();}
+  p.style.display='';p.classList.add('show');
+  var prog=$('#updateProgress');
+  if(prog){
+    if(job.state!=='running'){prog.textContent='';prog.style.display='none';}
+    else{
+      var log=String(job.log||'');
+      var has=function(needle){return log.indexOf(needle)>=0;};
+      var steps=[
+        (has('Downloading:')&&has('Downloaded'))?'[x] Download':'[ ] Download',
+        (has('Extracted source:')&&has('Applying into:'))?'[x] Apply files':'[ ] Apply files',
+        has('Running build.sh')?'[x] Build':'[ ] Build',
+        (has('Build succeeded')||has('Build failed'))?'[x] Build finished':'[ ] Build finished',
+        job.restarting?'[x] Restart':'[ ] Restart'
+      ];
+      prog.textContent=steps.join('\n');prog.style.display='';
+    }
+  }
+  var doit=$('#updateDo');if(doit)doit.disabled=(job.state==='running');
+}
+async function pollUpdate(){
+  var s=await pollJSON('/api/update/status');
+  if(s)renderUpdate(s);
+}
+function pollUpdateDone(){
+  (function loop(){
+    pollJSON('/api/update/status').then(function(s){
+      if(!s){setTimeout(loop,1500);return;}
+      renderUpdate(s);
+      var st=s.job&&s.job.state;
+      if(st==='running'){setTimeout(loop,1000);return;}
+      if(st==='success'){setTimeout(function(){location.replace('/?r='+Date.now());},1500);return;}
+    }).catch(function(){setTimeout(loop,2000);});
+  })();
+}
+
+buildHome();
+initTheme('themeBtn','hostit-ember-theme');
+initClock('sbClock');
+$('#btnStart').addEventListener('click',function(){postAction('/start','start');});
+$('#btnStop').addEventListener('click',function(){postAction('/stop','stop');});
+$('#btnRestart').addEventListener('click',function(){postAction('/restart','restart');});
+$('#btnSave').addEventListener('click',function(){
+  var b=this;b.disabled=true;
+  var data={server:($('#serverInput').value||'').trim(),token:$('#tokenInput').value,tls_pin_sha256:($('#tlsPinInput').value||'').trim()};
+  apiPost('/save',data).then(function(res){
+    b.disabled=false;
+    if(res.ok){setStatus('actStatus','Saved + restarting','ok');scheduleReload();}
+    else{readAPI(res).then(function(){setStatus('actStatus','save failed','err');}).catch(function(e){setStatus('actStatus',e.message||'save failed','err');});}
+  }).catch(function(){b.disabled=false;setStatus('actStatus','save error','err');});
+});
+$('#btnCopyDkim').addEventListener('click',function(){
+  var f=$('#dkimValue');var txt=f?f.value:'';
+  try{if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(txt);}else if(f){f.select();f.setSelectionRange(0,f.value.length);document.execCommand('copy');}}catch(_){}
+  var b=this;b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);
+});
+poll();setInterval(poll,2000);
+pollUpdate();setInterval(pollUpdate,30000);
+</script>
+</body>
+</html>

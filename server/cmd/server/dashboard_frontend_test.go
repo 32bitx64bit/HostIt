@@ -3,110 +3,100 @@ package main
 import (
 	"bytes"
 	"html/template"
+	"io/fs"
 	"strings"
 	"testing"
 
 	"hostit/server/internal/tunnel"
 )
 
+func mustReadTemplate(t *testing.T, path string) string {
+	t.Helper()
+	data, err := fs.ReadFile(templateFS, path)
+	if err != nil {
+		t.Fatalf("cannot read template %s: %v", path, err)
+	}
+	return string(data)
+}
+
 func TestStatsPollerRecoversAfterDashboardRestart(t *testing.T) {
+	html := mustReadTemplate(t, "templates/stats.html")
 	for _, want := range []string{"function scheduleReload()", "async function fetchJSON(url)", "AbortController", "Accept':'application/json'", "Syncing"} {
-		if !strings.Contains(serverStatsHTML, want) {
+		if !strings.Contains(html, want) {
 			t.Fatalf("server stats template missing restart recovery fragment %q", want)
 		}
 	}
-	if !strings.Contains(serverStatsHTML, "ok==='warn'") {
-		t.Fatal("server stats template should support a warning pill state while status is resyncing")
+}
+
+func TestStatsAgentTileRecoversToSyncingOnFetchFailure(t *testing.T) {
+	html := mustReadTemplate(t, "templates/stats.html")
+	// poll() must wrap its body in try/catch so a transient fetch failure
+	// (e.g. during an agent or server restart) sets the Agent tile to
+	// [SYNCING]/warn instead of leaving a stale [DISCONNECTED] label.
+	if !strings.Contains(html, "sg.textContent='[SYNCING]'") {
+		t.Fatal("stats template should set the Agent tile to [SYNCING] in the poll catch block")
+	}
+	if !strings.Contains(html, "sg.className='v warn'") {
+		t.Fatal("stats template should set the Agent tile to warn state in the poll catch block")
+	}
+	// fetchJSON should use finally (not catch+scheduleReload+return null)
+	// so transient network errors throw to the poll() caller instead of
+	// triggering a disruptive full-page reload.
+	if !strings.Contains(html, "finally{clearTimeout(t);}") {
+		t.Fatal("stats fetchJSON should use finally to clear the timer and let errors propagate")
 	}
 }
 
-func TestDashboardTemplateRendersAgentOwnership(t *testing.T) {
-	// Static markers for the multi-agent status UI.
-	for _, want := range []string{`id="agentsList"`, "j.agents", "agents.map(function(a)", "Owning agent", "data-agent-domain", "data-agent-email", "j.domainManager", "j.emailEnabled"} {
-		if !strings.Contains(serverStatsHTML, want) {
-			t.Fatalf("server stats template missing multi-agent fragment %q", want)
+func TestDashboardTemplateRendersAndPollsStats(t *testing.T) {
+	html := mustReadTemplate(t, "templates/stats.html")
+	for _, want := range []string{"/api/stats", "renderAgents", "renderRoutes", "renderBand", "renderConn"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("server stats template missing UI function %q", want)
 		}
 	}
-
-	// The "/" handler ignores Execute errors, so render here to catch faults.
-	tpl := template.Must(template.New("stats").Parse(serverStatsHTML))
+	tpl := template.Must(template.ParseFS(templateFS, "templates/stats.html"))
 	data := map[string]any{
-		"Cfg":        tunnel.ServerConfig{},
-		"Status":     tunnel.ServerStatus{AgentConnected: true},
-		"ConfigPath": "server.json",
-		"Msg":        "",
-		"Err":        nil,
-		"CSRF":       "test-csrf",
-		"Routes": []tunnel.RouteConfig{
-			{Name: "mc", Proto: "tcp", PublicAddr: ":25565", Agent: "laptop-mc"},
-		},
-		"RouteCount": 1,
-		"WebHTTPS":   false,
+		"CSRF":    "test-csrf",
+		"Version": "test",
 	}
 	var buf bytes.Buffer
 	if err := tpl.Execute(&buf, data); err != nil {
 		t.Fatalf("dashboard template execute failed: %v", err)
 	}
-	if !strings.Contains(buf.String(), "laptop-mc") {
-		t.Fatal("rendered dashboard did not include the route's owning agent")
+	if !strings.Contains(buf.String(), "/api/stats") {
+		t.Fatal("rendered dashboard did not reference /api/stats")
 	}
 }
 
-// The config page builds a local routeView; if the template references a route
-// field that view lacks, Execute errors mid-range and no route cards render.
-func TestConfigTemplateRendersRouteCards(t *testing.T) {
-	tpl := template.Must(template.New("config").Parse(serverConfigHTML))
-	type routeView struct {
-		Name, Proto, PublicAddr, LocalAddr, Domain, Agent string
-		IsEncrypted, IsDomainEnabled                      bool
+func TestConfigTemplateRenders(t *testing.T) {
+	html := mustReadTemplate(t, "templates/config.html")
+	for _, want := range []string{"/config/save", "route_count"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("config template missing %q", want)
+		}
 	}
+	tpl := template.Must(template.ParseFS(templateFS, "templates/config.html"))
 	data := map[string]any{
-		"Cfg":               tunnel.ServerConfig{},
-		"Status":            tunnel.ServerStatus{},
-		"ConfigPath":        "server.json",
-		"Msg":               "",
-		"Err":               nil,
 		"CSRF":              "test-csrf",
 		"Version":           "test",
 		"DomainRenewBefore": "720h",
-		"Routes":            []routeView{{Name: "mc", Proto: "tcp", PublicAddr: ":25565", Agent: "laptop-mc"}},
-		"RouteCount":        1,
-		"Agents":            []string{"default", "laptop-mc", "main-pc"},
-		"WebHTTPS":          false,
-		"WebTLSCert":        "",
-		"WebTLSKey":         "",
-		"WebTLSFP":          "",
+		"Cfg":               tunnel.ServerConfig{},
+		"Status":            tunnel.ServerStatus{},
 	}
 	var buf bytes.Buffer
 	if err := tpl.Execute(&buf, data); err != nil {
 		t.Fatalf("config template execute failed: %v", err)
 	}
-	out := buf.String()
-	if !strings.Contains(out, `name="route_0_name"`) || !strings.Contains(out, "mc") {
-		t.Fatal("config template did not render the route card")
-	}
-	// Owning agent must be a dropdown with the route's current owner selected.
-	if !strings.Contains(out, `<select name="route_0_agent">`) {
-		t.Fatal("config template did not render the owning-agent dropdown")
-	}
-	if !strings.Contains(out, `value="laptop-mc" selected`) {
-		t.Fatal("config template did not pre-select the route's current owner")
-	}
-	if !strings.Contains(out, `<option value="main-pc"`) {
-		t.Fatal("config template did not list other registered agents as options")
-	}
 }
 
-// The agents list builds innerHTML via esc(); if the helper isn't defined in
-// this template, poll() throws once an agent connects and the UI freezes on
-// "Syncing" / "No agents known yet".
 func TestStatsTemplateDefinesHelpersItCalls(t *testing.T) {
-	for _, fn := range []string{"esc", "fmtNum", "setPill"} {
-		if !strings.Contains(serverStatsHTML, fn+"(") {
+	html := mustReadTemplate(t, "templates/stats.html")
+	for _, fn := range []string{"fmtNum", "fmtBytes", "fmtMiB"} {
+		if !strings.Contains(html, fn+"(") {
 			continue
 		}
-		if !strings.Contains(serverStatsHTML, "function "+fn+"(") {
-			t.Errorf("serverStatsHTML calls %s() but never defines it", fn)
+		if !strings.Contains(html, "function "+fn+"(") {
+			t.Errorf("stats template calls %s() but never defines it", fn)
 		}
 	}
 }

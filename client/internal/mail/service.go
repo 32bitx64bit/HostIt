@@ -278,12 +278,12 @@ func (s *Service) ListAccounts() ([]WebAccount, error) {
 	return out, rows.Err()
 }
 
-func (s *Service) Authenticate(username, password string) (string, error) {
+func (s *Service) Authenticate(username, password string) (string, string, error) {
 	rec, err := s.authenticate(username, password)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return rec.Address, nil
+	return rec.Username, rec.Address, nil
 }
 
 func (s *Service) ListInbox(username string) ([]WebMessage, error) {
@@ -600,6 +600,19 @@ func (s *Service) reconcileAccountsLocked(cfg emailcfg.Config) error {
 		address := cfg.AddressFor(acct.Username)
 		if address == "" {
 			continue
+		}
+		// Merge any case-variant of this username (e.g. an "Alice" row left
+		// over from an older, non-normalized database) into the canonical
+		// lowercase username. Without this, the case-sensitive primary key
+		// would keep the old row alongside the new one, orphaning its messages
+		// so they count toward MessageCount but never appear in any inbox.
+		if _, err := tx.Exec(`UPDATE messages SET username = ? WHERE LOWER(username) = ? AND username <> ?`,
+			acct.Username, strings.ToLower(acct.Username), acct.Username); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM accounts WHERE LOWER(username) = ? AND username <> ?`,
+			strings.ToLower(acct.Username), acct.Username); err != nil {
+			return err
 		}
 		_, err = tx.Exec(`INSERT INTO accounts(username, address, password_hash, enabled, created_at, updated_at)
 			VALUES(?, ?, ?, ?, ?, ?)

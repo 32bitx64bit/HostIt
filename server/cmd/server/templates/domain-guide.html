@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{.CSRF}}">
+<title>HostIt // Server — Domain Guide</title>
+<script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<link rel="stylesheet" href="/static/theme.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="logo">HostIt <span class="sub">server</span></div>
+  <nav class="nav">
+    <a class="tab" href="/">Dashboard</a>
+    <a class="tab active" href="/config">Config</a>
+    <a class="tab" href="/email">Email</a>
+    <a class="tab" href="/controls">Controls</a>
+    <a class="tab" href="/apps">Apps</a>
+    <a class="tab" href="/network-test">Network Test</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="online-dot"></span><span class="online-label" id="onLabel">ONLINE</span>
+    <button class="theme-btn" id="themeBtn" aria-label="Toggle theme">dark</button>
+    <span class="ver">{{.Version}}</span>
+    <button class="theme-btn" id="logoutBtn">logout</button>
+  </div>
+</div>
+<main id="app" style="padding:16px 14px 26px;max-width:1320px;margin:0 auto;"></main>
+<div class="statusbar">
+  <div class="sb-seg sb-l1">hostit</div>
+  <div class="sb-seg sb-l2"><span class="win-act">domain</span></div>
+  <div class="sb-right">
+    <div class="sb-seg sb-r1" id="sbAgent">hostit-server</div>
+    <div class="sb-seg sb-r2">routes <span id="sbRoutes">0</span></div>
+    <div class="sb-seg sb-r3" id="sbClock">--:--:--</div>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+<script src="/static/components.js"></script>
+<script src="/static/app.js"></script>
+<script>
+var CSRF=document.querySelector('meta[name="csrf-token"]').content;
+var reloadTimer;
+function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
+async function fetchJSON(url){
+  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},8000);
+  try{
+    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
+    clearTimeout(t);
+    if(res.redirected||!res.headers.get('content-type')||res.headers.get('content-type').indexOf('application/json')===-1){scheduleReload();return null;}
+    return await res.json();
+  }catch(e){clearTimeout(t);scheduleReload();return null;}
+}
+async function apiPost(url,data){
+  var body=new URLSearchParams();body.set('csrf',CSRF);
+  if(data)for(var k in data)body.set(k,data[k]);
+  return await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
+}
+
+var INIT={domainBase:"{{.Cfg.DomainBase}}",httpAddr:"{{.Cfg.DomainHTTPAddr}}",httpsAddr:"{{.Cfg.DomainHTTPSAddr}}",certDir:"{{.Cfg.DomainCertDir}}",renewBefore:"{{.Cfg.DomainRenewBefore}}",acmeEmail:"{{.Cfg.DomainACMEEmail}}",publicAddr:"{{.Cfg.PublicAddr}}",autoTLS:{{.Cfg.DomainAutoTLS}},managerEnabled:{{.Cfg.DomainManagerEnabled}}};
+
+function lines(arr){return arr.map(function(x){return '<div class="ln"><span class="gt">&gt;</span> '+esc(x)+'</div>';}).join('');}
+
+function buildGuide(){
+  var base=INIT.domainBase||'<base>';
+  var pub=INIT.publicAddr||'<server-ip>';
+  var http=INIT.httpAddr||':80';
+  var https=INIT.httpsAddr||':443';
+  var cert=INIT.certDir||'<cert-dir>';
+  var renew=INIT.renewBefore||'<renew-before>';
+  var h=Ember.sectionHead({title:'Domain Guide',crumb:'/domain'});
+  var note=Ember.statusline({id:'guideNote',text:INIT.managerEnabled?('domain manager: enabled'):'domain manager is disabled — enable it in Config to activate managed routing'});
+  var how=Ember.panel({title:'How Domain Routing Works',cls:'mt12',body:'<div class="console">'+lines([
+    'Managed domain routing serves agent routes on public hostnames under your base domain.',
+    'Each route may bind a hostname like <name>.'+base+' that terminates TLS at the server and forwards to the agent.',
+    'When Auto TLS is on, the server issues and renews public certificates automatically via ACME (Let\'s Encrypt).',
+    'DNS records must point the relevant hostnames at this server so traffic reaches it.'
+  ])+'</div>'});
+  var cfg=Ember.panel({title:'Your Configuration',cls:'mt12',body:Ember.kv({pairs:[
+    {k:'manager',v:INIT.managerEnabled?'enabled':'disabled',state:INIT.managerEnabled?'good':'neutral'},
+    {k:'base domain',v:INIT.domainBase||'—'},
+    {k:'public addr',v:INIT.publicAddr||'—'},
+    {k:'http addr',v:INIT.httpAddr||'—'},
+    {k:'https addr',v:INIT.httpsAddr||'—'},
+    {k:'auto tls',v:INIT.autoTLS?'on':'off',state:INIT.autoTLS?'good':'neutral'},
+    {k:'acme email',v:INIT.acmeEmail||'—'},
+    {k:'cert dir',v:INIT.certDir||'—'},
+    {k:'renew before',v:INIT.renewBefore||'—'}
+  ]})});
+  var dns=Ember.panel({title:'DNS Setup',cls:'mt12',body:'<div class="console">'+lines([
+    '1. A record:  '+base+'  ->  '+pub+'   (point the base domain at this server)',
+    '2. A record:  *.'+base+'  ->  '+pub+'   (wildcard for subdomain routes)',
+    '   or CNAME:  *.'+base+'  ->  '+base+'   (alias the wildcard to the base domain)',
+    '3. Ensure port 80 ('+http+') is reachable for ACME HTTP-01 challenges.',
+    '4. HTTPS is served on '+https+' (typically port 443).',
+    '5. Certificates are stored in '+cert+' and renewed '+renew+' before expiry.'
+  ])+'</div>'});
+  $('#app').innerHTML=h+note+how+cfg+dns;
+  $('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+}
+
+buildGuide();
+initTheme('themeBtn','hostit-ember-theme');
+initClock('sbClock');
+</script>
+</body>
+</html>

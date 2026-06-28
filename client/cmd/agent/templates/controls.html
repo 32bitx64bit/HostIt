@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{.CSRFToken}}">
+<title>HostIt // Agent — Controls</title>
+<script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<link rel="stylesheet" href="/static/theme.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="logo">HostIt <span class="sub">agent</span></div>
+  <nav class="nav">
+    <a class="tab" href="/">Home</a>
+    <a class="tab active" href="/controls">Controls</a>
+    <a class="tab" href="/apps">Apps</a>
+    <a class="tab" href="/mail">Mail</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="online-dot"></span><span class="online-label" id="onLabel">ONLINE</span>
+    <button class="theme-btn" id="themeBtn" aria-label="Toggle theme">dark</button>
+    <span class="ver">{{.Version}}</span>
+  </div>
+</div>
+<main id="app"><div class="panel"><div class="panel-body"><div class="statusline"><span class="gt">&gt;</span> <span>loading...</span></div></div></div></main>
+<div class="statusbar">
+  <div class="sb-seg sb-l1">hostit</div>
+  <div class="sb-seg sb-l2"><span class="win-act">controls</span></div>
+  <div class="sb-right">
+    <div class="sb-seg sb-r1" id="sbAgent">agent</div>
+    <div class="sb-seg sb-r2">routes <span id="sbRoutes">0</span></div>
+    <div class="sb-seg sb-r3" id="sbClock">--:--:--</div>
+  </div>
+</div>
+<script src="/static/components.js"></script>
+<script src="/static/app.js"></script>
+<script>
+var CSRF = document.querySelector('meta[name="csrf-token"]').content;
+function apiData(payload) {
+  if (payload && payload.status === 'ok' && payload.data !== undefined) return payload.data;
+  if (payload && payload.status === 'error') throw new Error(payload.message || 'API error');
+  return payload;
+}
+async function readAPI(res) { return apiData(await res.json()); }
+var reloadScheduled = false;
+function scheduleReload() { if (reloadScheduled) return; reloadScheduled = true; setTimeout(function () { location.reload(); }, 1500); }
+async function fetchJSON(url) {
+  var ctl = new AbortController(); var timer = setTimeout(function () { ctl.abort(); }, 5000);
+  try {
+    var res = await fetch(url, { cache: 'no-store', headers: {'Accept':'application/json'}, signal: ctl.signal });
+    var ct = res.headers.get('content-type') || '';
+    if (res.redirected || ct.indexOf('application/json') < 0) { scheduleReload(); throw new Error('dashboard response changed'); }
+    if (!res.ok) throw new Error('http ' + res.status);
+    return await readAPI(res);
+  } finally { clearTimeout(timer); }
+}
+async function pollJSON(url) {
+  var ctl = new AbortController(); var timer = setTimeout(function () { ctl.abort(); }, 8000);
+  try {
+    var res = await fetch(url, { cache: 'no-store', headers: {'Accept':'application/json'}, signal: ctl.signal });
+    if (!res.ok || res.redirected) return null;
+    var ct = res.headers.get('content-type') || ''; if (ct.indexOf('application/json') < 0) return null;
+    return await readAPI(res);
+  } catch (e) { return null; } finally { clearTimeout(timer); }
+}
+function apiPost(url, data) {
+  var body = new URLSearchParams();
+  if (data) for (var k in data) body.set(k, data[k]);
+  return fetch(url, { method: 'POST', headers: { 'X-CSRF-Token': CSRF, 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString() });
+}
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+function build() {
+  var h = Ember.sectionHead({ title: 'Controls', crumb: '/ system' });
+
+  var updatesBody =
+    Ember.kv({ pairs: [
+      { k: 'current', v: '{{.Version}}', id: 'updCurrent' },
+      { k: 'available', v: '\u2014', state: 'acc', id: 'updAvail' },
+      { k: 'state', v: '\u2014', state: 'good', id: 'updState' }
+    ]})
+    + '<div class="row-gap" style="margin-bottom:10px;">'
+    + Ember.button({ id: 'btnCheckUpd', text: 'Check Now' })
+    + Ember.button({ id: 'btnUpd', text: 'Update', variant: 'primary', disabled: true })
+    + '</div>'
+    + Ember.statusline({ id: 'updStatus', text: 'idle' })
+    + '<div id="updJobWrap">' + Ember.logViewer({ consoleId: 'updJobLog', statsId: 'updJobStats', autoScrollId: 'updAutoScroll' }) + '</div>'
+    + '<hr style="border:none;border-top:1px solid var(--hairline);margin:8px 0 12px;">'
+    + '<div class="row">'
+    + Ember.field({ label: 'client.zip', content: '<input class="input" type="file" id="localComponentZip" accept=".zip">' })
+    + Ember.field({ label: 'shared.zip', content: '<input class="input" type="file" id="localSharedZip" accept=".zip">' })
+    + '</div>'
+    + '<div class="row-gap">' + Ember.button({ id: 'btnApplyLocal', text: 'Apply Local' }) + '</div>'
+    + Ember.statusline({ id: 'localStatus', text: 'idle' });
+
+  var systemdBody =
+    Ember.kv({ pairs: [
+      { k: 'Service', v: 'hostit-agent.service' },
+      { k: 'State', v: '\u2014', id: 'systemdState' }
+    ]})
+    + Ember.statusline({ id: 'systemdMsg', text: '\u2014' })
+    + '<div class="row-gap mt12">'
+    + Ember.button({ id: 'svcRestartBtn', text: 'Restart', cls: 'sm' })
+    + Ember.button({ id: 'svcStopBtn', text: 'Stop', variant: 'danger', cls: 'sm' })
+    + '</div>';
+
+  var processBody =
+    Ember.kv({ pairs: [
+      { k: 'Binary', v: 'hostit-agent' },
+      { k: 'Uptime', v: '\u2014', id: 'procUptime' }
+    ]})
+    + Ember.statusline({ id: 'procStatusline', text: 'direct process control' })
+    + '<div class="row-gap mt12">'
+    + Ember.button({ id: 'procRestart', text: 'Restart process', cls: 'sm' })
+    + Ember.button({ id: 'procExit', text: 'Exit process', variant: 'danger', cls: 'sm' })
+    + '</div>';
+
+  var topGrid = Ember.grid({ cols: 2, children:
+    Ember.panel({ title: 'Updates', body: updatesBody })
+    + Ember.grid({ children:
+      Ember.panel({ title: 'systemd', body: systemdBody })
+      + Ember.panel({ title: 'Process', body: processBody })
+    })
+  });
+
+  var logsWrap = '<div class="mt12" id="logsPanelWrap">' + Ember.logViewer({ consoleId: 'ctrlConsole', statsId: 'logStats', autoScrollId: 'ctrlAutoScroll' }) + '</div>';
+
+  $('#app').innerHTML = h + topGrid + logsWrap;
+
+  var fr = $('#logStats');
+  if (fr) fr.insertAdjacentHTML('beforebegin', Ember.button({ id: 'refreshLogsBtn', text: 'Refresh', cls: 'sm' }));
+
+  wire();
+}
+
+function wire() {
+  $$('#logsPanelWrap .chip[data-level]').forEach(function (c) {
+    c.addEventListener('click', function () {
+      $$('#logsPanelWrap .chip[data-level]').forEach(function (x) { x.classList.toggle('active', x === c); });
+      var lv = c.getAttribute('data-level');
+      logLevel = lv === 'ALL' ? 'all' : lv === 'WARN' ? 'warning' : 'error';
+      refreshLogs();
+    });
+  });
+  var r = $('#refreshLogsBtn'); if (r) r.addEventListener('click', refreshLogs);
+  $('#btnCheckUpd').addEventListener('click', checkNow);
+  $('#btnUpd').addEventListener('click', applyUpd);
+  $('#btnApplyLocal').addEventListener('click', applyLocalUpd);
+  $('#svcRestartBtn').addEventListener('click', function () { sysAction('/api/systemd/restart', 'Restarting\u2026'); });
+  $('#svcStopBtn').addEventListener('click', function () { sysAction('/api/systemd/stop', 'Stopping\u2026'); });
+  $('#procRestart').addEventListener('click', procRestart);
+  $('#procExit').addEventListener('click', procExit);
+}
+
+var logLevel = 'all';
+
+async function refreshUpd() {
+  try { var s = await pollJSON('/api/update/status'); setUpd(s); } catch (e) {}
+}
+function renderUpdJob(log) {
+  var el = $('#updJobLog'); if (!el) return;
+  log = String(log || '');
+  if (!log) { el.innerHTML = '<div class="ln muted">no update log yet.</div>'; return; }
+  el.innerHTML = log.split('\n').map(function (line) { return '<div class="ln">' + esc(line) + '</div>'; }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+function setUpd(s) {
+  if (!s) return;
+  var cur = $('#updCurrent'); if (cur) cur.textContent = s.currentVersion || '\u2014';
+  var av = $('#updAvail'); if (av) av.textContent = s.availableVersion || '\u2014';
+  var st = $('#updState'); if (st) { st.textContent = s.updateAvailable ? 'update available' : 'up to date'; st.className = 'v ' + (s.updateAvailable ? 'acc' : 'good'); }
+  var b = $('#btnUpd'); if (b) b.disabled = !s.updateAvailable;
+  renderUpdJob(s.job ? s.job.log : '');
+  if (s.job && s.job.state === 'running') setStatus('updStatus', 'update in progress...', 'ok');
+  else if (s.job && s.job.state === 'failed') setStatus('updStatus', 'err: update failed' + (s.job.lastError ? ': ' + s.job.lastError : ''), 'err');
+  else if (s.job && s.job.state === 'success') setStatus('updStatus', 'ok: update succeeded, restarting...', 'ok');
+}
+async function checkNow() {
+  setStatus('updStatus', 'checking upstream...', 'ok');
+  try {
+    var res = await apiPost('/api/update/check-now');
+    if (!res.ok) { setStatus('updStatus', 'err: check failed', 'err'); return; }
+    setUpd(await readAPI(res));
+  } catch (e) { setStatus('updStatus', 'err: check failed', 'err'); }
+}
+async function applyUpd() {
+  setStatus('updStatus', 'starting update...', 'ok');
+  try {
+    var res = await apiPost('/api/update/apply');
+    if (res.status === 202) { setStatus('updStatus', 'update in progress...', 'ok'); pollUpd(); }
+    else if (res.status === 409) { setStatus('updStatus', 'already in progress', ''); }
+    else { setStatus('updStatus', 'err: apply failed', 'err'); }
+  } catch (e) { setStatus('updStatus', 'err: apply failed', 'err'); }
+}
+async function pollUpd() {
+  for (var i = 0; i < 60; i++) {
+    await sleep(1000);
+    var st = null; try { st = await pollJSON('/api/update/status'); } catch (e) {}
+    setUpd(st);
+    if (st && st.job && st.job.state !== 'running') break;
+  }
+}
+async function applyLocalUpd() {
+  var comp = $('#localComponentZip');
+  if (!comp || !comp.files || !comp.files.length) { setStatus('localStatus', 'err: pick client.zip first', 'err'); return; }
+  var fd = new FormData();
+  fd.append('componentZip', comp.files[0]);
+  var shared = $('#localSharedZip');
+  if (shared && shared.files && shared.files.length) fd.append('sharedZip', shared.files[0]);
+  setStatus('localStatus', 'uploading local update...', 'ok');
+  try {
+    var res = await fetch('/api/update/apply-local', { method: 'POST', headers: { 'X-CSRF-Token': CSRF }, body: fd });
+    if (res.status === 202) { setStatus('localStatus', 'ok: local update started', 'ok'); pollUpd(); }
+    else if (res.status === 409) { setStatus('localStatus', 'already in progress', ''); }
+    else { var t = ''; try { t = await res.text(); } catch (_) {} setStatus('localStatus', 'err: ' + t, 'err'); }
+  } catch (e) { setStatus('localStatus', 'err: upload failed', 'err'); }
+}
+
+async function refreshSys() {
+  try { var st = await pollJSON('/api/systemd/status'); setSys(st); } catch (e) {}
+}
+function setSys(st) {
+  if (!st) return;
+  var el = $('#systemdState'); if (el) el.textContent = st.available ? (st.active || 'unknown') : 'unavailable';
+  var msg = st.error || (st.available ? 'unit: ' + (st.service || 'hostit-agent.service') : 'systemctl not available');
+  setStatus('systemdMsg', msg, st.error ? 'err' : '');
+}
+async function sysAction(url, msg) {
+  setStatus('systemdMsg', msg, '');
+  try {
+    var res = await apiPost(url);
+    if (res.status === 204 || res.ok) { setStatus('systemdMsg', 'OK', 'ok'); }
+    else { var t = ''; try { t = await res.text(); } catch (_) {} setStatus('systemdMsg', 'failed: ' + t, 'err'); }
+  } catch (e) { setStatus('systemdMsg', 'failed', 'err'); }
+  setTimeout(refreshSys, 600);
+}
+
+async function procRestart() {
+  setStatus('procStatusline', 'restarting process\u2026', '');
+  try { await apiPost('/api/process/restart'); } catch (e) {}
+  setTimeout(function () { location.reload(); }, 1200);
+}
+async function procExit() {
+  setStatus('procStatusline', 'exiting process\u2026', '');
+  try { await apiPost('/api/process/exit'); } catch (e) {}
+  setTimeout(function () { location.reload(); }, 1200);
+}
+
+async function refreshLogs() {
+  try { var p = await pollJSON('/api/logs?level=' + encodeURIComponent(logLevel) + '&limit=300'); renderLogs(p); } catch (e) {}
+}
+function lvClass(level) {
+  level = String(level || '').toLowerCase();
+  if (level === 'warn' || level === 'warning') return 'lv-warn';
+  if (level === 'error' || level === 'err' || level === 'fatal') return 'lv-error';
+  if (level === 'debug' || level === 'trace') return 'lv-debug';
+  return 'lv-info';
+}
+function srcClass(source) {
+  var s = String(source || '').toLowerCase();
+  if (s === 'agent' || s === 'tunnel' || s === 'mail' || s === 'system') return 'src-' + s;
+  return '';
+}
+function fmtLogTime(unix) {
+  if (!unix) return '';
+  var d = new Date(Number(unix) * 1000);
+  return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+function renderLogs(payload) {
+  var stats = $('#logStats');
+  if (stats) {
+    var s = (payload && payload.stats) || {};
+    stats.innerHTML = 'all:<b>' + (s.all || 0) + '</b> warn:<span class="w">' + (s.warning || 0) + '</span> err:<span class="e">' + (s.error || 0) + '</span>';
+  }
+  var con = $('#ctrlConsole');
+  if (!con) return;
+  var entries = (payload && payload.entries) || [];
+  if (!entries.length) { con.innerHTML = '<div class="ln muted">no matching logs.</div>'; return; }
+  var html = entries.slice().reverse().map(function (e) {
+    var lv = String(e.level || 'INFO').toUpperCase();
+    var sc = srcClass(e.source);
+    return '<div class="ln"><span class="ts">' + esc(fmtLogTime(e.timeUnix)) + '</span> <span class="' + lvClass(lv) + '">' + esc(lv) + '</span> ' + (sc ? '<span class="' + sc + '">' + esc(e.source || '') + '</span> ' : '') + esc(e.message || '') + '</div>';
+  }).join('');
+  con.innerHTML = html;
+  var auto = $('#ctrlAutoScroll');
+  if (!auto || auto.checked) con.scrollTop = con.scrollHeight;
+}
+
+async function pollStatus() {
+  try {
+    var m = await pollJSON('/metrics');
+    if (!m) { var ol = $('#onLabel'); if (ol) ol.textContent = 'Syncing'; return; }
+    var ol = $('#onLabel'); if (ol) ol.textContent = m.connected ? 'ONLINE' : 'OFFLINE';
+    var sr = $('#sbRoutes'); if (sr) sr.textContent = m.routes_count || 0;
+    var up = $('#procUptime'); if (up) up.textContent = fmtUptime(m.uptime_seconds);
+  } catch (e) { var ol2 = $('#onLabel'); if (ol2) ol2.textContent = 'Syncing'; }
+}
+function fmtUptime(s) {
+  s = Number(s || 0);
+  var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60), sec = Math.floor(s % 60);
+  if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+  if (h > 0) return h + 'h ' + m + 'm ' + sec + 's';
+  return m + 'm ' + sec + 's';
+}
+
+build();
+initTheme('themeBtn', 'hostit-ember-theme');
+initClock('sbClock');
+(function(){var as=$('#ctrlAutoScroll');if(!as)return;try{var v=localStorage.getItem('hostit-ember-autoscroll');if(v!==null)as.checked=v==='1';}catch(e){}as.addEventListener('change',function(){try{localStorage.setItem('hostit-ember-autoscroll',as.checked?'1':'0');}catch(e){}});})();
+refreshUpd(); setInterval(refreshUpd, 5000);
+refreshSys(); setInterval(refreshSys, 4000);
+refreshLogs(); setInterval(refreshLogs, 2500);
+pollStatus(); setInterval(pollStatus, 3000);
+</script>
+</body>
+</html>

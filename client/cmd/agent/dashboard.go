@@ -26,6 +26,7 @@ import (
 	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
 	"hostit/shared/version"
+	"hostit/shared/web"
 )
 
 type routeView struct {
@@ -43,9 +44,9 @@ type apitypesRoute struct {
 }
 
 func serveAgentDashboard(ctx context.Context, addr string, configPath string, ctrl *agentController, mailSvc *mail.Service) error {
-	tplHome := template.Must(template.New("home").Parse(agentHomeHTML))
-	tplControls := template.Must(template.New("controls").Parse(agentControlsHTML))
-	tplApps := template.Must(template.New("apps").Parse(agentAppsHTML))
+	tplHome := template.Must(template.ParseFS(templateFS, "templates/home.html"))
+	tplControls := template.Must(template.ParseFS(templateFS, "templates/controls.html"))
+	tplApps := template.Must(template.ParseFS(templateFS, "templates/apps.html"))
 
 	absCfg := configPath
 	if p, err := filepath.Abs(configPath); err == nil {
@@ -173,6 +174,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("/static/", web.Handler())
 
 	writeOK := func(w http.ResponseWriter, data any) {
 		w.Header().Set("Content-Type", "application/json")
@@ -516,7 +518,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	mux.HandleFunc("/config/save", saveHandler)
 
 	// ── Mail viewer API ─────────────────────────────────────────────
-	tplMail := template.Must(template.New("mail").Parse(agentMailHTML))
+	tplMail := template.Must(template.ParseFS(templateFS, "templates/mail.html"))
 
 	mux.HandleFunc("/api/mail/accounts", func(w http.ResponseWriter, r *http.Request) {
 		if mailSvc == nil {
@@ -617,13 +619,13 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		addr, err := mailSvc.Authenticate(req.Username, req.Password)
+		uname, addr, err := mailSvc.Authenticate(req.Username, req.Password)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "authentication failed")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeOK(w, map[string]string{"username": req.Username, "address": addr})
+		writeOK(w, map[string]string{"username": uname, "address": addr})
 	})
 
 	mux.HandleFunc("/api/mail/inbox", func(w http.ResponseWriter, r *http.Request) {
@@ -644,11 +646,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
+		uname, _, err := mailSvc.Authenticate(req.Username, req.Password)
+		if err != nil {
 			writeError(w, http.StatusUnauthorized, "authentication failed")
 			return
 		}
-		msgs, err := mailSvc.ListInbox(req.Username)
+		msgs, err := mailSvc.ListInbox(uname)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -679,11 +682,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
+		uname, _, err := mailSvc.Authenticate(req.Username, req.Password)
+		if err != nil {
 			writeError(w, http.StatusUnauthorized, "authentication failed")
 			return
 		}
-		msg, err := mailSvc.GetMessage(req.Username, req.MessageID)
+		msg, err := mailSvc.GetMessage(uname, req.MessageID)
 		if err != nil {
 			writeError(w, http.StatusNotFound, "message not found")
 			return
@@ -711,11 +715,12 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		if _, err := mailSvc.Authenticate(req.Username, req.Password); err != nil {
+		uname, _, err := mailSvc.Authenticate(req.Username, req.Password)
+		if err != nil {
 			writeError(w, http.StatusUnauthorized, "authentication failed")
 			return
 		}
-		if err := mailSvc.DeleteMessage(req.Username, req.MessageID); err != nil {
+		if err := mailSvc.DeleteMessage(uname, req.MessageID); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -752,7 +757,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		_ = tplMail.Execute(w, nil)
+		_ = tplMail.Execute(w, map[string]any{"CSRFToken": csrfToken, "Version": version.Current})
 	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

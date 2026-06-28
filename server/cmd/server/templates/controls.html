@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{.CSRF}}">
+<title>HostIt // Server — Controls</title>
+<script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<link rel="stylesheet" href="/static/theme.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="logo">HostIt <span class="sub">server</span></div>
+  <nav class="nav">
+    <a class="tab" href="/">Dashboard</a>
+    <a class="tab" href="/config">Config</a>
+    <a class="tab" href="/email">Email</a>
+    <a class="tab active" href="/controls">Controls</a>
+    <a class="tab" href="/apps">Apps</a>
+    <a class="tab" href="/network-test">Network Test</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="online-dot"></span><span class="online-label" id="onLabel">ONLINE</span>
+    <button class="theme-btn" id="themeBtn" aria-label="Toggle theme">dark</button>
+    <span class="ver">{{.Version}}</span>
+    <button class="theme-btn" id="logoutBtn">logout</button>
+  </div>
+</div>
+<main id="app" style="padding:16px 14px 26px;max-width:1320px;margin:0 auto;"></main>
+<div class="statusbar">
+  <div class="sb-seg sb-l1">hostit</div>
+  <div class="sb-seg sb-l2"><span class="win-act">controls</span></div>
+  <div class="sb-right">
+    <div class="sb-seg sb-r1" id="sbAgent">hostit-server</div>
+    <div class="sb-seg sb-r2">routes <span id="sbRoutes">0</span></div>
+    <div class="sb-seg sb-r3" id="sbClock">--:--:--</div>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+<script src="/static/components.js"></script>
+<script src="/static/app.js"></script>
+<script>
+var CSRF=document.querySelector('meta[name="csrf-token"]').content;
+var reloadTimer;
+function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
+async function fetchJSON(url){
+  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},8000);
+  try{
+    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
+    clearTimeout(t);
+    if(res.redirected||!res.headers.get('content-type')||res.headers.get('content-type').indexOf('application/json')===-1){scheduleReload();return null;}
+    return await res.json();
+  }catch(e){clearTimeout(t);scheduleReload();return null;}
+}
+async function pollJSON(url){
+  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},8000);
+  try{
+    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
+    clearTimeout(t);
+    if(!res.ok||res.redirected)return null;
+    var ct=res.headers.get('content-type')||'';if(ct.indexOf('application/json')===-1)return null;
+    return await res.json();
+  }catch(e){clearTimeout(t);return null;}
+}
+async function apiPost(url,data){
+  var body=new URLSearchParams();body.set('csrf',CSRF);
+  if(data)for(var k in data)body.set(k,data[k]);
+  return await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
+}
+function pad(n){return n<10?'0'+n:''+n;}
+function fmtUptime(sec){sec=Math.max(0,Math.floor(Number(sec||0)));var d=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60),s=sec%60;var str=pad(h)+':'+pad(m)+':'+pad(s);return d>0?d+'d '+str:str;}
+
+var INIT={dashInterval:"{{.DashInterval}}",domainRenewBefore:"{{.DomainRenewBefore}}",dynamicPortRange:"{{.Cfg.DynamicPortRange}}",maxDynamicRoutes:"{{.Cfg.MaxDynamicRoutesPerAgent}}",appDbPath:"{{.Cfg.AppDBPath}}",certDir:"{{.Cfg.DomainCertDir}}"};
+var INTERVAL_OPTS=[['5s',5],['10s',10],['30s',30],['1m',60],['2m',120],['5m',300],['10m',600]];
+function parseDurSec(s){s=String(s||'');if(!s)return 0;var t=0,m;m=/(\d+)\s*h/.exec(s);if(m)t+=parseInt(m[1],10)*3600;m=/(\d+)\s*m/.exec(s);if(m)t+=parseInt(m[1],10)*60;m=/(\d+)\s*s/.exec(s);if(m)t+=parseInt(m[1],10);return t;}
+function nearestInterval(sec){var best=INTERVAL_OPTS[0][0],bd=Math.abs(sec-INTERVAL_OPTS[0][1]);INTERVAL_OPTS.forEach(function(o){var d=Math.abs(sec-o[1]);if(d<bd){bd=d;best=o[0];}});return best;}
+
+function loadAdvVals(){
+  var v={portRange:INIT.dynamicPortRange||'',maxRoutes:Number(INIT.maxDynamicRoutes)>0?INIT.maxDynamicRoutes:'',appDb:INIT.appDbPath||'',certDir:INIT.certDir||'',renew:INIT.domainRenewBefore||''};
+  try{var sv=localStorage.getItem('hostit-ctrl-adv');if(sv){var j=JSON.parse(sv);['portRange','maxRoutes','appDb','certDir','renew'].forEach(function(k){if(j[k]!=null)v[k]=j[k];});}}catch(e){}
+  return v;
+}
+function saveAdvVals(){try{localStorage.setItem('hostit-ctrl-adv',JSON.stringify({portRange:$('#advPortRange').value,maxRoutes:$('#advMaxRoutes').value,appDb:$('#advAppDb').value,certDir:$('#advCertDir').value,renew:$('#advRenew').value}));}catch(e){}}
+
+function buildControls(){
+  var av=loadAdvVals();
+  var h=Ember.sectionHead({title:'Controls',crumb:'/controls'});
+  var dash=Ember.panel({title:'Dashboard Settings',body:
+    Ember.kv({pairs:[{k:'current',v:INIT.dashInterval||'30s',state:'acc',id:'curInterval'}]})+
+    Ember.field({label:'Poll Interval',content:Ember.select({id:'intervalSelect',options:[
+      {value:'5s',label:'5 seconds'},{value:'10s',label:'10 seconds'},{value:'30s',label:'30 seconds'},
+      {value:'1m',label:'1 minute'},{value:'2m',label:'2 minutes'},{value:'5m',label:'5 minutes'},{value:'10m',label:'10 minutes'}
+    ]})})+
+    '<div class="row-gap">'+Ember.button({text:'Apply + Restart',variant:'primary',id:'btnApplyInterval'})+Ember.statusline({id:'intervalStatus',text:'idle'})+'</div>'+
+    '<hr style="border:none;border-top:1px solid var(--hairline);margin:12px 0;">'+
+    Ember.field({label:'',content:Ember.toggle({id:'advSettings',label:'advanced settings',labelId:'advSettingsLbl'})})+
+    '<div id="advBlock" class="hidden" style="margin-top:10px;">'+
+    '<div class="row">'+
+    Ember.field({label:'Dynamic Port Range',content:Ember.input({id:'advPortRange',value:av.portRange,placeholder:'20000-30000'})})+
+    Ember.field({label:'Max Dynamic Routes / Agent',content:Ember.input({id:'advMaxRoutes',type:'number',value:av.maxRoutes,placeholder:'64'})})+
+    Ember.field({label:'App Database Path',content:Ember.input({id:'advAppDb',value:av.appDb,placeholder:'/var/lib/hostit/apps.db'})})+
+    Ember.field({label:'Domain Cert Directory',content:Ember.input({id:'advCertDir',value:av.certDir,placeholder:'/var/lib/hostit/certs'})})+
+    Ember.field({label:'Renew Certs Before',content:Ember.input({id:'advRenew',value:av.renew,placeholder:'168h'})})+'</div>'+
+    '<div class="row-gap">'+Ember.button({text:'Save Advanced',variant:'primary',id:'btnSaveAdvanced'})+Ember.statusline({id:'advStatus',text:'idle'})+'</div></div>'
+  });
+  var updates=Ember.panel({title:'Updates',body:
+    Ember.kv({pairs:[{k:'current',v:'—',id:'updCurrent'},{k:'available',v:'—',state:'acc',id:'updAvail'},{k:'state',v:'—',state:'good',id:'updState'}]})+
+    '<div class="row-gap" style="margin-bottom:10px;">'+Ember.button({text:'Check Now',id:'btnCheckUpd'})+Ember.button({text:'Update',variant:'primary',id:'btnUpd',disabled:true})+'</div>'+
+    Ember.statusline({id:'updStatus',text:'idle'})+
+    '<div id="updJobWrap">'+Ember.logViewer({consoleId:'updJobLog',statsId:'updJobStats',autoScrollId:'updAutoScroll'})+'</div>'+
+    '<hr style="border:none;border-top:1px solid var(--hairline);margin:8px 0 12px;">'+
+    '<div class="row">'+
+    Ember.field({label:'server.zip',content:'<input class="input" type="file" id="localServer" accept=".zip">'})+
+    Ember.field({label:'shared.zip',content:'<input class="input" type="file" id="localShared" accept=".zip">'})+'</div>'+
+    '<div class="row-gap">'+Ember.button({text:'Apply Local',id:'btnApplyLocal'})+'</div>'+
+    Ember.statusline({id:'localStatus',text:'idle'})
+  });
+  var topGrid='<div class="grid cols-2">'+updates+dash+'</div>';
+  var systemd=Ember.panel({title:'systemd',body:
+    Ember.kv({pairs:[{k:'unit',v:'hostit-server.service'},{k:'state',v:'—',state:'good',id:'svcState'}]})+
+    '<div class="row-gap">'+Ember.button({text:'Restart',id:'btnSvcRestart'})+Ember.button({text:'Stop',variant:'danger',id:'btnSvcStop'})+'</div>'+
+    Ember.statusline({id:'svcStatus',text:'idle'})
+  });
+  var proc=Ember.panel({title:'Process',body:
+    Ember.kv({pairs:[{k:'binary',v:'hostit-server',id:'procBinary'},{k:'uptime',v:'—',id:'procUptime'}]})+
+    '<div class="row-gap">'+Ember.button({text:'Restart Process',id:'btnProcRestart'})+Ember.button({text:'Exit Process',variant:'danger',id:'btnProcExit'})+'</div>'+
+    Ember.statusline({id:'procStatus',text:'idle'})
+  });
+  var midGrid='<div class="grid cols-2 mt12">'+systemd+proc+'</div>';
+  var logs='<div class="mt12" id="ctrlLogsWrap">'+Ember.logViewer({consoleId:'ctrlConsole',statsId:'logStats'})+'<div class="filter-row" style="margin-top:8px;">'+Ember.button({text:'Refresh',cls:'sm',id:'btnRefreshLogs'})+Ember.button({text:'Clear',cls:'sm',id:'btnClearLogs'})+'</div></div>';
+  $('#app').innerHTML=h+topGrid+midGrid+logs;
+
+  var isel=$('#intervalSelect');if(isel)isel.value=nearestInterval(parseDurSec(INIT.dashInterval));
+  styleSelects();
+  try{if(localStorage.getItem('hostit-ctrl-adv-open')==='1'){$('#advSettings').checked=true;$('#advBlock').classList.remove('hidden');}}catch(e){}
+  bindToggleLabel('advSettings','advSettingsLbl','show','hide');
+  wireControls();
+}
+
+var curLogLevel='ALL';
+function levelQuery(l){return l==='WARN'?'warning':l==='ERR'?'error':'';}
+function wireChips(wrapId, onChange){
+  $$('#'+wrapId+' .chip[data-level]').forEach(function(c){
+    c.addEventListener('click',function(){
+      $$('#'+wrapId+' .chip[data-level]').forEach(function(x){x.classList.toggle('active',x===c);});
+      onChange(c.getAttribute('data-level'));
+    });
+  });
+}
+
+function renderServerLogs(j){
+  var c=$('#ctrlConsole');if(!c)return;
+  var stats=j.stats||{};
+  var ls=$('#logStats');if(ls)ls.innerHTML='all:<b>'+(stats.all||0)+'</b> warn:<span class="w">'+(stats.warning||0)+'</span> err:<span class="e">'+(stats.error||0)+'</span>';
+  var entries=(j.entries||[]).slice().reverse();
+  c.innerHTML=entries.map(function(e){
+    var d=new Date(Number(e.timeUnix||0)*1000);
+    var t=d.getTime()?pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()):'';
+    var lv=String(e.level||'').toUpperCase();
+    return '<div class="ln"><span class="ts">'+t+'</span> <span class="lv-'+lv.toLowerCase()+'">'+lv+'</span> <span class="src-'+esc(e.source||'')+'">'+esc(e.source||'')+'</span> '+esc(e.message||'')+'</div>';
+  }).join('')||'<div class="ln muted">No log entries.</div>';
+  var as=$('#logAutoScroll');if(as&&as.checked)c.scrollTop=c.scrollHeight;
+}
+async function pollLogs(){
+  var j=await pollJSON('/api/logs?level='+encodeURIComponent(levelQuery(curLogLevel))+'&limit=300');if(!j)return;
+  $('#onLabel').textContent='ONLINE';
+  renderServerLogs(j);
+}
+
+var curUpdLevel='ALL';
+function renderUpdJob(log){
+  var c=$('#updJobLog');if(!c)return;
+  var lines=String(log||'').split(/\r?\n/).filter(function(l){return l.trim()!=='';});
+  var all=0,warn=0,err=0,rows=lines.map(function(l){
+    var lo=l.toLowerCase(),lv='INFO';
+    if(/error|fail|fatal/.test(lo))lv='ERROR';else if(/warn/.test(lo))lv='WARN';
+    if(lv==='ERROR')err++;else if(lv==='WARN')warn++;all++;
+    return {l:l,lv:lv};
+  });
+  var us=$('#updJobStats');if(us)us.innerHTML='all:<b>'+all+'</b> warn:<span class="w">'+warn+'</span> err:<span class="e">'+err+'</span>';
+  var filt=rows.filter(function(r){if(curUpdLevel==='WARN')return r.lv==='WARN'||r.lv==='ERROR';if(curUpdLevel==='ERR')return r.lv==='ERROR';return true;});
+  c.innerHTML=filt.map(function(r){return '<div class="ln"><span class="lv-'+r.lv.toLowerCase()+'">'+r.lv+'</span> '+esc(r.l)+'</div>';}).join('')||'<div class="ln muted">No update job output yet.</div>';
+  var as=$('#updAutoScroll');if(as&&as.checked)c.scrollTop=c.scrollHeight;
+}
+async function pollUpdate(){
+  var s=await pollJSON('/api/update/status');if(!s)return;
+  window._lastUpd=s;
+  $('#onLabel').textContent='ONLINE';
+  var cur=$('#updCurrent');if(cur)cur.textContent=s.currentVersion||'—';
+  var av=$('#updAvail');if(av)av.textContent=s.availableVersion||'—';
+  var st=$('#updState');if(st){st.textContent=s.updateAvailable?'update available':'up to date';st.className='v '+(s.updateAvailable?'acc':'good');}
+  var b=$('#btnUpd');if(b)b.disabled=!s.updateAvailable;
+  renderUpdJob(s.job?s.job.log:'');
+  if(s.job&&s.job.state==='running'){setStatus('updStatus','update in progress...','ok');}
+  else if(s.job&&s.job.state==='failed'){setStatus('updStatus','err: update failed'+(s.job.lastError?': '+s.job.lastError:''),'err');}
+  else if(s.job&&s.job.state==='success'){setStatus('updStatus','ok: update succeeded, restarting...','ok');}
+}
+
+async function pollSystemd(){
+  var s=await pollJSON('/api/systemd/status');if(!s)return;
+  var st=$('#svcState');if(!st)return;
+  if(!s.available){st.textContent='unavailable';st.className='v neutral';return;}
+  var act=String(s.active||'').toLowerCase();
+  st.textContent=s.active||'unknown';
+  st.className='v '+(act==='active'||act==='running'?'good':(act==='inactive'||act==='failed'?'bad':'neutral'));
+}
+
+async function pollMetrics(){
+  try{var r=await fetch('/metrics',{headers:{'Accept':'application/json'}});if(!r.ok)return;var j=await r.json();var up=$('#procUptime');if(up)up.textContent=fmtUptime(j.uptime_seconds);}catch(e){}
+}
+
+function wireControls(){
+  $('#btnApplyInterval').addEventListener('click',async function(){
+    var v=$('#intervalSelect').value;setStatus('intervalStatus','applying '+v+'...','ok');
+    var res=await apiPost('/api/dashboard/interval',{interval:v});
+    if(res.ok){setStatus('intervalStatus','ok: interval set to '+v+', restarting...','ok');setTimeout(function(){location.reload();},800);}
+    else{setStatus('intervalStatus','err: '+res.status,'err');}
+  });
+  var advChk=$('#advSettings'),advBlock=$('#advBlock');
+  advChk.addEventListener('change',function(){
+    advBlock.classList.toggle('hidden',!this.checked);
+    try{localStorage.setItem('hostit-ctrl-adv-open',this.checked?'1':'0');}catch(e){}
+    setStatus('advStatus',this.checked?'advanced settings shown':'advanced settings hidden','ok');
+  });
+  $('#btnSaveAdvanced').addEventListener('click',function(){saveAdvVals();setStatus('advStatus','ok: saved locally (edit config.json + restart to apply)','ok');});
+  $('#btnCheckUpd').addEventListener('click',async function(){setStatus('updStatus','checking upstream...','ok');await apiPost('/api/update/check-now');pollUpdate();});
+  $('#btnUpd').addEventListener('click',async function(){
+    if($('#btnUpd').disabled)return;setStatus('updStatus','starting update...','ok');
+    var res=await apiPost('/api/update/apply');
+    if(res.status===202)setStatus('updStatus','ok: update started','ok');
+    else if(res.status===409)setStatus('updStatus','err: update already in progress','err');
+    else setStatus('updStatus','err: '+res.status,'err');
+    pollUpdate();
+  });
+  $('#btnApplyLocal').addEventListener('click',async function(){
+    var sf=$('#localServer'),sh=$('#localShared');
+    if(!sf.files||!sf.files.length){setStatus('localStatus','err: server.zip (componentZip) required','err');return;}
+    var fd=new FormData();fd.append('componentZip',sf.files[0],sf.files[0].name);
+    if(sh.files&&sh.files.length)fd.append('sharedZip',sh.files[0],sh.files[0].name);
+    setStatus('localStatus','applying local update...','ok');
+    var res=await fetch('/api/update/apply-local',{method:'POST',headers:{'X-CSRF-Token':CSRF},body:fd});
+    if(res.status===202){setStatus('localStatus','ok: local update started','ok');pollUpdate();}
+    else if(res.status===409)setStatus('localStatus','err: update already in progress','err');
+    else{var tx='';try{tx=await res.text();}catch(e){}setStatus('localStatus','err: '+res.status+' '+tx,'err');}
+  });
+  $('#btnSvcRestart').addEventListener('click',async function(){setStatus('svcStatus','restarting service...','ok');var res=await apiPost('/api/systemd/restart');if(res.ok){setStatus('svcStatus','ok: service restarted','ok');pollSystemd();}else setStatus('svcStatus','err: '+res.status,'err');});
+  $('#btnSvcStop').addEventListener('click',async function(){if(!confirm('Stop hostit-server.service?'))return;setStatus('svcStatus','stopping service...','ok');var res=await apiPost('/api/systemd/stop');if(res.ok){setStatus('svcStatus','ok: service stopped','ok');pollSystemd();}else setStatus('svcStatus','err: '+res.status,'err');});
+  $('#btnProcRestart').addEventListener('click',async function(){setStatus('procStatus','restarting process...','ok');var res=await apiPost('/api/process/restart');if(res.status===202)setStatus('procStatus','ok: process restart requested','ok');else setStatus('procStatus','err: '+res.status,'err');});
+  $('#btnProcExit').addEventListener('click',async function(){if(!confirm('Exit the server process? This will stop the tunnel server.'))return;setStatus('procStatus','exiting process...','ok');var res=await apiPost('/api/process/exit');if(res.status===202)setStatus('procStatus','ok: process exit requested','ok');else setStatus('procStatus','err: '+res.status,'err');});
+  $('#btnRefreshLogs').addEventListener('click',pollLogs);
+  $('#btnClearLogs').addEventListener('click',function(){var c=$('#ctrlConsole');if(c)c.innerHTML='';var ls=$('#logStats');if(ls)ls.innerHTML='all:<b>0</b> warn:<span class="w">0</span> err:<span class="e">0</span>';});
+  wireChips('ctrlLogsWrap',function(l){curLogLevel=l;pollLogs();});
+  wireChips('updJobWrap',function(l){curUpdLevel=l;var s=window._lastUpd;renderUpdJob(s&&s.job?s.job.log:'');});
+
+  $('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+}
+
+buildControls();
+initTheme('themeBtn','hostit-ember-theme');
+initClock('sbClock');
+(function(){var as=$('#logAutoScroll');if(!as)return;try{var v=localStorage.getItem('hostit-ember-autoscroll');if(v!==null)as.checked=v==='1';}catch(e){}as.addEventListener('change',function(){try{localStorage.setItem('hostit-ember-autoscroll',as.checked?'1':'0');}catch(e){}});})();
+pollUpdate();setInterval(pollUpdate,5000);
+pollSystemd();setInterval(pollSystemd,5000);
+pollMetrics();setInterval(pollMetrics,5000);
+pollLogs();setInterval(pollLogs,2500);
+window._lastUpd=null;
+</script>
+</body>
+</html>

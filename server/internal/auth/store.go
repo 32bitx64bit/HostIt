@@ -31,10 +31,15 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(5)
 	db.SetMaxIdleConns(2)
 
-	// SQLite requires this per-connection PRAGMA to enforce FK constraints.
-	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	for _, pragma := range []string{
+		`PRAGMA journal_mode = WAL`,
+		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA foreign_keys = ON`,
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("pragma %q: %w", pragma, err)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

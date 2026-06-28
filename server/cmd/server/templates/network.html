@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{.CSRF}}">
+<title>HostIt // Server — Network Test</title>
+<script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<link rel="stylesheet" href="/static/theme.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="logo">HostIt <span class="sub">server</span></div>
+  <nav class="nav">
+    <a class="tab" href="/">Dashboard</a>
+    <a class="tab" href="/config">Config</a>
+    <a class="tab" href="/email">Email</a>
+    <a class="tab" href="/controls">Controls</a>
+    <a class="tab" href="/apps">Apps</a>
+    <a class="tab active" href="/network-test">Network Test</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="online-dot"></span><span class="online-label" id="onLabel">ONLINE</span>
+    <button class="theme-btn" id="themeBtn" aria-label="Toggle theme">dark</button>
+    <span class="ver">{{.Version}}</span>
+    <button class="theme-btn" id="logoutBtn">logout</button>
+  </div>
+</div>
+<main id="app" style="padding:16px 14px 26px;max-width:1320px;margin:0 auto;"></main>
+<div class="statusbar">
+  <div class="sb-seg sb-l1">hostit</div>
+  <div class="sb-seg sb-l2"><span class="win-act">network</span></div>
+  <div class="sb-right">
+    <div class="sb-seg sb-r1" id="sbAgent">hostit-server</div>
+    <div class="sb-seg sb-r2">routes <span id="sbRoutes">0</span></div>
+    <div class="sb-seg sb-r3" id="sbClock">--:--:--</div>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+<script src="/static/components.js"></script>
+<script src="/static/app.js"></script>
+<script>
+var CSRF=document.querySelector('meta[name="csrf-token"]').content;
+var reloadTimer;
+function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
+async function fetchJSON(url){
+  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},8000);
+  try{
+    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
+    clearTimeout(t);
+    if(res.redirected||!res.headers.get('content-type')||res.headers.get('content-type').indexOf('application/json')===-1){scheduleReload();return null;}
+    return await res.json();
+  }catch(e){clearTimeout(t);scheduleReload();return null;}
+}
+async function apiPost(url,data){
+  var body=new URLSearchParams();body.set('csrf',CSRF);
+  if(data)for(var k in data)body.set(k,data[k]);
+  return await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
+}
+function pad(n){return n<10?'0'+n:''+n;}
+function num(v){return v!=null&&v!==''?Number(v):null;}
+
+var DL_BYTES=4194304,UL_BYTES=4194304,PING_N=10;
+var directRunning=false,agentRunning=false;
+
+function buildNetwork(){
+  var h=Ember.sectionHead({title:'Network Test',crumb:'/network-test'});
+  var grid='<div class="grid cols-2">'+
+    Ember.panel({title:'Browser \u2194 Server',body:'<div class="row-gap">'+Ember.button({text:'Run Direct Test',variant:'primary',id:'ntDirect'})+Ember.statusline({id:'ntDirectStatus',text:'idle'})+'</div><div id="ntDirectResults"><div class="muted">Run a direct browser-to-server test.</div></div>'})+
+    Ember.panel({title:'Server \u2194 Agent',body:'<div class="row-gap">'+Ember.button({text:'Run Agent Path Test',variant:'primary',id:'ntAgent'})+Ember.statusline({id:'ntAgentStatus',text:'idle'})+'</div><div id="ntAgentResults"><div class="muted">Run a server-to-agent path test (10 packets, 1KiB).</div></div>'})+
+    '</div>';
+  $('#app').innerHTML=h+grid;
+  $('#ntDirect').addEventListener('click',runDirect);
+  $('#ntAgent').addEventListener('click',runAgent);
+  $('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+}
+
+async function runDirect(){
+  if(directRunning)return;directRunning=true;
+  $('#ntDirect').disabled=true;
+  setStatus('ntDirectStatus','running direct test...','ok');
+  $('#ntDirectResults').innerHTML='<div class="muted">Pinging server ('+PING_N+' samples)...</div>';
+  var rtts=[],lost=0;
+  for(var i=0;i<PING_N;i++){
+    var t0=performance.now();
+    try{var r=await fetch('/api/nettest/ping',{headers:{'Accept':'application/json'}});if(r.ok){await r.json();rtts.push(performance.now()-t0);}else{lost++;}}catch(e){lost++;}
+  }
+  var latAvg=rtts.length?rtts.reduce(function(a,b){return a+b;},0)/rtts.length:0;
+  var loss=(lost/PING_N)*100;
+  $('#onLabel').textContent='ONLINE';
+
+  setStatus('ntDirectStatus','downloading test file...','ok');
+  var dlMbps=0;
+  try{
+    var t0=performance.now();
+    var r=await fetch('/api/nettest/direct-download?bytes='+DL_BYTES);
+    if(r.ok){var buf=await r.arrayBuffer();var el=(performance.now()-t0)/1000;dlMbps=el>0?(buf.byteLength*8/el/1e6):0;}
+  }catch(e){}
+
+  setStatus('ntDirectStatus','uploading test data...','ok');
+  var ulMbps=0;
+  try{
+    var body=new Uint8Array(UL_BYTES);
+    var t0=performance.now();
+    var r=await fetch('/api/nettest/direct-upload',{method:'POST',body:body});
+    if(r.ok){var j=await r.json();ulMbps=num(j.mbps)||0;}
+  }catch(e){}
+
+  $('#ntDirectResults').innerHTML=Ember.resultGrid({items:[
+    {label:'Latency (avg)',value:latAvg?latAvg.toFixed(1)+' ms':'—',id:'ntDLat'},
+    {label:'Packet loss',value:loss.toFixed(1)+'%',id:'ntDPLoss'},
+    {label:'Download',value:dlMbps?dlMbps.toFixed(2)+' Mbps':'—',id:'ntDDL'},
+    {label:'Upload',value:ulMbps?ulMbps.toFixed(2)+' Mbps':'—',id:'ntDUL'}
+  ]});
+  setStatus('ntDirectStatus','ok: test complete','ok');
+  $('#ntDirect').disabled=false;directRunning=false;
+}
+
+async function runAgent(){
+  if(agentRunning)return;agentRunning=true;
+  $('#ntAgent').disabled=true;
+  setStatus('ntAgentStatus','running agent path test...','ok');
+  $('#ntAgentResults').innerHTML='<div class="muted">Running agent path test...</div>';
+  var res=await apiPost('/api/nettest/agent',{count:'10',payload_bytes:'1024',timeout_ms:'5000'});
+  if(!res.ok){var tx='';try{tx=await res.text();}catch(e){}setStatus('ntAgentStatus','err: '+(tx||res.status),'err');$('#ntAgent').disabled=false;agentRunning=false;return;}
+  var j=await res.json();
+  $('#onLabel').textContent='ONLINE';
+  $('#ntAgentResults').innerHTML=Ember.resultGrid({items:[
+    {label:'Latency (avg)',value:j.avgLatencyMs!=null?Number(j.avgLatencyMs).toFixed(1)+' ms':'—',id:'ntALat'},
+    {label:'Latency (min)',value:j.minLatencyMs!=null?Number(j.minLatencyMs).toFixed(1)+' ms':'—',id:'ntALatMin'},
+    {label:'Latency (max)',value:j.maxLatencyMs!=null?Number(j.maxLatencyMs).toFixed(1)+' ms':'—',id:'ntALatMax'},
+    {label:'Jitter',value:j.jitterMs!=null?Number(j.jitterMs).toFixed(2)+' ms':'—',id:'ntAJit'},
+    {label:'Packet loss',value:j.lossPercent!=null?Number(j.lossPercent).toFixed(2)+'%':'—',id:'ntAPLoss'},
+    {label:'Download',value:j.downloadMbps!=null?Number(j.downloadMbps).toFixed(2)+' Mbps':'—',id:'ntADL'},
+    {label:'Upload',value:j.uploadMbps!=null?Number(j.uploadMbps).toFixed(2)+' Mbps':'—',id:'ntAUL'}
+  ]});
+  setStatus('ntAgentStatus','ok: test complete ('+(j.durationMs||0)+'ms)','ok');
+  $('#ntAgent').disabled=false;agentRunning=false;
+}
+
+buildNetwork();
+initTheme('themeBtn','hostit-ember-theme');
+initClock('sbClock');
+</script>
+</body>
+</html>

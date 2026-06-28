@@ -47,6 +47,14 @@ func NewManager(repo string, component Component, assetName string, moduleDir st
 	if m.st.Job.State == "" {
 		m.st.Job.State = JobIdle
 	}
+	// A "running" job cannot survive a process restart (no goroutine is
+	// executing it here), and a lingering Restarting flag means the previous
+	// process already completed an update and we are its freshly-started
+	// successor. Clear both so they do not pin the update popup open forever.
+	if m.st.Job.State == JobRunning || m.st.Job.Restarting {
+		m.st.Job = JobStatus{State: JobIdle}
+		_ = m.Store.Save(m.st)
+	}
 	return m
 }
 

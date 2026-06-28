@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{.CSRF}}">
+<title>HostIt // Sign In</title>
+<script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<link rel="stylesheet" href="/static/theme.css">
+<style>
+  .signin-card { margin: 40px auto; max-width: 380px; }
+  .auth-corner { position: fixed; top: 12px; right: 12px; z-index: 50; }
+  .auth-logo { font-size: 22px; font-weight: 600; letter-spacing: 0.02em; margin-bottom: 16px; }
+  .auth-logo .gt { color: var(--yellow); }
+  .auth-logo .sub { font-size: 12px; font-weight: 400; color: var(--fg4); }
+  .auth-ver { text-align: center; color: var(--fg4); font-size: 11px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div class="auth-corner">
+  <button class="theme-btn" id="themeBtn" aria-label="Toggle theme">dark</button>
+</div>
+<main id="app"></main>
+<script>var MSG = "{{.Msg}}"; var VER = "{{.Version}}";</script>
+<script src="/static/components.js"></script>
+<script src="/static/app.js"></script>
+<script>
+(function(){
+  var CSRF = document.querySelector('meta[name="csrf-token"]').content;
+  function build(){
+    var logo = '<div class="auth-logo"><span class="gt">&gt;</span> HostIt <span class="sub">sign in</span></div>';
+    var flash = MSG ? '<div style="margin-bottom:14px">' + Ember.statusline({text: MSG}) + '</div>' : '';
+    var formInner =
+      Ember.field({label:'Username',labelFor:'lfUser',content:Ember.input({id:'lfUser',type:'text',placeholder:'username',spellcheck:false})})+
+      Ember.field({label:'Password',labelFor:'lfPass',content:Ember.input({id:'lfPass',type:'password',placeholder:'password'})})+
+      '<input type="hidden" name="csrf" value="'+esc(CSRF)+'">'+
+      Ember.button({id:'lfSubmit',variant:'primary',text:'Sign In',type:'submit'});
+    var card = Ember.panel({cls:'signin-card',body: logo+flash+'<form method="POST" action="/login" id="loginForm">'+formInner+'</form>'});
+    $('#app').innerHTML = card + '<div class="auth-ver">HostIt v'+esc(VER)+'</div>';
+    $('#lfUser').name = 'username';
+    $('#lfPass').name = 'password';
+    initTheme('themeBtn','hostit-ember-theme');
+  }
+  build();
+})();
+</script>
+</body>
+</html>

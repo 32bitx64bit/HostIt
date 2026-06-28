@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{.CSRF}}">
+<title>HostIt // Setup</title>
+<script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+<link rel="stylesheet" href="/static/theme.css">
+<style>
+  .signin-card { margin: 40px auto; max-width: 380px; }
+  .auth-corner { position: fixed; top: 12px; right: 12px; z-index: 50; }
+  .auth-logo { font-size: 22px; font-weight: 600; letter-spacing: 0.02em; margin-bottom: 2px; }
+  .auth-logo .gt { color: var(--yellow); }
+  .auth-logo .sub { font-size: 12px; font-weight: 400; color: var(--fg4); }
+  .auth-sub { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg4); margin-bottom: 16px; }
+  .auth-ver { text-align: center; color: var(--fg4); font-size: 11px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div class="auth-corner">
+  <button class="theme-btn" id="themeBtn" aria-label="Toggle theme">dark</button>
+</div>
+<main id="app">
+  <div class="panel signin-card">
+    <div class="panel-body">
+      <div class="auth-logo"><span class="gt">&gt;</span> HostIt <span class="sub">setup</span></div>
+      <div class="auth-sub">Create admin account</div>
+      {{if .Msg}}<div class="statusline" style="margin-bottom:14px"><span class="gt">&gt;</span> <span>{{.Msg}}</span></div>{{end}}
+      {{if .Err}}<div class="errline show" style="margin-bottom:14px">{{.Err}}</div>{{end}}
+      <form method="POST" action="/setup" id="setupForm">
+        <div class="field">
+          <label for="sfUser">Username</label>
+          <input class="input" id="sfUser" name="username" type="text" value="{{.Username}}" placeholder="admin" autocomplete="off">
+          {{if .ErrUsername}}<div class="errline show">{{.ErrUsername}}</div>{{end}}
+        </div>
+        <div class="field">
+          <label for="sfPass">Password</label>
+          <input class="input" id="sfPass" name="password" type="password" placeholder="password" autocomplete="off">
+          {{if .ErrPassword}}<div class="errline show">{{.ErrPassword}}</div>{{end}}
+        </div>
+        <div class="field">
+          <label for="sfConf">Confirm Password</label>
+          <input class="input" id="sfConf" name="confirm" type="password" placeholder="confirm password" autocomplete="off">
+          {{if .ErrConfirm}}<div class="errline show">{{.ErrConfirm}}</div>{{end}}
+        </div>
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <button class="btn primary" type="submit">Create</button>
+      </form>
+    </div>
+  </div>
+  <div class="auth-ver">HostIt v{{.Version}}</div>
+</main>
+<script src="/static/components.js"></script>
+<script src="/static/app.js"></script>
+<script>
+initTheme('themeBtn','hostit-ember-theme');
+</script>
+</body>
+</html>
