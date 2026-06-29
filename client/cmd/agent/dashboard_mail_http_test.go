@@ -178,3 +178,53 @@ func waitForListen(base string) error {
 	}
 	return context.DeadlineExceeded
 }
+
+// TestAgentAPIRejectsNonJSONContentType locks in the CSRF defense for the
+// dual-use JSON API: a forged cross-origin "simple" request (text/plain or
+// form-encoded) is rejected with 415 before reaching the handler, while a real
+// application/json request from the SDK passes the guard.
+func TestAgentAPIRejectsNonJSONContentType(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dctrl := newAgentController(ctx, agent.Config{})
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addr := freePort(t)
+	go func() { _ = serveAgentDashboard(ctx, addr, cfgPath, dctrl, nil) }()
+	base := "http://" + addr
+	if err := waitForListen(base); err != nil {
+		t.Fatalf("dashboard never started: %v", err)
+	}
+
+	body := `{"name":"x","proto":"tcp","local_port":3000}`
+	do := func(ct string) int {
+		req, _ := http.NewRequest(http.MethodPost, base+"/api/v1/register", strings.NewReader(body))
+		if ct != "" {
+			req.Header.Set("Content-Type", ct)
+		}
+		req.Host = addr
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		_ = res.Body.Close()
+		return res.StatusCode
+	}
+
+	// Forgeable content types must be rejected before the handler runs.
+	for _, ct := range []string{"text/plain", "application/x-www-form-urlencoded", ""} {
+		if code := do(ct); code != http.StatusUnsupportedMediaType {
+			t.Fatalf("Content-Type %q: status = %d, want 415", ct, code)
+		}
+	}
+
+	// application/json passes the guard (agent isn't connected, so the handler
+	// itself returns 503 — the point is it is NOT a 415 from the guard).
+	if code := do("application/json"); code == http.StatusUnsupportedMediaType {
+		t.Fatalf("application/json was rejected by the content-type guard, want pass-through")
+	}
+}

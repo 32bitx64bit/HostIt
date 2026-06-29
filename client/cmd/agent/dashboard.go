@@ -176,6 +176,30 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	mux := http.NewServeMux()
 	mux.Handle("/static/", web.Handler())
 
+	// requireJSON blocks browser-driven CSRF on the dual-use JSON API (SDK +
+	// dashboard). A cross-origin page cannot set Content-Type: application/json
+	// on a POST/PATCH without a CORS preflight this server never approves, so
+	// requiring it rejects forged requests while real API clients (which send
+	// it) are unaffected. GET/HEAD are stateless; DELETE can't be forged cross-origin.
+	requireJSON := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost || r.Method == http.MethodPatch {
+				ct := r.Header.Get("Content-Type")
+				if i := strings.IndexByte(ct, ';'); i >= 0 {
+					ct = ct[:i]
+				}
+				if !strings.EqualFold(strings.TrimSpace(ct), "application/json") {
+					http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+					return
+				}
+			}
+			next(w, r)
+		}
+	}
+	handleJSON := func(pattern string, h http.HandlerFunc) {
+		mux.HandleFunc(pattern, requireJSON(h))
+	}
+
 	writeOK := func(w http.ResponseWriter, data any) {
 		w.Header().Set("Content-Type", "application/json")
 		out := map[string]any{"status": "ok"}
@@ -520,7 +544,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 	// ── Mail viewer API ─────────────────────────────────────────────
 	tplMail := template.Must(template.ParseFS(templateFS, "templates/mail.html"))
 
-	mux.HandleFunc("/api/mail/accounts", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/mail/accounts", func(w http.ResponseWriter, r *http.Request) {
 		if mailSvc == nil {
 			if r.Method == http.MethodGet {
 				w.Header().Set("Content-Type", "application/json")
@@ -565,7 +589,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 	})
 
-	mux.HandleFunc("/api/mail/accounts/", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/mail/accounts/", func(w http.ResponseWriter, r *http.Request) {
 		if mailSvc == nil {
 			writeError(w, http.StatusServiceUnavailable, "mail service unavailable")
 			return
@@ -601,7 +625,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		}
 	})
 
-	mux.HandleFunc("/api/mail/login", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/mail/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -628,7 +652,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		writeOK(w, map[string]string{"username": uname, "address": addr})
 	})
 
-	mux.HandleFunc("/api/mail/inbox", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/mail/inbox", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -663,7 +687,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		writeOK(w, msgs)
 	})
 
-	mux.HandleFunc("/api/mail/message", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/mail/message", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -696,7 +720,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		writeOK(w, msg)
 	})
 
-	mux.HandleFunc("/api/mail/delete", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/mail/delete", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -727,7 +751,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	mux.HandleFunc("/api/mail/lock", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/mail/lock", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -792,7 +816,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		})
 	})
 
-	mux.HandleFunc("/api/v1/register", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/v1/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -950,7 +974,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		writeOK(w, result)
 	})
 
-	mux.HandleFunc("/api/v1/domains/select", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/v1/domains/select", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -1009,7 +1033,7 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		})
 	})
 
-	mux.HandleFunc("/api/v1/routes/update", func(w http.ResponseWriter, r *http.Request) {
+	handleJSON("/api/v1/routes/update", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch && r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
