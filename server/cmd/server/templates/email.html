@@ -7,14 +7,6 @@
 <title>HostIt // Server — Email</title>
 <script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <link rel="stylesheet" href="/static/theme.css">
-<style>
-.acct-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px;}
-.acct-card+.acct-card{margin-top:12px;}
-.acct-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;}
-.acct-head b{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg4);}
-.btn-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px;}
-.note-box{font-size:12px;color:var(--fg4);padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg1);margin-bottom:14px;}
-</style>
 </head>
 <body>
 <div class="topbar">
@@ -47,24 +39,6 @@
 <script src="/static/components.js"></script>
 <script src="/static/app.js"></script>
 <script>
-var CSRF = document.querySelector('meta[name="csrf-token"]').content;
-var reloadTimer;
-function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
-async function fetchJSON(url){
-  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},5000);
-  try{
-    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
-    clearTimeout(t);
-    if(res.redirected||!res.headers.get('content-type')||res.headers.get('content-type').indexOf('application/json')===-1){scheduleReload();return null;}
-    return await res.json();
-  }catch(e){clearTimeout(t);scheduleReload();return null;}
-}
-async function apiPost(url,data){
-  var body=new URLSearchParams();body.set('csrf',CSRF);
-  if(data)for(var k in data)body.set(k,data[k]);
-  var res=await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
-  return res;
-}
 function val(id){var el=$('#'+id);return el?el.value:'';}
 function chk(id){var el=$('#'+id);return el?el.checked:false;}
 
@@ -99,12 +73,19 @@ function renderAccountCard(i,a){
   var ph=a.passwordSet?'Leave blank to keep existing':'Set password';
   var hint=a.passwordSet?'Password already set. Leave blank to keep.':'No password set yet. Required for new accounts.';
   return '<div class="acct-card" data-idx="'+i+'">'+
-    '<div class="acct-head"><b>'+(a.address||('account #'+i))+'</b>'+Ember.button({id:'rmAcct_'+i,text:'Remove',variant:'danger',cls:'sm'})+'</div>'+
+    '<div class="acct-head"><b>'+esc(a.address||('account #'+i))+'</b>'+Ember.button({id:'rmAcct_'+i,text:'Remove',variant:'danger',cls:'sm'})+'</div>'+
     '<div class="grid cols-2">'+
     Ember.field({label:'Username',hint:'Enter only the username part (before the @).',content:Ember.input({id:'au_'+i,value:a.username,placeholder:'alice'})})+
-    Ember.field({label:'Password',hint:hint,content:Ember.input({id:'ap_'+i,type:'password',value:'',placeholder:ph})})+
+    Ember.field({label:'Password',hint:hint,content:Ember.input({id:'ap_'+i,type:'password',value:a.password||'',placeholder:ph})})+
     Ember.field({label:'Enabled',content:Ember.toggle({id:'ae_'+i,labelId:'ael_'+i,label:a.enabled?'on':'off',checked:!!a.enabled})})+
     '</div></div>';
+}
+
+function syncAccountsFromDOM(){
+  ACCOUNTS.forEach(function(a,i){
+    if(!$('#au_'+i))return;
+    a.username=val('au_'+i);a.password=val('ap_'+i);a.enabled=chk('ae_'+i);
+  });
 }
 
 function renderAccounts(){
@@ -113,7 +94,7 @@ function renderAccounts(){
   else{el.innerHTML=ACCOUNTS.map(function(a,i){return renderAccountCard(i,a);}).join('');}
   ACCOUNTS.forEach(function(a,i){
     if($('#ae_'+i))bindToggleLabel('ae_'+i,'ael_'+i,'on','off');
-    var rm=$('#rmAcct_'+i);if(rm)rm.addEventListener('click',function(){ACCOUNTS.splice(i,1);renderAccounts();updateAcctCount();});
+    var rm=$('#rmAcct_'+i);if(rm)rm.addEventListener('click',function(){syncAccountsFromDOM();ACCOUNTS.splice(i,1);renderAccounts();});
   });
   updateAcctCount();
 }
@@ -174,38 +155,6 @@ async function saveEmail(){
   }catch(e){setStatus('emailStatus','error: '+e.message,'err');}
 }
 
-function renderChecks(report){
-  var el=$('#checkResults');if(!el)return;
-  if(!report){el.innerHTML='<div class="muted">No report.</div>';return;}
-  var html='';
-  if(report.summary){html+='<div class="statusline"><span class="gt">&gt;</span> <span>'+esc(report.summary)+'</span></div>';}
-  if(report.counts){
-    html+='<div class="btn-row" style="margin:8px 0;">'+
-      Ember.badge({text:'ok '+report.counts.ok,state:'good'})+
-      Ember.badge({text:'warn '+report.counts.warn,state:'warn'})+
-      Ember.badge({text:'fail '+report.counts.fail,state:'bad'})+
-      '</div>';
-  }
-  var checks=report.checks||[];
-  if(!checks.length){html+='<div class="muted">No checks ran.</div>';}
-  else{html+=checks.map(function(c){
-    return Ember.checkItem({name:c.name,status:c.status,summary:c.summary,fix:c.fix,details:c.details});
-  }).join('');}
-  el.innerHTML=html;
-}
-
-async function runChecks(){
-  var btn=$('#runChecksBtn');if(btn)btn.disabled=true;
-  setStatus('emailStatus','running mail checks...','ok');
-  var el=$('#checkResults');if(el)el.innerHTML='<div class="muted">checking...</div>';
-  try{
-    var res=await apiPost('/api/email/check',{});
-    if(res.ok){var j=await res.json();renderChecks(j);setStatus('emailStatus','checks complete','ok');}
-    else{var t=await res.text();if(el)el.innerHTML='<div class="statusline err"><span class="gt">&gt;</span> <span>'+esc(t.slice(0,200))+'</span></div>';setStatus('emailStatus','check error','err');}
-  }catch(e){if(el)el.innerHTML='<div class="muted">error: '+esc(e.message)+'</div>';setStatus('emailStatus','error: '+e.message,'err');}
-  finally{if(btn)btn.disabled=false;}
-}
-
 function buildEmail(){
   var h=Ember.sectionHead({title:'Email',crumb:'/ email'});
   var status=Ember.statusline({id:'emailStatus',text:'ready'});
@@ -255,9 +204,9 @@ function buildEmail(){
 
   $('#saveMail').addEventListener('click',saveEmail);
   $('#saveAccts').addEventListener('click',saveEmail);
-  $('#runChecksBtn').addEventListener('click',runChecks);
+  initMailChecks('emailStatus');
   $('#setupGuideBtn').addEventListener('click',function(){location.href='/email/setup';});
-  $('#addAcctBtn').addEventListener('click',function(){ACCOUNTS.push({username:'',address:'',passwordSet:false,enabled:true});renderAccounts();});
+  $('#addAcctBtn').addEventListener('click',function(){syncAccountsFromDOM();ACCOUNTS.push({username:'',address:'',passwordSet:false,enabled:true});renderAccounts();});
   $('#emailStorageUnlimited').addEventListener('change',syncStorageLimit);
 }
 
@@ -269,7 +218,7 @@ function syncStorageLimit(){
 buildEmail();
 initTheme('themeBtn','hostit-ember-theme');
 initClock('sbClock');
-$('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+initLogout();
 </script>
 </body>
 </html>

@@ -36,31 +36,6 @@
 <script src="/static/components.js"></script>
 <script src="/static/app.js"></script>
 <script>
-var CSRF = document.querySelector('meta[name="csrf-token"]').content;
-function apiData(payload) {
-  if (payload && payload.status === 'ok' && payload.data !== undefined) return payload.data;
-  if (payload && payload.status === 'error') throw new Error(payload.message || 'API error');
-  return payload;
-}
-async function readAPI(res) { return apiData(await res.json()); }
-var reloadScheduled = false;
-function scheduleReload() { if (reloadScheduled) return; reloadScheduled = true; setTimeout(function () { location.reload(); }, 1500); }
-async function fetchJSON(url) {
-  var ctl = new AbortController(); var timer = setTimeout(function () { ctl.abort(); }, 5000);
-  try {
-    var res = await fetch(url, { cache: 'no-store', headers: {'Accept':'application/json'}, signal: ctl.signal });
-    var ct = res.headers.get('content-type') || '';
-    if (res.redirected || ct.indexOf('application/json') < 0) { scheduleReload(); throw new Error('dashboard response changed'); }
-    if (!res.ok) throw new Error('http ' + res.status);
-    return await readAPI(res);
-  } finally { clearTimeout(timer); }
-}
-function apiPost(url, data) {
-  var body = new URLSearchParams();
-  if (data) for (var k in data) body.set(k, data[k]);
-  return fetch(url, { method: 'POST', headers: { 'X-CSRF-Token': CSRF, 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString() });
-}
-
 function build() {
   var h = Ember.sectionHead({ title: 'Apps', crumb: '/ tunnels' });
 
@@ -90,7 +65,7 @@ function build() {
     ] })
   });
 
-  var eventsPanel = Ember.panel({ title: 'Events', head: '<span class="pspacer"></span>' + Ember.badge({ text: 'SSE', state: 'good' }), body:
+  var eventsPanel = Ember.panel({ title: 'Events', head: '<span class="pspacer"></span>' + Ember.badge({ text: 'SSE', state: 'neutral', id: 'sseBadge' }), body:
     Ember.console({ id: 'eventLog' })
   });
 
@@ -171,13 +146,18 @@ function addEvent(ev) {
   log.insertBefore(row, log.firstChild);
   while (log.children.length > 100) log.removeChild(log.lastChild);
 }
+function setSSEBadge(state) {
+  var b = $('#sseBadge'); if (b) b.className = 'badge ' + state;
+}
 function startEvents() {
   try {
     var source = new EventSource('/api/v1/events');
+    source.onopen = function () { setSSEBadge('good'); };
+    source.onerror = function () { setSSEBadge('warn'); };
     source.onmessage = function (e) {
       try { var ev = JSON.parse(e.data); addEvent(ev); } catch (_) {}
     };
-  } catch (e) {}
+  } catch (e) { setSSEBadge('bad'); }
 }
 
 build();

@@ -7,14 +7,6 @@
 <title>HostIt // Server — Configuration</title>
 <script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <link rel="stylesheet" href="/static/theme.css">
-<style>
-.route-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px;}
-.route-card+.route-card{margin-top:12px;}
-.route-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;}
-.route-card-head b{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg4);}
-.btn-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px;}
-.note-box{font-size:12px;color:var(--fg4);padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg1);margin-bottom:14px;}
-</style>
 </head>
 <body>
 <div class="topbar">
@@ -47,24 +39,6 @@
 <script src="/static/components.js"></script>
 <script src="/static/app.js"></script>
 <script>
-var CSRF = document.querySelector('meta[name="csrf-token"]').content;
-var reloadTimer;
-function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
-async function fetchJSON(url){
-  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},5000);
-  try{
-    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
-    clearTimeout(t);
-    if(res.redirected||!res.headers.get('content-type')||res.headers.get('content-type').indexOf('application/json')===-1){scheduleReload();return null;}
-    return await res.json();
-  }catch(e){clearTimeout(t);scheduleReload();return null;}
-}
-async function apiPost(url,data){
-  var body=new URLSearchParams();body.set('csrf',CSRF);
-  if(data)for(var k in data)body.set(k,data[k]);
-  var res=await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
-  return res;
-}
 function val(id){var el=$('#'+id);return el?el.value:'';}
 function chk(id){var el=$('#'+id);return el?el.checked:false;}
 
@@ -120,6 +94,14 @@ function renderRouteCard(i,r){
     '</div></div>';
 }
 
+function syncRoutesFromDOM(){
+  ROUTES.forEach(function(r,i){
+    if(!$('#rn_'+i))return;
+    r.name=val('rn_'+i);r.agent=val('ra_'+i);r.proto=val('rp_'+i);r.pub=val('rpub_'+i);
+    r.local=val('rloc_'+i);r.domain=val('rdom_'+i);r.encrypted=chk('renc_'+i);r.domainEnabled=chk('rde_'+i);
+  });
+}
+
 function renderRoutes(){
   var el=$('#routeList');if(!el)return;
   if(!ROUTES.length){el.innerHTML='<div class="muted">No routes configured. Add one below.</div>';}
@@ -128,7 +110,7 @@ function renderRoutes(){
   ROUTES.forEach(function(r,i){
     if($('#renc_'+i))bindToggleLabel('renc_'+i,'rencl_'+i,'on','off');
     if($('#rde_'+i))bindToggleLabel('rde_'+i,'rdel_'+i,'on','off');
-    var rm=$('#rmRoute_'+i);if(rm)rm.addEventListener('click',function(){ROUTES.splice(i,1);renderRoutes();updateRouteCount();});
+    var rm=$('#rmRoute_'+i);if(rm)rm.addEventListener('click',function(){syncRoutesFromDOM();ROUTES.splice(i,1);renderRoutes();});
   });
   updateRouteCount();
 }
@@ -267,13 +249,13 @@ function buildConfig(){
   $('#genTokenBtn').addEventListener('click',genToken);
   if($('#regenTLSBtn'))$('#regenTLSBtn').addEventListener('click',function(){saveConfig({tls_regen:'1'});});
   $('#regenWebBtn').addEventListener('click',function(){saveConfig({web_tls_regen:'1'});});
-  $('#addRouteBtn').addEventListener('click',function(){ROUTES.push({name:'',proto:'tcp',pub:'',local:'',domain:'',agent:AGENTS[0]||'default',encrypted:false,domainEnabled:false});renderRoutes();});
+  $('#addRouteBtn').addEventListener('click',function(){syncRoutesFromDOM();ROUTES.push({name:'',proto:'tcp',pub:'',local:'',domain:'',agent:AGENTS[0]||'default',encrypted:false,domainEnabled:false});renderRoutes();});
 }
 
 buildConfig();
 initTheme('themeBtn','hostit-ember-theme');
 initClock('sbClock');
-$('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+initLogout();
 </script>
 </body>
 </html>

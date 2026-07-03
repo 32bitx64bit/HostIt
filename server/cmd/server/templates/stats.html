@@ -41,29 +41,10 @@
 <script src="/static/components.js"></script>
 <script src="/static/app.js"></script>
 <script>
-var CSRF = document.querySelector('meta[name="csrf-token"]').content;
-var reloadTimer;
-function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
 function fmtNum(n){n=Number(n||0);return n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':''+n;}
 function fmtBytes(n){n=Number(n||0);if(n>=1073741824)return(n/1073741824).toFixed(2)+' GiB';if(n>=1048576)return(n/1048576).toFixed(2)+' MiB';if(n>=1024)return(n/1024).toFixed(2)+' KiB';return n+' B';}
 function fmtMiB(n){return(Number(n||0)/1048576).toFixed(1);}
 function fmtInterval(s){s=Number(s||0);if(s>=60)return Math.round(s/60)+'m';return s+'s';}
-async function fetchJSON(url){
-  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},5000);
-  try{
-    var res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'},signal:ctrl.signal});
-    var ct=res.headers.get('content-type')||'';
-    if(res.redirected||ct.indexOf('application/json')<0){scheduleReload();throw new Error('dashboard response changed');}
-    if(!res.ok)throw new Error('http '+res.status);
-    return await res.json();
-  }finally{clearTimeout(t);}
-}
-async function apiPost(url,data){
-  var body=new URLSearchParams();body.set('csrf',CSRF);
-  if(data)for(var k in data)body.set(k,data[k]);
-  var res=await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
-  return res;
-}
 
 function buildDash(){
   var h=Ember.sectionHead({title:'Server Overview',crumb:'/ dashboard'});
@@ -161,11 +142,12 @@ function renderTransport(systemEvents,udp){
   renderList('tcpConsole',tcpEvs,'No TCP events yet.');
 }
 
+var openRoutes={};
 function renderRoutes(routes){
   var el=$('#routesDash');if(!el)return;
   if(!routes||!routes.length){el.innerHTML='<div class="muted">No routes configured.</div>';return;}
   el.innerHTML=routes.map(function(r,idx){
-    return Ember.routeCard({name:r.name,proto:r.proto,pub:r.publicAddr,owner:r.agent,on:r.enabled,active:r.active,idx:idx});
+    return Ember.routeCard({name:r.name,proto:r.proto,pub:r.publicAddr,owner:r.agent,on:r.enabled,active:r.active,idx:idx,open:!!openRoutes[r.name]});
   }).join('');
   routes.forEach(function(r,idx){
     var evs=(r.events||[]).slice(-20);
@@ -186,7 +168,14 @@ function renderRoutes(routes){
     }
   });
   $$('.route-head').forEach(function(h){
-    h.addEventListener('click',function(e){if(e.target.closest('.rtoggle'))return;$('#route_'+h.getAttribute('data-rt')).classList.toggle('open');});
+    h.addEventListener('click',function(e){
+      if(e.target.closest('.rtoggle'))return;
+      var idx=+h.getAttribute('data-rt');
+      var card=$('#route_'+idx);
+      card.classList.toggle('open');
+      var r=routes[idx];
+      if(r){if(card.classList.contains('open'))openRoutes[r.name]=true;else delete openRoutes[r.name];}
+    });
   });
   $$('.rtoggle').forEach(function(t){
     t.addEventListener('click',function(e){e.stopPropagation();toggleRoute(+t.getAttribute('data-rt'));});
@@ -226,22 +215,20 @@ async function poll(){
   }
 }
 
-var updateTimer;
 async function pollUpdate(){
-  var s=await fetchJSON('/api/update/status');if(!s)return;
-  var canUpdate = !!s.showPopup && isNewerVersion(s.availableVersion, s.currentVersion);
-  if(canUpdate){
-    var p=$('#updatePopup');
+  var s=await pollJSON('/api/update/status');if(!s)return;
+  var p=$('#updatePopup');if(!p)return;
+  if(!s.showPopup||!isNewerVersion(s.availableVersion,s.currentVersion))return;
+  if(!p.dataset.built){
     p.innerHTML=Ember.updatePopup({current:s.currentVersion,available:s.availableVersion});
-    p.style.display='';p.classList.add('show');
+    p.dataset.built='1';
     $('#updateClose').addEventListener('click',function(){p.classList.remove('show');p.style.display='none';});
     $('#updateSkip').addEventListener('click',function(){apiPost('/api/update/skip');p.classList.remove('show');p.style.display='none';});
     $('#updateLater').addEventListener('click',function(){apiPost('/api/update/remind');p.classList.remove('show');p.style.display='none';});
     $('#updateDo').addEventListener('click',function(){apiPost('/api/update/apply');$('#updateProgress').textContent='> starting update...\n';});
   }
+  p.style.display='';p.classList.add('show');
 }
-
-function pad(n){return n<10?'0'+n:''+n;}
 
 buildDash();
 initTheme('themeBtn','hostit-ember-theme');
@@ -250,9 +237,9 @@ initChartTooltip();
 $$('.chip[data-target="band"]').forEach(function(c){c.addEventListener('click',function(){bandRange=c.getAttribute('data-range');$$('.chip[data-target="band"]').forEach(function(x){x.classList.toggle('active',x===c);});if(lastStats)renderBand(lastStats.series);});});
 $$('.chip[data-target="conn"]').forEach(function(c){c.addEventListener('click',function(){connRange=c.getAttribute('data-range');$$('.chip[data-target="conn"]').forEach(function(x){x.classList.toggle('active',x===c);});if(lastStats)renderConn(lastStats.series);});});
 $$('#agentsTable th.sortable').forEach(function(th){th.addEventListener('click',function(){var k=th.getAttribute('data-sort');if(agentsSort.key===k)agentsSort.dir*=-1;else{agentsSort.key=k;agentsSort.dir=1;}if(lastStats)renderAgents(lastStats.agents);});});
-$('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+initLogout();
 poll();setInterval(poll,3000);
-pollUpdate();updateTimer=setInterval(pollUpdate,30000);
+pollUpdate();setInterval(pollUpdate,30000);
 </script>
 </body>
 </html>

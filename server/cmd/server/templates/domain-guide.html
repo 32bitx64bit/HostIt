@@ -40,24 +40,6 @@
 <script src="/static/components.js"></script>
 <script src="/static/app.js"></script>
 <script>
-var CSRF=document.querySelector('meta[name="csrf-token"]').content;
-var reloadTimer;
-function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
-async function fetchJSON(url){
-  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},8000);
-  try{
-    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
-    clearTimeout(t);
-    if(res.redirected||!res.headers.get('content-type')||res.headers.get('content-type').indexOf('application/json')===-1){scheduleReload();return null;}
-    return await res.json();
-  }catch(e){clearTimeout(t);scheduleReload();return null;}
-}
-async function apiPost(url,data){
-  var body=new URLSearchParams();body.set('csrf',CSRF);
-  if(data)for(var k in data)body.set(k,data[k]);
-  return await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
-}
-
 var INIT={domainBase:"{{.Cfg.DomainBase}}",httpAddr:"{{.Cfg.DomainHTTPAddr}}",httpsAddr:"{{.Cfg.DomainHTTPSAddr}}",certDir:"{{.Cfg.DomainCertDir}}",renewBefore:"{{.Cfg.DomainRenewBefore}}",acmeEmail:"{{.Cfg.DomainACMEEmail}}",publicAddr:"{{.Cfg.PublicAddr}}",autoTLS:{{.Cfg.DomainAutoTLS}},managerEnabled:{{.Cfg.DomainManagerEnabled}}};
 
 function lines(arr){return arr.map(function(x){return '<div class="ln"><span class="gt">&gt;</span> '+esc(x)+'</div>';}).join('');}
@@ -97,7 +79,7 @@ function buildGuide(){
     '5. Certificates are stored in '+cert+' and renewed '+renew+' before expiry.'
   ])+'</div>'});
   $('#app').innerHTML=h+note+how+cfg+dns;
-  $('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+  initLogout();
 }
 
 buildGuide();

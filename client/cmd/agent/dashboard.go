@@ -140,7 +140,6 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			"Running":          running,
 			"Connected":        connected,
 			"AgentID":          ctrl.EffectiveAgentID(),
-			"HasToken":         hasToken,
 			"TokenPlaceholder": tokenPlaceholder,
 			"LastErr":          lastErr,
 			"ConfigPath":       configPath,

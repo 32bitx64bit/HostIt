@@ -7,19 +7,6 @@
 <title>HostIt // Server — Email Setup</title>
 <script>(function(){try{var s=localStorage.getItem('hostit-ember-theme');var t=s||(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <link rel="stylesheet" href="/static/theme.css">
-<style>
-.dns-rec{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px;}
-.dns-rec+.dns-rec{margin-top:12px;}
-.dns-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;}
-.dns-type{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border:1px solid var(--border);border-radius:4px;color:var(--yellow);background:var(--bg1);}
-.dns-host{display:flex;align-items:center;gap:6px;flex:1;min-width:160px;}
-.dns-host code{font-family:var(--mono,ui-monospace);font-size:12px;word-break:break-all;}
-.dns-val{display:flex;align-items:flex-start;gap:6px;}
-.dns-val code{font-family:var(--mono,ui-monospace);font-size:12px;word-break:break-all;background:var(--bg1);padding:4px 7px;border-radius:4px;display:block;}
-.lbl{font-size:11px;color:var(--fg4);text-transform:uppercase;letter-spacing:.06em;}
-.btn-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px;}
-.note-box{font-size:12px;color:var(--fg4);padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg1);margin-bottom:14px;}
-</style>
 </head>
 <body>
 <div class="topbar">
@@ -52,25 +39,6 @@
 <script src="/static/components.js"></script>
 <script src="/static/app.js"></script>
 <script>
-var CSRF = document.querySelector('meta[name="csrf-token"]').content;
-var reloadTimer;
-function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
-async function fetchJSON(url){
-  var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort();},5000);
-  try{
-    var res=await fetch(url,{headers:{'Accept':'application/json'},signal:ctrl.signal});
-    clearTimeout(t);
-    if(res.redirected||!res.headers.get('content-type')||res.headers.get('content-type').indexOf('application/json')===-1){scheduleReload();return null;}
-    return await res.json();
-  }catch(e){clearTimeout(t);scheduleReload();return null;}
-}
-async function apiPost(url,data){
-  var body=new URLSearchParams();body.set('csrf',CSRF);
-  if(data)for(var k in data)body.set(k,data[k]);
-  var res=await fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
-  return res;
-}
-
 var REC = {
   emailDomain: "{{.EmailDomain}}",
   mailHost: "{{.MailHost}}",
@@ -104,38 +72,6 @@ function copyText(text,btnId){
   var b=$('#'+btnId);if(b){var t=b.textContent;b.textContent='copied';setTimeout(function(){b.textContent=t;},1200);}
 }
 
-function renderChecks(report){
-  var el=$('#checkResults');if(!el)return;
-  if(!report){el.innerHTML='<div class="muted">No report.</div>';return;}
-  var html='';
-  if(report.summary){html+='<div class="statusline"><span class="gt">&gt;</span> <span>'+esc(report.summary)+'</span></div>';}
-  if(report.counts){
-    html+='<div class="btn-row" style="margin:8px 0;">'+
-      Ember.badge({text:'ok '+report.counts.ok,state:'good'})+
-      Ember.badge({text:'warn '+report.counts.warn,state:'warn'})+
-      Ember.badge({text:'fail '+report.counts.fail,state:'bad'})+
-      '</div>';
-  }
-  var checks=report.checks||[];
-  if(!checks.length){html+='<div class="muted">No checks ran.</div>';}
-  else{html+=checks.map(function(c){
-    return Ember.checkItem({name:c.name,status:c.status,summary:c.summary,fix:c.fix,details:c.details});
-  }).join('');}
-  el.innerHTML=html;
-}
-
-async function runChecks(){
-  var btn=$('#runChecksBtn');if(btn)btn.disabled=true;
-  setStatus('setupStatus','running mail checks...','ok');
-  var el=$('#checkResults');if(el)el.innerHTML='<div class="muted">checking...</div>';
-  try{
-    var res=await apiPost('/api/email/check',{});
-    if(res.ok){var j=await res.json();renderChecks(j);setStatus('setupStatus','checks complete','ok');}
-    else{var t=await res.text();if(el)el.innerHTML='<div class="statusline err"><span class="gt">&gt;</span> <span>'+esc(t.slice(0,200))+'</span></div>';setStatus('setupStatus','check error','err');}
-  }catch(e){if(el)el.innerHTML='<div class="muted">error: '+esc(e.message)+'</div>';setStatus('setupStatus','error: '+e.message,'err');}
-  finally{if(btn)btn.disabled=false;}
-}
-
 function buildSetup(){
   var h=Ember.sectionHead({title:'Email Setup',crumb:'/ email/setup'});
   var status=Ember.statusline({id:'setupStatus',text:'ready'});
@@ -161,13 +97,13 @@ function buildSetup(){
     var b=$('#dnsCopy_'+i);if(b)b.addEventListener('click',function(){copyText(r.copy||r.value,'dnsCopy_'+i);});
   });
   $('#backEmailBtn').addEventListener('click',function(){location.href='/email';});
-  $('#runChecksBtn').addEventListener('click',runChecks);
+  initMailChecks('setupStatus');
 }
 
 buildSetup();
 initTheme('themeBtn','hostit-ember-theme');
 initClock('sbClock');
-$('#logoutBtn').addEventListener('click',function(){var f=document.createElement('form');f.method='POST';f.action='/logout';var i=document.createElement('input');i.type='hidden';i.name='csrf';i.value=CSRF;f.appendChild(i);document.body.appendChild(f);f.submit();});
+initLogout();
 </script>
 </body>
 </html>

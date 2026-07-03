@@ -4,10 +4,62 @@ function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function
 function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
 function nowClock() { var d = new Date(); return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()); }
-function randHex(n) { var h = ''; for (var i = 0; i < (n || 8); i++) h += '0123456789abcdef'[Math.floor(Math.random() * 16)]; return h; }
 
-function protoTag(p) {
-  return '<span class="tag ' + p + '">' + p.toUpperCase() + '</span>';
+var CSRF = (function () { var m = document.querySelector('meta[name="csrf-token"]'); return m ? m.content : ''; })();
+
+var _reloadTimer;
+function scheduleReload() { if (_reloadTimer) return; _reloadTimer = setTimeout(function () { location.reload(); }, 1500); }
+
+function apiData(payload) {
+  if (payload && payload.status === 'ok' && payload.data !== undefined) return payload.data;
+  if (payload && payload.status === 'error') throw new Error(payload.message || 'API error');
+  return payload;
+}
+async function readAPI(res) { return apiData(await res.json()); }
+
+async function fetchJSON(url, timeoutMs) {
+  var ctl = new AbortController();
+  var timer = setTimeout(function () { ctl.abort(); }, timeoutMs || 5000);
+  try {
+    var res = await fetch(url, { cache: 'no-store', headers: { 'Accept': 'application/json' }, signal: ctl.signal });
+    var ct = res.headers.get('content-type') || '';
+    if (res.redirected || ct.indexOf('application/json') < 0) { scheduleReload(); throw new Error('dashboard response changed'); }
+    if (!res.ok) throw new Error('http ' + res.status);
+    return await readAPI(res);
+  } finally { clearTimeout(timer); }
+}
+
+async function pollJSON(url, timeoutMs) {
+  var ctl = new AbortController();
+  var timer = setTimeout(function () { ctl.abort(); }, timeoutMs || 8000);
+  try {
+    var res = await fetch(url, { cache: 'no-store', headers: { 'Accept': 'application/json' }, signal: ctl.signal });
+    if (!res.ok || res.redirected) return null;
+    var ct = res.headers.get('content-type') || '';
+    if (ct.indexOf('application/json') < 0) return null;
+    return await readAPI(res);
+  } catch (e) { return null; } finally { clearTimeout(timer); }
+}
+
+function apiPost(url, data) {
+  var body = new URLSearchParams();
+  body.set('csrf', CSRF);
+  if (data) for (var k in data) body.set(k, data[k]);
+  return fetch(url, { method: 'POST', headers: { 'X-CSRF-Token': CSRF, 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString() });
+}
+
+function initLogout(btnId) {
+  var btn = $('#' + (btnId || 'logoutBtn'));
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    var f = document.createElement('form');
+    f.method = 'POST'; f.action = '/logout';
+    var i = document.createElement('input');
+    i.type = 'hidden'; i.name = 'csrf'; i.value = CSRF;
+    f.appendChild(i);
+    document.body.appendChild(f);
+    f.submit();
+  });
 }
 
 function setStatus(id, text, kind) {
@@ -21,19 +73,6 @@ function setStatus(id, text, kind) {
   clearTimeout(el._t);
   el._t = setTimeout(function () { el.classList.remove('flash', 'err'); }, 2200);
 }
-
-function logHtml(cls, src, msg) {
-  return '<div class="ln"><span class="ts">' + nowClock() + '</span> <span class="' + cls + '">' + src + '</span> ' + esc(msg) + '</div>';
-}
-
-function pushLog(id, html, cap) {
-  var c = $('#' + id); if (!c) return;
-  c.insertAdjacentHTML('beforeend', html);
-  while (c.childNodes.length > (cap || 90)) c.removeChild(c.firstChild);
-  c.scrollTop = c.scrollHeight;
-}
-
-var RANGE = { '1H': 12, '6H': 24, '12H': 36, '24H': 48 };
 
 function drawBars(cfg) {
   var svg = $('#' + cfg.svg); if (!svg) return;
@@ -70,12 +109,6 @@ function drawBars(cfg) {
     });
     axis.innerHTML = ah;
   }
-}
-
-function makeChartSeries(n, base, amp, noise) {
-  var arr = [];
-  for (var i = 0; i < n; i++) arr.push(base + Math.sin(i / 4) * amp + Math.random() * noise);
-  return arr;
 }
 
 function styleSelects(root) {
@@ -143,18 +176,6 @@ function initTheme(btnId, key) {
   });
 }
 
-function initTabs(tabSelector, sectionPrefix, winId) {
-  var tabs = $$(tabSelector);
-  tabs.forEach(function (t) {
-    t.addEventListener('click', function () {
-      var id = t.getAttribute('data-tab');
-      tabs.forEach(function (x) { x.classList.toggle('active', x === t); });
-      $$(sectionPrefix).forEach(function (s) { s.classList.toggle('active', s.id === 'sec-' + id); });
-      if (winId) { var w = $('#' + winId); if (w) w.textContent = id; }
-    });
-  });
-}
-
 function initChartTooltip() {
   document.addEventListener('mousemove', function (e) {
     var tip = $('#tip');
@@ -167,16 +188,6 @@ function initChartTooltip() {
       tip.style.left = (e.clientX + 12) + 'px';
       tip.style.top = (e.clientY - 28) + 'px';
     } else { tip.style.display = 'none'; }
-  });
-}
-
-function initChartScales(target, getRange, setRange, render) {
-  $$('.chip[data-target="' + target + '"]').forEach(function (c) {
-    c.addEventListener('click', function () {
-      var rng = c.getAttribute('data-range');
-      $$('.chip[data-target="' + target + '"]').forEach(function (x) { x.classList.toggle('active', x === c); });
-      setRange(rng); render();
-    });
   });
 }
 
@@ -193,6 +204,47 @@ function bindToggleLabel(swId, lblId, on, off) {
   function up() { lbl.textContent = sw.checked ? on : off; }
   sw.addEventListener('change', up);
   up();
+}
+
+function renderMailChecks(report) {
+  var el = $('#checkResults'); if (!el) return;
+  if (!report) { el.innerHTML = '<div class="muted">No report.</div>'; return; }
+  var html = '';
+  if (report.summary) html += '<div class="statusline"><span class="gt">&gt;</span> <span>' + esc(report.summary) + '</span></div>';
+  if (report.counts) {
+    html += '<div class="btn-row" style="margin:8px 0;">'
+      + Ember.badge({ text: 'ok ' + report.counts.ok, state: 'good' })
+      + Ember.badge({ text: 'warn ' + report.counts.warn, state: 'warn' })
+      + Ember.badge({ text: 'fail ' + report.counts.fail, state: 'bad' })
+      + '</div>';
+  }
+  var checks = report.checks || [];
+  if (!checks.length) html += '<div class="muted">No checks ran.</div>';
+  else html += checks.map(function (c) {
+    return Ember.checkItem({ name: c.name, status: c.status, summary: c.summary, fix: c.fix, details: c.details });
+  }).join('');
+  el.innerHTML = html;
+}
+
+function initMailChecks(statusId) {
+  var btn = $('#runChecksBtn'); if (!btn) return;
+  btn.addEventListener('click', async function () {
+    btn.disabled = true;
+    setStatus(statusId, 'running mail checks...', 'ok');
+    var el = $('#checkResults'); if (el) el.innerHTML = '<div class="muted">checking...</div>';
+    try {
+      var res = await apiPost('/api/email/check', {});
+      if (res.ok) { renderMailChecks(await res.json()); setStatus(statusId, 'checks complete', 'ok'); }
+      else {
+        var t = await res.text();
+        if (el) el.innerHTML = '<div class="statusline err"><span class="gt">&gt;</span> <span>' + esc(t.slice(0, 200)) + '</span></div>';
+        setStatus(statusId, 'check error', 'err');
+      }
+    } catch (e) {
+      if (el) el.innerHTML = '<div class="muted">error: ' + esc(e.message) + '</div>';
+      setStatus(statusId, 'error: ' + e.message, 'err');
+    } finally { btn.disabled = false; }
+  });
 }
 
 function parseVersionTag(s) {

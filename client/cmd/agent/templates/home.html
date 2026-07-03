@@ -43,49 +43,8 @@ var INIT = {
   tokenPlaceholder: "{{.TokenPlaceholder}}",
   tlsPin: "{{.Cfg.TLSPinSHA256}}",
   agentId: "{{.AgentID}}",
-  hasToken: {{if .HasToken}}true{{else}}false{{end}},
   version: "{{.Version}}"
 };
-var CSRF = document.querySelector('meta[name="csrf-token"]').content;
-
-function apiData(payload){
-  if(payload && payload.status==='ok' && payload.data!==undefined) return payload.data;
-  if(payload && payload.status==='error') throw new Error(payload.message||'API error');
-  return payload;
-}
-async function readAPI(res){
-  return apiData(await res.json());
-}
-var reloadTimer;
-function scheduleReload(){if(reloadTimer)return;reloadTimer=setTimeout(function(){location.reload();},1500);}
-async function fetchJSON(url){
-  var ctrl=new AbortController();
-  var t=setTimeout(function(){ctrl.abort();},5000);
-  try{
-    var res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'},signal:ctrl.signal});
-    var ct=res.headers.get('content-type')||'';
-    if(res.redirected||ct.indexOf('application/json')<0){scheduleReload();throw new Error('dashboard response changed');}
-    if(!res.ok)throw new Error('http '+res.status);
-    return await readAPI(res);
-  }finally{clearTimeout(t);}
-}
-async function pollJSON(url){
-  var ctrl=new AbortController();
-  var t=setTimeout(function(){ctrl.abort();},8000);
-  try{
-    var res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'},signal:ctrl.signal});
-    clearTimeout(t);
-    if(!res.ok||res.redirected)return null;
-    var ct=res.headers.get('content-type')||'';if(ct.indexOf('application/json')<0)return null;
-    return await readAPI(res);
-  }catch(e){clearTimeout(t);return null;}
-}
-function apiPost(url,data){
-  var body=new URLSearchParams();
-  if(data)for(var k in data)body.set(k,data[k]);
-  return fetch(url,{method:'POST',headers:{'X-CSRF-Token':CSRF,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
-}
-
 function buildHome(){
   var head=Ember.sectionHead({title:'Agent Overview',crumb:'/ home'});
   var tiles=Ember.grid({cols:3,children:

@@ -158,7 +158,7 @@ var Ember = (function () {
   }
 
   function routeCard(o) {
-    return '<div class="route" id="route_' + o.idx + '">'
+    return '<div class="route' + (o.open ? ' open' : '') + '" id="route_' + o.idx + '">'
       + '<div class="route-head" data-rt="' + o.idx + '">'
       + '<span class="caret">&#9654;</span>'
       + '<span class="rname">' + esc(o.name) + '</span> ' + tag({ proto: o.proto })
@@ -186,33 +186,6 @@ var Ember = (function () {
       + '<span class="check-status ' + o.status + '">' + statusLabel + '</span></div>'
       + details + fix + '</div>';
   }
-
-  function tabBar(o) {
-    return '<div class="topbar">'
-      + '<div class="logo">HostIt <span class="sub">' + esc(o.role || '') + '</span></div>'
-      + '<nav class="nav">' + (o.tabs || []).map(function (t) {
-        return '<button class="tab' + (t.id === o.active ? ' active' : '') + '" data-tab="' + esc(t.id) + '" role="tab">' + esc(t.label) + '</button>';
-      }).join('') + '</nav>'
-      + '<div class="topbar-right">'
-      + '<span class="online-dot"></span><span class="online-label">' + esc(o.online || 'ONLINE') + '</span>'
-      + '<button class="theme-btn" id="themeBtn" aria-label="Toggle theme">' + esc(o.themeLabel || 'dark') + '</button>'
-      + '<span class="ver">' + esc(o.version || 'v3.1.1') + '</span>'
-      + (o.logout ? '<button class="theme-btn" id="logoutBtn">logout</button>' : '')
-      + '</div></div>';
-  }
-
-  function tmuxBar(o) {
-    return '<div class="statusbar">'
-      + '<div class="sb-seg sb-l1">hostit</div>'
-      + '<div class="sb-seg sb-l2"><span class="win-act" id="sbWin">' + esc(o.win || 'home') + '</span></div>'
-      + '<div class="sb-right">'
-      + '<div class="sb-seg sb-r1" id="sbAgent">' + esc(o.agent || '') + '</div>'
-      + '<div class="sb-seg sb-r2">routes <span id="sbRoutes">' + esc(o.routes || '0') + '</span></div>'
-      + '<div class="sb-seg sb-r3" id="sbClock">' + esc(o.clock || '') + '</div>'
-      + '</div></div>';
-  }
-
-  function tip() { return '<div class="tip" id="tip"></div>'; }
 
   function updatePopup(o) {
     function v(s) { s = String(s || ''); return (s.charAt(0) === 'v' || s.charAt(0) === 'V') ? s.slice(1) : s; }
@@ -257,9 +230,6 @@ var Ember = (function () {
     table: table,
     routeCard: routeCard,
     checkItem: checkItem,
-    tabBar: tabBar,
-    tmuxBar: tmuxBar,
-    tip: tip,
     updatePopup: updatePopup,
     resultGrid: resultGrid
   };
