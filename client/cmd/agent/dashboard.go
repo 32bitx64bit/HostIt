@@ -23,6 +23,7 @@ import (
 	"hostit/shared/configio"
 	"hostit/shared/logging"
 	"hostit/shared/module"
+	"hostit/shared/netutil"
 	"hostit/shared/systemdutil"
 	"hostit/shared/updater"
 	"hostit/shared/version"
@@ -846,6 +847,10 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		if req.LocalHost != "" {
 			localHost = req.LocalHost
 		}
+		if err := netutil.ValidateAgentLocalHost(localHost); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		localAddr := net.JoinHostPort(localHost, strconv.Itoa(req.LocalPort))
 
 		_, running, connected, lastErr, _ := ctrl.Get()
@@ -1066,6 +1071,10 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 			localHost := "127.0.0.1"
 			if req.LocalHost != "" {
 				localHost = req.LocalHost
+			}
+			if err := netutil.ValidateAgentLocalHost(localHost); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
 			}
 			update.LocalAddr = net.JoinHostPort(localHost, strconv.Itoa(req.LocalPort))
 		}

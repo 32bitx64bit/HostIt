@@ -424,8 +424,23 @@ func (s *fakeBenchServer) acceptDataConnBench(b *testing.B) (net.Conn, string, s
 		_ = conn.Close()
 		b.Fatal(err)
 	}
+	routeName := string(routeBytes)
+	if routeName != protocol.RouteMailOutboundTCP {
+		var pairLen byte
+		if err := binary.Read(conn, binary.BigEndian, &pairLen); err != nil {
+			_ = conn.Close()
+			b.Fatal(err)
+		}
+		if pairLen > 0 {
+			pairBytes := make([]byte, int(pairLen))
+			if _, err := io.ReadFull(conn, pairBytes); err != nil {
+				_ = conn.Close()
+				b.Fatal(err)
+			}
+		}
+	}
 	_ = conn.SetReadDeadline(time.Time{})
-	return conn, string(routeBytes), string(clientBytes)
+	return conn, routeName, string(clientBytes)
 }
 
 func payloadLabel(n int) string {

@@ -26,6 +26,7 @@ import (
 	"hostit/shared/configio"
 	"hostit/shared/emailcfg"
 	"hostit/shared/logging"
+	"hostit/shared/netutil"
 	"hostit/shared/protocol"
 )
 
@@ -592,6 +593,10 @@ func registerAppsFromConfig(ctx context.Context, ctrl *agentController, apps []a
 		localHost := "127.0.0.1"
 		if app.LocalHost != "" {
 			localHost = app.LocalHost
+		}
+		if err := netutil.ValidateAgentLocalHost(localHost); err != nil {
+			agentlog.Log.Infof(logging.CatSystem, "auto-register app %q skipped: %v", app.Name, err)
+			continue
 		}
 		localAddr := net.JoinHostPort(localHost, strconv.Itoa(app.LocalPort))
 		req := apitypes.RouteRequest{

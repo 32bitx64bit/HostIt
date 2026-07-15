@@ -1,6 +1,8 @@
 package tunnel
 
 import (
+	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -264,6 +266,169 @@ func TestProcessRouteRequestLocked_MaxDynamicRoutes(t *testing.T) {
 	}
 }
 
+func TestProcessRouteRequestLocked_MaxDynamicRoutesAllSources(t *testing.T) {
+	s := NewServer(ServerConfig{
+		ControlAddr:              "127.0.0.1:0",
+		DataAddr:                 "127.0.0.1:0",
+		Token:                    "testtoken",
+		DisableTLS:               true,
+		PairTimeout:              3 * time.Second,
+		DynamicPortRange:         "30210-30250",
+		MaxDynamicRoutesPerAgent: 1,
+	}, nil)
+	defer func() {
+		s.mu.Lock()
+		for _, ln := range s.publicTCP {
+			ln.Close()
+		}
+		for _, c := range s.publicUDP {
+			c.Close()
+		}
+		s.mu.Unlock()
+	}()
+	s.mu.Lock()
+
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
+		RequestID: "r1", Name: "app1", Proto: "tcp",
+		LocalAddr: "127.0.0.1:1", PublicPort: 30210, Source: "apps.json",
+	})
+	if r1.Status != "active" {
+		t.Fatalf("app1: Status = %q, want active (err=%q)", r1.Status, r1.Error)
+	}
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
+		RequestID: "r2", Name: "app2", Proto: "tcp",
+		LocalAddr: "127.0.0.1:2", PublicPort: 30211, Source: "apps.json",
+	})
+	s.mu.Unlock()
+
+	if resp.Status != "failed" {
+		t.Fatalf("Status = %q for apps.json source, want failed", resp.Status)
+	}
+}
+
+func TestProcessRouteRequestLocked_UDPListenFailureRollsBack(t *testing.T) {
+	blocker, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("prebind udp: %v", err)
+	}
+	defer blocker.Close()
+	port := blocker.LocalAddr().(*net.UDPAddr).Port
+
+	s := NewServer(ServerConfig{
+		ControlAddr:      "127.0.0.1:0",
+		DataAddr:         "127.0.0.1:0",
+		Token:            "testtoken",
+		DisableTLS:       true,
+		PairTimeout:      3 * time.Second,
+		DynamicPortRange: "30300-30350",
+	}, nil)
+	s.mu.Lock()
+	resp := s.testProcessRouteRequest(apitypes.RouteRequest{
+		RequestID:  "udp-fail",
+		Name:       "udproute",
+		Proto:      "udp",
+		LocalAddr:  "127.0.0.1:9",
+		PublicPort: port,
+		Source:     "api",
+	})
+	_, exists := s.dynamicRoutes["udproute"]
+	s.mu.Unlock()
+
+	if resp.Status != "failed" {
+		t.Fatalf("Status = %q, want failed when udp listen is blocked (err=%q)", resp.Status, resp.Error)
+	}
+	if exists {
+		t.Fatal("dynamic route should be rolled back after udp listen failure")
+	}
+}
+
+func TestProcessRouteUpdateLocked_UDPListenFailurePreservesOld(t *testing.T) {
+	blocker, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("prebind udp: %v", err)
+	}
+	defer blocker.Close()
+	blockedPort := blocker.LocalAddr().(*net.UDPAddr).Port
+
+	oldLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve old port: %v", err)
+	}
+	oldPort := oldLn.Addr().(*net.TCPAddr).Port
+	oldLn.Close()
+
+	s := NewServer(ServerConfig{
+		ControlAddr:      "127.0.0.1:0",
+		DataAddr:         "127.0.0.1:0",
+		Token:            "testtoken",
+		DisableTLS:       true,
+		PairTimeout:      3 * time.Second,
+		DynamicPortRange: "30360-30400",
+	}, nil)
+	defer func() {
+		s.mu.Lock()
+		for _, ln := range s.publicTCP {
+			ln.Close()
+		}
+		for _, c := range s.publicUDP {
+			c.Close()
+		}
+		s.mu.Unlock()
+	}()
+
+	s.mu.Lock()
+	reg := s.testProcessRouteRequest(apitypes.RouteRequest{
+		RequestID:  "upd-both",
+		Name:       "bothroute",
+		Proto:      "both",
+		LocalAddr:  "127.0.0.1:9",
+		PublicPort: oldPort,
+		Source:     "api",
+	})
+	if reg.Status != "active" {
+		s.mu.Unlock()
+		t.Fatalf("register: Status = %q, want active (err=%q)", reg.Status, reg.Error)
+	}
+	oldPublicAddr := s.dynamicRoutes["bothroute"].Route.PublicAddr
+	oldTCP := s.publicTCP["bothroute"]
+	oldUDP := s.publicUDP["bothroute"]
+	if oldTCP == nil || oldUDP == nil {
+		s.mu.Unlock()
+		t.Fatal("expected both TCP and UDP listeners after register")
+	}
+
+	ack := s.processRouteUpdateLocked(apitypes.RouteUpdate{
+		RequestID:  "upd-both-fail",
+		Name:       "bothroute",
+		PublicPort: blockedPort,
+	}, protocol.DefaultAgentID)
+
+	dr := s.dynamicRoutes["bothroute"]
+	tcpAfter := s.publicTCP["bothroute"]
+	udpAfter := s.publicUDP["bothroute"]
+	s.mu.Unlock()
+
+	if ack.Status != "failed" {
+		t.Fatalf("Status = %q, want failed when udp listen is blocked (err=%q)", ack.Status, ack.Error)
+	}
+	if dr.Route.PublicAddr != oldPublicAddr {
+		t.Fatalf("PublicAddr = %q, want preserved %q", dr.Route.PublicAddr, oldPublicAddr)
+	}
+	if tcpAfter != oldTCP {
+		t.Fatal("TCP listener should be unchanged after failed port update")
+	}
+	if udpAfter != oldUDP {
+		t.Fatal("UDP listener should be unchanged after failed port update")
+	}
+
+	// New TCP bind must have been rolled back so the blocked port's TCP side is free.
+	probe, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", blockedPort))
+	if err != nil {
+		t.Fatalf("leaked TCP listener on new port %d: %v", blockedPort, err)
+	}
+	probe.Close()
+}
+
 func TestProcessRouteRequestLocked_DomainQuery(t *testing.T) {
 	s := NewServer(ServerConfig{
 		ControlAddr:          "127.0.0.1:0",
@@ -391,7 +556,7 @@ func TestProcessRouteConfirmLocked_BasicConfirm(t *testing.T) {
 		RequestID: "req-c1",
 		Name:      "app",
 		Domain:    "app.example.com",
-	})
+	}, protocol.DefaultAgentID)
 	s.mu.Unlock()
 
 	if ack.Status != "active" {
@@ -414,7 +579,7 @@ func TestProcessRouteConfirmLocked_RouteNotFound(t *testing.T) {
 		RequestID: "req-c2",
 		Name:      "nonexistent",
 		Domain:    "nonexistent.example.com",
-	})
+	}, protocol.DefaultAgentID)
 
 	if ack.Status != "failed" {
 		t.Fatalf("Status = %q, want %q", ack.Status, "failed")
@@ -454,7 +619,7 @@ func TestProcessRouteConfirmLocked_DomainConflict(t *testing.T) {
 		RequestID: "req-c3",
 		Name:      "newapp",
 		Domain:    "taken.example.com",
-	})
+	}, protocol.DefaultAgentID)
 
 	if ack.Status != "failed" {
 		t.Fatalf("Status = %q, want %q for domain conflict", ack.Status, "failed")
@@ -477,11 +642,69 @@ func TestProcessRouteConfirmLocked_InvalidDomain(t *testing.T) {
 		RequestID: "req-c4",
 		Name:      "app2",
 		Domain:    "bad domain!",
-	})
+	}, protocol.DefaultAgentID)
 	s.mu.Unlock()
 
 	if ack.Status != "failed" {
 		t.Fatalf("Status = %q, want %q for invalid domain", ack.Status, "failed")
+	}
+}
+
+func TestProcessRouteConfirmLocked_OutsideBaseDomain(t *testing.T) {
+	s := NewServer(ServerConfig{
+		ControlAddr:          "127.0.0.1:0",
+		DataAddr:             "127.0.0.1:0",
+		Token:                "testtoken",
+		DisableTLS:           true,
+		PairTimeout:          3 * time.Second,
+		DynamicPortRange:     "30550-30580",
+		DomainManagerEnabled: true,
+		DomainBase:           "example.com",
+		DomainHTTPSAddr:      "127.0.0.1:443",
+	}, nil)
+	s.mu.Lock()
+	r1 := s.testProcessRouteRequest(apitypes.RouteRequest{
+		RequestID: "req-obase", Name: "appbase", Proto: "tcp",
+		LocalAddr: "127.0.0.1:3000", PublicPort: 30550, Source: "api",
+	})
+	if r1.Status != "active" {
+		t.Fatalf("register: Status = %q, want active", r1.Status)
+	}
+	ack := s.processRouteConfirmLocked(apitypes.RouteConfirm{
+		RequestID: "req-obase",
+		Name:      "appbase",
+		Domain:    "evil.com",
+	}, protocol.DefaultAgentID)
+	s.mu.Unlock()
+	if ack.Status != "failed" {
+		t.Fatalf("Status = %q, want failed for domain outside base", ack.Status)
+	}
+}
+
+func TestProcessRouteRemoveLocked_RejectsOtherOwner(t *testing.T) {
+	s := NewServer(ServerConfig{
+		ControlAddr:      "127.0.0.1:0",
+		DataAddr:         "127.0.0.1:0",
+		Token:            "testtoken",
+		DisableTLS:       true,
+		PairTimeout:      3 * time.Second,
+		DynamicPortRange: "30590-30620",
+	}, nil)
+	s.mu.Lock()
+	r1 := s.processRouteRequestLocked(apitypes.RouteRequest{
+		RequestID: "own-1", Name: "owned", Proto: "tcp",
+		LocalAddr: "127.0.0.1:1", PublicPort: 30590, Source: "api",
+	}, "agent-a")
+	if r1.Status != "active" {
+		t.Fatalf("register: Status = %q want active err=%q", r1.Status, r1.Error)
+	}
+	ack := s.processRouteRemoveLocked(apitypes.RouteRemove{Name: "owned", Source: "api"}, "agent-b")
+	s.mu.Unlock()
+	if ack.OK {
+		t.Fatal("remove by non-owner should fail")
+	}
+	if ack.Error != "route owned by another agent" {
+		t.Fatalf("Error = %q, want ownership error", ack.Error)
 	}
 }
 
@@ -506,7 +729,7 @@ func TestProcessRouteRemoveLocked_BasicRemoval(t *testing.T) {
 
 	ack := s.processRouteRemoveLocked(apitypes.RouteRemove{
 		Name: "removeme", Source: "api",
-	})
+	}, protocol.DefaultAgentID)
 	s.mu.Unlock()
 
 	if !ack.OK {
@@ -531,7 +754,7 @@ func TestProcessRouteRemoveLocked_NotFound(t *testing.T) {
 
 	ack := s.processRouteRemoveLocked(apitypes.RouteRemove{
 		Name: "nonexistent", Source: "api",
-	})
+	}, protocol.DefaultAgentID)
 
 	if ack.OK {
 		t.Fatal("OK = true for nonexistent route, want false")
@@ -563,7 +786,7 @@ func TestProcessRouteRemoveLocked_CleanupDerivedKeys(t *testing.T) {
 
 	s.processRouteRemoveLocked(apitypes.RouteRemove{
 		Name: "encrypted-app", Source: "api",
-	})
+	}, protocol.DefaultAgentID)
 	s.mu.Unlock()
 
 	s.mu.RLock()

@@ -132,6 +132,16 @@ func (d *dashState) route(name string) *routeDash {
 	return rd
 }
 
+func (d *dashState) removeRoute(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	d.mu.Lock()
+	delete(d.routes, name)
+	d.mu.Unlock()
+}
+
 func (d *dashState) addBytes(at time.Time, n int64) {
 	if n <= 0 {
 		return

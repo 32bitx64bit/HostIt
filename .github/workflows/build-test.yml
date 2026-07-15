@@ -14,7 +14,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: server/go.mod
 
       - name: Build ${{ matrix.component }}
         run: |
@@ -32,7 +32,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: client/go.mod
 
       - name: Build client on Windows
         run: cd client && go build ./cmd/agent

@@ -83,6 +83,7 @@ func fakeEncryptedAgentRoutes(ctx context.Context, controlAddr, dataAddr string,
 		if pkt.Type == protocol.TypeConnect {
 			routeName := pkt.Route
 			clientID := pkt.Client
+			pairToken := append([]byte(nil), pkt.Payload...)
 			go func() {
 				localAddr, ok := localAddrs[routeName]
 				if !ok {
@@ -103,11 +104,13 @@ func fakeEncryptedAgentRoutes(ctx context.Context, controlAddr, dataAddr string,
 
 				routeBytes := []byte(routeName)
 				clientBytes := []byte(clientID)
-				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes))
+				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes)+1+len(pairToken))
 				buf = append(buf, byte(len(routeBytes)))
 				buf = append(buf, routeBytes...)
 				buf = append(buf, byte(len(clientBytes)))
 				buf = append(buf, clientBytes...)
+				buf = append(buf, byte(len(pairToken)))
+				buf = append(buf, pairToken...)
 
 				dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if _, err := dataConn.Write(buf); err != nil {

@@ -238,7 +238,7 @@ $$('.chip[data-target="band"]').forEach(function(c){c.addEventListener('click',f
 $$('.chip[data-target="conn"]').forEach(function(c){c.addEventListener('click',function(){connRange=c.getAttribute('data-range');$$('.chip[data-target="conn"]').forEach(function(x){x.classList.toggle('active',x===c);});if(lastStats)renderConn(lastStats.series);});});
 $$('#agentsTable th.sortable').forEach(function(th){th.addEventListener('click',function(){var k=th.getAttribute('data-sort');if(agentsSort.key===k)agentsSort.dir*=-1;else{agentsSort.key=k;agentsSort.dir=1;}if(lastStats)renderAgents(lastStats.agents);});});
 initLogout();
-poll();setInterval(poll,3000);
+poll();setInterval(poll,5000);
 pollUpdate();setInterval(pollUpdate,30000);
 </script>
 </body>

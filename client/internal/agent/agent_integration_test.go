@@ -249,7 +249,8 @@ func TestAgentReceivesEmailConfigFromHello(t *testing.T) {
 func (s *fakeTunnelServer) sendConnect(t *testing.T, routeName, clientID string) {
 	t.Helper()
 	conn := s.waitForControl(t)
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeConnect, Route: routeName, Client: clientID}); err != nil {
+	pairToken := []byte("test-pair-token-01") // 18 bytes; agent echoes on data plane
+	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeConnect, Route: routeName, Client: clientID, Payload: pairToken}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -292,11 +293,26 @@ func (s *fakeTunnelServer) acceptDataConn(t *testing.T) (net.Conn, string, strin
 		_ = conn.Close()
 		t.Fatal(err)
 	}
+	routeName := string(routeBytes)
+	if routeName != protocol.RouteMailOutboundTCP {
+		var pairLen byte
+		if err := binary.Read(conn, binary.BigEndian, &pairLen); err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		if pairLen > 0 {
+			pairBytes := make([]byte, int(pairLen))
+			if _, err := io.ReadFull(conn, pairBytes); err != nil {
+				_ = conn.Close()
+				t.Fatal(err)
+			}
+		}
+	}
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		_ = conn.Close()
 		t.Fatal(err)
 	}
-	return conn, string(routeBytes), string(clientBytes)
+	return conn, routeName, string(clientBytes)
 }
 
 func (s *fakeTunnelServer) waitForAgentUDPAddr(t *testing.T) *net.UDPAddr {

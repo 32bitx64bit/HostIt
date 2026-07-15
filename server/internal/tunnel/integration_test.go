@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"hostit/shared/apitypes"
+	"hostit/shared/protocol"
 )
 
 func freeTCPPortForIntegrationTest(t *testing.T) int {
@@ -73,7 +74,7 @@ func TestDynamicRouteRegisterConfirmRemove(t *testing.T) {
 
 	ack := s.processRouteConfirmLocked(apitypes.RouteConfirm{
 		RequestID: "e2e-1", Name: "webapp", Domain: "webapp.example.com",
-	})
+	}, protocol.DefaultAgentID)
 	if ack.Status != "active" {
 		t.Fatalf("confirm: Status = %q, want active", ack.Status)
 	}
@@ -89,7 +90,7 @@ func TestDynamicRouteRegisterConfirmRemove(t *testing.T) {
 		t.Fatalf("stored domain = %q, want webapp.example.com", dr.Route.Domain)
 	}
 
-	rmAck := s.processRouteRemoveLocked(apitypes.RouteRemove{Name: "webapp", Source: "api"})
+	rmAck := s.processRouteRemoveLocked(apitypes.RouteRemove{Name: "webapp", Source: "api"}, protocol.DefaultAgentID)
 	if !rmAck.OK {
 		t.Fatalf("remove: OK = %v, want true", rmAck.OK)
 	}
@@ -125,7 +126,7 @@ func TestDynamicRouteUpdateLocalAddr(t *testing.T) {
 
 	updateAck := s.processRouteUpdateLocked(apitypes.RouteUpdate{
 		RequestID: "e2e-upd", Name: "myapp", LocalAddr: "127.0.0.1:4000",
-	})
+	}, protocol.DefaultAgentID)
 	if updateAck.Status != "updated" {
 		t.Fatalf("update: Status = %q, want updated", updateAck.Status)
 	}
@@ -157,7 +158,7 @@ func TestDynamicRouteUpdateNonExistent(t *testing.T) {
 
 	ack := s.processRouteUpdateLocked(apitypes.RouteUpdate{
 		RequestID: "e2e-nx", Name: "nonexistent", LocalAddr: "127.0.0.1:9999",
-	})
+	}, protocol.DefaultAgentID)
 	if ack.Status != "failed" {
 		t.Fatalf("Status = %q, want failed", ack.Status)
 	}
@@ -387,7 +388,7 @@ func TestDynamicRouteUpdatePortChange(t *testing.T) {
 
 	ack := s.processRouteUpdateLocked(apitypes.RouteUpdate{
 		RequestID: "e2e-pu2", Name: "portchange", PublicPort: ports[1],
-	})
+	}, protocol.DefaultAgentID)
 	if ack.Status != "updated" {
 		t.Fatalf("update: Status = %q, want updated", ack.Status)
 	}

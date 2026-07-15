@@ -75,12 +75,12 @@ func newTestSessionID(t *testing.T) crypto.UDPSessionID {
 	return id
 }
 
-func startFakeUDPAgent(t *testing.T, ctx context.Context, dataAddr, token string, prefixes map[string]string, sessionID crypto.UDPSessionID, encryptedRoutes map[string]bool, sessionCrypto *crypto.UDPSessionCrypto) *fakeUDPAgent {
+func startFakeUDPAgent(t *testing.T, ctx context.Context, srv *Server, dataAddr, token string, prefixes map[string]string, sessionID crypto.UDPSessionID, encryptedRoutes map[string]bool, sessionCrypto *crypto.UDPSessionCrypto) *fakeUDPAgent {
 	t.Helper()
-	return startFakeUDPAgentAs(t, ctx, dataAddr, token, protocol.DefaultAgentID, prefixes, sessionID, encryptedRoutes, sessionCrypto)
+	return startFakeUDPAgentAs(t, ctx, srv, dataAddr, token, protocol.DefaultAgentID, prefixes, sessionID, encryptedRoutes, sessionCrypto)
 }
 
-func startFakeUDPAgentAs(t *testing.T, ctx context.Context, dataAddr, token, agentID string, prefixes map[string]string, sessionID crypto.UDPSessionID, encryptedRoutes map[string]bool, sessionCrypto *crypto.UDPSessionCrypto) *fakeUDPAgent {
+func startFakeUDPAgentAs(t *testing.T, ctx context.Context, srv *Server, dataAddr, token, agentID string, prefixes map[string]string, sessionID crypto.UDPSessionID, encryptedRoutes map[string]bool, sessionCrypto *crypto.UDPSessionCrypto) *fakeUDPAgent {
 	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", dataAddr)
 	if err != nil {
@@ -91,6 +91,17 @@ func startFakeUDPAgentAs(t *testing.T, ctx context.Context, dataAddr, token, age
 		t.Fatal(err)
 	}
 	agent := &fakeUDPAgent{conn: conn, seen: make(map[string]int)}
+
+	// UDP register requires a live control session from the same host.
+	if srv != nil {
+		srv.sessionsMu.Lock()
+		srv.sessions[agentID] = &agentSession{
+			agentID:     agentID,
+			remoteAddr:  "127.0.0.1:9",
+			connectTime: time.Now(),
+		}
+		srv.sessionsMu.Unlock()
+	}
 
 	sendRegister := func() {
 		data, err := authedUDPRegister(token, sessionID, agentID)
@@ -257,7 +268,7 @@ func TestEndToEndUDP(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "udp:"}, newTestSessionID(t), nil, nil)
+	startFakeUDPAgent(t, ctx, srv, dataAddr, "testtoken", map[string]string{"game": "udp:"}, newTestSessionID(t), nil, nil)
 
 	client := dialPublicUDP(t, publicAddr)
 	defer client.Close()
@@ -287,7 +298,7 @@ func TestEndToEndUDPConcurrentClients(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "udp:"}, newTestSessionID(t), nil, nil)
+	startFakeUDPAgent(t, ctx, srv, dataAddr, "testtoken", map[string]string{"game": "udp:"}, newTestSessionID(t), nil, nil)
 
 	const clients = 12
 	errCh := make(chan error, clients)
@@ -352,7 +363,7 @@ func TestEndToEndUDPMultiRoute(t *testing.T) {
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "route-a")
 	waitPublicUDPRoute(t, srv, "route-b")
-	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"route-a": "a:", "route-b": "b:"}, newTestSessionID(t), nil, nil)
+	startFakeUDPAgent(t, ctx, srv, dataAddr, "testtoken", map[string]string{"route-a": "a:", "route-b": "b:"}, newTestSessionID(t), nil, nil)
 
 	clientA := dialPublicUDP(t, publicAAddr)
 	defer clientA.Close()
@@ -407,7 +418,7 @@ func TestEndToEndUDPEncrypted(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
-	startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"game": "secure:"}, sessionID, map[string]bool{"game": true}, sessionCrypto)
+	startFakeUDPAgent(t, ctx, srv, dataAddr, "testtoken", map[string]string{"game": "secure:"}, sessionID, map[string]bool{"game": true}, sessionCrypto)
 
 	client := dialPublicUDP(t, publicAddr)
 	defer client.Close()
@@ -448,7 +459,7 @@ func TestPublicUDPDropsWithoutAgentAndWhenDisabled(t *testing.T) {
 	defer noAgentClient.Close()
 	assertNoUDPResponse(t, noAgentClient, []byte("drop"), 250*time.Millisecond)
 
-	agent := startFakeUDPAgent(t, ctx, dataAddr, "testtoken", map[string]string{"disabled": "disabled:"}, newTestSessionID(t), nil, nil)
+	agent := startFakeUDPAgent(t, ctx, srv, dataAddr, "testtoken", map[string]string{"disabled": "disabled:"}, newTestSessionID(t), nil, nil)
 	waitTunnelCondition(t, 2*time.Second, "fake UDP agent did not register", func() bool {
 		return srv.testUDPLastSeen(protocol.DefaultAgentID) != 0
 	})
@@ -481,6 +492,15 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 	}, nil)
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
+
+	// Live control session required before UDP register is accepted.
+	srv.sessionsMu.Lock()
+	srv.sessions[protocol.DefaultAgentID] = &agentSession{
+		agentID:     protocol.DefaultAgentID,
+		remoteAddr:  "127.0.0.1:9",
+		connectTime: time.Now(),
+	}
+	srv.sessionsMu.Unlock()
 
 	serverUDPAddr, err := net.ResolveUDPAddr("udp", dataAddr)
 	if err != nil {
@@ -556,18 +576,7 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 	}
 	defer agentConn.Close()
 
-	waitTunnelCondition(t, 2*time.Second, "agent UDP registration did not reach server", func() bool {
-		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = agentConn.WriteToUDP(reg, serverUDPAddr)
-		return srv.testUDPLastSeen(protocol.DefaultAgentID) != 0
-	})
-	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
-		t.Fatal("agent UDP address was not stored before control connect")
-	}
-
+	// Connect control first — UDP register is rejected without a live session.
 	conn := dialTCPForLifecycleTest(t, controlAddr)
 	defer conn.Close()
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -597,8 +606,131 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 		t.Fatalf("first control packet type = %d, want HELLO", pkt.Type)
 	}
 
-	// UDP state persists across a control (re)connect; only an agent restart rotates it.
+	waitTunnelCondition(t, 2*time.Second, "agent UDP registration did not reach server", func() bool {
+		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = agentConn.WriteToUDP(reg, serverUDPAddr)
+		return srv.testUDPLastSeen(protocol.DefaultAgentID) != 0
+	})
 	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
-		t.Fatal("agent UDP state should persist across control connect")
+		t.Fatal("agent UDP address was not stored after control connect")
+	}
+
+	// Displacing the control session must not clear UDP (same agent reconnects);
+	// only a full disconnect of the current session clears it.
+	conn2 := dialTCPForLifecycleTest(t, controlAddr)
+	defer conn2.Close()
+	if err := conn2.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, serverNonce2, err := crypto.AuthenticateClient(conn2, "testtoken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub2, sig2 := testIdentity(serverNonce2)
+	verPayload2, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub2, IdentitySig: sig2})
+	if err := protocol.WritePacket(conn2, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocol.ReadPacket(conn2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocol.ReadPacket(conn2); err != nil {
+		t.Fatal(err)
+	}
+
+	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("agent UDP state should persist across control reconnect")
+	}
+}
+
+func TestUDPRegisterRejectedWithoutControlSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	controlAddr := freeTCPAddr(t)
+	dataAddr := freeTCPAddr(t)
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "game", Proto: "udp", PublicAddr: freeUDPAddr(t)}},
+		Token:       "testtoken",
+		PairTimeout: 5 * time.Second,
+		DisableTLS:  true,
+	}, nil)
+	go func() { _ = srv.Run(ctx) }()
+	waitPublicUDPRoute(t, srv, "game")
+
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", dataAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentConn.Close()
+
+	for i := 0; i < 5; i++ {
+		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = agentConn.WriteToUDP(reg, serverUDPAddr)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("UDP register must be rejected when no control session exists")
+	}
+}
+
+func TestUDPRegisterRejectedFromMismatchedIP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	controlAddr := freeTCPAddr(t)
+	dataAddr := freeTCPAddr(t)
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "game", Proto: "udp", PublicAddr: freeUDPAddr(t)}},
+		Token:       "testtoken",
+		PairTimeout: 5 * time.Second,
+		DisableTLS:  true,
+	}, nil)
+	go func() { _ = srv.Run(ctx) }()
+	waitPublicUDPRoute(t, srv, "game")
+
+	// Control peer appears to be a non-loopback address; UDP from 127.0.0.1 must fail.
+	srv.sessionsMu.Lock()
+	srv.sessions[protocol.DefaultAgentID] = &agentSession{
+		agentID:     protocol.DefaultAgentID,
+		remoteAddr:  "203.0.113.10:12345",
+		connectTime: time.Now(),
+	}
+	srv.sessionsMu.Unlock()
+
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", dataAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentConn.Close()
+
+	for i := 0; i < 5; i++ {
+		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), "default")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = agentConn.WriteToUDP(reg, serverUDPAddr)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("UDP register must be rejected when source IP does not match control peer")
 	}
 }

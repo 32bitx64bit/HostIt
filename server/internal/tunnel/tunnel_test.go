@@ -661,7 +661,7 @@ func TestIsAllowedOutboundSMTPTarget(t *testing.T) {
 	}
 }
 
-func TestNextClientIDIsCompact(t *testing.T) {
+func TestNextClientIDIsUnique(t *testing.T) {
 	s := &Server{}
 	first := s.nextClientID()
 	second := s.nextClientID()
@@ -671,8 +671,8 @@ func TestNextClientIDIsCompact(t *testing.T) {
 	if first == second {
 		t.Fatalf("nextClientID returned duplicate ids: %q", first)
 	}
-	if len(first) > 16 || len(second) > 16 {
-		t.Fatalf("nextClientID should stay compact, got %q (%d) and %q (%d)", first, len(first), second, len(second))
+	if len(first) < 16 || len(second) < 16 {
+		t.Fatalf("nextClientID should be high-entropy hex, got %q (%d) and %q (%d)", first, len(first), second, len(second))
 	}
 }
 
@@ -916,11 +916,14 @@ func TestServerRapidReconnectWithStaleControlSession(t *testing.T) {
 
 					routeBytes := []byte(pkt.Route)
 					clientBytes := []byte(pkt.Client)
-					buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes))
+					pairToken := pkt.Payload
+					buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes)+1+len(pairToken))
 					buf = append(buf, byte(len(routeBytes)))
 					buf = append(buf, routeBytes...)
 					buf = append(buf, byte(len(clientBytes)))
 					buf = append(buf, clientBytes...)
+					buf = append(buf, byte(len(pairToken)))
+					buf = append(buf, pairToken...)
 
 					if _, err := dataConn.Write(buf); err != nil {
 						_ = dataConn.Close()
@@ -1486,6 +1489,7 @@ func fakeAgentRoutesAs(ctx context.Context, controlAddr, dataAddr, agentID strin
 		if pkt.Type == protocol.TypeConnect {
 			routeName := pkt.Route
 			clientID := pkt.Client
+			pairToken := append([]byte(nil), pkt.Payload...)
 			go func() {
 				localAddr, ok := localAddrs[routeName]
 				if !ok {
@@ -1505,11 +1509,13 @@ func fakeAgentRoutesAs(ctx context.Context, controlAddr, dataAddr, agentID strin
 
 				routeBytes := []byte(routeName)
 				clientBytes := []byte(clientID)
-				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes))
+				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes)+1+len(pairToken))
 				buf = append(buf, byte(len(routeBytes)))
 				buf = append(buf, routeBytes...)
 				buf = append(buf, byte(len(clientBytes)))
 				buf = append(buf, clientBytes...)
+				buf = append(buf, byte(len(pairToken)))
+				buf = append(buf, pairToken...)
 
 				dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if _, err := dataConn.Write(buf); err != nil {

@@ -306,14 +306,38 @@ func (r *serverRunner) Get() (tunnel.ServerConfig, tunnel.ServerStatus, error) {
 
 func (r *serverRunner) Dashboard(now time.Time) (tunnel.ServerConfig, tunnel.ServerStatus, tunnel.DashboardSnapshot, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	cfg := r.cfg
+	err := r.err
+	srv := r.srv
+	r.mu.Unlock()
 	var st tunnel.ServerStatus
 	var snap tunnel.DashboardSnapshot
-	if r.srv != nil {
-		st = r.srv.Status()
-		snap = r.srv.Dashboard(now)
+	if srv != nil {
+		st = srv.Status()
+		snap = srv.Dashboard(now)
 	}
-	return r.cfg, st, snap, r.err
+	return cfg, st, snap, err
+}
+
+func (r *serverRunner) EffectiveRoutes() []tunnel.RouteConfig {
+	r.mu.Lock()
+	srv := r.srv
+	cfg := r.cfg
+	r.mu.Unlock()
+	if srv != nil {
+		return srv.EffectiveRoutes()
+	}
+	return tunnel.EffectiveRoutesFromConfig(cfg)
+}
+
+func (r *serverRunner) UDPStats() map[string]any {
+	r.mu.Lock()
+	srv := r.srv
+	r.mu.Unlock()
+	if srv == nil {
+		return map[string]any{"totalDrops": uint64(0), "lossPercent": 0.0}
+	}
+	return srv.UDPStats()
 }
 
 func (r *serverRunner) RunAgentNettest(ctx context.Context, req tunnel.AgentNettestRequest) (tunnel.AgentNettestResult, error) {
@@ -462,26 +486,26 @@ func (r *serverRunner) SetRouteEnabled(routeName string, enabled bool) bool {
 		}
 	}
 
-	if !found {
-		return false
-	}
-
 	if r.srv != nil {
-		r.srv.SetRouteEnabled(routeName, enabled)
+		if r.srv.SetRouteEnabled(routeName, enabled) {
+			found = true
+		}
 	}
-	return true
+	return found
 }
 
 func (r *serverRunner) GetRouteEnabled(routeName string) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.srv != nil {
-		return r.srv.GetRouteEnabled(routeName)
+	srv := r.srv
+	cfg := r.cfg
+	r.mu.Unlock()
+	if srv != nil {
+		return srv.GetRouteEnabled(routeName)
 	}
 	// When the tunnel server isn't running, fall back to the persisted config
 	// so the dashboard reflects toggles made before/without a live server
 	// instead of always reporting the default (enabled).
-	for _, rt := range r.cfg.Routes {
+	for _, rt := range cfg.Routes {
 		if rt.Name == routeName {
 			return rt.IsEnabled()
 		}
@@ -917,13 +941,14 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			cfg, _, snap, _ := runner.Dashboard(time.Now())
+			_, _, snap, _ := runner.Dashboard(time.Now())
+			routes := runner.EffectiveRoutes()
 			w.Header().Set("Content-Type", "application/json")
 			writeJSON(w, map[string]any{
 				"uptime_seconds":     int64(time.Since(startTime).Seconds()),
 				"agent_connected":    snap.AgentConnected,
 				"agents":             snap.Agents,
-				"routes_count":       len(cfg.Routes),
+				"routes_count":       len(routes),
 				"active_connections": snap.ActiveClients,
 				"bytes_total":        snap.BytesTotal,
 				"version":            version.Current,
@@ -946,8 +971,9 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				Enabled    bool                    `json:"enabled"`
 				Events     []tunnel.DashboardEvent `json:"events"`
 			}
-			outRoutes := make([]routeOut, 0, len(cfg.Routes))
-			for _, rt := range cfg.Routes {
+			allRoutes := runner.EffectiveRoutes()
+			outRoutes := make([]routeOut, 0, len(allRoutes))
+			for _, rt := range allRoutes {
 				rs := snap.Routes[rt.Name]
 				outRoutes = append(outRoutes, routeOut{
 					Name:       rt.Name,
@@ -971,6 +997,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				"runtime":        snap.Runtime,
 				"series":         snap.Series,
 				"routes":         outRoutes,
+				"udp":            runner.UDPStats(),
 				"systemEvents":   snap.Routes["_system"].Events,
 				"err": func() string {
 					if err == nil {

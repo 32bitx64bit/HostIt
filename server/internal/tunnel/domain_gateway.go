@@ -541,7 +541,7 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 
 	clientID := s.nextClientID()
 	pendingKey := makePendingTCPKey(routeName, clientID)
-	entry := newPendingTCPEntry()
+	entry := newPendingTCPPair(owner, session.remoteAddr)
 
 	s.mu.Lock()
 	s.pendingTCP[pendingKey] = entry
@@ -553,7 +553,7 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 		entry.cancel()
 	}
 
-	reqPkt := &protocol.Packet{Type: protocol.TypeConnect, Route: routeName, Client: clientID}
+	reqPkt := &protocol.Packet{Type: protocol.TypeConnect, Route: routeName, Client: clientID, Payload: entry.pairToken}
 	session.writeMu.Lock()
 	session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	err := protocol.WritePacket(session.conn, reqPkt)

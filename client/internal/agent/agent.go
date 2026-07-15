@@ -33,6 +33,9 @@ const (
 	agentControlWriteDeadline = 5 * time.Second
 	udpRegisterInterval       = 2 * time.Second
 	udpSessionIdleTimeout     = 2 * time.Minute
+	// Cap concurrent public→local TCP relays (TLS dial + auth per connect).
+	maxConcurrentConnects = 1024
+	maxConcurrentProbes   = 4
 	// versionMismatchBackoff replaces the normal reconnect backoff when the
 	// server rejected our protocol version: hammering every 2s cannot
 	// succeed until one side is updated.
@@ -67,7 +70,8 @@ type helloPayload struct {
 }
 
 func RunWithHooks(ctx context.Context, cfg Config, hooks *Hooks) error {
-	a := &Agent{cfg: cfg, hooks: hooks}
+	a := NewAgent(cfg)
+	a.hooks = hooks
 	return a.Run(ctx)
 }
 
@@ -98,6 +102,10 @@ type Agent struct {
 	pendingRouteAcks  map[string]chan *apitypes.RouteAck
 	pendingRemoveAcks map[string]chan *apitypes.RouteRemoveAck
 	pendingUpdateAcks map[string]chan *apitypes.RouteUpdateAck
+
+	connectSem chan struct{}
+	probeSem   chan struct{}
+	tlsSession tls.ClientSessionCache
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -148,6 +156,9 @@ func NewAgent(cfg Config) *Agent {
 		pendingRouteAcks:  make(map[string]chan *apitypes.RouteAck),
 		pendingRemoveAcks: make(map[string]chan *apitypes.RouteRemoveAck),
 		pendingUpdateAcks: make(map[string]chan *apitypes.RouteUpdateAck),
+		connectSem:        make(chan struct{}, maxConcurrentConnects),
+		probeSem:          make(chan struct{}, maxConcurrentProbes),
+		tlsSession:        tls.NewLRUClientSessionCache(64),
 	}
 }
 
@@ -272,9 +283,14 @@ func (a *Agent) SendRouteUpdate(ctx context.Context, update apitypes.RouteUpdate
 }
 
 func tlsConfigWithPin(cfg Config) (*tls.Config, error) {
+	return tlsConfigWithPinAndCache(cfg, nil)
+}
+
+func tlsConfigWithPinAndCache(cfg Config, cache tls.ClientSessionCache) (*tls.Config, error) {
+	var tlsCfg *tls.Config
 	if pin := strings.TrimSpace(cfg.TLSPinSHA256); pin != "" {
 		expectedPin := pin
-		return &tls.Config{
+		tlsCfg = &tls.Config{
 			InsecureSkipVerify: true,
 			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 				if len(rawCerts) == 0 {
@@ -287,13 +303,17 @@ func tlsConfigWithPin(cfg Config) (*tls.Config, error) {
 				}
 				return nil
 			},
-		}, nil
-	}
-	if cfg.InsecureTLS {
+		}
+	} else if cfg.InsecureTLS {
 		logging.Global().Warnf(logging.CatEncryption, "TLS certificate verification is disabled (InsecureTLS=true). This is vulnerable to MITM attacks. Set tls_pin_sha256 for secure pinning.")
-		return &tls.Config{InsecureSkipVerify: true}, nil
+		tlsCfg = &tls.Config{InsecureSkipVerify: true}
+	} else {
+		return nil, fmt.Errorf("TLS is enabled but no certificate pin is configured. Set tls_pin_sha256 to the server certificate SHA-256 fingerprint, or set InsecureTLS=true to explicitly accept any certificate (not recommended)")
 	}
-	return nil, fmt.Errorf("TLS is enabled but no certificate pin is configured. Set tls_pin_sha256 to the server certificate SHA-256 fingerprint, or set InsecureTLS=true to explicitly accept any certificate (not recommended)")
+	if cache != nil {
+		tlsCfg.ClientSessionCache = cache
+	}
+	return tlsCfg, nil
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -481,10 +501,13 @@ func (a *Agent) connectAndRun() error {
 			tlsCfg = &tls.Config{InsecureSkipVerify: true}
 		} else {
 			var tlsErr error
-			tlsCfg, tlsErr = tlsConfigWithPin(a.cfg)
+			tlsCfg, tlsErr = tlsConfigWithPinAndCache(a.cfg, a.tlsSession)
 			if tlsErr != nil {
 				return fmt.Errorf("tls config failed: %w", tlsErr)
 			}
+		}
+		if tlsCfg != nil && a.tlsSession != nil && tlsCfg.ClientSessionCache == nil {
+			tlsCfg.ClientSessionCache = a.tlsSession
 		}
 		conn, err = tls.DialWithDialer(controlDialer, "tcp", a.cfg.ControlAddr(), tlsCfg)
 		if err == nil && a.cfg.TLSPinSHA256 == "" && !a.cfg.InsecureTLS {
@@ -692,6 +715,10 @@ func (a *Agent) baseKeyForAlg(alg string) ([]byte, error) {
 	if a.baseKeyByAlg == nil {
 		a.baseKeyByAlg = make(map[string][]byte)
 	}
+	if existing, ok := a.baseKeyByAlg[alg]; ok {
+		a.mu.Unlock()
+		return existing, nil
+	}
 	a.baseKeyByAlg[alg] = key
 	a.mu.Unlock()
 	return key, nil
@@ -753,10 +780,12 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 		if pkt.Type == protocol.TypePing {
 			a.controlWriteMu.Lock()
 			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			protocol.WritePacket(conn, &protocol.Packet{
+			if err := protocol.WritePacket(conn, &protocol.Packet{
 				Type:    protocol.TypePong,
 				Payload: pkt.Payload,
-			})
+			}); err != nil {
+				logging.Global().Warnf(logging.CatTCP, "failed to write control pong: %v", err)
+			}
 			conn.SetWriteDeadline(time.Time{})
 			a.controlWriteMu.Unlock()
 			continue
@@ -778,7 +807,17 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				logging.Global().Errorf(logging.CatTCP, "failed to parse email probe request: %v", err)
 				continue
 			}
+			if a.probeSem == nil {
+				a.probeSem = make(chan struct{}, maxConcurrentProbes)
+			}
+			select {
+			case a.probeSem <- struct{}{}:
+			default:
+				logging.Global().Warnf(logging.CatTCP, "email probe dropped: too many in flight")
+				continue
+			}
 			go func(req protocol.EmailProbeRequest) {
+				defer func() { <-a.probeSem }()
 				res := protocol.EmailProbeResult{}
 				if a.hooks == nil || a.hooks.OnEmailProbe == nil {
 					res.Error = "email probe handler not configured"
@@ -794,8 +833,20 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 					logging.Global().Errorf(logging.CatTCP, "failed to marshal email probe result: %v", err)
 					return
 				}
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 				a.controlWriteMu.Lock()
 				defer a.controlWriteMu.Unlock()
+				a.mu.RLock()
+				live := a.controlConn
+				a.mu.RUnlock()
+				if live != conn {
+					logging.Global().Warnf(logging.CatTCP, "skipping email probe result: control connection replaced")
+					return
+				}
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeEmailProbeResult, Payload: payload}); err != nil {
 					logging.Global().Errorf(logging.CatTCP, "failed to send email probe result: %v", err)
@@ -926,6 +977,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 		if pkt.Type == protocol.TypeConnect {
 			routeName := pkt.Route
 			clientID := pkt.Client
+			pairToken := append([]byte(nil), pkt.Payload...)
 
 			a.mu.RLock()
 			rt, ok := a.cfg.Routes[routeName]
@@ -936,9 +988,20 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				continue
 			}
 
+			if a.connectSem == nil {
+				a.connectSem = make(chan struct{}, maxConcurrentConnects)
+			}
+			select {
+			case a.connectSem <- struct{}{}:
+			default:
+				logging.Global().Warnf(logging.CatTCP, "connection limit reached, rejecting connect route=%s client=%s", routeName, clientID)
+				continue
+			}
+
 			a.wg.Add(1)
-			go func(ctx context.Context, routeName, clientID string, rt RemoteRoute) {
+			go func(ctx context.Context, routeName, clientID string, rt RemoteRoute, pairToken []byte) {
 				defer a.wg.Done()
+				defer func() { <-a.connectSem }()
 
 				select {
 				case <-ctx.Done():
@@ -953,7 +1016,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				if a.cfg.DisableTLS {
 					dataConn, err = dataDialer.Dial("tcp", a.cfg.DataAddr())
 				} else {
-					tlsCfg, tlsErr := tlsConfigWithPin(a.cfg)
+					tlsCfg, tlsErr := tlsConfigWithPinAndCache(a.cfg, a.tlsSession)
 					if tlsErr != nil {
 						logging.Global().Errorf(logging.CatTCP, "tls config failed: %v", tlsErr)
 						return
@@ -978,12 +1041,17 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 
 				routeBytes := []byte(routeName)
 				clientBytes := []byte(clientID)
+				if len(pairToken) > 255 {
+					pairToken = pairToken[:255]
+				}
 
-				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes))
+				buf := make([]byte, 0, 1+len(routeBytes)+1+len(clientBytes)+1+len(pairToken))
 				buf = append(buf, byte(len(routeBytes)))
 				buf = append(buf, routeBytes...)
 				buf = append(buf, byte(len(clientBytes)))
 				buf = append(buf, clientBytes...)
+				buf = append(buf, byte(len(pairToken)))
+				buf = append(buf, pairToken...)
 
 				dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if _, err := dataConn.Write(buf); err != nil {
@@ -1048,8 +1116,11 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 				relay.ProxyWithIdleTimeout(localConn, dataConn, 5*time.Minute)
 				tracker.remove(dataConn)
 				tracker.remove(localConn)
-			}(ctx, routeName, clientID, rt)
+			}(ctx, routeName, clientID, rt, pairToken)
+			continue
 		}
+
+		logging.Global().RateLimitedWarn(logging.CatTCP, "agent-unknown-pkt", fmt.Sprintf("ignoring unknown control packet type=%d", pkt.Type))
 	}
 }
 

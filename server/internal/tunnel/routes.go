@@ -28,6 +28,12 @@ func effectiveRoutes(cfg ServerConfig, dynamicRoutes map[string]dynamicRouteEntr
 	return routes
 }
 
+// EffectiveRoutesFromConfig returns static + synthetic routes when no live
+// server is available (dashboard fallback).
+func EffectiveRoutesFromConfig(cfg ServerConfig) []RouteConfig {
+	return effectiveRoutes(cfg, nil)
+}
+
 func emailSynthRoutes(cfg ServerConfig) []RouteConfig {
 	var routes []RouteConfig
 	if rt, ok := emailInboundRoute(cfg); ok {

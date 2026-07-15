@@ -275,10 +275,10 @@ build();
 initTheme('themeBtn', 'hostit-ember-theme');
 initClock('sbClock');
 (function(){var as=$('#ctrlAutoScroll');if(!as)return;try{var v=localStorage.getItem('hostit-ember-autoscroll');if(v!==null)as.checked=v==='1';}catch(e){}as.addEventListener('change',function(){try{localStorage.setItem('hostit-ember-autoscroll',as.checked?'1':'0');}catch(e){}});})();
-refreshUpd(); setInterval(refreshUpd, 5000);
-refreshSys(); setInterval(refreshSys, 4000);
-refreshLogs(); setInterval(refreshLogs, 2500);
-pollStatus(); setInterval(pollStatus, 3000);
+refreshUpd(); setInterval(refreshUpd, 10000);
+refreshSys(); setInterval(refreshSys, 8000);
+refreshLogs(); setInterval(refreshLogs, 5000);
+pollStatus(); setInterval(pollStatus, 5000);
 </script>
 </body>
 </html>

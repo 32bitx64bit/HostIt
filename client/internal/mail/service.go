@@ -104,6 +104,9 @@ type Service struct {
 	imapTLSLn           net.Listener
 
 	imapMessages map[string][]storedMessage
+
+	// probeWaiters are signaled when a matching probe message is stored.
+	probeWaiters map[string]chan struct{}
 }
 
 type accountRecord struct {
@@ -1149,8 +1152,31 @@ func (s *Service) storeMessage(username, mailbox string, flags []string, raw []b
 	s.mu.Lock()
 	delete(s.imapMessages, username)
 	s.refreshStatusLocked("")
+	s.notifyProbeWaitersLocked(raw)
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *Service) notifyProbeWaitersLocked(raw []byte) {
+	if len(s.probeWaiters) == 0 {
+		return
+	}
+	parsed, err := stdmail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return
+	}
+	id := strings.TrimSpace(parsed.Header.Get("X-HostIt-Probe"))
+	if id == "" {
+		return
+	}
+	if ch, ok := s.probeWaiters[id]; ok {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+		delete(s.probeWaiters, id)
+	}
 }
 
 func (s *Service) deliverLocal(address, mailbox string, raw []byte) error {
@@ -1530,10 +1556,17 @@ func (s *Service) buildIMAPUser(rec *accountRecord, password string) (*imapmemse
 		if s.imapMessages == nil {
 			s.imapMessages = make(map[string][]storedMessage)
 		}
-		if _, exists := s.imapMessages[rec.Username]; !exists {
+		if existing, exists := s.imapMessages[rec.Username]; exists {
+			msgs = existing
+		} else {
 			s.imapMessages[rec.Username] = msgs
 		}
 		s.mu.Unlock()
+	}
+	// Cap in-memory IMAP hydration to avoid unbounded login cost on huge mailboxes.
+	const maxIMAPHydrate = 5000
+	if len(msgs) > maxIMAPHydrate {
+		msgs = msgs[len(msgs)-maxIMAPHydrate:]
 	}
 	for _, msg := range msgs {
 		flags := make([]imap.Flag, 0, len(msg.Flags))
@@ -1597,31 +1630,75 @@ func (s *Service) waitForProbeMessage(ctx context.Context, username, probeID str
 	if strings.TrimSpace(username) == "" || strings.TrimSpace(probeID) == "" {
 		return false, "probe input missing", nil
 	}
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
 	want := strings.TrimSpace(probeID)
+
+	// Fast path: already delivered.
+	if mailbox, ok, err := s.findProbeMessage(username, want); err != nil {
+		return false, "failed to read mailbox", err
+	} else if ok {
+		return true, "probe message received in " + mailbox, nil
+	}
+
+	waitCh := make(chan struct{})
+	s.mu.Lock()
+	if s.probeWaiters == nil {
+		s.probeWaiters = make(map[string]chan struct{})
+	}
+	// Replace any stale waiter for the same probe ID.
+	if old, ok := s.probeWaiters[want]; ok {
+		select {
+		case <-old:
+		default:
+			close(old)
+		}
+	}
+	s.probeWaiters[want] = waitCh
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.probeWaiters[want] == waitCh {
+			delete(s.probeWaiters, want)
+		}
+		s.mu.Unlock()
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	for {
-		msgs, err := s.listMessages(username)
-		if err != nil {
-			return false, "failed to read mailbox", err
-		}
-		for _, msg := range msgs {
-			parsed, err := stdmail.ReadMessage(bytes.NewReader(msg.Raw))
-			if err != nil {
-				continue
-			}
-			if strings.TrimSpace(parsed.Header.Get("X-HostIt-Probe")) == want {
-				return true, "probe message received in " + msg.Mailbox, nil
-			}
-		}
-		if time.Now().After(deadline) {
-			return false, "probe message was not received", nil
-		}
 		select {
 		case <-ctx.Done():
 			return false, "probe cancelled", ctx.Err()
-		case <-ticker.C:
+		case <-waitCh:
+			if mailbox, ok, err := s.findProbeMessage(username, want); err != nil {
+				return false, "failed to read mailbox", err
+			} else if ok {
+				return true, "probe message received in " + mailbox, nil
+			}
+			return false, "probe message was not received", nil
+		case <-timer.C:
+			if mailbox, ok, err := s.findProbeMessage(username, want); err != nil {
+				return false, "failed to read mailbox", err
+			} else if ok {
+				return true, "probe message received in " + mailbox, nil
+			}
+			return false, "probe message was not received", nil
 		}
 	}
+}
+
+func (s *Service) findProbeMessage(username, probeID string) (mailbox string, ok bool, err error) {
+	msgs, err := s.listMessages(username)
+	if err != nil {
+		return "", false, err
+	}
+	for _, msg := range msgs {
+		parsed, err := stdmail.ReadMessage(bytes.NewReader(msg.Raw))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(parsed.Header.Get("X-HostIt-Probe")) == probeID {
+			return msg.Mailbox, true, nil
+		}
+	}
+	return "", false, nil
 }

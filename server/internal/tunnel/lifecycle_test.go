@@ -76,16 +76,18 @@ func dialControlForLifecycleTest(t *testing.T, controlAddr, token string) net.Co
 	return conn
 }
 
-func writeDataHandshakeForLifecycleTest(t *testing.T, conn net.Conn, routeName, clientID string) {
+func writeDataHandshakeForLifecycleTest(t *testing.T, conn net.Conn, routeName, clientID string, pairToken []byte) {
 	t.Helper()
-	if len(routeName) > 255 || len(clientID) > 255 {
-		t.Fatalf("route/client too long for handshake: %d/%d", len(routeName), len(clientID))
+	if len(routeName) > 255 || len(clientID) > 255 || len(pairToken) > 255 {
+		t.Fatalf("route/client/pair too long for handshake: %d/%d/%d", len(routeName), len(clientID), len(pairToken))
 	}
-	header := make([]byte, 0, 2+len(routeName)+len(clientID))
+	header := make([]byte, 0, 3+len(routeName)+len(clientID)+len(pairToken))
 	header = append(header, byte(len(routeName)))
 	header = append(header, routeName...)
 	header = append(header, byte(len(clientID)))
 	header = append(header, clientID...)
+	header = append(header, byte(len(pairToken)))
+	header = append(header, pairToken...)
 	if _, err := conn.Write(header); err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +214,7 @@ func TestDataHandshakeUnknownPairClosesConnectionWithoutPendingLeak(t *testing.T
 	if _, _, err := crypto.AuthenticateClient(conn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
-	writeDataHandshakeForLifecycleTest(t, conn, "missing-route", "client-1")
+	writeDataHandshakeForLifecycleTest(t, conn, "missing-route", "client-1", nil)
 
 	buf := make([]byte, 1)
 	if _, err := conn.Read(buf); err == nil {
@@ -361,7 +363,7 @@ func TestLateDataHandshakeAfterPairTimeoutIsClosed(t *testing.T) {
 	if _, _, err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
-	writeDataHandshakeForLifecycleTest(t, dataConn, req.Route, req.Client)
+	writeDataHandshakeForLifecycleTest(t, dataConn, req.Route, req.Client, req.Payload)
 	if _, err := dataConn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("late data connection stayed open after pair timeout")
 	}
@@ -440,7 +442,7 @@ func TestDataHandshakeDeliveredConnPairsWithWaitingPublicClient(t *testing.T) {
 	if _, _, err := crypto.AuthenticateClient(dataConn, "testtoken"); err != nil {
 		t.Fatal(err)
 	}
-	writeDataHandshakeForLifecycleTest(t, dataConn, req.Route, req.Client)
+	writeDataHandshakeForLifecycleTest(t, dataConn, req.Route, req.Client, req.Payload)
 
 	publicPayload := []byte("from-public")
 	dataPayload := []byte("from-agent")

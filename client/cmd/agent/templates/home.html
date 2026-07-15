@@ -227,7 +227,7 @@ $('#btnCopyDkim').addEventListener('click',function(){
   try{if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(txt);}else if(f){f.select();f.setSelectionRange(0,f.value.length);document.execCommand('copy');}}catch(_){}
   var b=this;b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);
 });
-poll();setInterval(poll,2000);
+poll();setInterval(poll,5000);
 pollUpdate();setInterval(pollUpdate,30000);
 </script>
 </body>

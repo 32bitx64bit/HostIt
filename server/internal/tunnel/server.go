@@ -2,8 +2,11 @@ package tunnel
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -84,13 +87,39 @@ type pendingTCPEntry struct {
 	done      chan struct{}
 	readyOnce sync.Once
 	doneOnce  sync.Once
+
+	// owner is the agent that must claim this pairing on the data plane.
+	owner string
+	// controlRemote is the control-session peer addr when TypeConnect was sent.
+	controlRemote string
+	// pairToken is a one-time secret sent only on the control channel; the
+	// agent must present it on the data connection to claim the pair.
+	pairToken []byte
 }
+
+const pairTokenLen = 16
 
 func newPendingTCPEntry() *pendingTCPEntry {
 	return &pendingTCPEntry{
 		ready: make(chan struct{}),
 		done:  make(chan struct{}),
 	}
+}
+
+// newPendingTCPPair creates a pending public↔agent pairing bound to the
+// owning agent's live control session.
+func newPendingTCPPair(owner, controlRemote string) *pendingTCPEntry {
+	token := make([]byte, pairTokenLen)
+	if _, err := rand.Read(token); err != nil {
+		// Extremely unlikely; fall back to a non-empty deterministic token
+		// so pairing still requires presenting something non-empty.
+		copy(token, []byte("hostit-pair-fallback"))
+	}
+	e := newPendingTCPEntry()
+	e.owner = owner
+	e.controlRemote = controlRemote
+	e.pairToken = token
+	return e
 }
 
 func (p *pendingTCPEntry) cancel() {
@@ -214,6 +243,18 @@ type Server struct {
 	dynamicPortHigh int
 
 	counters counterRegistry
+
+	// helloDebounce coalesces rapid route mutations into one HELLO broadcast.
+	helloMu       sync.Mutex
+	helloPending  bool
+	helloTimer    *time.Timer
+
+	// registeredAgentsCache avoids hitting SQLite on every dashboard poll.
+	registeredAgentsMu    sync.Mutex
+	registeredAgentsCache map[string]int64
+	registeredAgentsAt    time.Time
+
+	udpDrops atomic.Uint64
 }
 
 type agentUDPState struct {
@@ -324,9 +365,15 @@ func (s *Server) publishPublicUDPLocked() {
 	s.publicUDPSnap.Store(&cp)
 }
 
-// updateUDPAgentAddr is copy-on-write; only acceptAgentUDP calls it (single writer).
+// updateUDPAgentAddr is copy-on-write when the addr/session changes; only
+// acceptAgentUDP calls it (single writer). Refresh-only updates store lastSeen
+// in place to avoid cloning the agent map every ~2s.
 func (s *Server) updateUDPAgentAddr(agentID string, addr netip.AddrPort, sessionID crypto.UDPSessionID, nowNano int64) {
 	old := s.loadUDPAgents()
+	if st := old[agentID]; st != nil && st.addr == addr && st.crypto != nil && st.crypto.sessionID == sessionID {
+		st.lastSeen.Store(nowNano)
+		return
+	}
 	st := old[agentID]
 	var uc *agentUDPCrypto
 	if st != nil && st.crypto != nil && st.crypto.sessionID == sessionID {
@@ -410,8 +457,13 @@ func (s *Server) abortPendingTCPForAgentLocked(agentID string) {
 }
 
 func (s *Server) nextClientID() string {
-	id := atomic.AddUint64(&s.clientIDCounter, 1)
-	return strconv.FormatUint(id, 36)
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fallback keeps uniqueness even if entropy fails briefly.
+		id := atomic.AddUint64(&s.clientIDCounter, 1)
+		return "c" + strconv.FormatUint(id, 36) + hex.EncodeToString(b[:8])
+	}
+	return hex.EncodeToString(b[:])
 }
 
 type helloRoute struct {
@@ -523,14 +575,7 @@ func (s *Server) agentStatuses() []AgentStatus {
 	}
 	s.mu.RUnlock()
 
-	registered := make(map[string]int64) // agent id -> first seen unix
-	if s.appStore != nil {
-		if recs, err := s.appStore.ListAgents(s.ctx); err == nil {
-			for _, r := range recs {
-				registered[r.AgentID] = r.FirstSeen.Unix()
-			}
-		}
-	}
+	registered := s.cachedRegisteredAgents()
 
 	ids := make(map[string]struct{})
 	for id := range sess {
@@ -566,6 +611,41 @@ func (s *Server) agentStatuses() []AgentStatus {
 	return out
 }
 
+func (s *Server) cachedRegisteredAgents() map[string]int64 {
+	const ttl = 5 * time.Second
+	s.registeredAgentsMu.Lock()
+	defer s.registeredAgentsMu.Unlock()
+	if s.registeredAgentsCache != nil && time.Since(s.registeredAgentsAt) < ttl {
+		return s.registeredAgentsCache
+	}
+	registered := make(map[string]int64)
+	if s.appStore != nil {
+		if recs, err := s.appStore.ListAgents(s.ctx); err == nil {
+			for _, r := range recs {
+				registered[r.AgentID] = r.FirstSeen.Unix()
+			}
+		}
+	}
+	s.registeredAgentsCache = registered
+	s.registeredAgentsAt = time.Now()
+	return registered
+}
+
+// EffectiveRoutes returns static + synthetic + dynamic routes currently active.
+func (s *Server) EffectiveRoutes() []RouteConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return effectiveRoutes(s.cfg, s.dynamicRoutes)
+}
+
+// UDPStats returns aggregate UDP drop counters for the dashboard.
+func (s *Server) UDPStats() map[string]any {
+	return map[string]any{
+		"totalDrops":  s.udpDrops.Load(),
+		"lossPercent": 0.0, // end-to-end loss requires nettest; drops are local rejects
+	}
+}
+
 // KnownAgentIDs lists agent IDs useful for assigning route ownership: the
 // default agent, plus every connected, registered, or route-owning agent.
 func (s *Server) KnownAgentIDs() []string {
@@ -597,6 +677,66 @@ func (s *Server) dropSession(agentID string) {
 			sess.conn.Close()
 		}
 	}
+	// Drop UDP return path so a forged register cannot keep delivering
+	// after the real control session is gone.
+	s.clearUDPAgent(agentID)
+}
+
+// clearUDPAgent removes an agent's UDP registration (copy-on-write).
+func (s *Server) clearUDPAgent(agentID string) {
+	old := s.loadUDPAgents()
+	if _, ok := old[agentID]; !ok {
+		return
+	}
+	newMap := make(map[string]*agentUDPState, len(old))
+	for k, v := range old {
+		if k == agentID {
+			continue
+		}
+		newMap[k] = v
+	}
+	s.udpAgents.Store(&newMap)
+}
+
+// controlSessionRemoteAddr returns the remote addr string for a live control
+// session, or "" if the agent is not connected on the control plane.
+func (s *Server) controlSessionRemoteAddr(agentID string) string {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	sess := s.sessions[agentID]
+	if sess == nil {
+		return ""
+	}
+	return sess.remoteAddr
+}
+
+// udpRegisterAllowed reports whether a verified UDP register for agentID from
+// udpAddr may be adopted. Requires a live control session whose peer IP matches
+// the UDP source (loopback-to-loopback counts as a match).
+func udpRegisterAllowed(controlRemote string, udpAddr netip.AddrPort) bool {
+	if controlRemote == "" || !udpAddr.IsValid() {
+		return false
+	}
+	host, _, err := net.SplitHostPort(controlRemote)
+	if err != nil {
+		host = controlRemote
+	}
+	host = strings.Trim(host, "[]")
+	cip := net.ParseIP(host)
+	if cip == nil {
+		return false
+	}
+	caddr, ok := netip.AddrFromSlice(cip)
+	if !ok {
+		return false
+	}
+	caddr = caddr.Unmap()
+	uaddr := udpAddr.Addr().Unmap()
+	if caddr == uaddr {
+		return true
+	}
+	// Control over IPv4 loopback and UDP over IPv6 loopback (or vice versa).
+	return caddr.IsLoopback() && uaddr.IsLoopback()
 }
 
 // OverrideAgentID renames a registered agent: it rebinds the ID in the registry,
@@ -905,7 +1045,25 @@ func (s *Server) buildHelloPacketForAgent(agentID string) (*protocol.Packet, err
 }
 
 // broadcastHello pushes each connected agent its filtered HELLO after a route change.
+// Rapid successive mutations are coalesced into a single broadcast.
 func (s *Server) broadcastHello() {
+	const debounce = 50 * time.Millisecond
+	s.helloMu.Lock()
+	defer s.helloMu.Unlock()
+	if s.helloPending {
+		return
+	}
+	s.helloPending = true
+	s.helloTimer = time.AfterFunc(debounce, func() {
+		s.helloMu.Lock()
+		s.helloPending = false
+		s.helloTimer = nil
+		s.helloMu.Unlock()
+		s.broadcastHelloNow()
+	})
+}
+
+func (s *Server) broadcastHelloNow() {
 	type target struct {
 		id   string
 		sess *agentSession
@@ -1304,9 +1462,14 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner stri
 		publicAddr = fmt.Sprintf(":%d", assigned)
 	}
 
-	if req.Source == "api" && s.cfg.MaxDynamicRoutesPerAgent > 0 {
-		dynamicCount := len(s.dynamicRoutes)
-		if dynamicCount >= s.cfg.MaxDynamicRoutesPerAgent {
+	if s.cfg.MaxDynamicRoutesPerAgent > 0 {
+		ownerCount := 0
+		for _, dr := range s.dynamicRoutes {
+			if dr.Route.OwnerAgent() == owner {
+				ownerCount++
+			}
+		}
+		if ownerCount >= s.cfg.MaxDynamicRoutesPerAgent {
 			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "max dynamic routes reached"}
 		}
 	}
@@ -1396,17 +1559,21 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner stri
 	}
 	if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == routeProtoUDP || rt.Proto == routeProtoBoth) {
 		addr, err := net.ResolveUDPAddr("udp", rt.PublicAddr)
-		if err == nil {
-			conn, err := net.ListenUDP("udp", addr)
-			if err == nil {
-				conn.SetReadBuffer(8 * 1024 * 1024)
-				conn.SetWriteBuffer(8 * 1024 * 1024)
-				s.publicUDP[rt.Name] = conn
-				if s.ctx != nil {
-					s.wg.Add(1)
-					go s.acceptPublicUDP(conn, rt.Name)
-				}
-			}
+		if err != nil {
+			s.rollbackDynamicRouteLocked(req.Name)
+			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to resolve udp %s: %v", rt.PublicAddr, err)}
+		}
+		conn, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			s.rollbackDynamicRouteLocked(req.Name)
+			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen udp on %s: %v", rt.PublicAddr, err)}
+		}
+		conn.SetReadBuffer(8 * 1024 * 1024)
+		conn.SetWriteBuffer(8 * 1024 * 1024)
+		s.publicUDP[rt.Name] = conn
+		if s.ctx != nil {
+			s.wg.Add(1)
+			go s.acceptPublicUDP(conn, rt.Name)
 		}
 	}
 
@@ -1426,6 +1593,26 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner stri
 		LocalAddr:        rt.LocalAddr,
 		Domain:           domain,
 		AvailableDomains: availableDomains,
+	}
+}
+
+// rollbackDynamicRouteLocked undoes a partially applied dynamic route create
+// (e.g. TCP listen succeeded but UDP listen failed).
+func (s *Server) rollbackDynamicRouteLocked(name string) {
+	if ln, exists := s.publicTCP[name]; exists {
+		ln.Close()
+		delete(s.publicTCP, name)
+	}
+	if conn, exists := s.publicUDP[name]; exists {
+		conn.Close()
+		delete(s.publicUDP, name)
+	}
+	delete(s.dynamicRoutes, name)
+	delete(s.derivedKeys, name)
+	s.connSemaphores.Delete(name)
+	s.domainProxyCache.Delete(name)
+	if s.dash != nil {
+		s.dash.removeRoute(name)
 	}
 }
 
@@ -1488,7 +1675,7 @@ func (s *Server) handleRouteConfirm(conn net.Conn, session *agentSession, payloa
 	}
 
 	s.mu.Lock()
-	ack := s.processRouteConfirmLocked(confirm)
+	ack := s.processRouteConfirmLocked(confirm, session.agentID)
 	var drProto, drLocalAddr, drDomain, drAgent string
 	var drEncrypted, drEnabled bool
 	if dr, ok := s.dynamicRoutes[confirm.Name]; ok {
@@ -1544,15 +1731,26 @@ func (s *Server) handleRouteConfirm(conn net.Conn, session *agentSession, payloa
 	s.broadcastHello()
 }
 
-func (s *Server) processRouteConfirmLocked(confirm apitypes.RouteConfirm) apitypes.RouteAck {
+func (s *Server) processRouteConfirmLocked(confirm apitypes.RouteConfirm, owner string) apitypes.RouteAck {
 	dr, ok := s.dynamicRoutes[confirm.Name]
 	if !ok {
 		return apitypes.RouteAck{RequestID: confirm.RequestID, Status: "failed", Name: confirm.Name, Error: "dynamic route not found"}
+	}
+	if owner == "" {
+		owner = protocol.DefaultAgentID
+	}
+	if dr.Route.OwnerAgent() != owner {
+		return apitypes.RouteAck{RequestID: confirm.RequestID, Status: "failed", Name: confirm.Name, Error: "route owned by another agent"}
 	}
 
 	domain := normalizeHostname(confirm.Domain)
 	if err := validateHostname(domain); err != nil {
 		return apitypes.RouteAck{RequestID: confirm.RequestID, Status: "failed", Name: confirm.Name, Error: "invalid domain: " + err.Error()}
+	}
+	if s.cfg.DomainManagerEnabled {
+		if base := normalizeHostname(s.cfg.DomainBase); base != "" && !hostnameWithinBase(domain, base) {
+			return apitypes.RouteAck{RequestID: confirm.RequestID, Status: "failed", Name: confirm.Name, Error: fmt.Sprintf("domain %q must be within base domain %q", domain, s.cfg.DomainBase)}
+		}
 	}
 
 	allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
@@ -1586,7 +1784,7 @@ func (s *Server) handleRouteRemove(conn net.Conn, session *agentSession, payload
 	}
 
 	s.mu.Lock()
-	ack := s.processRouteRemoveLocked(remove)
+	ack := s.processRouteRemoveLocked(remove, session.agentID)
 	s.mu.Unlock()
 
 	if ack.OK && s.appStore != nil {
@@ -1612,10 +1810,16 @@ func (s *Server) handleRouteRemove(conn net.Conn, session *agentSession, payload
 	s.broadcastHello()
 }
 
-func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove) apitypes.RouteRemoveAck {
-	_, ok := s.dynamicRoutes[remove.Name]
+func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove, owner string) apitypes.RouteRemoveAck {
+	dr, ok := s.dynamicRoutes[remove.Name]
 	if !ok {
 		return apitypes.RouteRemoveAck{Name: remove.Name, Error: "dynamic route not found"}
+	}
+	if owner == "" {
+		owner = protocol.DefaultAgentID
+	}
+	if dr.Route.OwnerAgent() != owner {
+		return apitypes.RouteRemoveAck{Name: remove.Name, Error: "route owned by another agent"}
 	}
 
 	if ln, exists := s.publicTCP[remove.Name]; exists {
@@ -1629,6 +1833,11 @@ func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove) apitypes.
 
 	delete(s.dynamicRoutes, remove.Name)
 	delete(s.derivedKeys, remove.Name)
+	s.connSemaphores.Delete(remove.Name)
+	s.domainProxyCache.Delete(remove.Name)
+	if s.dash != nil {
+		s.dash.removeRoute(remove.Name)
+	}
 
 	s.updateRouteCacheLocked()
 
@@ -1643,7 +1852,7 @@ func (s *Server) handleRouteUpdate(conn net.Conn, session *agentSession, payload
 	}
 
 	s.mu.Lock()
-	ack := s.processRouteUpdateLocked(req)
+	ack := s.processRouteUpdateLocked(req, session.agentID)
 	var updProto, updPublicAddr, updLocalAddr, updDomain string
 	var updEncrypted, updDomainEnabled, updEnabled bool
 	if dr, ok := s.dynamicRoutes[req.Name]; ok {
@@ -1695,10 +1904,16 @@ func (s *Server) handleRouteUpdate(conn net.Conn, session *agentSession, payload
 	s.broadcastHello()
 }
 
-func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate) apitypes.RouteUpdateAck {
+func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate, owner string) apitypes.RouteUpdateAck {
 	dr, ok := s.dynamicRoutes[req.Name]
 	if !ok {
 		return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "dynamic route not found"}
+	}
+	if owner == "" {
+		owner = protocol.DefaultAgentID
+	}
+	if dr.Route.OwnerAgent() != owner {
+		return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "route owned by another agent"}
 	}
 
 	if req.LocalAddr != "" {
@@ -1713,38 +1928,62 @@ func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate) apitypes.Rou
 				return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("public port %d conflicts with route %q", req.PublicPort, rt.Name)}
 			}
 		}
-		oldLn, hasOldLn := s.publicTCP[req.Name]
-		if hasOldLn {
-			oldLn.Close()
-			delete(s.publicTCP, req.Name)
-		}
-		oldConn, hasOldConn := s.publicUDP[req.Name]
-		if hasOldConn {
-			oldConn.Close()
-			delete(s.publicUDP, req.Name)
-		}
-		dr.Route.PublicAddr = newAddr
-
-		if dr.Route.Proto == routeProtoTCP || dr.Route.Proto == routeProtoBoth {
-			ln, err := net.Listen("tcp", newAddr)
-			if err != nil {
-				return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen on %s: %v", newAddr, err)}
-			}
-			s.publicTCP[req.Name] = ln
-			s.wg.Add(1)
-			go s.acceptPublicTCP(ln, req.Name)
-		}
-		if dr.Route.Proto == routeProtoUDP || dr.Route.Proto == routeProtoBoth {
-			addr, err := net.ResolveUDPAddr("udp", newAddr)
-			if err == nil {
-				conn, err := net.ListenUDP("udp", addr)
-				if err == nil {
-					conn.SetReadBuffer(8 * 1024 * 1024)
-					conn.SetWriteBuffer(8 * 1024 * 1024)
-					s.publicUDP[req.Name] = conn
-					s.wg.Add(1)
-					go s.acceptPublicUDP(conn, req.Name)
+		oldAddr := dr.Route.PublicAddr
+		// Already bound to this address: keep existing listeners.
+		if strings.TrimSpace(oldAddr) != "" && publicTCPAddrsConflict(oldAddr, newAddr) {
+			dr.Route.PublicAddr = newAddr
+		} else {
+			// Bind new listeners before closing old ones so a partial failure
+			// (e.g. TCP ok, UDP fail on "both") leaves the route unchanged.
+			needTCP := dr.Route.Proto == routeProtoTCP || dr.Route.Proto == routeProtoBoth
+			needUDP := dr.Route.Proto == routeProtoUDP || dr.Route.Proto == routeProtoBoth
+			var newTCP net.Listener
+			var newUDP *net.UDPConn
+			if needTCP {
+				ln, err := net.Listen("tcp", newAddr)
+				if err != nil {
+					return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen on %s: %v", newAddr, err)}
 				}
+				newTCP = ln
+			}
+			if needUDP {
+				addr, err := net.ResolveUDPAddr("udp", newAddr)
+				if err != nil {
+					if newTCP != nil {
+						newTCP.Close()
+					}
+					return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to resolve udp %s: %v", newAddr, err)}
+				}
+				conn, err := net.ListenUDP("udp", addr)
+				if err != nil {
+					if newTCP != nil {
+						newTCP.Close()
+					}
+					return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen udp on %s: %v", newAddr, err)}
+				}
+				conn.SetReadBuffer(8 * 1024 * 1024)
+				conn.SetWriteBuffer(8 * 1024 * 1024)
+				newUDP = conn
+			}
+
+			if oldLn, ok := s.publicTCP[req.Name]; ok {
+				oldLn.Close()
+				delete(s.publicTCP, req.Name)
+			}
+			if oldConn, ok := s.publicUDP[req.Name]; ok {
+				oldConn.Close()
+				delete(s.publicUDP, req.Name)
+			}
+			dr.Route.PublicAddr = newAddr
+			if newTCP != nil {
+				s.publicTCP[req.Name] = newTCP
+				s.wg.Add(1)
+				go s.acceptPublicTCP(newTCP, req.Name)
+			}
+			if newUDP != nil {
+				s.publicUDP[req.Name] = newUDP
+				s.wg.Add(1)
+				go s.acceptPublicUDP(newUDP, req.Name)
 			}
 		}
 	}
@@ -2292,6 +2531,18 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) Stop() {
+	s.helloMu.Lock()
+	if s.helloTimer != nil {
+		s.helloTimer.Stop()
+		s.helloTimer = nil
+	}
+	pending := s.helloPending
+	s.helloPending = false
+	s.helloMu.Unlock()
+	if pending {
+		s.broadcastHelloNow()
+	}
+
 	s.cancel()
 	if s.controlLn != nil {
 		s.controlLn.Close()
@@ -2511,11 +2762,16 @@ func (s *Server) acceptControl(ln net.Listener) {
 			defer s.wg.Done()
 			defer func() {
 				c.Close()
+				cleared := false
 				s.sessionsMu.Lock()
 				if s.sessions[agentID] == session {
 					delete(s.sessions, agentID)
+					cleared = true
 				}
 				s.sessionsMu.Unlock()
+				if cleared {
+					s.clearUDPAgent(agentID)
+				}
 			}()
 
 			pingCtx, pingCancel := context.WithCancel(sessionCtx)
@@ -2706,6 +2962,19 @@ func (s *Server) acceptData(ln net.Listener) {
 			continue
 		}
 
+		// Pairing token is sent in the clear before optional tunnel encryption.
+		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+			conn.Close()
+			continue
+		}
+		pairBytes := make([]byte, lenBuf[0])
+		if lenBuf[0] > 0 {
+			if _, err := io.ReadFull(conn, pairBytes); err != nil {
+				conn.Close()
+				continue
+			}
+		}
+
 		rc, _ := s.getRouteConfig(routeName)
 		isEncrypted := rc.isEncrypted
 
@@ -2733,11 +3002,26 @@ func (s *Server) acceptData(ln net.Listener) {
 		}
 		s.mu.Unlock()
 
-		if ok {
-			entry.deliver(conn)
-		} else {
+		if !ok {
+			logging.Global().RateLimitedWarn(logging.CatTCP, "data-unmatched-"+routeName, fmt.Sprintf("data handshake with no pending pairing route=%s client=%s from=%s", routeName, clientID, conn.RemoteAddr()))
 			conn.Close()
+			continue
 		}
+		if len(entry.pairToken) > 0 && subtle.ConstantTimeCompare(entry.pairToken, pairBytes) != 1 {
+			logging.Global().RateLimitedWarn(logging.CatTCP, "data-pair-token-"+routeName, fmt.Sprintf("rejected data pairing with bad token route=%s client=%s from=%s", routeName, clientID, conn.RemoteAddr()))
+			conn.Close()
+			entry.cancel()
+			continue
+		}
+		if ap, err := netip.ParseAddrPort(conn.RemoteAddr().String()); err == nil {
+			if entry.controlRemote != "" && !udpRegisterAllowed(entry.controlRemote, ap) {
+				logging.Global().RateLimitedWarn(logging.CatTCP, "data-pair-ip-"+routeName, fmt.Sprintf("rejected data pairing from %s; control peer is %s route=%s client=%s", conn.RemoteAddr(), entry.controlRemote, routeName, clientID))
+				conn.Close()
+				entry.cancel()
+				continue
+			}
+		}
+		entry.deliver(conn)
 	}
 }
 
@@ -2797,16 +3081,17 @@ func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
 			continue
 		}
 
-		entry := newPendingTCPEntry()
+		entry := newPendingTCPPair(owner, session.remoteAddr)
 		pendingKey := makePendingTCPKey(routeName, clientID)
 		s.mu.Lock()
 		s.pendingTCP[pendingKey] = entry
 		s.mu.Unlock()
 
 		reqPkt := &protocol.Packet{
-			Type:   protocol.TypeConnect,
-			Route:  routeName,
-			Client: clientID,
+			Type:    protocol.TypeConnect,
+			Route:   routeName,
+			Client:  clientID,
+			Payload: entry.pairToken,
 		}
 		session.writeMu.Lock()
 		session.conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
@@ -3037,6 +3322,15 @@ func (s *Server) acceptAgentUDP() {
 			if regAgentID == "" {
 				regAgentID = protocol.DefaultAgentID
 			}
+			controlRemote := s.controlSessionRemoteAddr(regAgentID)
+			if controlRemote == "" {
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-nosession", fmt.Sprintf("rejected UDP register for agent %q from %s: no live control session", regAgentID, addr))
+				continue
+			}
+			if !udpRegisterAllowed(controlRemote, addr) {
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-ip", fmt.Sprintf("rejected UDP register for agent %q from %s: does not match control peer %s", regAgentID, addr, controlRemote))
+				continue
+			}
 			prev := s.loadUDPAgents()[regAgentID]
 			if prev == nil {
 				logging.Global().Infof(logging.CatUDP, "Agent %q UDP address registered: %s", regAgentID, addr.String())
@@ -3085,6 +3379,7 @@ func (s *Server) acceptAgentUDP() {
 				aadBuf = crypto.AppendUDPDataAAD(aadBuf[:0], routeName, clientID)
 				decrypted, err := st.crypto.dec.Open(decryptBuf, payload, aadBuf)
 				if err != nil {
+					s.udpDrops.Add(1)
 					logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-open-"+routeName, fmt.Sprintf("dropping undecryptable UDP packet route=%s client=%s err=%v", routeName, clientID, err))
 					continue
 				}
@@ -3186,10 +3481,12 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		}
 		st := s.loadUDPAgents()[owner]
 		if st == nil || !st.addr.IsValid() {
+			s.udpDrops.Add(1)
 			continue
 		}
 		// Owner registration gone stale; acceptAgentUDP prunes it.
 		if time.Since(time.Unix(0, st.lastSeen.Load())) > udpRegisterTimeout {
+			s.udpDrops.Add(1)
 			continue
 		}
 		agentAddr := st.addr
@@ -3198,11 +3495,13 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 		if rc.isEncrypted {
 			if st.crypto == nil {
 				// No registered agent session yet; nothing to encrypt for.
+				s.udpDrops.Add(1)
 				continue
 			}
 			aadBuf = crypto.AppendUDPDataAAD(aadBuf[:0], routeName, clientStr)
 			encrypted, err := st.crypto.enc.Seal(encryptBuf, payload, aadBuf)
 			if err != nil {
+				s.udpDrops.Add(1)
 				continue
 			}
 			payload = encrypted

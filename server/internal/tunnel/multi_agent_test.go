@@ -179,8 +179,8 @@ func TestMultiAgentUDPRoutingByOwner(t *testing.T) {
 	waitPublicUDPRoute(t, srv, "udp-a")
 	waitPublicUDPRoute(t, srv, "udp-b")
 
-	startFakeUDPAgentAs(t, ctx, dataAddr, "testtoken", "uagent-a", map[string]string{"udp-a": "A:"}, newTestSessionID(t), nil, nil)
-	startFakeUDPAgentAs(t, ctx, dataAddr, "testtoken", "uagent-b", map[string]string{"udp-b": "B:"}, newTestSessionID(t), nil, nil)
+	startFakeUDPAgentAs(t, ctx, srv, dataAddr, "testtoken", "uagent-a", map[string]string{"udp-a": "A:"}, newTestSessionID(t), nil, nil)
+	startFakeUDPAgentAs(t, ctx, srv, dataAddr, "testtoken", "uagent-b", map[string]string{"udp-b": "B:"}, newTestSessionID(t), nil, nil)
 
 	clientA := dialPublicUDP(t, publicA)
 	defer clientA.Close()
