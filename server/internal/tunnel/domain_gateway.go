@@ -570,6 +570,12 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 		cleanup()
 		return nil, ctx.Err()
 	case <-timer.C:
+		// Race: delivery may have landed at the same moment the timer
+		// fired. Use it instead of discarding a valid pair (mirrors
+		// acceptPublicTCP).
+		if agentConn := entry.take(); agentConn != nil {
+			return agentConn, nil
+		}
 		cleanup()
 		return nil, fmt.Errorf("timeout waiting for route %s backend", routeName)
 	case <-entry.done:

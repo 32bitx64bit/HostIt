@@ -52,7 +52,6 @@ const (
 	writeDeadlineStandard  = 5 * time.Second
 	readDeadlineStandard   = 45 * time.Second
 	authDeadline           = 5 * time.Second
-	handshakeDeadline      = 15 * time.Second
 	pingInterval           = 5 * time.Second
 	healthCheckInterval    = 10 * time.Second
 	healthCheckTimeout     = 45 * time.Second
@@ -68,6 +67,8 @@ const (
 	// Byte-counter flush cadence for dashboard hot paths.
 	dashBatchInterval = 100 * time.Millisecond
 )
+
+var handshakeDeadline = 15 * time.Second
 
 type agentSession struct {
 	conn        net.Conn
@@ -245,9 +246,9 @@ type Server struct {
 	counters counterRegistry
 
 	// helloDebounce coalesces rapid route mutations into one HELLO broadcast.
-	helloMu       sync.Mutex
-	helloPending  bool
-	helloTimer    *time.Timer
+	helloMu      sync.Mutex
+	helloPending bool
+	helloTimer   *time.Timer
 
 	// registeredAgentsCache avoids hitting SQLite on every dashboard poll.
 	registeredAgentsMu    sync.Mutex
@@ -2998,7 +2999,6 @@ func (s *Server) acceptData(ln net.Listener) {
 		entry, ok := s.pendingTCP[pendingKey]
 		if ok {
 			delete(s.pendingTCP, pendingKey)
-			conn.SetReadDeadline(time.Time{})
 		}
 		s.mu.Unlock()
 
@@ -3021,6 +3021,11 @@ func (s *Server) acceptData(ln net.Listener) {
 				continue
 			}
 		}
+		// SetDeadline above armed both read and write. Clearing only the
+		// read side left a ~15s write deadline on domain keep-alive conns
+		// returned by dialRouteTCP (public relays overwrite it via idle
+		// timeout wrappers). Clear both before handing the conn off.
+		_ = conn.SetDeadline(time.Time{})
 		entry.deliver(conn)
 	}
 }

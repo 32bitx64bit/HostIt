@@ -444,6 +444,87 @@ func TestManagedDomainHTTPSProxyReusesBackendConnections(t *testing.T) {
 	}
 }
 
+// TestManagedDomainHTTPSKeepAliveSurvivesHandshakeDeadline guards against
+// acceptData leaving a write deadline on paired data conns. Domain GET
+// keep-alive reuses those conns; a stale handshake write deadline makes
+// the next request fail after the deadline elapses.
+func TestManagedDomainHTTPSKeepAliveSurvivesHandshakeDeadline(t *testing.T) {
+	prev := handshakeDeadline
+	handshakeDeadline = 200 * time.Millisecond
+	t.Cleanup(func() { handshakeDeadline = prev })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var backendConnections atomic.Int32
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "ok:%s", r.URL.Path)
+	}))
+	backend.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			backendConnections.Add(1)
+		}
+	}
+	backend.Start()
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	controlAddr := freeTCPAddr(t)
+	dataAddr := freeTCPAddr(t)
+	httpsAddr := freeTCPAddr(t)
+	domainEnabled := true
+	cfg := ServerConfig{
+		ControlAddr:          controlAddr,
+		DataAddr:             dataAddr,
+		Token:                "testtoken",
+		DisableTLS:           true,
+		PairTimeout:          10 * time.Second,
+		DomainManagerEnabled: true,
+		DomainHTTPSAddr:      httpsAddr,
+		DomainBase:           "example.test",
+		DomainCertDir:        t.TempDir(),
+		Routes: []RouteConfig{{
+			Name:          "web",
+			Proto:         "tcp",
+			LocalAddr:     backendURL.Host,
+			Domain:        "app.example.test",
+			DomainEnabled: &domainEnabled,
+		}},
+	}
+
+	srv := NewServer(cfg, nil)
+	go func() { _ = srv.Run(ctx) }()
+	go fakeAgentRoutes(ctx, controlAddr, dataAddr, map[string]string{"web": backendURL.Host}, "testtoken")
+
+	client := newManagedHTTPSClient(t, httpsAddr, "app.example.test")
+	resp := waitHTTPStatus(t, func() (*http.Response, error) {
+		return client.Get("https://app.example.test/one")
+	}, http.StatusOK)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	time.Sleep(handshakeDeadline + 150*time.Millisecond)
+
+	resp2, err := client.Get("https://app.example.test/two")
+	if err != nil {
+		t.Fatalf("keep-alive request after handshake deadline: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("keep-alive status = %d body=%q, want 200", resp2.StatusCode, body)
+	}
+	_, _ = io.Copy(io.Discard, resp2.Body)
+
+	if got := backendConnections.Load(); got != 1 {
+		t.Fatalf("backend connection count = %d, want 1 reused tunnel connection", got)
+	}
+}
+
 func TestManagedDomainProxyTransportAllowsLongPosts(t *testing.T) {
 	srv := NewServer(ServerConfig{}, nil)
 	proxy := srv.domainProxy("web", "app.example.test")
