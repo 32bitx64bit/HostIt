@@ -16,16 +16,9 @@ import (
 // agent-identity signature. The signature binds the UDP session to the unique
 // server nonce from one authenticated control connection.
 const (
-	// Legacy token-only register format. Protocol v3 never accepts this format;
-	// the helpers remain for historical test vectors only.
-	udpRegisterLabel  = "udp-register-v3"
 	udpRegisterMACLen = 16
 	UDPSessionIDLen   = 16
 	MaxAgentIDLen     = 255
-	// timestamp(8) || random(8) || sessionID(16)
-	udpRegisterPrefixLen = 8 + 8 + UDPSessionIDLen
-	// prefix || agentIDLen(1) || mac(16), with a zero-length agent ID.
-	UDPRegisterMinLen = udpRegisterPrefixLen + 1 + udpRegisterMACLen
 
 	boundUDPRegisterLabel     = "udp-register-v4"
 	boundUDPIdentityLabel     = "hostit-udp-register-identity-v1"
@@ -188,66 +181,6 @@ func (r BoundUDPRegister) VerifyIdentity(publicKey []byte) bool {
 		return false
 	}
 	return VerifyIdentityChallenge(publicKey, boundUDPIdentityMessage(r.signed), r.signature[:])
-}
-
-// BuildUDPRegister builds the legacy token-only register payload.
-//
-// Deprecated: protocol v3 requires BuildBoundUDPRegister. This helper remains
-// solely for historical tests and must not be used by the client runtime.
-func BuildUDPRegister(token string, sessionID UDPSessionID, agentID string) ([]byte, error) {
-	if token == "" {
-		return nil, nil
-	}
-	if len(agentID) > MaxAgentIDLen {
-		return nil, fmt.Errorf("agent id too long: %d > %d bytes", len(agentID), MaxAgentIDLen)
-	}
-	macStart := udpRegisterPrefixLen + 1 + len(agentID)
-	buf := make([]byte, macStart+udpRegisterMACLen)
-	binary.BigEndian.PutUint64(buf[0:8], uint64(time.Now().UnixMilli()))
-	if _, err := io.ReadFull(rand.Reader, buf[8:16]); err != nil {
-		return nil, err
-	}
-	copy(buf[16:32], sessionID[:])
-	buf[udpRegisterPrefixLen] = byte(len(agentID))
-	copy(buf[udpRegisterPrefixLen+1:macStart], agentID)
-	mac := udpRegisterMAC(token, buf[:macStart])
-	copy(buf[macStart:], mac)
-	return buf, nil
-}
-
-// VerifyUDPRegister checks a legacy token-only register payload.
-//
-// Deprecated: protocol v3 servers require ParseBoundUDPRegister followed by
-// VerifyIdentity. This helper remains solely for historical tests.
-func VerifyUDPRegister(token string, payload []byte, now time.Time, window time.Duration) (UDPRegisterKey, UDPSessionID, string, bool) {
-	var key UDPRegisterKey
-	var sessionID UDPSessionID
-	if token == "" || len(payload) < UDPRegisterMinLen {
-		return key, sessionID, "", false
-	}
-	agentIDLen := int(payload[udpRegisterPrefixLen])
-	macStart := udpRegisterPrefixLen + 1 + agentIDLen
-	if len(payload) != macStart+udpRegisterMACLen {
-		return key, sessionID, "", false
-	}
-	expected := udpRegisterMAC(token, payload[:macStart])
-	if !hmac.Equal(payload[macStart:macStart+udpRegisterMACLen], expected) {
-		return key, sessionID, "", false
-	}
-	if !udpRegisterTimestampValid(binary.BigEndian.Uint64(payload[0:8]), now, window) {
-		return key, sessionID, "", false
-	}
-	copy(key[:], payload[0:16])
-	copy(sessionID[:], payload[16:32])
-	agentID := string(payload[udpRegisterPrefixLen+1 : macStart])
-	return key, sessionID, agentID, true
-}
-
-func udpRegisterMAC(token string, data []byte) []byte {
-	mac := hmac.New(sha256.New, []byte(token))
-	mac.Write([]byte(udpRegisterLabel))
-	mac.Write(data)
-	return mac.Sum(nil)[:udpRegisterMACLen]
 }
 
 func boundUDPRegisterMAC(token string, data []byte) []byte {
