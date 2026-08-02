@@ -488,18 +488,6 @@ func (a *agentController) Start() {
 			a.mu.Unlock()
 			a.pushEvent(apitypes.AppEvent{Type: "disconnected", Timestamp: time.Now().UnixMilli(), Detail: err.Error()})
 		},
-		OnError: func(err error) {
-			a.mu.Lock()
-			if a.runID != rid {
-				a.mu.Unlock()
-				return
-			}
-			a.connected = false
-			if err != nil {
-				a.lastErr = err.Error()
-			}
-			a.mu.Unlock()
-		},
 		OnTLSPinDiscovered: func(pin string) {
 			a.mu.Lock()
 			if a.runID != rid {

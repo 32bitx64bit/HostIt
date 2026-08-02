@@ -182,9 +182,8 @@ func loopbackPipe(b *testing.B) (net.Conn, net.Conn) {
 	return client, server.conn
 }
 
-// BenchmarkCountingConnRead checks the per-byte cost of countingConn,
-// which wraps the public-side hot path. The new atomic.Int64 + Flush
-// path should be cheaper than the old closure-based approach.
+// BenchmarkCountingConnRead checks the per-byte cost of the counting wrapper,
+// which wraps the public-side hot path and accounts each Read atomically.
 func BenchmarkCountingConnRead(b *testing.B) {
 	payload := make([]byte, 16<<10)
 	if _, err := rand.Read(payload); err != nil {
@@ -194,10 +193,10 @@ func BenchmarkCountingConnRead(b *testing.B) {
 	defer a.Close()
 	defer bSide.Close()
 
-	// Mirror the new countingConn API: an atomic counter drained by Flush,
-	// not a per-read closure that calls into the dashboard.
-	var pending atomic.Int64
-	wrapper := &countingBenchConn{Conn: bSide, pending: &pending}
+	// Mirror the production API: a direct atomic add per Read, not a
+	// per-read closure or a periodically flushed counter.
+	var total atomic.Int64
+	wrapper := &countingBenchConn{Conn: bSide, total: &total}
 
 	done := make(chan struct{})
 	go func() {
@@ -215,21 +214,19 @@ func BenchmarkCountingConnRead(b *testing.B) {
 	}
 	a.Close()
 	<-done
-	// Final flush so a regression in the drain path is also visible.
-	pending.Store(0)
 }
 
 // countingBenchConn mirrors production countingConn: intercepts Read to
-// count bytes via an atomic counter.
+// count bytes via a direct atomic counter.
 type countingBenchConn struct {
 	net.Conn
-	pending *atomic.Int64
+	total *atomic.Int64
 }
 
 func (c *countingBenchConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		c.pending.Add(int64(n))
+		c.total.Add(int64(n))
 	}
 	return n, err
 }
@@ -237,7 +234,7 @@ func (c *countingBenchConn) Read(p []byte) (int, error) {
 func payloadLabel(n int) string {
 	switch {
 	case n >= (1 << 20):
-		return mbLabel(n >> 20) + "MB"
+		return mbLabel(n>>20) + "MB"
 	case n >= (1 << 10):
 		return kbLabel(n>>10) + "KB"
 	default:
