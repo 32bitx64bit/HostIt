@@ -47,22 +47,20 @@ var CFG = {
   data: "{{.Cfg.DataAddr}}",
   pairTimeout: "{{.Cfg.PairTimeout}}",
   token: "{{.Cfg.Token}}",
-  disableTLS: {{if .Cfg.DisableTLS}}true{{else}}false{{end}},
+  disableTLS: "{{if .Cfg.DisableTLS}}true{{else}}false{{end}}" === "true",
   tlsCertFile: "{{.Cfg.TLSCertFile}}",
-  webHTTPS: {{if .Cfg.WebHTTPS}}true{{else}}false{{end}},
+  webHTTPS: "{{if .Cfg.WebHTTPS}}true{{else}}false{{end}}" === "true",
   webTLSFP: "{{.WebTLSFP}}",
   encryptionAlgorithm: "{{.Cfg.EncryptionAlgorithm}}",
-  domainManagerEnabled: {{if .Cfg.DomainManagerEnabled}}true{{else}}false{{end}},
+  domainManagerEnabled: "{{if .Cfg.DomainManagerEnabled}}true{{else}}false{{end}}" === "true",
   domainBase: "{{.Cfg.DomainBase}}",
-  domainAutoTLS: {{if .Cfg.DomainAutoTLS}}true{{else}}false{{end}},
+  domainAutoTLS: "{{if .Cfg.DomainAutoTLS}}true{{else}}false{{end}}" === "true",
   domainHTTPAddr: "{{.Cfg.DomainHTTPAddr}}",
   domainHTTPSAddr: "{{.Cfg.DomainHTTPSAddr}}",
   domainACMEEmail: "{{.Cfg.DomainACMEEmail}}"
 };
-var AGENTS = [{{range .Agents}}"{{.}}",{{end}}];
-var ROUTES = [
-{{range .Routes}}{name:"{{.Name}}",proto:"{{.Proto}}",pub:"{{.PublicAddr}}",local:"{{.LocalAddr}}",domain:"{{.Domain}}",agent:"{{.Agent}}",encrypted:{{if .IsEncrypted}}true{{else}}false{{end}},domainEnabled:{{if .IsDomainEnabled}}true{{else}}false{{end}}},{{end}}
-];
+var AGENTS = JSON.parse('[{{range $i, $a := .Agents}}{{if $i}},{{end}}"{{$a}}"{{end}}]');
+var ROUTES = JSON.parse('[{{range $i, $r := .Routes}}{{if $i}},{{end}}{"name":"{{$r.Name}}","proto":"{{$r.Proto}}","pub":"{{$r.PublicAddr}}","local":"{{$r.LocalAddr}}","domain":"{{$r.Domain}}","agent":"{{$r.Agent}}","encrypted":{{if $r.IsEncrypted}}true{{else}}false{{end}},"domainEnabled":{{if $r.IsDomainEnabled}}true{{else}}false{{end}}}{{end}}]');
 
 function agentOptions(selected){
   var opts=[],seen={};
