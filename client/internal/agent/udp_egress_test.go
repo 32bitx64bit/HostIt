@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"net"
 	"sync"
 	"testing"
@@ -11,28 +10,19 @@ import (
 	"hostit/shared/protocol"
 )
 
-type blockingAgentUDPWriter struct {
-	firstOnce sync.Once
-	started   chan struct{}
-	release   chan struct{}
-	writes    chan []byte
+type recordingAgentUDPWriter struct {
+	writes chan []byte
 
 	mu        sync.Mutex
 	active    int
 	maxActive int
 }
 
-func newBlockingAgentUDPWriter() *blockingAgentUDPWriter {
-	return &blockingAgentUDPWriter{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-		writes:  make(chan []byte, 32),
-	}
+func newRecordingAgentUDPWriter() *recordingAgentUDPWriter {
+	return &recordingAgentUDPWriter{writes: make(chan []byte, 32)}
 }
 
-func (w *blockingAgentUDPWriter) SetWriteDeadline(time.Time) error { return nil }
-
-func (w *blockingAgentUDPWriter) WriteToUDP(payload []byte, _ *net.UDPAddr) (int, error) {
+func (w *recordingAgentUDPWriter) WriteToUDP(payload []byte, _ *net.UDPAddr) (int, error) {
 	w.mu.Lock()
 	w.active++
 	if w.active > w.maxActive {
@@ -40,10 +30,6 @@ func (w *blockingAgentUDPWriter) WriteToUDP(payload []byte, _ *net.UDPAddr) (int
 	}
 	w.mu.Unlock()
 
-	w.firstOnce.Do(func() {
-		close(w.started)
-		<-w.release
-	})
 	w.writes <- append([]byte(nil), payload...)
 
 	w.mu.Lock()
@@ -58,11 +44,11 @@ func nextAgentUDPPacket(t *testing.T, writes <-chan []byte) protocol.Packet {
 	case data := <-writes:
 		pkt, err := protocol.UnmarshalUDP(data)
 		if err != nil {
-			t.Fatalf("unmarshal egress packet: %v", err)
+			t.Fatalf("unmarshal UDP packet: %v", err)
 		}
 		return *pkt
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for UDP egress write")
+		t.Fatal("timed out waiting for UDP write")
 		return protocol.Packet{}
 	}
 }
@@ -76,157 +62,29 @@ func agentRouteEpoch(t *testing.T, a *Agent, route string) uint64 {
 	return epoch
 }
 
-func TestAgentUDPEgressFairlySchedulesRoutesWithOneWriter(t *testing.T) {
+func TestAgentUDPEgressSendsDataImmediately(t *testing.T) {
 	a := NewAgent(Config{Routes: map[string]RemoteRoute{
-		"video":   {Name: "video"},
 		"control": {Name: "control"},
 	}})
-	videoEpoch := agentRouteEpoch(t, a, "video")
-	controlEpoch := agentRouteEpoch(t, a, "control")
+	epoch := agentRouteEpoch(t, a, "control")
+	writer := newRecordingAgentUDPWriter()
+	egress := newAgentUDPEgress(a, writer, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7001})
 
-	writer := newBlockingAgentUDPWriter()
-	egress, err := newAgentUDPEgress(a, writer, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7001})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go egress.run(ctx)
-
-	if err := egress.enqueueData("video", "client", videoEpoch, []byte("video-0")); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-writer.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first video write did not enter sink")
-	}
-	if err := egress.enqueueData("video", "client", videoEpoch, []byte("video-1")); err != nil {
-		t.Fatal(err)
-	}
-	if err := egress.enqueueData("video", "client", videoEpoch, []byte("video-2")); err != nil {
-		t.Fatal(err)
-	}
-	if err := egress.enqueueData("control", "client", controlEpoch, []byte("input")); err != nil {
-		t.Fatal(err)
-	}
-	close(writer.release)
-
-	first := nextAgentUDPPacket(t, writer.writes)
-	second := nextAgentUDPPacket(t, writer.writes)
-	third := nextAgentUDPPacket(t, writer.writes)
-	fourth := nextAgentUDPPacket(t, writer.writes)
-	if first.Route != "video" || string(first.Payload) != "video-0" {
-		t.Fatalf("first packet = route %q payload %q, want in-flight video", first.Route, first.Payload)
-	}
-	if second.Route != "video" || string(second.Payload) != "video-1" {
-		t.Fatalf("second packet = route %q payload %q, want at most one queued video before control", second.Route, second.Payload)
-	}
-	if third.Route != "control" || string(third.Payload) != "input" {
-		t.Fatalf("third packet = route %q payload %q, want newly active control", third.Route, third.Payload)
-	}
-	if fourth.Route != "video" || string(fourth.Payload) != "video-2" {
-		t.Fatalf("fourth packet = route %q payload %q, want remaining video", fourth.Route, fourth.Payload)
-	}
-	writer.mu.Lock()
-	maxActive := writer.maxActive
-	writer.mu.Unlock()
-	if maxActive != 1 {
-		t.Fatalf("concurrent socket writers = %d, want exactly one", maxActive)
+	egress.sendData("control", "client", epoch, []byte("input"))
+	pkt := nextAgentUDPPacket(t, writer.writes)
+	if pkt.Route != "control" || string(pkt.Payload) != "input" {
+		t.Fatalf("packet = route %q payload %q, want control/input", pkt.Route, pkt.Payload)
 	}
 }
 
-func TestAgentUDPEgressRegistrationUsesSystemPriority(t *testing.T) {
-	a := NewAgent(Config{Routes: map[string]RemoteRoute{"video": {Name: "video"}}})
-	videoEpoch := agentRouteEpoch(t, a, "video")
-	writer := newBlockingAgentUDPWriter()
-	egress, err := newAgentUDPEgress(a, writer, &net.UDPAddr{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go egress.run(ctx)
-
-	_ = egress.enqueueData("video", "client", videoEpoch, []byte("video-0"))
-	<-writer.started
-	_ = egress.enqueueData("video", "client", videoEpoch, []byte("video-1"))
-	a.mu.Lock()
-	a.udpRegisterReady = true
-	a.mu.Unlock()
-	if err := egress.enqueueRegister(crypto.UDPControlNonce{}, []byte("proof")); err != nil {
-		t.Fatal(err)
-	}
-	close(writer.release)
-	_ = nextAgentUDPPacket(t, writer.writes)
-	if pkt := nextAgentUDPPacket(t, writer.writes); pkt.Type != protocol.TypeRegister || string(pkt.Payload) != "proof" {
-		t.Fatalf("second packet = type %d payload %q, want system registration", pkt.Type, pkt.Payload)
-	}
-}
-
-func TestAgentUDPEgressDropsQueuedStaleControlGeneration(t *testing.T) {
-	a := NewAgent(Config{Routes: map[string]RemoteRoute{"video": {Name: "video"}}})
-	videoEpoch := agentRouteEpoch(t, a, "video")
-	oldNonce := crypto.UDPControlNonce{1}
-	newNonce := crypto.UDPControlNonce{2}
-	a.mu.Lock()
-	a.udpControlNonce = oldNonce
-	a.udpRegisterReady = true
-	a.mu.Unlock()
-
-	writer := newBlockingAgentUDPWriter()
-	egress, err := newAgentUDPEgress(a, writer, &net.UDPAddr{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go egress.run(ctx)
-
-	if err := egress.enqueueData("video", "client", videoEpoch, []byte("in-flight")); err != nil {
-		t.Fatal(err)
-	}
-	<-writer.started
-	if err := egress.enqueueRegister(oldNonce, []byte("stale-proof")); err != nil {
-		t.Fatal(err)
-	}
-	a.mu.Lock()
-	a.udpControlNonce = newNonce
-	a.mu.Unlock()
-	if err := egress.enqueueRegister(newNonce, []byte("current-proof")); err != nil {
-		t.Fatal(err)
-	}
-	close(writer.release)
-
-	if pkt := nextAgentUDPPacket(t, writer.writes); pkt.Type != protocol.TypeData {
-		t.Fatalf("first packet type = %d, want in-flight data", pkt.Type)
-	}
-	if pkt := nextAgentUDPPacket(t, writer.writes); pkt.Type != protocol.TypeRegister || string(pkt.Payload) != "current-proof" {
-		t.Fatalf("packet after stale proof = type %d payload %q, want current proof", pkt.Type, pkt.Payload)
-	}
-}
-
-func TestAgentUDPEgressDropsQueuedStaleRouteEpoch(t *testing.T) {
-	initialRoute := RemoteRoute{Name: "video", LocalAddr: "127.0.0.1:5000"}
-	a := NewAgent(Config{Routes: map[string]RemoteRoute{"video": initialRoute}})
+func TestAgentUDPEgressDropsStaleRouteEpoch(t *testing.T) {
+	a := NewAgent(Config{Routes: map[string]RemoteRoute{
+		"video": {Name: "video", LocalAddr: "127.0.0.1:5000"},
+	}})
 	oldEpoch := agentRouteEpoch(t, a, "video")
+	writer := newRecordingAgentUDPWriter()
+	egress := newAgentUDPEgress(a, writer, &net.UDPAddr{})
 
-	writer := newBlockingAgentUDPWriter()
-	egress, err := newAgentUDPEgress(a, writer, &net.UDPAddr{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go egress.run(ctx)
-
-	if err := egress.enqueueData("video", "client", oldEpoch, []byte("in-flight")); err != nil {
-		t.Fatal(err)
-	}
-	<-writer.started
-	if err := egress.enqueueData("video", "client", oldEpoch, []byte("stale")); err != nil {
-		t.Fatal(err)
-	}
 	a.mu.Lock()
 	a.replaceRoutesLocked(map[string]RemoteRoute{
 		"video": {Name: "video", LocalAddr: "127.0.0.1:5001"},
@@ -236,16 +94,46 @@ func TestAgentUDPEgressDropsQueuedStaleRouteEpoch(t *testing.T) {
 	if newEpoch == 0 || newEpoch == oldEpoch {
 		t.Fatalf("route epoch did not advance: old=%d new=%d", oldEpoch, newEpoch)
 	}
-	if err := egress.enqueueData("video", "client", newEpoch, []byte("fresh")); err != nil {
-		t.Fatal(err)
-	}
-	close(writer.release)
 
-	if pkt := nextAgentUDPPacket(t, writer.writes); string(pkt.Payload) != "in-flight" {
-		t.Fatalf("first payload = %q, want in-flight", pkt.Payload)
+	egress.sendData("video", "client", oldEpoch, []byte("stale"))
+	select {
+	case <-writer.writes:
+		t.Fatal("stale epoch was written")
+	case <-time.After(20 * time.Millisecond):
 	}
+
+	egress.sendData("video", "client", newEpoch, []byte("fresh"))
 	if pkt := nextAgentUDPPacket(t, writer.writes); string(pkt.Payload) != "fresh" {
-		t.Fatalf("packet after stale epoch = %q, want fresh", pkt.Payload)
+		t.Fatalf("payload = %q, want fresh", pkt.Payload)
+	}
+}
+
+func TestAgentUDPEgressDropsStaleControlGeneration(t *testing.T) {
+	a := NewAgent(Config{Routes: map[string]RemoteRoute{"video": {Name: "video"}}})
+	oldNonce := crypto.UDPControlNonce{1}
+	newNonce := crypto.UDPControlNonce{2}
+	a.mu.Lock()
+	a.udpControlNonce = oldNonce
+	a.udpRegisterReady = true
+	a.mu.Unlock()
+
+	writer := newRecordingAgentUDPWriter()
+	egress := newAgentUDPEgress(a, writer, &net.UDPAddr{})
+
+	a.mu.Lock()
+	a.udpControlNonce = newNonce
+	a.mu.Unlock()
+	egress.sendRegister(oldNonce, []byte("stale-proof"))
+	select {
+	case <-writer.writes:
+		t.Fatal("stale control generation was written")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	egress.sendRegister(newNonce, []byte("current-proof"))
+	pkt := nextAgentUDPPacket(t, writer.writes)
+	if pkt.Type != protocol.TypeRegister || string(pkt.Payload) != "current-proof" {
+		t.Fatalf("packet = type %d payload %q, want current proof", pkt.Type, pkt.Payload)
 	}
 }
 
@@ -274,29 +162,20 @@ func TestAgentUDPEgressEncryptionCountersFollowWireOrder(t *testing.T) {
 	a.udpCryptoByAlg = map[string]*crypto.UDPSessionCrypto{"test": agentCrypto}
 	videoEpoch := agentRouteEpoch(t, a, "video")
 	controlEpoch := agentRouteEpoch(t, a, "control")
-	writer := newBlockingAgentUDPWriter()
-	egress, err := newAgentUDPEgress(a, writer, &net.UDPAddr{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go egress.run(ctx)
+	writer := newRecordingAgentUDPWriter()
+	egress := newAgentUDPEgress(a, writer, &net.UDPAddr{})
 
-	_ = egress.enqueueData("video", "client", videoEpoch, []byte("video-0"))
-	<-writer.started
-	_ = egress.enqueueData("video", "client", videoEpoch, []byte("video-1"))
-	_ = egress.enqueueData("video", "client", videoEpoch, []byte("video-2"))
-	_ = egress.enqueueData("control", "client", controlEpoch, []byte("input"))
-	close(writer.release)
+	egress.sendData("video", "client", videoEpoch, []byte("video-0"))
+	egress.sendData("video", "client", videoEpoch, []byte("video-1"))
+	egress.sendData("control", "client", controlEpoch, []byte("input"))
 
-	want := []string{"video-0", "video-1", "input", "video-2"}
+	want := []string{"video-0", "video-1", "input"}
 	for i, wantPayload := range want {
 		pkt := nextAgentUDPPacket(t, writer.writes)
 		aad := crypto.AppendUDPDataAAD(nil, pkt.Route, pkt.Client)
 		plaintext, err := peerCrypto.Dec.Open(nil, pkt.Payload, aad)
 		if err != nil {
-			t.Fatalf("wire packet %d failed ordered replay/decrypt check: %v", i, err)
+			t.Fatalf("wire packet %d failed ordered decrypt: %v", i, err)
 		}
 		if string(plaintext) != wantPayload {
 			t.Fatalf("wire packet %d plaintext = %q, want %q", i, plaintext, wantPayload)
@@ -323,16 +202,9 @@ func TestAgentSendUDPRegisterWaitsForHelloAndBindsControlGeneration(t *testing.T
 	a.udpSessionID = sessionID
 	a.udpControlNonce = controlNonce
 	a.udpRegisterReady = false
-	writer := newBlockingAgentUDPWriter()
-	close(writer.release)
-	egress, err := newAgentUDPEgress(a, writer, &net.UDPAddr{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	writer := newRecordingAgentUDPWriter()
+	egress := newAgentUDPEgress(a, writer, &net.UDPAddr{})
 	a.udpEgress = egress
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go egress.run(ctx)
 
 	a.sendUDPRegister()
 	select {
@@ -341,7 +213,6 @@ func TestAgentSendUDPRegisterWaitsForHelloAndBindsControlGeneration(t *testing.T
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	// Model the atomic state transition performed after a valid initial HELLO.
 	a.mu.Lock()
 	a.replaceRoutesLocked(map[string]RemoteRoute{
 		"control": {Name: "control", Proto: "udp", LocalAddr: "127.0.0.1:47999"},

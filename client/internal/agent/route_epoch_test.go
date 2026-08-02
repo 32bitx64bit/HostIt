@@ -22,7 +22,6 @@ func (c *trackedAgentUDPSessionConn) Close() error {
 func replaceAgentTestRoutes(a *Agent, routes map[string]RemoteRoute) {
 	a.mu.Lock()
 	a.replaceRoutesLocked(routes)
-	a.routeCacheGen.Add(1)
 	a.mu.Unlock()
 }
 

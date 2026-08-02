@@ -94,7 +94,6 @@ func installFakeUDPSession(srv *Server, agentID, remoteAddr string, identity *fa
 		connectTime:       time.Now(),
 		identityPublicKey: append([]byte(nil), identity.publicKey...),
 		controlNonce:      identity.controlNonce,
-		features:          []string{protocol.FeatureBoundUDPRegister},
 	}
 	srv.sessionsMu.Unlock()
 }
@@ -637,7 +636,7 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 	}
 	identity := newFakeUDPIdentityForControl(t, serverNonce)
 	verPayload, _ := json.Marshal(protocol.VersionPayload{
-		Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures,
+		Version:   protocol.ProtocolVersion,
 		PublicKey: identity.publicKey, IdentitySig: identity.sign(serverNonce),
 	})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
@@ -670,8 +669,7 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 		t.Fatal("agent UDP address was not stored after control connect")
 	}
 
-	// Displacing the control session preserves the last authenticated UDP path
-	// during the reconnect grace while the replacement proves its generation.
+	// Displacing the control session immediately clears the old UDP path.
 	conn2 := dialTCPForLifecycleTest(t, controlAddr)
 	defer conn2.Close()
 	if err := conn2.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -683,7 +681,7 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 	}
 	identity2 := newFakeUDPIdentityForControl(t, serverNonce2)
 	verPayload2, _ := json.Marshal(protocol.VersionPayload{
-		Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures,
+		Version:   protocol.ProtocolVersion,
 		PublicKey: identity2.publicKey, IdentitySig: identity2.sign(serverNonce2),
 	})
 	if err := protocol.WritePacket(conn2, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload2}); err != nil {
@@ -696,8 +694,8 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
-		t.Fatal("agent UDP state should persist during control reconnect grace")
+	if srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("agent UDP state survived control reconnect")
 	}
 
 	if err := conn2.Close(); err != nil {
@@ -707,8 +705,8 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 		_, ok := srv.sessionForAgent(protocol.DefaultAgentID)
 		return !ok
 	})
-	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
-		t.Fatal("agent UDP state was cleared immediately instead of entering disconnect grace")
+	if srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("agent UDP state survived control disconnect")
 	}
 }
 
@@ -783,22 +781,6 @@ func TestLegacyUDPRegisterRejectedByProtocolV3(t *testing.T) {
 	defer agentConn.Close()
 
 	sessionID := newTestSessionID(t)
-	legacyPayload, err := crypto.BuildUDPRegister("testtoken", sessionID, protocol.DefaultAgentID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister, Payload: legacyPayload}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 3; i++ {
-		_, _ = agentConn.WriteToUDP(legacy, serverUDPAddr)
-		time.Sleep(20 * time.Millisecond)
-	}
-	if srv.testUDPAddrValid(protocol.DefaultAgentID) {
-		t.Fatal("protocol v3 accepted a legacy token-only UDP register")
-	}
-
 	bound, err := authedUDPRegister("testtoken", sessionID, protocol.DefaultAgentID, identity)
 	if err != nil {
 		t.Fatal(err)

@@ -189,79 +189,21 @@ func TestUDPAgentCOWMutationsPreserveConcurrentEntries(t *testing.T) {
 	}
 }
 
-func TestStaleUDPGraceExpiryPreservesReplacementGeneration(t *testing.T) {
+func TestClearUDPAgentRemovesCurrentRegistration(t *testing.T) {
 	srv := NewServer(ServerConfig{}, nil)
 	const agentID = "agent-a"
 	addr := testUDPAddr(40000)
 	sessionID := testUDPSessionID(1)
 	gen1 := testUDPControlNonce(1)
-	gen2 := testUDPControlNonce(2)
 
 	srv.updateUDPAgentAddr(agentID, addr, sessionID, gen1, time.Now().UnixNano())
 	st1 := srv.loadUDPAgents()[agentID]
 	if st1 == nil || st1.controlNonce != gen1 {
 		t.Fatal("first control generation was not installed")
 	}
-
-	stale := &udpGraceTimer{controlNonce: gen1, timer: time.NewTimer(time.Hour)}
-	defer stale.timer.Stop()
-	srv.udpAgentsMu.Lock()
-	srv.udpGraceTimers[agentID] = stale
-	srv.udpAgentsMu.Unlock()
-
-	// The real agent keeps the same UDP socket and UDP session ID through a TCP
-	// reconnect. Control generation must therefore participate in replacement.
-	srv.updateUDPAgentAddr(agentID, addr, sessionID, gen2, time.Now().UnixNano())
-	st2 := srv.loadUDPAgents()[agentID]
-	if st2 == nil || st2.controlNonce != gen2 {
-		t.Fatal("replacement control generation was not installed")
-	}
-	if st2 == st1 {
-		t.Fatal("same addr/session fast path ignored the replacement control generation")
-	}
-
-	// Model an already-running stale callback that still owns its timer slot.
-	// The state-generation check must preserve the replacement even then.
-	srv.udpAgentsMu.Lock()
-	srv.udpGraceTimers[agentID] = stale
-	srv.udpAgentsMu.Unlock()
-	srv.expireUDPAgent(agentID, stale)
-	if st := srv.loadUDPAgents()[agentID]; st == nil || st.controlNonce != gen2 {
-		t.Fatal("stale generation-1 grace callback cleared generation 2")
-	}
-
-	current := &udpGraceTimer{controlNonce: gen2, timer: time.NewTimer(time.Hour)}
-	defer current.timer.Stop()
-	srv.udpAgentsMu.Lock()
-	srv.udpGraceTimers[agentID] = current
-	srv.udpAgentsMu.Unlock()
-	srv.expireUDPAgent(agentID, current)
+	srv.clearUDPAgent(agentID)
 	if srv.loadUDPAgents()[agentID] != nil {
-		t.Fatal("current generation grace callback did not clear its own state")
-	}
-}
-
-func TestServerStopDrainsGraceScheduledByDisconnect(t *testing.T) {
-	srv := NewServer(ServerConfig{}, nil)
-	srv.ctx, srv.cancel = context.WithCancel(context.Background())
-	srv.updateUDPAgentAddr("agent-a", testUDPAddr(41000), testUDPSessionID(3), testUDPControlNonce(3), time.Now().UnixNano())
-
-	// Model the control goroutine's deferred disconnect cleanup: it cannot run
-	// until Stop cancels the server, which is after Stop's initial timer drain.
-	srv.wg.Add(1)
-	go func() {
-		defer srv.wg.Done()
-		<-srv.ctx.Done()
-		srv.sessionsMu.Lock()
-		srv.scheduleUDPAgentClearLocked("agent-a")
-		srv.sessionsMu.Unlock()
-	}()
-
-	srv.Stop()
-	srv.udpAgentsMu.Lock()
-	defer srv.udpAgentsMu.Unlock()
-	if len(srv.udpGraceTimers) != 0 {
-		t.Fatalf("Stop returned with %d UDP grace timers", len(srv.udpGraceTimers))
+		t.Fatal("control disconnect did not clear UDP registration immediately")
 	}
 }
 

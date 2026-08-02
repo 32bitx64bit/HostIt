@@ -169,11 +169,11 @@ client.UpdateRoute(ctx, "my-app", sdk.RouteUpdate{
 })
 ```
 
-### UDP Scheduling
+### UDP Transport
 
-The UDP tunnel serves one datagram per active route in round-robin order, so a high-volume route cannot monopolize the shared tunnel socket while another route has packets waiting. Registration traffic uses a separate internal priority queue. This behavior is automatic and requires no per-route traffic-class configuration.
+UDP is send-and-forget: each datagram is encrypted (when the route requires it) and written immediately. There is no application-level fair queue or buffering beyond the kernel socket. Congestion becomes packet loss instead of added latency.
 
-> The identity-bound UDP registration and route-fair transport uses protocol v3. Upgrade the server and every agent together; protocol-v2 peers are intentionally rejected instead of silently falling back to the unsafe registration path.
+> The identity-bound UDP registration uses protocol v3. Upgrade the server and every agent together; protocol-v2 peers are intentionally rejected instead of silently falling back to the unsafe registration path.
 
 The tunnel warns when an outer UDP datagram exceeds its conservative 1,200-byte path target. If a Sunshine/Moonlight path shows fragmentation loss, measure the path MTU and lower Sunshine's `packetsize` (or the Moonlight equivalent where available); 1,024 bytes is a conservative starting point. HostIt accepts complete outer frames above 1,200 bytes up to the 65,507-byte UDP limit, although normal queue pressure or the network can still drop UDP traffic.
 

@@ -25,7 +25,6 @@ import (
 	"hostit/shared/netutil"
 	"hostit/shared/protocol"
 	"hostit/shared/relay"
-	"hostit/shared/udpfair"
 	"hostit/shared/version"
 )
 
@@ -61,7 +60,6 @@ type Hooks struct {
 	OnRouteAck         func(apitypes.RouteAck)
 	OnRouteRemoveAck   func(apitypes.RouteRemoveAck)
 	OnDisconnected     func(err error)
-	OnError            func(err error)
 	OnTLSPinDiscovered func(pin string)
 }
 
@@ -223,12 +221,6 @@ func (a *Agent) EffectiveAgentID() string {
 	return a.cfg.EffectiveAgentID()
 }
 
-func (a *Agent) ControlConn() net.Conn {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.controlConn
-}
-
 // sendAndWait sends a control packet and waits for a response (CLEAN-5).
 func sendAndWait[Resp any](ctx context.Context, a *Agent,
 	pending map[string]chan *Resp, key string,
@@ -256,13 +248,10 @@ func sendAndWait[Resp any](ctx context.Context, a *Agent,
 		a.controlWriteMu.Unlock()
 		return nil, fmt.Errorf("not connected to server")
 	}
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: pktType, Payload: payload}); err != nil {
-		conn.SetWriteDeadline(time.Time{})
+	if err := writeControl(conn, &protocol.Packet{Type: pktType, Payload: payload}, 5*time.Second); err != nil {
 		a.controlWriteMu.Unlock()
 		return nil, err
 	}
-	conn.SetWriteDeadline(time.Time{})
 	a.controlWriteMu.Unlock()
 
 	select {
@@ -273,6 +262,16 @@ func sendAndWait[Resp any](ctx context.Context, a *Agent,
 	case <-time.After(30 * time.Second):
 		return nil, fmt.Errorf("%s", timeoutMsg)
 	}
+}
+
+// writeControl bounds one control-channel packet write and always clears the
+// deadline, including when the write fails.
+func writeControl(conn net.Conn, pkt *protocol.Packet, deadline time.Duration) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(deadline)); err != nil {
+		return err
+	}
+	defer conn.SetWriteDeadline(time.Time{})
+	return protocol.WritePacket(conn, pkt)
 }
 
 func (a *Agent) SendRouteRequest(ctx context.Context, req apitypes.RouteRequest) (*apitypes.RouteResponse, error) {
@@ -427,23 +426,13 @@ func (a *Agent) startUDPData(ctx context.Context) error {
 	if bufferResult.WriteErr != nil {
 		logging.Global().Warnf(logging.CatUDP, "failed to request shared UDP write buffer bytes=%d: %v", bufferResult.WriteBytes, bufferResult.WriteErr)
 	}
-	egress, err := newAgentUDPEgress(a, udpConn, serverAddr)
-	if err != nil {
-		udpConn.Close()
-		return fmt.Errorf("create UDP egress scheduler: %w", err)
-	}
+	egress := newAgentUDPEgress(a, udpConn, serverAddr)
 
 	a.mu.Lock()
 	a.serverUDP = serverAddr
 	a.udpDataConn = udpConn
 	a.udpEgress = egress
 	a.mu.Unlock()
-
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		egress.run(ctx)
-	}()
 
 	a.sendUDPRegister()
 
@@ -476,15 +465,11 @@ func (a *Agent) startUDPData(ctx context.Context) error {
 func (a *Agent) closeUDPDataConn() {
 	a.mu.Lock()
 	udpConn := a.udpDataConn
-	egress := a.udpEgress
 	if udpConn != nil {
 		a.udpDataConn = nil
 	}
 	a.udpEgress = nil
 	a.mu.Unlock()
-	if egress != nil {
-		egress.close()
-	}
 	if udpConn != nil {
 		udpConn.Close()
 	}
@@ -511,13 +496,7 @@ func (a *Agent) sendUDPRegister() {
 		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-auth", fmt.Sprintf("failed to build UDP register auth: %v", err))
 		return
 	}
-	if err := egress.enqueueRegister(controlNonce, authPayload); err != nil {
-		logging.Global().RateLimitedError(logging.CatUDP, "agent-udp-register-enqueue", fmt.Sprintf("failed to queue UDP register: %v", err))
-	}
-}
-
-func (a *Agent) refreshUDPRegistration() {
-	a.sendUDPRegister()
+	egress.sendRegister(controlNonce, authPayload)
 }
 
 func sameUDPEgressRoute(a, b RemoteRoute) bool {
@@ -531,8 +510,7 @@ func sameUDPEgressRoute(a, b RemoteRoute) bool {
 }
 
 // nextRouteEpochLocked returns a non-zero process-local epoch. a.mu must be
-// held. Epochs never need to survive a process restart because queued packets
-// do not survive one either.
+// held. Epochs never need to survive a process restart.
 func (a *Agent) nextRouteEpochLocked() uint64 {
 	a.nextRouteEpoch++
 	if a.nextRouteEpoch == 0 {
@@ -562,6 +540,7 @@ func (a *Agent) replaceRoutesLocked(routes map[string]RemoteRoute) {
 	}
 	a.cfg.Routes = routes
 	a.routeEpochs = nextEpochs
+	a.routeCacheGen.Add(1)
 }
 
 func (a *Agent) currentUDPEgressRoute(routeName string) (RemoteRoute, *crypto.UDPSessionCrypto, uint64, bool) {
@@ -651,15 +630,12 @@ func (a *Agent) connectAndRun() error {
 	verPayload, _ := json.Marshal(protocol.VersionPayload{
 		Version:     protocol.ProtocolVersion,
 		AgentID:     proposedID,
-		Features:    protocol.SupportedFeatures,
 		PublicKey:   id.PublicKey(),
 		IdentitySig: id.Sign(serverNonce),
 	})
-	conn.SetWriteDeadline(time.Now().Add(agentControlWriteDeadline))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+	if err := writeControl(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}, agentControlWriteDeadline); err != nil {
 		return fmt.Errorf("failed to send version negotiate: %w", err)
 	}
-	conn.SetWriteDeadline(time.Time{})
 
 	conn.SetReadDeadline(time.Now().Add(agentControlReadDeadline))
 	var verPkt protocol.Packet
@@ -699,10 +675,6 @@ func (a *Agent) connectAndRun() error {
 		logging.Global().Infof(logging.CatSystem, "Server assigned agent id %q (proposed %q)", vp.AssignedAgentID, proposedID)
 	}
 
-	features := protocol.NegotiateFeatures(protocol.SupportedFeatures, vp.Features)
-	if !protocol.HasFeature(features, protocol.FeatureBoundUDPRegister) {
-		return fmt.Errorf("%w: protocol %s server did not negotiate required feature %q", errVersionIncompatible, protocol.ProtocolVersion, protocol.FeatureBoundUDPRegister)
-	}
 	controlNonce, ok := crypto.NewUDPControlNonce(serverNonce)
 	if !ok {
 		return fmt.Errorf("control auth returned invalid server nonce length %d", len(serverNonce))
@@ -723,7 +695,7 @@ func (a *Agent) connectAndRun() error {
 		}
 		a.mu.Unlock()
 	}()
-	logging.Global().Infof(logging.CatSystem, "Server version negotiated: %s features=%v", serverVer, features)
+	logging.Global().Infof(logging.CatSystem, "Server version negotiated: %s", serverVer)
 
 	logging.Global().Infof(logging.CatSystem, "Agent control connected on %s data=%s", a.cfg.ControlAddr(), a.cfg.DataAddr())
 
@@ -739,13 +711,11 @@ func (a *Agent) connectAndRun() error {
 				return
 			case <-ticker.C:
 				a.controlWriteMu.Lock()
-				conn.SetWriteDeadline(time.Now().Add(agentControlWriteDeadline))
-				if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypePing}); err != nil {
+				if err := writeControl(conn, &protocol.Packet{Type: protocol.TypePing}, agentControlWriteDeadline); err != nil {
 					a.controlWriteMu.Unlock()
 					conn.Close()
 					return
 				}
-				conn.SetWriteDeadline(time.Time{})
 				a.controlWriteMu.Unlock()
 			}
 		}
@@ -797,7 +767,6 @@ func (a *Agent) Stop() {
 		a.cancel()
 	}
 	a.mu.Lock()
-	egress := a.udpEgress
 	a.udpEgress = nil
 	controlConn := a.controlConn
 	pendingControlConn := a.pendingControlConn
@@ -813,9 +782,6 @@ func (a *Agent) Stop() {
 	}
 	if pendingControlConn != nil && pendingControlConn != controlConn {
 		pendingControlConn.Close()
-	}
-	if egress != nil {
-		egress.close()
 	}
 	a.wg.Wait()
 }
@@ -914,14 +880,12 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 
 		if pkt.Type == protocol.TypePing {
 			a.controlWriteMu.Lock()
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := protocol.WritePacket(conn, &protocol.Packet{
+			if err := writeControl(conn, &protocol.Packet{
 				Type:    protocol.TypePong,
 				Payload: pkt.Payload,
-			}); err != nil {
+			}, 5*time.Second); err != nil {
 				logging.Global().Warnf(logging.CatTCP, "failed to write control pong: %v", err)
 			}
-			conn.SetWriteDeadline(time.Time{})
 			a.controlWriteMu.Unlock()
 			continue
 		}
@@ -982,11 +946,9 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 					logging.Global().Warnf(logging.CatTCP, "skipping email probe result: control connection replaced")
 					return
 				}
-				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeEmailProbeResult, Payload: payload}); err != nil {
+				if err := writeControl(conn, &protocol.Packet{Type: protocol.TypeEmailProbeResult, Payload: payload}, 5*time.Second); err != nil {
 					logging.Global().Errorf(logging.CatTCP, "failed to send email probe result: %v", err)
 				}
-				conn.SetWriteDeadline(time.Time{})
 			}(req)
 			continue
 		}
@@ -1028,7 +990,6 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 			a.replaceRoutesLocked(routes)
 			a.cfg.Email = email
 			a.serverPublicAddr = publicAddr
-			a.routeCacheGen.Add(1)
 			a.udpRegisterReady = true
 			if a.pendingControlConn == conn {
 				a.controlConn = conn
@@ -1038,7 +999,7 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 			// The server installs the authenticated control generation before it
 			// emits HELLO. Routes and crypto are now installed before the first
 			// registration makes this UDP session eligible for forwarding.
-			a.refreshUDPRegistration()
+			a.sendUDPRegister()
 			logging.Global().Infof(logging.CatSystem, "Received %d routes from server", len(routes))
 			if !helloSeen {
 				helloSeen = true
@@ -1277,34 +1238,36 @@ func (a *Agent) handleControl(ctx context.Context, conn net.Conn, tracker *connT
 
 func dialLocalTCP(ctx context.Context, localAddr string) (net.Conn, error) {
 	const (
-		maxAttempts = 5
 		dialTimeout = 2 * time.Second
-		retryDelay  = 250 * time.Millisecond
+		retryDelay  = 100 * time.Millisecond
 	)
 
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+	dial := func() (net.Conn, error) {
 		dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 15 * time.Second}
-		conn, err := dialer.Dial("tcp", localAddr)
-		if err == nil {
-			netutil.SetTCPKeepAlive(conn, 15*time.Second)
-			netutil.SetTCPNoDelay(conn)
-			return conn, nil
-		}
-		lastErr = err
-		if attempt < maxAttempts {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(retryDelay):
-			}
-		}
+		return dialer.DialContext(ctx, "tcp", localAddr)
 	}
 
-	return nil, lastErr
+	conn, err := dial()
+	if err == nil {
+		netutil.SetTCPKeepAlive(conn, 15*time.Second)
+		netutil.SetTCPNoDelay(conn)
+		return conn, nil
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(retryDelay):
+	}
+	conn, err = dial()
+	if err != nil {
+		return nil, err
+	}
+	netutil.SetTCPKeepAlive(conn, 15*time.Second)
+	netutil.SetTCPNoDelay(conn)
+	return conn, nil
 }
 
 func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (net.Conn, error) {
@@ -1368,10 +1331,8 @@ func DialMailOutboundTCP(ctx context.Context, cfg Config, remoteAddr string) (ne
 }
 
 type agentUDPSession struct {
-	conn             agentUDPSessionConn
-	routeEpoch       uint64
-	lastSeen         int64 // atomic, unix nano
-	writeDeadlineSet time.Time
+	conn       agentUDPSessionConn
+	routeEpoch uint64
 }
 
 type agentUDPSessionConn interface {
@@ -1379,7 +1340,6 @@ type agentUDPSessionConn interface {
 	Write([]byte) (int, error)
 	Close() error
 	SetReadDeadline(time.Time) error
-	SetWriteDeadline(time.Time) error
 }
 
 // loadAgentUDPSessionForEpoch returns only a session created for the current
@@ -1437,9 +1397,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	buf := make([]byte, 65536)
 	decryptBuf := make([]byte, 65536)
 	aadBuf := make([]byte, 0, 512)
-	// Route/client strings repeat on every datagram of a flow; interning
-	// removes both per-packet string allocations.
-	interner := protocol.NewStringInterner(4096)
 	var pkt protocol.Packet
 
 	// Only datagrams from the server's data address are honored; spoofed traffic is dropped.
@@ -1458,29 +1415,12 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 	}
 
 	var sessions sync.Map
-
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				sessions.Range(func(_, v any) bool {
-					v.(*agentUDPSession).conn.Close()
-					return true
-				})
-				return
-			case now := <-ticker.C:
-				cutoff := now.Add(-2 * time.Minute).UnixNano()
-				sessions.Range(func(k, v any) bool {
-					sess := v.(*agentUDPSession)
-					if atomic.LoadInt64(&sess.lastSeen) < cutoff && sessions.CompareAndDelete(k, sess) {
-						_ = sess.conn.Close()
-					}
-					return true
-				})
-			}
-		}
+		<-ctx.Done()
+		sessions.Range(func(_, v any) bool {
+			_ = v.(*agentUDPSession).conn.Close()
+			return true
+		})
 	}()
 
 	type routeConfig struct {
@@ -1533,7 +1473,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 		refreshRouteCacheIfNeeded()
 
-		err = protocol.UnmarshalUDPToInterned(buf[:n], &pkt, interner)
+		err = protocol.UnmarshalUDPTo(buf[:n], &pkt)
 		if err != nil {
 			continue
 		}
@@ -1583,7 +1523,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 			for sess == nil {
 				if current, exists := loadAgentUDPSessionForEpoch(&sessions, key, rc.epoch); exists {
 					sess = current
-					atomic.StoreInt64(&sess.lastSeen, time.Now().UnixNano())
 					break
 				}
 				localAddr, err := net.ResolveUDPAddr("udp", rc.localAddr)
@@ -1602,7 +1541,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 				newSess := &agentUDPSession{
 					conn:       localConn,
 					routeEpoch: rc.epoch,
-					lastSeen:   time.Now().UnixNano(),
 				}
 				actual, loaded := sessions.LoadOrStore(key, newSess)
 				if loaded {
@@ -1646,7 +1584,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 							}
 
 							if current, ok := sessions.Load(key); ok && current == sess {
-								atomic.StoreInt64(&sess.lastSeen, time.Now().UnixNano())
 							} else {
 								return
 							}
@@ -1657,13 +1594,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 							if egress == nil {
 								return
 							}
-							if err := egress.enqueueData(key.route, key.client, sess.routeEpoch, respBuf[:rn]); err != nil {
-								if errors.Is(err, udpfair.ErrFull) {
-									logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-queue-full-"+key.route, fmt.Sprintf("dropping UDP response from bounded queue route=%s payload=%d", key.route, rn))
-								} else if !errors.Is(err, udpfair.ErrClosed) {
-									logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-enqueue-"+key.route, fmt.Sprintf("failed to queue UDP response route=%s client=%s payload=%d err=%v", key.route, key.client, rn, err))
-								}
-							}
+							egress.sendData(key.route, key.client, sess.routeEpoch, respBuf[:rn])
 						}
 					}(key, newSess)
 				}
@@ -1671,13 +1602,6 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 
 			if sess != nil {
 				if s := sess; s.conn != nil {
-					now := time.Now()
-					if now.Sub(s.writeDeadlineSet) >= sharedUDPWriteDeadlineRefresh {
-						if err := s.conn.SetWriteDeadline(now.Add(sharedUDPWriteTimeout)); err != nil {
-							logging.Global().RateLimitedWarn(logging.CatUDP, "agent-local-udp-write-deadline-"+routeName, fmt.Sprintf("failed to bound local UDP write route=%s: %v", routeName, err))
-						}
-						s.writeDeadlineSet = now
-					}
 					n, err := s.conn.Write(payload)
 					if err != nil {
 						logging.Global().RateLimitedWarn(logging.CatUDP, "agent-udp-write-local-"+routeName, fmt.Sprintf("failed to write UDP payload to local route=%s client=%s bytes=%d err=%v", routeName, clientID, len(payload), err))
@@ -1693,8 +1617,7 @@ func (a *Agent) handleUDPData(ctx context.Context, udpConn *net.UDPConn) error {
 }
 
 func warnLargeTunneledUDPDatagram(direction, routeName, clientID string, frameLen int) {
-	if !protocol.UDPFrameExceedsRecommendedSize(frameLen) {
-		return
-	}
-	logging.Global().RateLimitedWarn(logging.CatUDP, "udp-mtu-"+direction+"-"+routeName, fmt.Sprintf("large tunneled UDP datagram direction=%s route=%s client=%s bytes=%d recommended_max=%d", direction, routeName, clientID, frameLen, protocol.RecommendedMaxUDPDatagramSize))
+	protocol.WarnLargeTunneledUDPDatagram(direction, routeName, clientID, frameLen, func(key, message string) {
+		logging.Global().RateLimitedWarn(logging.CatUDP, key, message)
+	})
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -13,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/netip"
 	"sort"
 	"strconv"
@@ -29,7 +29,6 @@ import (
 	"hostit/shared/netutil"
 	"hostit/shared/protocol"
 	"hostit/shared/relay"
-	"hostit/shared/udpfair"
 	"hostit/shared/version"
 )
 
@@ -62,16 +61,10 @@ const (
 	udpRegisterTimeout     = 60 * time.Second
 	// Clock-skew/replay window for authenticated UDP registers.
 	udpRegisterAuthWindow = 30 * time.Second
-	// Keep the last authenticated UDP path alive across a short control-plane
-	// reconnect. A replacement registration is bound to a fresh control nonce,
-	// so it can safely cancel this expiry without relying on source IP.
-	udpControlLossGrace   = 15 * time.Second
 	domainShutdownTimeout = 5 * time.Second
 	nettestTimeout        = 2 * time.Second
 	bwTestTimeout         = 5 * time.Second
 	emailProbeAllowTTL    = time.Minute
-	// Byte-counter flush cadence for dashboard hot paths.
-	dashBatchInterval = 100 * time.Millisecond
 )
 
 var handshakeDeadline = 15 * time.Second
@@ -84,9 +77,7 @@ type agentSession struct {
 	connectTime       time.Time
 	identityPublicKey []byte
 	controlNonce      crypto.UDPControlNonce
-	// features is the negotiated capability intersection for this session.
-	features []string
-	writeMu  sync.Mutex
+	writeMu           sync.Mutex
 }
 
 type pendingTCPEntry struct {
@@ -203,12 +194,10 @@ type Server struct {
 	udpAgents atomic.Pointer[map[string]*agentUDPState]
 	// udpAgentsMu serializes the complete load-clone-store transaction. An
 	// atomic pointer alone does not make concurrent copy-on-write updates safe.
-	udpAgentsMu    sync.Mutex
-	udpGraceTimers map[string]*udpGraceTimer
+	udpAgentsMu sync.Mutex
 
 	mu            sync.RWMutex
 	udpDataConn   *net.UDPConn
-	udpEgress     *serverUDPEgress
 	controlLn     net.Listener
 	dataLn        net.Listener
 	domainHTTPLn  net.Listener
@@ -217,13 +206,16 @@ type Server struct {
 	publicTCP map[string]net.Listener
 	// publicUDP is the mutable source of truth, guarded by s.mu. publicUDPSnap
 	// holds a copy-on-write snapshot for the lock-free downstream UDP read path.
-	publicUDP         map[string]*net.UDPConn
-	publicUDPSnap     atomic.Pointer[map[string]*net.UDPConn]
-	domainHTTPServer  *http.Server
-	domainHTTPSServer *http.Server
-	domainCerts       *domainCertManager
-	domains           *domainManager
-	domainProxyCache  sync.Map
+	publicUDP            map[string]*net.UDPConn
+	publicUDPSnap        atomic.Pointer[map[string]*net.UDPConn]
+	domainHTTPServer     *http.Server
+	domainHTTPSServer    *http.Server
+	domainCerts          *domainCertManager
+	domains              *domainManager
+	domainProxyCache     sync.Map
+	domainProxyOnce      sync.Once
+	domainProxyShared    *httputil.ReverseProxy
+	domainProxyTransport *managedProxyTransport
 
 	pendingTCP map[pendingTCPKey]*pendingTCPEntry
 
@@ -260,8 +252,6 @@ type Server struct {
 	dynamicPortLow  int
 	dynamicPortHigh int
 
-	counters counterRegistry
-
 	// helloDebounce coalesces rapid route mutations into one HELLO broadcast.
 	helloMu      sync.Mutex
 	helloPending bool
@@ -281,11 +271,6 @@ type agentUDPState struct {
 	sessionID    crypto.UDPSessionID
 	crypto       *agentUDPCrypto
 	controlNonce crypto.UDPControlNonce
-}
-
-type udpGraceTimer struct {
-	controlNonce crypto.UDPControlNonce
-	timer        *time.Timer
 }
 
 const maxSeenUDPRegistersPerAgent = 32
@@ -486,7 +471,6 @@ func (s *Server) updateUDPAgentAddr(agentID string, addr netip.AddrPort, session
 }
 
 func (s *Server) updateUDPAgentAddrLocked(agentID string, addr netip.AddrPort, sessionID crypto.UDPSessionID, controlNonce crypto.UDPControlNonce, nowNano int64) {
-	s.cancelUDPGraceLocked(agentID)
 	old := s.loadUDPAgents()
 	if st := old[agentID]; st != nil && st.addr == addr && st.sessionID == sessionID && st.controlNonce == controlNonce {
 		st.lastSeen.Store(nowNano)
@@ -543,56 +527,8 @@ func (s *Server) pruneUDPAgentsLocked(nowNano int64) {
 	for _, id := range stale {
 		logging.Global().Infof(logging.CatUDP, "Agent %q UDP address timed out after %s inactivity", id, udpRegisterTimeout)
 		delete(newMap, id)
-		s.cancelUDPGraceLocked(id)
 	}
 	s.udpAgents.Store(&newMap)
-}
-
-// scheduleUDPAgentClearLocked starts a generation-safe expiry for the UDP
-// endpoint currently published for agentID. The caller must hold sessionsMu;
-// this preserves the global sessionsMu -> udpAgentsMu lock order.
-func (s *Server) scheduleUDPAgentClearLocked(agentID string) {
-	s.udpAgentsMu.Lock()
-	defer s.udpAgentsMu.Unlock()
-
-	st := s.loadUDPAgents()[agentID]
-	if st == nil {
-		return
-	}
-	if existing := s.udpGraceTimers[agentID]; existing != nil {
-		if existing.controlNonce == st.controlNonce {
-			return
-		}
-		existing.timer.Stop()
-	}
-	entry := &udpGraceTimer{controlNonce: st.controlNonce}
-	entry.timer = time.AfterFunc(udpControlLossGrace, func() {
-		s.expireUDPAgent(agentID, entry)
-	})
-	s.udpGraceTimers[agentID] = entry
-}
-
-func (s *Server) expireUDPAgent(agentID string, entry *udpGraceTimer) {
-	s.udpAgentsMu.Lock()
-	defer s.udpAgentsMu.Unlock()
-	if s.udpGraceTimers[agentID] != entry {
-		return
-	}
-	delete(s.udpGraceTimers, agentID)
-	st := s.loadUDPAgents()[agentID]
-	if st == nil || st.controlNonce != entry.controlNonce {
-		return
-	}
-	if s.removeUDPAgentLocked(agentID) {
-		logging.Global().Infof(logging.CatUDP, "Agent %q UDP path expired after %s control disconnect grace", agentID, udpControlLossGrace)
-	}
-}
-
-func (s *Server) cancelUDPGraceLocked(agentID string) {
-	if entry := s.udpGraceTimers[agentID]; entry != nil {
-		entry.timer.Stop()
-		delete(s.udpGraceTimers, agentID)
-	}
 }
 
 func (s *Server) removeUDPAgentLocked(agentID string) bool {
@@ -608,15 +544,6 @@ func (s *Server) removeUDPAgentLocked(agentID string) bool {
 	}
 	s.udpAgents.Store(&newMap)
 	return true
-}
-
-func (s *Server) stopUDPGraceTimers() {
-	s.udpAgentsMu.Lock()
-	defer s.udpAgentsMu.Unlock()
-	for id, entry := range s.udpGraceTimers {
-		entry.timer.Stop()
-		delete(s.udpGraceTimers, id)
-	}
 }
 
 type pendingTCPKey struct {
@@ -837,20 +764,9 @@ func (s *Server) EffectiveRoutes() []RouteConfig {
 
 // UDPStats returns aggregate UDP drop counters for the dashboard.
 func (s *Server) UDPStats() map[string]any {
-	var queueStats udpfair.Stats
-	if s.udpEgress != nil {
-		queueStats = s.udpEgress.queue.Stats()
-	}
-	queueDrops := queueStats.Dropped.Overflow + queueStats.Dropped.Expired
 	return map[string]any{
-		"totalDrops":         s.udpDrops.Load() + queueDrops,
-		"queueDrops":         queueDrops,
-		"queueOverflowDrops": queueStats.Dropped.Overflow,
-		"queueExpiredDrops":  queueStats.Dropped.Expired,
-		"queuedPackets":      queueStats.QueuedPackets,
-		"queuedBytes":        queueStats.QueuedBytes,
-		"activeRoutes":       queueStats.ActiveRoutes,
-		"lossPercent":        0.0, // end-to-end loss requires nettest; drops are local rejects
+		"totalDrops":  s.udpDrops.Load(),
+		"lossPercent": 0.0, // end-to-end loss requires nettest; drops are local rejects
 	}
 }
 
@@ -879,7 +795,6 @@ func (s *Server) dropSession(agentID string) {
 	// Administrative drops are intentional revocations, not transient
 	// reconnects, so remove the UDP endpoint immediately.
 	s.udpAgentsMu.Lock()
-	s.cancelUDPGraceLocked(agentID)
 	s.removeUDPAgentLocked(agentID)
 	s.udpAgentsMu.Unlock()
 	s.sessionsMu.Unlock()
@@ -897,7 +812,6 @@ func (s *Server) dropSession(agentID string) {
 func (s *Server) clearUDPAgent(agentID string) {
 	s.udpAgentsMu.Lock()
 	defer s.udpAgentsMu.Unlock()
-	s.cancelUDPGraceLocked(agentID)
 	s.removeUDPAgentLocked(agentID)
 }
 
@@ -1013,6 +927,9 @@ func (s *Server) SetAgentDomainEnabled(agentID string, enabled bool) {
 		filtered = append(filtered, agentID)
 	}
 	s.cfg.DomainDisabledAgents = filtered
+	if s.domains != nil {
+		s.domains.rebuildLocked()
+	}
 	s.mu.Unlock()
 	logging.Global().Infof(logging.CatSystem, "Agent %q managed-domain routing set to %t", agentID, enabled)
 }
@@ -1089,6 +1006,9 @@ func (s *Server) updateRouteCacheLocked() {
 	}
 	s.routeCache.Store(newCache)
 	s.publishPublicUDPLocked()
+	if s.domains != nil {
+		s.domains.rebuildLocked()
+	}
 }
 
 func (s *Server) getRouteConfig(name string) (routeConfig, bool) {
@@ -1310,13 +1230,21 @@ func (s *Server) broadcastHelloNow() {
 			continue
 		}
 		pkt := &protocol.Packet{Type: protocol.TypeHello, Payload: b}
-		t.sess.conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-		if err := protocol.WritePacket(t.sess.conn, pkt); err != nil {
+		if err := writeControl(t.sess.conn, pkt, writeDeadlineStandard); err != nil {
 			logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %q: %v", t.id, err)
 		}
-		t.sess.conn.SetWriteDeadline(time.Time{})
 		t.sess.writeMu.Unlock()
 	}
+}
+
+// writeControl bounds one control-channel packet write and always clears the
+// deadline, including when the write fails.
+func writeControl(conn net.Conn, pkt *protocol.Packet, deadline time.Duration) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(deadline)); err != nil {
+		return err
+	}
+	defer conn.SetWriteDeadline(time.Time{})
+	return protocol.WritePacket(conn, pkt)
 }
 
 func (s *Server) runtimeStats(lastAgentConnectAt, lastAgentDisconnectAt time.Time) *DashboardRuntime {
@@ -1582,11 +1510,9 @@ func (s *Server) handleRouteRequest(conn net.Conn, session *agentSession, payloa
 	}
 
 	session.writeMu.Lock()
-	conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteResponse, Payload: respPayload}); err != nil {
+	if err := writeControl(conn, &protocol.Packet{Type: protocol.TypeRouteResponse, Payload: respPayload}, writeDeadlineStandard); err != nil {
 		logging.Global().Errorf(logging.CatTCP, "failed to send route response: %v", err)
 	}
-	conn.SetWriteDeadline(time.Time{})
 	session.writeMu.Unlock()
 
 	s.broadcastHello()
@@ -1694,6 +1620,8 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner stri
 	domain := strings.TrimSpace(req.Domain)
 	var availableDomains []apitypes.DomainOption
 
+	// A concrete domain in the initial request is preferred; _query/auto
+	// remain for clients and SDKs that intentionally negotiate in stages.
 	if domain == "_query" {
 		availableDomains = s.buildDomainOptionsLocked()
 		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "pending_domain", Name: req.Name, Domain: normalizeHostname(s.cfg.DomainBase), AvailableDomains: availableDomains}
@@ -1798,35 +1726,17 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner stri
 		}
 	}
 
-	if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == routeProtoTCP || rt.Proto == routeProtoBoth) {
-		ln, err := net.Listen("tcp", rt.PublicAddr)
-		if err != nil {
-			delete(s.dynamicRoutes, req.Name)
-			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen on %s: %v", rt.PublicAddr, err)}
-		}
-		s.publicTCP[rt.Name] = ln
-		if s.ctx != nil {
-			s.wg.Add(1)
-			go s.acceptPublicTCP(ln, rt.Name)
-		}
+	newTCP, newUDP, err := s.openPublicListeners(rt)
+	if err != nil {
+		s.rollbackDynamicRouteLocked(req.Name)
+		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: err.Error()}
 	}
-	if strings.TrimSpace(rt.PublicAddr) != "" && (rt.Proto == routeProtoUDP || rt.Proto == routeProtoBoth) {
-		addr, err := net.ResolveUDPAddr("udp", rt.PublicAddr)
-		if err != nil {
-			s.rollbackDynamicRouteLocked(req.Name)
-			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to resolve udp %s: %v", rt.PublicAddr, err)}
-		}
-		conn, err := net.ListenUDP("udp", addr)
-		if err != nil {
-			s.rollbackDynamicRouteLocked(req.Name)
-			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen udp on %s: %v", rt.PublicAddr, err)}
-		}
-		configureRouteUDPSocket(conn, rt.Name)
-		s.publicUDP[rt.Name] = conn
-		if s.ctx != nil {
-			s.wg.Add(1)
-			go s.acceptPublicUDP(conn, rt.Name)
-		}
+	s.installPublicListeners(rt, newTCP, newUDP)
+	if newTCP == nil && newUDP == nil && strings.TrimSpace(rt.PublicAddr) != "" {
+		// A route with an unsupported protocol is rejected by request
+		// validation; this guard keeps the helper safe for internal callers.
+		s.rollbackDynamicRouteLocked(req.Name)
+		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "route has no public listener"}
 	}
 
 	s.updateRouteCacheLocked()
@@ -1851,6 +1761,76 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner stri
 // rollbackDynamicRouteLocked undoes a partially applied dynamic route create
 // (e.g. TCP listen succeeded but UDP listen failed).
 func (s *Server) rollbackDynamicRouteLocked(name string) {
+	s.teardownPublicListeners(name)
+	delete(s.dynamicRoutes, name)
+	delete(s.derivedKeys, name)
+	s.connSemaphores.Delete(name)
+	s.domainProxyCache.Delete(name)
+	if s.dash != nil {
+		s.dash.removeRoute(name)
+	}
+}
+
+// openPublicListeners binds all listeners for route. It binds into temporary
+// values so callers can preserve existing listeners if any bind fails.
+func (s *Server) openPublicListeners(route RouteConfig) (net.Listener, *net.UDPConn, error) {
+	if strings.TrimSpace(route.PublicAddr) == "" {
+		return nil, nil, nil
+	}
+	needTCP := route.Proto == routeProtoTCP || route.Proto == routeProtoBoth
+	needUDP := route.Proto == routeProtoUDP || route.Proto == routeProtoBoth
+	var tcpListener net.Listener
+	if needTCP {
+		ln, err := net.Listen("tcp", route.PublicAddr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to listen on %s: %v", route.PublicAddr, err)
+		}
+		tcpListener = ln
+	}
+	var udpConn *net.UDPConn
+	if needUDP {
+		addr, err := net.ResolveUDPAddr("udp", route.PublicAddr)
+		if err != nil {
+			if tcpListener != nil {
+				tcpListener.Close()
+			}
+			return nil, nil, fmt.Errorf("failed to resolve udp %s: %v", route.PublicAddr, err)
+		}
+		conn, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			if tcpListener != nil {
+				tcpListener.Close()
+			}
+			return nil, nil, fmt.Errorf("failed to listen udp on %s: %v", route.PublicAddr, err)
+		}
+		configureRouteUDPSocket(conn, route.Name)
+		udpConn = conn
+	}
+	return tcpListener, udpConn, nil
+}
+
+// installPublicListeners publishes already-bound listeners and starts their
+// accept loops. The caller must hold s.mu.
+func (s *Server) installPublicListeners(route RouteConfig, tcpListener net.Listener, udpConn *net.UDPConn) {
+	if tcpListener != nil {
+		s.publicTCP[route.Name] = tcpListener
+		if s.ctx != nil {
+			s.wg.Add(1)
+			go s.acceptPublicTCP(tcpListener, route.Name)
+		}
+	}
+	if udpConn != nil {
+		s.publicUDP[route.Name] = udpConn
+		if s.ctx != nil {
+			s.wg.Add(1)
+			go s.acceptPublicUDP(udpConn, route.Name)
+		}
+	}
+}
+
+// teardownPublicListeners removes and closes all public listeners for a route.
+// The caller must hold s.mu.
+func (s *Server) teardownPublicListeners(name string) {
 	if ln, exists := s.publicTCP[name]; exists {
 		ln.Close()
 		delete(s.publicTCP, name)
@@ -1858,13 +1838,6 @@ func (s *Server) rollbackDynamicRouteLocked(name string) {
 	if conn, exists := s.publicUDP[name]; exists {
 		conn.Close()
 		delete(s.publicUDP, name)
-	}
-	delete(s.dynamicRoutes, name)
-	delete(s.derivedKeys, name)
-	s.connSemaphores.Delete(name)
-	s.domainProxyCache.Delete(name)
-	if s.dash != nil {
-		s.dash.removeRoute(name)
 	}
 }
 
@@ -1967,11 +1940,9 @@ func (s *Server) handleRouteConfirm(conn net.Conn, session *agentSession, payloa
 	}
 
 	session.writeMu.Lock()
-	conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteAck, Payload: ackPayload}); err != nil {
+	if err := writeControl(conn, &protocol.Packet{Type: protocol.TypeRouteAck, Payload: ackPayload}, writeDeadlineStandard); err != nil {
 		logging.Global().Errorf(logging.CatTCP, "failed to send route ack: %v", err)
 	}
-	conn.SetWriteDeadline(time.Time{})
 	session.writeMu.Unlock()
 
 	s.broadcastHello()
@@ -2046,11 +2017,9 @@ func (s *Server) handleRouteRemove(conn net.Conn, session *agentSession, payload
 	}
 
 	session.writeMu.Lock()
-	conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteRemoveAck, Payload: ackPayload}); err != nil {
+	if err := writeControl(conn, &protocol.Packet{Type: protocol.TypeRouteRemoveAck, Payload: ackPayload}, writeDeadlineStandard); err != nil {
 		logging.Global().Errorf(logging.CatTCP, "failed to send route remove ack: %v", err)
 	}
-	conn.SetWriteDeadline(time.Time{})
 	session.writeMu.Unlock()
 
 	s.broadcastHello()
@@ -2068,14 +2037,7 @@ func (s *Server) processRouteRemoveLocked(remove apitypes.RouteRemove, owner str
 		return apitypes.RouteRemoveAck{Name: remove.Name, Error: "route owned by another agent"}
 	}
 
-	if ln, exists := s.publicTCP[remove.Name]; exists {
-		ln.Close()
-		delete(s.publicTCP, remove.Name)
-	}
-	if conn, exists := s.publicUDP[remove.Name]; exists {
-		conn.Close()
-		delete(s.publicUDP, remove.Name)
-	}
+	s.teardownPublicListeners(remove.Name)
 
 	delete(s.dynamicRoutes, remove.Name)
 	delete(s.derivedKeys, remove.Name)
@@ -2145,11 +2107,9 @@ func (s *Server) handleRouteUpdate(conn net.Conn, session *agentSession, payload
 	}
 
 	session.writeMu.Lock()
-	conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeRouteUpdateAck, Payload: ackPayload}); err != nil {
+	if err := writeControl(conn, &protocol.Packet{Type: protocol.TypeRouteUpdateAck, Payload: ackPayload}, writeDeadlineStandard); err != nil {
 		logging.Global().Errorf(logging.CatTCP, "failed to send route update ack: %v", err)
 	}
-	conn.SetWriteDeadline(time.Time{})
 	session.writeMu.Unlock()
 
 	s.broadcastHello()
@@ -2187,56 +2147,16 @@ func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate, owner string
 			dr.Route.PublicAddr = newAddr
 		} else {
 			// Bind new listeners before closing old ones so a partial failure
-			// (e.g. TCP ok, UDP fail on "both") leaves the route unchanged.
-			needTCP := dr.Route.Proto == routeProtoTCP || dr.Route.Proto == routeProtoBoth
-			needUDP := dr.Route.Proto == routeProtoUDP || dr.Route.Proto == routeProtoBoth
-			var newTCP net.Listener
-			var newUDP *net.UDPConn
-			if needTCP {
-				ln, err := net.Listen("tcp", newAddr)
-				if err != nil {
-					return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen on %s: %v", newAddr, err)}
-				}
-				newTCP = ln
+			// leaves the route unchanged.
+			nextRoute := dr.Route
+			nextRoute.PublicAddr = newAddr
+			newTCP, newUDP, err := s.openPublicListeners(nextRoute)
+			if err != nil {
+				return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: err.Error()}
 			}
-			if needUDP {
-				addr, err := net.ResolveUDPAddr("udp", newAddr)
-				if err != nil {
-					if newTCP != nil {
-						newTCP.Close()
-					}
-					return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to resolve udp %s: %v", newAddr, err)}
-				}
-				conn, err := net.ListenUDP("udp", addr)
-				if err != nil {
-					if newTCP != nil {
-						newTCP.Close()
-					}
-					return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen udp on %s: %v", newAddr, err)}
-				}
-				configureRouteUDPSocket(conn, dr.Route.Name)
-				newUDP = conn
-			}
-
-			if oldLn, ok := s.publicTCP[req.Name]; ok {
-				oldLn.Close()
-				delete(s.publicTCP, req.Name)
-			}
-			if oldConn, ok := s.publicUDP[req.Name]; ok {
-				oldConn.Close()
-				delete(s.publicUDP, req.Name)
-			}
+			s.teardownPublicListeners(req.Name)
 			dr.Route.PublicAddr = newAddr
-			if newTCP != nil {
-				s.publicTCP[req.Name] = newTCP
-				s.wg.Add(1)
-				go s.acceptPublicTCP(newTCP, req.Name)
-			}
-			if newUDP != nil {
-				s.publicUDP[req.Name] = newUDP
-				s.wg.Add(1)
-				go s.acceptPublicUDP(newUDP, req.Name)
-			}
+			s.installPublicListeners(dr.Route, newTCP, newUDP)
 		}
 	}
 
@@ -2387,8 +2307,7 @@ func (s *Server) RunAgentNettest(ctx context.Context, req AgentNettestRequest) (
 
 		sendStart := time.Now()
 		session.writeMu.Lock()
-		session.conn.SetWriteDeadline(time.Now().Add(writeDeadlineShort))
-		err := protocol.WritePacket(session.conn, pkt)
+		err := writeControl(session.conn, pkt, writeDeadlineShort)
 		session.writeMu.Unlock()
 		if err != nil {
 			continue
@@ -2548,8 +2467,7 @@ func (s *Server) RunAgentEmailProbe(ctx context.Context, req protocol.EmailProbe
 	pkt := &protocol.Packet{Type: protocol.TypeEmailProbeRequest, Payload: payload}
 
 	session.writeMu.Lock()
-	session.conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-	err = protocol.WritePacket(session.conn, pkt)
+	err = writeControl(session.conn, pkt, writeDeadlineStandard)
 	session.writeMu.Unlock()
 	if err != nil {
 		return protocol.EmailProbeResult{}, err
@@ -2588,7 +2506,6 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 		pendingTCP:           make(map[pendingTCPKey]*pendingTCPEntry),
 		dash:                 newDashState(),
 		sessions:             make(map[string]*agentSession),
-		udpGraceTimers:       make(map[string]*udpGraceTimer),
 		probeOutboundTargets: make(map[string]time.Time),
 		maxConnsPerRoute:     defaultMaxConnsPerRoute,
 		dynamicRoutes:        make(map[string]dynamicRouteEntry),
@@ -2666,22 +2583,6 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	// Shared flusher for byte counters; avoids a goroutine per connection.
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		ticker := time.NewTicker(dashBatchInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			case <-ticker.C:
-				s.flushCounters()
-			}
-		}
-	}()
-
 	var controlLn net.Listener
 	var dataLn net.Listener
 	var err error
@@ -2739,16 +2640,6 @@ func (s *Server) Start(ctx context.Context) error {
 	if bufferResult.WriteErr != nil {
 		logging.Global().Warnf(logging.CatUDP, "failed to request shared UDP write buffer bytes=%d: %v", bufferResult.WriteBytes, bufferResult.WriteErr)
 	}
-	s.udpEgress, err = newServerUDPEgress(s, s.udpDataConn)
-	if err != nil {
-		s.udpDataConn.Close()
-		return fmt.Errorf("create UDP egress scheduler: %w", err)
-	}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.udpEgress.run(s.ctx)
-	}()
 	s.wg.Add(1)
 	go s.acceptAgentUDP()
 
@@ -2806,13 +2697,8 @@ func (s *Server) Stop() {
 	}
 	s.helloPending = false
 	s.helloMu.Unlock()
-	s.stopUDPGraceTimers()
-
 	if s.cancel != nil {
 		s.cancel()
-	}
-	if s.udpEgress != nil {
-		s.udpEgress.close()
 	}
 	if s.controlLn != nil {
 		s.controlLn.Close()
@@ -2825,8 +2711,8 @@ func (s *Server) Stop() {
 	}
 
 	// Control readers otherwise remain blocked until their read deadline. Clear
-	// the authoritative map first so deferred cleanup cannot schedule a shutdown
-	// grace timer, then cancel and close sessions outside sessionsMu.
+	// the authoritative map first, then cancel and close sessions outside
+	// sessionsMu.
 	s.sessionsMu.Lock()
 	sessions := make([]*agentSession, 0, len(s.sessions))
 	for _, session := range s.sessions {
@@ -2883,10 +2769,6 @@ func (s *Server) Stop() {
 		conn.Close()
 	}
 	s.wg.Wait()
-	// A live control goroutine can schedule its disconnect grace while Stop is
-	// closing listeners. Once every producer has exited, drain timers again so
-	// Stop never returns with a callback retaining or mutating this server.
-	s.stopUDPGraceTimers()
 }
 
 // rejectVersion tells an authenticated peer why its negotiation failed
@@ -2895,8 +2777,7 @@ func (s *Server) Stop() {
 func (s *Server) rejectVersion(conn net.Conn, reason string) {
 	payload, err := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Error: reason})
 	if err == nil {
-		conn.SetWriteDeadline(time.Now().Add(writeDeadlineShort))
-		_ = protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: payload})
+		_ = writeControl(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: payload}, writeDeadlineShort)
 	}
 	conn.Close()
 }
@@ -2906,8 +2787,7 @@ func (s *Server) rejectVersion(conn net.Conn, reason string) {
 func (s *Server) rejectIdentityConflict(conn net.Conn) {
 	payload, err := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Conflict: true})
 	if err == nil {
-		conn.SetWriteDeadline(time.Now().Add(writeDeadlineShort))
-		_ = protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: payload})
+		_ = writeControl(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: payload}, writeDeadlineShort)
 	}
 	conn.Close()
 }
@@ -2975,13 +2855,6 @@ func (s *Server) acceptControl(ln net.Listener) {
 			s.rejectVersion(conn, reason)
 			continue
 		}
-		features := protocol.NegotiateFeatures(protocol.SupportedFeatures, vp.Features)
-		if !protocol.HasFeature(features, protocol.FeatureBoundUDPRegister) {
-			reason := fmt.Sprintf("protocol %s requires feature %q", protocol.ProtocolVersion, protocol.FeatureBoundUDPRegister)
-			logging.Global().Errorf(logging.CatTCP, "rejecting agent from %s: %s", remoteAddr, reason)
-			s.rejectVersion(conn, reason)
-			continue
-		}
 		agentID := strings.TrimSpace(vp.AgentID)
 		if agentID == "" {
 			agentID = protocol.DefaultAgentID
@@ -3022,11 +2895,10 @@ func (s *Server) acceptControl(ln net.Listener) {
 			}
 			agentID = resolved
 		}
-		logging.Global().Infof(logging.CatTCP, "Agent %q version negotiated from %s: %s features=%v", agentID, remoteAddr, agentVer, features)
+		logging.Global().Infof(logging.CatTCP, "Agent %q version negotiated from %s: %s", agentID, remoteAddr, agentVer)
 
-		verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures, AssignedAgentID: agentID})
-		conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-		if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
+		verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, AssignedAgentID: agentID})
+		if err := writeControl(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}, writeDeadlineStandard); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to send version negotiate to %s: %v", remoteAddr, err)
 			conn.Close()
 			continue
@@ -3045,6 +2917,12 @@ func (s *Server) acceptControl(ln net.Listener) {
 		if existing := s.sessions[agentID]; existing != nil {
 			oldSession = existing
 		}
+		if oldSession != nil {
+			// A replacement starts with no inherited UDP authorization. Keep
+			// the clear serialized with session publication so a fresh
+			// registration cannot be cleared by the old session teardown.
+			s.clearUDPAgent(agentID)
+		}
 		sessionCtx, sessionCancel := context.WithCancel(s.ctx)
 		session := &agentSession{
 			conn:              conn,
@@ -3054,16 +2932,12 @@ func (s *Server) acceptControl(ln net.Listener) {
 			connectTime:       time.Now(),
 			identityPublicKey: append([]byte(nil), vp.PublicKey...),
 			controlNonce:      controlNonce,
-			features:          features,
 		}
 		// Once published, broadcastHello and CONNECT producers may obtain this
 		// session immediately. Hold its write lock across publication and the
 		// initial HELLO so no later control frame can overtake or interleave it.
 		session.writeMu.Lock()
 		s.sessions[agentID] = session
-		// Bound any previously published generation while the replacement
-		// proves its UDP endpoint. A valid new registration cancels this timer.
-		s.scheduleUDPAgentClearLocked(agentID)
 		s.sessionsMu.Unlock()
 
 		if oldSession != nil {
@@ -3083,32 +2957,38 @@ func (s *Server) acceptControl(ln net.Listener) {
 		helloPkt, err := s.buildHelloPacketForAgent(agentID)
 		if err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to build HELLO packet: %v", err)
+			clearUDP := false
 			s.sessionsMu.Lock()
 			if s.sessions[agentID] == session {
 				delete(s.sessions, agentID)
-				s.scheduleUDPAgentClearLocked(agentID)
+				clearUDP = true
 			}
 			s.sessionsMu.Unlock()
+			if clearUDP {
+				s.clearUDPAgent(agentID)
+			}
 			sessionCancel()
 			conn.Close()
 			session.writeMu.Unlock()
 			continue
 		}
-		conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-		if err := protocol.WritePacket(conn, helloPkt); err != nil {
+		if err := writeControl(conn, helloPkt, writeDeadlineStandard); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
+			clearUDP := false
 			s.sessionsMu.Lock()
 			if s.sessions[agentID] == session {
 				delete(s.sessions, agentID)
-				s.scheduleUDPAgentClearLocked(agentID)
+				clearUDP = true
 			}
 			s.sessionsMu.Unlock()
+			if clearUDP {
+				s.clearUDPAgent(agentID)
+			}
 			sessionCancel()
 			conn.Close()
 			session.writeMu.Unlock()
 			continue
 		}
-		conn.SetWriteDeadline(time.Time{})
 		session.writeMu.Unlock()
 
 		s.mu.Lock()
@@ -3133,12 +3013,16 @@ func (s *Server) acceptControl(ln net.Listener) {
 			defer s.wg.Done()
 			defer func() {
 				c.Close()
+				clearUDP := false
 				s.sessionsMu.Lock()
 				if s.sessions[agentID] == session {
 					delete(s.sessions, agentID)
-					s.scheduleUDPAgentClearLocked(agentID)
+					clearUDP = true
 				}
 				s.sessionsMu.Unlock()
+				if clearUDP {
+					s.clearUDPAgent(agentID)
+				}
 			}()
 
 			pingCtx, pingCancel := context.WithCancel(sessionCtx)
@@ -3150,6 +3034,7 @@ func (s *Server) acceptControl(ln net.Listener) {
 			go func() {
 				ticker := time.NewTicker(pingInterval)
 				defer ticker.Stop()
+				lastHealthCheck := time.Now()
 				for {
 					select {
 					case <-pingCtx.Done():
@@ -3157,27 +3042,15 @@ func (s *Server) acceptControl(ln net.Listener) {
 					case <-ticker.C:
 						if s.isCurrentSession(agentID, session) {
 							session.writeMu.Lock()
-							c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-							if err := protocol.WritePacket(c, &protocol.Packet{Type: protocol.TypePing}); err != nil {
+							if err := writeControl(c, &protocol.Packet{Type: protocol.TypePing}, writeDeadlineStandard); err != nil {
 								session.writeMu.Unlock()
 								c.Close()
 								return
 							}
 							session.writeMu.Unlock()
 						}
-					}
-				}
-			}()
-
-			go func() {
-				ticker := time.NewTicker(healthCheckInterval)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-pingCtx.Done():
-						return
-					case <-ticker.C:
-						if s.isCurrentSession(agentID, session) {
+						if time.Since(lastHealthCheck) >= healthCheckInterval && s.isCurrentSession(agentID, session) {
+							lastHealthCheck = time.Now()
 							lastPongTime := time.Unix(0, lastPong.Load().(int64))
 							if time.Since(lastPongTime) > healthCheckTimeout {
 								logging.Global().Errorf(logging.CatTCP, "agent health check timeout, closing connection")
@@ -3212,11 +3085,10 @@ func (s *Server) acceptControl(ln net.Listener) {
 				c.SetReadDeadline(deadlineAt)
 				if pkt.Type == protocol.TypePing {
 					session.writeMu.Lock()
-					c.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-					protocol.WritePacket(c, &protocol.Packet{
+					_ = writeControl(c, &protocol.Packet{
 						Type:    protocol.TypePong,
 						Payload: pkt.Payload,
-					})
+					}, writeDeadlineStandard)
 					session.writeMu.Unlock()
 					continue
 				}
@@ -3273,338 +3145,18 @@ func (s *Server) acceptControl(ln net.Listener) {
 	}
 }
 
-func (s *Server) acceptData(ln net.Listener) {
-	defer s.wg.Done()
-	defer ln.Close()
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return
-			}
-			logging.Global().Errorf(logging.CatTCP, "data accept error: %v", err)
-			continue
-		}
-		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
-		netutil.SetTCPNoDelay(conn)
-
-		handshakeDL := time.Now().Add(handshakeDeadline)
-		conn.SetDeadline(handshakeDL)
-		clientNonce, serverNonce, err := crypto.AuthenticateServer(conn, s.cfg.Token)
-		if err != nil {
-			logging.Global().Errorf(logging.CatTCP, "data auth failed from %s: %v", conn.RemoteAddr(), err)
-			conn.Close()
-			continue
-		}
-		conn.SetReadDeadline(handshakeDL)
-
-		var lenBuf [1]byte
-		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-			conn.Close()
-			continue
-		}
-		routeBytes := make([]byte, lenBuf[0])
-		if _, err := io.ReadFull(conn, routeBytes); err != nil {
-			conn.Close()
-			continue
-		}
-
-		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-			conn.Close()
-			continue
-		}
-		clientBytes := make([]byte, lenBuf[0])
-		if _, err := io.ReadFull(conn, clientBytes); err != nil {
-			conn.Close()
-			continue
-		}
-		clientID := string(clientBytes)
-		conn.SetReadDeadline(handshakeDL)
-
-		routeName := string(routeBytes)
-		if routeName == protocol.RouteMailOutboundTCP {
-			target := string(clientBytes)
-			s.dialMailOutboundTCP(conn, target)
-			continue
-		}
-
-		// Pairing token is sent in the clear before optional tunnel encryption.
-		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-			conn.Close()
-			continue
-		}
-		pairBytes := make([]byte, lenBuf[0])
-		if lenBuf[0] > 0 {
-			if _, err := io.ReadFull(conn, pairBytes); err != nil {
-				conn.Close()
-				continue
-			}
-		}
-
-		rc, _ := s.getRouteConfig(routeName)
-		isEncrypted := rc.isEncrypted
-
-		if isEncrypted {
-			key := rc.derivedKey
-			if key == nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to derive key for route %s: key is nil", routeName)
-				conn.Close()
-				continue
-			}
-			conn, err = crypto.WrapTCP(conn, key, clientNonce, serverNonce, false)
-			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to wrap tcp for route %s: %v", routeName, err)
-				conn.Close()
-				continue
-			}
-		}
-
-		pendingKey := makePendingTCPKey(routeName, clientID)
-		s.mu.Lock()
-		entry, ok := s.pendingTCP[pendingKey]
-		if ok {
-			delete(s.pendingTCP, pendingKey)
-		}
-		s.mu.Unlock()
-
-		if !ok {
-			logging.Global().RateLimitedWarn(logging.CatTCP, "data-unmatched-"+routeName, fmt.Sprintf("data handshake with no pending pairing route=%s client=%s from=%s", routeName, clientID, conn.RemoteAddr()))
-			conn.Close()
-			continue
-		}
-		if len(entry.pairToken) > 0 && subtle.ConstantTimeCompare(entry.pairToken, pairBytes) != 1 {
-			logging.Global().RateLimitedWarn(logging.CatTCP, "data-pair-token-"+routeName, fmt.Sprintf("rejected data pairing with bad token route=%s client=%s from=%s", routeName, clientID, conn.RemoteAddr()))
-			conn.Close()
-			entry.cancel()
-			continue
-		}
-		if ap, err := netip.ParseAddrPort(conn.RemoteAddr().String()); err == nil {
-			if entry.controlRemote != "" && !controlPeerIPMatches(entry.controlRemote, ap) {
-				logging.Global().RateLimitedWarn(logging.CatTCP, "data-pair-ip-"+routeName, fmt.Sprintf("rejected data pairing from %s; control peer is %s route=%s client=%s", conn.RemoteAddr(), entry.controlRemote, routeName, clientID))
-				conn.Close()
-				entry.cancel()
-				continue
-			}
-		}
-		// SetDeadline above armed both read and write. Clearing only the
-		// read side left a ~15s write deadline on domain keep-alive conns
-		// returned by dialRouteTCP (public relays overwrite it via idle
-		// timeout wrappers). Clear both before handing the conn off.
-		_ = conn.SetDeadline(time.Time{})
-		entry.deliver(conn)
-	}
-}
-
-func (s *Server) acceptPublicTCP(ln net.Listener, routeName string) {
-	defer s.wg.Done()
-	defer ln.Close()
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return
-			}
-			logging.Global().Errorf(logging.CatTCP, "public tcp accept error: %v", err)
-			continue
-		}
-
-		semVal, _ := s.connSemaphores.LoadOrStore(routeName, make(chan struct{}, s.maxConnsPerRoute))
-		sem, ok := semVal.(chan struct{})
-		if !ok {
-			logging.Global().Errorf(logging.CatTCP, "invalid semaphore type for route=%s, rejecting", routeName)
-			conn.Close()
-			continue
-		}
-		select {
-		case sem <- struct{}{}:
-		default:
-			logging.Global().Warnf(logging.CatTCP, "connection limit reached for route=%s, rejecting", routeName)
-			conn.Close()
-			continue
-		}
-
-		netutil.SetTCPKeepAlive(conn, tcpKeepAliveInterval)
-		netutil.SetTCPNoDelay(conn)
-		// Reap public peers that vanish without a clean shutdown quickly,
-		// so the relay (and the agent's downstream session) is freed
-		// before the relay idle timeout.
-		netutil.TuneDeadPeerDetection(conn)
-		clientID := s.nextClientID()
-		logging.Global().Infof(logging.CatTCP, "New public TCP connection route=%s client=%s", routeName, clientID)
-
-		rc, ok := s.getRouteConfig(routeName)
-		enabled := ok && rc.enabled
-		owner := rc.owner
-		if owner == "" {
-			owner = protocol.DefaultAgentID
-		}
-		session, sessionOK := s.sessionForAgent(owner)
-
-		if !sessionOK || !enabled {
-			<-sem
-			if isEmailRoute(routeName) {
-				logging.Global().Warnf(logging.CatTCP, "mail public connection rejected route=%s owner=%s agentConnected=%v enabled=%v", routeName, owner, sessionOK, enabled)
-				writeMailRouteUnavailable(conn, routeName)
-			}
-			conn.Close()
-			continue
-		}
-
-		entry := newPendingTCPPair(owner, session.remoteAddr)
-		pendingKey := makePendingTCPKey(routeName, clientID)
-		s.mu.Lock()
-		s.pendingTCP[pendingKey] = entry
-		s.mu.Unlock()
-
-		reqPkt := &protocol.Packet{
-			Type:    protocol.TypeConnect,
-			Route:   routeName,
-			Client:  clientID,
-			Payload: entry.pairToken,
-		}
-		session.writeMu.Lock()
-		session.conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
-		writeErr := protocol.WritePacket(session.conn, reqPkt)
-		session.writeMu.Unlock()
-		if writeErr != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to request agent connect route=%s client=%s: %v", routeName, clientID, writeErr)
-			<-sem
-			writeMailRouteUnavailable(conn, routeName)
-			conn.Close()
-			s.mu.Lock()
-			delete(s.pendingTCP, pendingKey)
-			s.mu.Unlock()
-			entry.cancel()
-			continue
-		}
-
-		go func(c net.Conn, clientID string, sem chan struct{}) {
-			defer c.Close()
-			defer func() { <-sem }()
-			timer := time.NewTimer(s.cfg.PairTimeout)
-			defer timer.Stop()
-			select {
-			case <-entry.done:
-				logging.Global().Warnf(logging.CatTCP, "agent pairing aborted route=%s client=%s", routeName, clientID)
-				writeMailRouteUnavailable(c, routeName)
-				return
-			case <-entry.ready:
-				agentConn := entry.take()
-				if agentConn == nil {
-					logging.Global().Warnf(logging.CatTCP, "agent pairing missing backend route=%s client=%s", routeName, clientID)
-					writeMailRouteUnavailable(c, routeName)
-					return
-				}
-				logging.Global().Infof(logging.CatTCP, "paired public TCP route=%s client=%s", routeName, clientID)
-				s.dash.addConn(time.Now())
-				s.dash.incActive(routeName)
-				defer s.dash.decActive(routeName)
-
-				s.runCountedRelay(routeName, c, agentConn)
-
-			case <-timer.C:
-				// Race: delivery may have landed at the same moment the
-				// timer fired. Use it instead of discarding a valid pair.
-				agentConn := entry.take()
-				if agentConn != nil {
-					logging.Global().Infof(logging.CatTCP, "paired public TCP route=%s client=%s (race recovery)", routeName, clientID)
-					s.dash.addConn(time.Now())
-					s.dash.incActive(routeName)
-					defer s.dash.decActive(routeName)
-
-					s.runCountedRelay(routeName, c, agentConn)
-					return
-				}
-				logging.Global().Warnf(logging.CatTCP, "pair timeout route=%s client=%s", routeName, clientID)
-				s.mu.Lock()
-				delete(s.pendingTCP, pendingKey)
-				s.mu.Unlock()
-				entry.cancel()
-				writeMailRouteUnavailable(c, routeName)
-			}
-		}(conn, clientID, sem)
-	}
-}
-
-// runCountedRelay wraps the public + agent leg in countingConns and runs
-// the relay. The shared flusher goroutine on the Server periodically
-// drains the byte counters into the dashboard, so the per-connection
-// overhead is just the atomic adds inside each Read.
-func (s *Server) runCountedRelay(routeName string, publicConn, agentConn net.Conn) {
-	pubCounter := &countingConn{Conn: publicConn}
-	agtCounter := &countingConn{Conn: agentConn}
-	s.registerCounters(pubCounter, agtCounter)
-	defer s.unregisterCounters(pubCounter, agtCounter)
-	relay.ProxyWithIdleTimeout(pubCounter, agtCounter, proxyIdleTimeout)
-	now := time.Now()
-	if n := pubCounter.Flush(); n > 0 {
-		s.dash.addBytes(now, n)
-	}
-	if n := agtCounter.Flush(); n > 0 {
-		s.dash.addBytes(now, n)
-	}
-}
-
-type counterRegistry struct {
-	mu     sync.Mutex
-	active map[*countingConn]struct{}
-}
-
-func (s *Server) registerCounters(pub, agt *countingConn) {
-	s.counters.mu.Lock()
-	if s.counters.active == nil {
-		s.counters.active = make(map[*countingConn]struct{}, 64)
-	}
-	s.counters.active[pub] = struct{}{}
-	s.counters.active[agt] = struct{}{}
-	s.counters.mu.Unlock()
-}
-
-func (s *Server) unregisterCounters(pub, agt *countingConn) {
-	s.counters.mu.Lock()
-	delete(s.counters.active, pub)
-	delete(s.counters.active, agt)
-	s.counters.mu.Unlock()
-}
-
-func (s *Server) flushCounters() {
-	s.counters.mu.Lock()
-	counters := make([]*countingConn, 0, len(s.counters.active))
-	for c := range s.counters.active {
-		counters = append(counters, c)
-	}
-	s.counters.mu.Unlock()
-	if len(counters) == 0 {
-		return
-	}
-	now := time.Now()
-	for _, c := range counters {
-		if n := c.Flush(); n > 0 {
-			s.dash.addBytes(now, n)
-		}
-	}
-}
-
-// countingConn atomically accumulates bytes that flow through Read. The
-// per-Read cost is a single atomic add; the shared flusher calls Flush
-// periodically to push totals to the dashboard.
+// countingConn accounts bytes directly as they flow through Read.
 type countingConn struct {
 	net.Conn
-	pending atomic.Int64
+	dash *dashState
 }
 
 func (c *countingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
-	if n > 0 {
-		c.pending.Add(int64(n))
+	if n > 0 && c.dash != nil {
+		c.dash.addBytes(time.Now(), int64(n))
 	}
 	return n, err
-}
-
-func (c *countingConn) Flush() int64 {
-	return c.pending.Swap(0)
 }
 
 func (c *countingConn) CloseRead() error {
@@ -3619,285 +3171,4 @@ func (c *countingConn) CloseWrite() error {
 		return cw.CloseWrite()
 	}
 	return c.Conn.Close()
-}
-
-func (s *Server) acceptAgentUDP() {
-	defer s.wg.Done()
-	defer s.udpDataConn.Close()
-
-	buf := make([]byte, 65536)
-	decryptBuf := make([]byte, 65536)
-	aadBuf := make([]byte, 0, 512)
-	// Route/client strings repeat on every datagram of a flow; interning
-	// removes both per-packet string allocations.
-	interner := protocol.NewStringInterner(4096)
-	var pkt protocol.Packet
-
-	var pendingBytes int64
-	var pendingBytesTime time.Time
-	defer func() {
-		if pendingBytes > 0 {
-			s.dash.addBytes(pendingBytesTime, pendingBytes)
-		}
-	}()
-
-	// Deduplicate accepted proofs before taking sessionsMu or running Ed25519
-	// verification. Bookkeeping is bounded independently for each live identity.
-	seenRegisters := newUDPRegisterReplayCache()
-	var lastRegisterReplayPrune int64
-
-	// Two-generation client-addr parse cache: the same client strings repeat
-	// on every datagram of a flow, so parsing once per flow avoids the
-	// per-packet netip.ParseAddrPort cost.
-	const maxClientAddrCache = 10000 / 2
-	clientAddrCur := make(map[string]netip.AddrPort)
-	var clientAddrPrev map[string]netip.AddrPort
-	type publicWriteDeadlineState struct {
-		conn *net.UDPConn
-		set  time.Time
-	}
-	publicWriteDeadlines := make(map[string]publicWriteDeadlineState)
-
-	for {
-		n, addr, err := s.udpDataConn.ReadFromUDPAddrPort(buf)
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return
-			}
-			continue
-		}
-
-		err = protocol.UnmarshalUDPToInterned(buf[:n], &pkt, interner)
-		if err != nil {
-			continue
-		}
-
-		if pkt.Type == protocol.TypeRegister {
-			// A v3 peer must prove its identity, UDP session, and exact live control
-			// generation before the observed source is adopted. Source-IP equality
-			// is deliberately unnecessary for split-path/NAT deployments. The signed
-			// nonce blocks token-only impersonation, and the replay cache prevents a
-			// proof from moving the endpoint again after its first accepted use.
-			nowT := time.Now()
-			reg, ok := crypto.ParseBoundUDPRegister(s.cfg.Token, pkt.Payload, nowT, udpRegisterAuthWindow)
-			if !ok {
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-reject", fmt.Sprintf("rejected malformed/unauthenticated bound UDP register from %s", addr))
-				continue
-			}
-			if reg.AgentID == "" {
-				reg.AgentID = protocol.DefaultAgentID
-			}
-			nowNano := nowT.UnixNano()
-			if nowNano-lastRegisterReplayPrune >= int64(udpRegisterAuthWindow/2) {
-				seenRegisters.prune(nowNano)
-				lastRegisterReplayPrune = nowNano
-			}
-			if seen, full := seenRegisters.status(reg.AgentID, reg.ControlNonce, reg.Key, nowNano); seen || full {
-				continue
-			}
-
-			s.sessionsMu.Lock()
-			sess := s.sessions[reg.AgentID]
-			if sess == nil {
-				s.sessionsMu.Unlock()
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-nosession", fmt.Sprintf("rejected UDP register for agent %q from %s: no live control session", reg.AgentID, addr))
-				continue
-			}
-			if !protocol.HasFeature(sess.features, protocol.FeatureBoundUDPRegister) || sess.controlNonce != reg.ControlNonce || !reg.VerifyIdentity(sess.identityPublicKey) {
-				s.sessionsMu.Unlock()
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-generation", fmt.Sprintf("rejected UDP register for agent %q from %s: identity/control generation mismatch", reg.AgentID, addr))
-				continue
-			}
-
-			if !seenRegisters.record(reg.AgentID, reg.ControlNonce, reg.Key, reg.ValidUntil().UnixNano(), nowNano) {
-				s.sessionsMu.Unlock()
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-rate-"+reg.AgentID, fmt.Sprintf("rejected excessive UDP registrations for agent %q from %s", reg.AgentID, addr))
-				continue
-			}
-
-			s.udpAgentsMu.Lock()
-			prev := s.loadUDPAgents()[reg.AgentID]
-			if prev == nil {
-				logging.Global().Infof(logging.CatUDP, "Agent %q UDP address registered: %s", reg.AgentID, addr.String())
-			} else if prev.addr != addr {
-				logging.Global().Infof(logging.CatUDP, "Agent %q UDP address updated: %s", reg.AgentID, addr.String())
-			}
-			s.updateUDPAgentAddrLocked(reg.AgentID, addr, reg.SessionID, reg.ControlNonce, nowNano)
-			s.pruneUDPAgentsLocked(nowNano)
-			s.udpAgentsMu.Unlock()
-			s.sessionsMu.Unlock()
-			continue
-		}
-
-		if pkt.Type == protocol.TypeData {
-			routeName := pkt.Route
-			clientID := pkt.Client
-
-			// One route-cache load yields owner, enabled, and encryption.
-			rc, rcOK := s.getRouteConfig(routeName)
-			if !rcOK || !rc.enabled {
-				continue
-			}
-			owner := rc.owner
-			if owner == "" {
-				owner = protocol.DefaultAgentID
-			}
-			// Accept tunneled data only from the route owner's registered address.
-			st := s.loadUDPAgents()[owner]
-			if st == nil || st.addr != addr {
-				continue
-			}
-			// Active data refreshes liveness (throttled).
-			now := time.Now().UnixNano()
-			if now-st.lastSeen.Load() > int64(500*time.Millisecond) {
-				st.lastSeen.Store(now)
-			}
-
-			pubConn, ok := s.loadPublicUDP()[routeName]
-			if !ok {
-				continue
-			}
-
-			payload := pkt.Payload
-			if rc.isEncrypted {
-				if st.crypto == nil {
-					continue
-				}
-				aadBuf = crypto.AppendUDPDataAAD(aadBuf[:0], routeName, clientID)
-				decrypted, err := st.crypto.dec.Open(decryptBuf, payload, aadBuf)
-				if err != nil {
-					s.udpDrops.Add(1)
-					logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-open-"+routeName, fmt.Sprintf("dropping undecryptable UDP packet route=%s client=%s err=%v", routeName, clientID, err))
-					continue
-				}
-				payload = decrypted
-			}
-
-			clientAddrPort, cached := clientAddrCur[clientID]
-			if !cached {
-				if clientAddrPort, cached = clientAddrPrev[clientID]; !cached {
-					ap, err := netip.ParseAddrPort(clientID)
-					if err != nil {
-						continue
-					}
-					clientAddrPort = ap
-				}
-				if len(clientAddrCur) >= maxClientAddrCache {
-					clientAddrPrev = clientAddrCur
-					clientAddrCur = make(map[string]netip.AddrPort, 64)
-				}
-				clientAddrCur[clientID] = clientAddrPort
-			}
-
-			pendingBytes += int64(len(payload))
-			if pendingBytesTime.IsZero() {
-				pendingBytesTime = time.Now()
-			} else if time.Since(pendingBytesTime) > dashBatchInterval {
-				s.dash.addBytes(pendingBytesTime, pendingBytes)
-				pendingBytes = 0
-				pendingBytesTime = time.Time{}
-			}
-			nowT := time.Now()
-			deadlineState := publicWriteDeadlines[routeName]
-			if deadlineState.conn != pubConn || nowT.Sub(deadlineState.set) >= sharedUDPWriteDeadlineRefresh {
-				if err := pubConn.SetWriteDeadline(nowT.Add(sharedUDPWriteTimeout)); err != nil {
-					logging.Global().RateLimitedWarn(logging.CatUDP, "server-public-udp-write-deadline-"+routeName, fmt.Sprintf("failed to bound public UDP write route=%s: %v", routeName, err))
-				}
-				publicWriteDeadlines[routeName] = publicWriteDeadlineState{conn: pubConn, set: nowT}
-			}
-			written, err := pubConn.WriteToUDPAddrPort(payload, clientAddrPort)
-			if err != nil {
-				s.udpDrops.Add(1)
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-write-public-"+routeName, fmt.Sprintf("failed to write UDP payload to public client route=%s client=%s bytes=%d err=%v", routeName, clientID, len(payload), err))
-				continue
-			}
-			if written != len(payload) {
-				s.udpDrops.Add(1)
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-short-write-public-"+routeName, fmt.Sprintf("short UDP payload write to public client route=%s client=%s wrote=%d want=%d", routeName, clientID, written, len(payload)))
-			}
-		}
-	}
-}
-
-func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
-	defer s.wg.Done()
-	defer conn.Close()
-
-	buf := make([]byte, 65536)
-
-	// Two-generation addr->string cache: when the current generation fills,
-	// it becomes the previous one and live entries are promoted back on
-	// access. Bounded without the churn of evicting random hot entries.
-	const maxAddrStrCache = 10000 / 2
-	addrStrCur := make(map[netip.AddrPort]string)
-	var addrStrPrev map[netip.AddrPort]string
-	var pendingBytes int64
-	var pendingBytesTime time.Time
-	defer func() {
-		if pendingBytes > 0 {
-			s.dash.addBytes(pendingBytesTime, pendingBytes)
-		}
-	}()
-
-	for {
-		n, addr, err := conn.ReadFromUDPAddrPort(buf)
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return
-			}
-			continue
-		}
-
-		clientStr, ok := addrStrCur[addr]
-		if !ok {
-			if clientStr, ok = addrStrPrev[addr]; !ok {
-				clientStr = addr.String()
-			}
-			if len(addrStrCur) >= maxAddrStrCache {
-				addrStrPrev = addrStrCur
-				addrStrCur = make(map[netip.AddrPort]string, 64)
-			}
-			addrStrCur[addr] = clientStr
-		}
-
-		rc, rcOK := s.getRouteConfig(routeName)
-		if !rcOK || !rc.enabled {
-			continue
-		}
-		owner := rc.owner
-		if owner == "" {
-			owner = protocol.DefaultAgentID
-		}
-		st := s.loadUDPAgents()[owner]
-		if st == nil || !st.addr.IsValid() {
-			s.udpDrops.Add(1)
-			continue
-		}
-		// Owner registration gone stale; acceptAgentUDP prunes it.
-		if time.Since(time.Unix(0, st.lastSeen.Load())) > udpRegisterTimeout {
-			s.udpDrops.Add(1)
-			continue
-		}
-		pendingBytes += int64(n)
-		if pendingBytesTime.IsZero() {
-			pendingBytesTime = time.Now()
-		} else if time.Since(pendingBytesTime) > dashBatchInterval {
-			s.dash.addBytes(pendingBytesTime, pendingBytes)
-			pendingBytes = 0
-			pendingBytesTime = time.Time{}
-		}
-		if err := s.udpEgress.enqueue(routeName, clientStr, owner, rc.epoch, st, buf[:n]); err != nil {
-			if err != udpfair.ErrFull && err != udpfair.ErrClosed {
-				s.udpDrops.Add(1)
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-enqueue-"+routeName, fmt.Sprintf("failed to queue UDP packet route=%s client=%s payload=%d err=%v", routeName, clientStr, n, err))
-			}
-		}
-	}
-}
-
-func warnLargeTunneledUDPDatagram(direction, routeName, clientID string, frameLen int) {
-	if !protocol.UDPFrameExceedsRecommendedSize(frameLen) {
-		return
-	}
-	logging.Global().RateLimitedWarn(logging.CatUDP, "udp-mtu-"+direction+"-"+routeName, fmt.Sprintf("large tunneled UDP datagram direction=%s route=%s client=%s bytes=%d recommended_max=%d", direction, routeName, clientID, frameLen, protocol.RecommendedMaxUDPDatagramSize))
 }
