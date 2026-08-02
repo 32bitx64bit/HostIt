@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"unsafe"
@@ -71,6 +72,18 @@ func UDPFrameLen(route, client string, payloadLen int) int {
 
 func UDPFrameExceedsRecommendedSize(frameLen int) bool {
 	return frameLen > RecommendedMaxUDPDatagramSize
+}
+
+// WarnLargeTunneledUDPDatagram reports an oversized-but-valid tunneled UDP
+// frame through the caller's endpoint-specific logger.
+func WarnLargeTunneledUDPDatagram(direction, routeName, clientID string, frameLen int, warn func(key, message string)) {
+	if !UDPFrameExceedsRecommendedSize(frameLen) || warn == nil {
+		return
+	}
+	warn("udp-mtu-"+direction+"-"+routeName, fmt.Sprintf(
+		"large tunneled UDP datagram direction=%s route=%s client=%s bytes=%d recommended_max=%d",
+		direction, routeName, clientID, frameLen, RecommendedMaxUDPDatagramSize,
+	))
 }
 
 var (
@@ -248,14 +261,6 @@ func UnmarshalUDP(data []byte) (*Packet, error) {
 }
 
 func UnmarshalUDPTo(data []byte, p *Packet) error {
-	return UnmarshalUDPToInterned(data, p, nil)
-}
-
-// UnmarshalUDPToInterned is UnmarshalUDPTo with an optional StringInterner.
-// Route and client strings repeat across virtually every datagram of a
-// flow; interning removes the two per-packet string allocations on the
-// receive hot path.
-func UnmarshalUDPToInterned(data []byte, p *Packet, in *StringInterner) error {
 	if len(data) > MaxUDPDatagramSize {
 		return ErrUDPDatagramTooBig
 	}
@@ -276,7 +281,7 @@ func UnmarshalUDPToInterned(data []byte, p *Packet, in *StringInterner) error {
 		return ErrInvalidPacket
 	}
 
-	p.Route = in.intern(data[i : i+routeLen])
+	p.Route = string(data[i : i+routeLen])
 	i += routeLen
 
 	clientLen := int(data[i])
@@ -285,45 +290,9 @@ func UnmarshalUDPToInterned(data []byte, p *Packet, in *StringInterner) error {
 	if len(data) < i+clientLen {
 		return ErrInvalidPacket
 	}
-	p.Client = in.intern(data[i : i+clientLen])
+	p.Client = string(data[i : i+clientLen])
 	i += clientLen
 
 	p.Payload = data[i:]
 	return nil
-}
-
-// StringInterner deduplicates byte-slice-to-string conversions. Lookups of
-// already-seen values are allocation-free (map access by string(b) does not
-// allocate). NOT safe for concurrent use; each receive loop owns its own.
-type StringInterner struct {
-	m   map[string]string
-	max int
-}
-
-// NewStringInterner returns an interner holding at most max entries; when
-// full it resets, which only costs the subsequent re-allocation of live
-// strings.
-func NewStringInterner(max int) *StringInterner {
-	if max <= 0 {
-		max = 1024
-	}
-	return &StringInterner{m: make(map[string]string, 64), max: max}
-}
-
-func (si *StringInterner) intern(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
-	if si == nil {
-		return string(b)
-	}
-	if s, ok := si.m[string(b)]; ok {
-		return s
-	}
-	if len(si.m) >= si.max {
-		clear(si.m)
-	}
-	s := string(b)
-	si.m[s] = s
-	return s
 }

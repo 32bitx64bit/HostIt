@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"unsafe"
 )
 
 type zeroProgressWriter struct{}
@@ -639,8 +638,7 @@ func TestReadPacketToEmptyRouteAndClient(t *testing.T) {
 	}
 }
 
-func TestUnmarshalUDPToInterned(t *testing.T) {
-	in := NewStringInterner(16)
+func TestUnmarshalUDPTo(t *testing.T) {
 	pkt := &Packet{Type: TypeData, Route: "game", Client: "1.2.3.4:5", Payload: []byte("x")}
 	data, err := MarshalUDP(pkt, nil)
 	if err != nil {
@@ -648,45 +646,20 @@ func TestUnmarshalUDPToInterned(t *testing.T) {
 	}
 
 	var p1, p2 Packet
-	if err := UnmarshalUDPToInterned(data, &p1, in); err != nil {
+	if err := UnmarshalUDPTo(data, &p1); err != nil {
 		t.Fatal(err)
 	}
-	if err := UnmarshalUDPToInterned(data, &p2, in); err != nil {
+	if err := UnmarshalUDPTo(data, &p2); err != nil {
 		t.Fatal(err)
 	}
 	if p1.Route != "game" || p1.Client != "1.2.3.4:5" {
 		t.Fatalf("decoded fields wrong: %+v", p1)
 	}
-	// Interned strings must be the identical backing allocation.
-	if unsafe.StringData(p1.Route) != unsafe.StringData(p2.Route) {
-		t.Error("route strings were not interned")
-	}
-	if unsafe.StringData(p1.Client) != unsafe.StringData(p2.Client) {
-		t.Error("client strings were not interned")
-	}
-
-	// nil interner still decodes correctly.
 	var p3 Packet
-	if err := UnmarshalUDPToInterned(data, &p3, nil); err != nil {
+	if err := UnmarshalUDPTo(data, &p3); err != nil {
 		t.Fatal(err)
 	}
 	if p3.Route != "game" || p3.Client != "1.2.3.4:5" {
 		t.Fatalf("nil-interner decode wrong: %+v", p3)
-	}
-}
-
-func TestStringInternerBounded(t *testing.T) {
-	in := NewStringInterner(4)
-	for i := 0; i < 100; i++ {
-		s := in.intern([]byte{byte('a' + i%26), byte('0' + i%10)})
-		if s == "" {
-			t.Fatal("empty intern result")
-		}
-		if len(in.m) > 4 {
-			t.Fatalf("interner grew past max: %d", len(in.m))
-		}
-	}
-	if in.intern(nil) != "" {
-		t.Fatal("nil bytes must intern to empty string")
 	}
 }
