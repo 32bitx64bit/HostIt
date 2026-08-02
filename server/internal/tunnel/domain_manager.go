@@ -2,6 +2,8 @@ package tunnel
 
 import (
 	"sort"
+	"strings"
+	"sync/atomic"
 
 	"hostit/shared/emailcfg"
 )
@@ -17,17 +19,34 @@ type managedDomainSnapshot struct {
 	httpsHosts []string
 }
 
+type domainRoutingSnapshot struct {
+	managedDomainSnapshot
+	routes         map[string]RouteConfig
+	domainDisabled map[string]struct{}
+}
+
 type domainManager struct {
-	server *Server
+	server   *Server
+	snapshot atomic.Value // stores *domainRoutingSnapshot
 }
 
 func newDomainManager(s *Server) *domainManager {
-	return &domainManager{server: s}
+	m := &domainManager{server: s}
+	m.snapshot.Store(&domainRoutingSnapshot{
+		managedDomainSnapshot: managedDomainSnapshot{entries: map[string]managedDomainEntry{}},
+		routes:                map[string]RouteConfig{},
+		domainDisabled:        map[string]struct{}{},
+	})
+	return m
 }
 
 func buildManagedDomainSnapshot(cfg ServerConfig) managedDomainSnapshot {
+	return buildManagedDomainSnapshotForRoutes(cfg, cfg.Routes)
+}
+
+func buildManagedDomainSnapshotForRoutes(cfg ServerConfig, routes []RouteConfig) managedDomainSnapshot {
 	entries := make(map[string]managedDomainEntry)
-	for _, rt := range cfg.Routes {
+	for _, rt := range routes {
 		if !rt.IsEnabled() || !rt.IsDomainEnabled() {
 			continue
 		}
@@ -63,14 +82,38 @@ func buildManagedDomainSnapshot(cfg ServerConfig) managedDomainSnapshot {
 	return managedDomainSnapshot{entries: entries, httpsHosts: httpsHosts}
 }
 
-func (m *domainManager) snapshot() managedDomainSnapshot {
+// rebuildLocked publishes a complete immutable routing snapshot. Callers must
+// hold server.mu while reading cfg and dynamicRoutes.
+func (m *domainManager) rebuildLocked() {
 	if m == nil || m.server == nil {
-		return managedDomainSnapshot{entries: map[string]managedDomainEntry{}}
+		return
 	}
-	m.server.mu.RLock()
 	cfg := m.server.cfg
-	m.server.mu.RUnlock()
-	return buildManagedDomainSnapshot(cfg)
+	routes := effectiveRoutes(cfg, m.server.dynamicRoutes)
+	managed := buildManagedDomainSnapshotForRoutes(cfg, routes)
+	routeMap := make(map[string]RouteConfig, len(routes))
+	for _, rt := range routes {
+		routeMap[rt.Name] = rt
+	}
+	disabled := make(map[string]struct{}, len(cfg.DomainDisabledAgents))
+	for _, id := range cfg.DomainDisabledAgents {
+		if id = strings.TrimSpace(id); id != "" {
+			disabled[id] = struct{}{}
+		}
+	}
+	m.snapshot.Store(&domainRoutingSnapshot{
+		managedDomainSnapshot: managed,
+		routes:                routeMap,
+		domainDisabled:        disabled,
+	})
+}
+
+func (m *domainManager) load() *domainRoutingSnapshot {
+	if m == nil {
+		return nil
+	}
+	snap, _ := m.snapshot.Load().(*domainRoutingSnapshot)
+	return snap
 }
 
 func (m *domainManager) lookup(host string) (managedDomainEntry, bool) {
@@ -78,7 +121,11 @@ func (m *domainManager) lookup(host string) (managedDomainEntry, bool) {
 	if host == "" {
 		return managedDomainEntry{}, false
 	}
-	entry, ok := m.snapshot().entries[host]
+	snap := m.load()
+	if snap == nil {
+		return managedDomainEntry{}, false
+	}
+	entry, ok := snap.entries[host]
 	return entry, ok
 }
 
@@ -91,7 +138,10 @@ func (m *domainManager) lookupHTTPS(host string) (managedDomainEntry, bool) {
 }
 
 func (m *domainManager) httpsHosts() []string {
-	snap := m.snapshot()
+	snap := m.load()
+	if snap == nil {
+		return nil
+	}
 	out := make([]string, len(snap.httpsHosts))
 	copy(out, snap.httpsHosts)
 	return out
@@ -103,4 +153,22 @@ func (m *domainManager) defaultHTTPSHost() string {
 		return ""
 	}
 	return hosts[0] // hosts is already sorted; return the first one
+}
+
+func (m *domainManager) route(name string) (RouteConfig, bool) {
+	snap := m.load()
+	if snap == nil {
+		return RouteConfig{}, false
+	}
+	rt, ok := snap.routes[name]
+	return rt, ok
+}
+
+func (m *domainManager) domainEnabledForAgent(agentID string) bool {
+	snap := m.load()
+	if snap == nil {
+		return true
+	}
+	_, disabled := snap.domainDisabled[agentID]
+	return !disabled
 }

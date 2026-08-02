@@ -65,6 +65,20 @@ func requiresFreshTunnelConn(req *http.Request) bool {
 	}
 }
 
+type managedProxyRouteContextKey struct{}
+
+func withManagedProxyRoute(req *http.Request, routeName string) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), managedProxyRouteContextKey{}, routeName))
+}
+
+func managedProxyRoute(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	routeName, _ := req.Context().Value(managedProxyRouteContextKey{}).(string)
+	return routeName
+}
+
 type domainCertManager struct {
 	server      *Server
 	autocert    *autocert.Manager
@@ -285,12 +299,9 @@ func (s *Server) managedRoute(host string) (RouteConfig, bool) {
 	if !ok {
 		return RouteConfig{}, false
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, rt := range s.cfg.Routes {
-		if rt.IsEnabled() && strings.TrimSpace(rt.Name) == entry.HTTPSRouteName {
-			return rt, true
-		}
+	rt, ok := s.domains.route(entry.HTTPSRouteName)
+	if ok && rt.IsEnabled() {
+		return rt, true
 	}
 	return RouteConfig{}, false
 }
@@ -299,12 +310,17 @@ func (s *Server) managedRoute(host string) (RouteConfig, bool) {
 // managed-domain routing turned on.
 func (s *Server) domainEnabledForRoute(routeName string) bool {
 	owner := protocol.DefaultAgentID
-	if rc, ok := s.getRouteConfig(routeName); ok && rc.owner != "" {
-		owner = rc.owner
+	if s != nil && s.domains != nil {
+		if rt, ok := s.domains.route(routeName); ok {
+			owner = rt.OwnerAgent()
+		} else if rc, ok := s.getRouteConfig(routeName); ok && rc.owner != "" {
+			owner = rc.owner
+		}
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cfg.DomainEnabledForAgent(owner)
+	if s != nil && s.domains != nil {
+		return s.domains.domainEnabledForAgent(owner)
+	}
+	return false
 }
 
 func normalizeRequestHost(hostport string) string {
@@ -365,7 +381,7 @@ func (s *Server) emailACMEProxyHandler(fallback http.Handler) http.Handler {
 			return
 		}
 		proxy := s.domainProxy(entry.HTTPChallengeRoute, host)
-		proxy.ServeHTTP(w, r)
+		proxy.ServeHTTP(w, withManagedProxyRoute(r, entry.HTTPChallengeRoute))
 	})
 }
 
@@ -388,66 +404,55 @@ func (s *Server) domainProxyHandler() http.Handler {
 			return
 		}
 		proxy := s.domainProxy(entry.HTTPSRouteName, host)
-		proxy.ServeHTTP(w, r)
+		proxy.ServeHTTP(w, withManagedProxyRoute(r, entry.HTTPSRouteName))
 	})
 }
 
 func (s *Server) domainProxy(routeName string, host string) *httputil.ReverseProxy {
-	if cached, ok := s.domainProxyCache.Load(routeName); ok {
-		if proxy, ok := cached.(*httputil.ReverseProxy); ok && proxy != nil {
-			return proxy
+	s.domainProxyOnce.Do(func() {
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				route, _ := ctx.Value(managedProxyRouteContextKey{}).(string)
+				if route == "" {
+					return nil, fmt.Errorf("managed proxy route missing")
+				}
+				return s.dialRouteTCP(ctx, route)
+			},
+			MaxIdleConns:          64,
+			MaxIdleConnsPerHost:   32,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: managedProxyResponseHeaderTimeout,
+			ExpectContinueTimeout: managedProxyExpectContinueTimeout,
+			ForceAttemptHTTP2:     false,
 		}
-	}
-
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return s.dialRouteTCP(ctx, routeName)
-		},
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: managedProxyResponseHeaderTimeout,
-		ExpectContinueTimeout: managedProxyExpectContinueTimeout,
-		ForceAttemptHTTP2:     false,
-	}
-
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetXForwarded()
-			pr.Out.URL.Scheme = "http"
-			pr.Out.URL.Host = "tunnel-backend"
-			pr.Out.Host = pr.In.Host
-		},
-		Transport: &managedProxyTransport{base: transport},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			transport.CloseIdleConnections()
-			logging.Global().Errorf(logging.CatTCP, "managed domain proxy error host=%s route=%s: %v", host, routeName, err)
-			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-		},
-	}
-
-	actual, loaded := s.domainProxyCache.LoadOrStore(routeName, proxy)
-	if loaded {
-		transport.CloseIdleConnections()
-		if existing, ok := actual.(*httputil.ReverseProxy); ok && existing != nil {
-			return existing
+		managed := &managedProxyTransport{base: transport}
+		s.domainProxyTransport = managed
+		s.domainProxyShared = &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetXForwarded()
+				pr.Out.URL.Scheme = "http"
+				// Keep each route's connection pool separate. DialContext
+				// ignores this synthetic host and resolves the route from the
+				// request context.
+				route := managedProxyRoute(pr.In)
+				pr.Out.URL.Host = "tunnel-backend-" + route
+				pr.Out.Host = pr.In.Host
+			},
+			Transport: managed,
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				managed.CloseIdleConnections()
+				logging.Global().Errorf(logging.CatTCP, "managed domain proxy error host=%s route=%s: %v", r.Host, managedProxyRoute(r), err)
+				http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+			},
 		}
-	}
-	return proxy
+	})
+	return s.domainProxyShared
 }
 
 func (s *Server) closeDomainProxyIdleConnections() {
-	s.domainProxyCache.Range(func(_, value any) bool {
-		proxy, ok := value.(*httputil.ReverseProxy)
-		if !ok || proxy == nil {
-			return true
-		}
-		type idleCloser interface{ CloseIdleConnections() }
-		if transport, ok := proxy.Transport.(idleCloser); ok && transport != nil {
-			transport.CloseIdleConnections()
-		}
-		return true
-	})
+	if s.domainProxyTransport != nil {
+		s.domainProxyTransport.CloseIdleConnections()
+	}
 }
 
 func (s *Server) startDomainGateway() error {
@@ -555,8 +560,7 @@ func (s *Server) dialRouteTCP(ctx context.Context, routeName string) (net.Conn, 
 
 	reqPkt := &protocol.Packet{Type: protocol.TypeConnect, Route: routeName, Client: clientID, Payload: entry.pairToken}
 	session.writeMu.Lock()
-	session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	err := protocol.WritePacket(session.conn, reqPkt)
+	err := writeControl(session.conn, reqPkt, 5*time.Second)
 	session.writeMu.Unlock()
 	if err != nil {
 		cleanup()
