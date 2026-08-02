@@ -1,5 +1,16 @@
 package netutil
 
+const (
+	// SharedUDPReadBufferBytes and SharedUDPWriteBufferBytes are the kernel
+	// buffers used by the agent/server tunnel UDP sockets.
+	SharedUDPReadBufferBytes  = 256 * 1024
+	SharedUDPWriteBufferBytes = 256 * 1024
+	// RouteUDPReadBufferBytes and RouteUDPWriteBufferBytes are the buffers
+	// used by public per-route UDP sockets.
+	RouteUDPReadBufferBytes  = 128 * 1024
+	RouteUDPWriteBufferBytes = 128 * 1024
+)
+
 // UDPBufferSetter is implemented by net.UDPConn. Keeping the narrow interface
 // makes socket-buffer setup testable without opening a real socket or depending
 // on platform-specific effective buffer sizes.
