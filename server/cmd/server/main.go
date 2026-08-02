@@ -443,13 +443,22 @@ func (r *serverRunner) KnownAgentIDs() []string {
 }
 
 func (r *serverRunner) ListApps(ctx context.Context) ([]appstore.Application, error) {
+	// Read the registry from the store directly so the Apps page still works
+	// while the tunnel is restarting or temporarily stopped.
 	r.mu.Lock()
-	srv := r.srv
+	store := r.appStore
 	r.mu.Unlock()
-	if srv == nil {
-		return nil, fmt.Errorf("server not running")
+	if store == nil {
+		return []appstore.Application{}, nil
 	}
-	return srv.ListApps(ctx)
+	apps, err := store.ListApplications(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if apps == nil {
+		apps = []appstore.Application{}
+	}
+	return apps, nil
 }
 
 func (r *serverRunner) SetAppEnabled(label string, enabled bool) bool {

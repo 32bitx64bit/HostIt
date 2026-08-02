@@ -49,7 +49,7 @@ func fakeEncryptedAgentRoutes(ctx context.Context, controlAddr, dataAddr string,
 	controlConn.SetDeadline(time.Time{})
 
 	pub, sig := testIdentity(serverNonce)
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub, IdentitySig: sig})
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures, PublicKey: pub, IdentitySig: sig})
 	controlConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := protocol.WritePacket(controlConn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		return

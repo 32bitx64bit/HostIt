@@ -253,6 +253,36 @@ func TestClientStatus(t *testing.T) {
 	}
 }
 
+func TestClientServerInfo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/server" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeErrorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		writeOKResponse(w, http.StatusOK, ServerInfoResponse{
+			PublicAddr: "203.0.113.10",
+			Connected:  true,
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	resp, err := client.ServerInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.PublicAddr != "203.0.113.10" {
+		t.Fatalf("PublicAddr = %q, want %q", resp.PublicAddr, "203.0.113.10")
+	}
+	if !resp.Connected {
+		t.Fatal("Connected = false, want true")
+	}
+}
+
 func TestClientNoAPIKey(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

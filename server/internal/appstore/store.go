@@ -273,14 +273,11 @@ func (s *Store) DeleteApplication(ctx context.Context, label string) error {
 
 func (s *Store) AddRoute(ctx context.Context, appID int64, route AppRoute) (*AppRoute, error) {
 	now := time.Now().Unix()
-	agentID := strings.TrimSpace(route.AgentID)
-	if agentID == "" {
-		agentID = "default"
-	}
+	normalizeAppRoute(&route)
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO app_routes(app_id, route_name, proto, public_addr, local_addr, agent_id, encrypted, domain, domain_enabled, enabled, created_at)
 		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		appID, route.RouteName, route.Proto, route.PublicAddr, route.LocalAddr, agentID,
+		appID, route.RouteName, route.Proto, route.PublicAddr, route.LocalAddr, route.AgentID,
 		boolToInt(route.Encrypted), route.Domain, boolToInt(route.DomainEnabled), boolToInt(route.Enabled), now)
 	if err != nil {
 		return nil, err
@@ -291,9 +288,39 @@ func (s *Store) AddRoute(ctx context.Context, appID int64, route AppRoute) (*App
 	}
 	route.ID = id
 	route.AppID = appID
-	route.AgentID = agentID
 	route.CreatedAt = time.Unix(now, 0)
 	return &route, nil
+}
+
+func normalizeAppRoute(route *AppRoute) {
+	route.AgentID = strings.TrimSpace(route.AgentID)
+	if route.AgentID == "" {
+		route.AgentID = "default"
+	}
+}
+
+// UpdateRoute updates a persisted route in place. Row identity, application
+// ownership, and creation time remain stable, so a failed update cannot lose
+// the route as a remove-then-insert sequence could.
+func (s *Store) UpdateRoute(ctx context.Context, route AppRoute) error {
+	normalizeAppRoute(&route)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE app_routes
+		 SET proto = ?, public_addr = ?, local_addr = ?, agent_id = ?, encrypted = ?, domain = ?, domain_enabled = ?, enabled = ?
+		 WHERE route_name = ?`,
+		route.Proto, route.PublicAddr, route.LocalAddr, route.AgentID,
+		boolToInt(route.Encrypted), route.Domain, boolToInt(route.DomainEnabled), boolToInt(route.Enabled), route.RouteName)
+	if err != nil {
+		return err
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (s *Store) RemoveRoute(ctx context.Context, routeName string) error {

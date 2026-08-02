@@ -33,17 +33,25 @@ const (
 const RouteMailOutboundTCP = "hostit_mail_outbound"
 
 var (
-	ErrInvalidPacket = errors.New("invalid packet")
-	ErrPayloadTooBig = errors.New("payload too big")
-	ErrFieldTooLong  = errors.New("route or client field too long")
+	ErrInvalidPacket     = errors.New("invalid packet")
+	ErrPayloadTooBig     = errors.New("payload too big")
+	ErrFieldTooLong      = errors.New("route or client field too long")
+	ErrUDPDatagramTooBig = errors.New("udp datagram too big")
 )
 
 const MaxPayloadSize = 64*1024 - 1 // Maximum payload frameable in uint16 length field.
 
+// MaxUDPDatagramSize is the largest UDP payload that is valid on both IPv4
+// and IPv6 without UDP jumbograms. MarshalUDP applies this limit to the whole
+// tunneled frame, including its route/client fields and any encryption
+// overhead already present in Packet.Payload.
+const MaxUDPDatagramSize = 65507
+
 // RecommendedMaxUDPDatagramSize is a conservative outer UDP payload size that
-// usually avoids IP fragmentation across typical 1500-byte Ethernet paths after
-// IPv4/IPv6 and UDP headers are added.
-const RecommendedMaxUDPDatagramSize = 1400
+// fits within the IPv6 minimum path MTU after IPv6 and UDP headers are added.
+// Frames above this target remain valid up to MaxUDPDatagramSize; callers use
+// this threshold for warnings rather than rejection.
+const RecommendedMaxUDPDatagramSize = 1200
 
 const maxPacketBufSize = 5 + 255 + 255 + MaxPayloadSize
 
@@ -202,6 +210,9 @@ func MarshalUDP(p *Packet, dst []byte) ([]byte, error) {
 	}
 
 	totalLen := 1 + 1 + len(p.Route) + 1 + len(p.Client) + len(p.Payload)
+	if totalLen > MaxUDPDatagramSize {
+		return nil, ErrUDPDatagramTooBig
+	}
 
 	if cap(dst) < totalLen {
 		dst = make([]byte, totalLen)
@@ -245,6 +256,9 @@ func UnmarshalUDPTo(data []byte, p *Packet) error {
 // flow; interning removes the two per-packet string allocations on the
 // receive hot path.
 func UnmarshalUDPToInterned(data []byte, p *Packet, in *StringInterner) error {
+	if len(data) > MaxUDPDatagramSize {
+		return ErrUDPDatagramTooBig
+	}
 	if len(data) < 3 {
 		return ErrInvalidPacket
 	}

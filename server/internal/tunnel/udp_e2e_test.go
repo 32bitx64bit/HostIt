@@ -42,11 +42,68 @@ type fakeUDPAgent struct {
 	seen map[string]int
 }
 
-// authedUDPRegister builds a fresh token-authenticated register packet.
-// It must be called per send (the authenticator is single-use within the
-// server's freshness window), so callers must not cache the result.
-func authedUDPRegister(token string, sessionID crypto.UDPSessionID, agentID string) ([]byte, error) {
-	payload, err := crypto.BuildUDPRegister(token, sessionID, agentID)
+type fakeUDPIdentity struct {
+	publicKey    []byte
+	controlNonce crypto.UDPControlNonce
+	sign         func([]byte) []byte
+}
+
+func newFakeUDPIdentity(t *testing.T) *fakeUDPIdentity {
+	t.Helper()
+	pub, priv, err := crypto.GenerateAgentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlNonce, ok := crypto.NewUDPControlNonce(pub)
+	if !ok {
+		t.Fatalf("test identity public key has unexpected length %d", len(pub))
+	}
+	return &fakeUDPIdentity{
+		publicKey:    append([]byte(nil), pub...),
+		controlNonce: controlNonce,
+		sign: func(challenge []byte) []byte {
+			return crypto.SignIdentityChallenge(priv, challenge)
+		},
+	}
+}
+
+func newFakeUDPIdentityForControl(t *testing.T, serverNonce []byte) *fakeUDPIdentity {
+	t.Helper()
+	pub, priv, err := crypto.GenerateAgentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlNonce, ok := crypto.NewUDPControlNonce(serverNonce)
+	if !ok {
+		t.Fatalf("server control nonce has unexpected length %d", len(serverNonce))
+	}
+	return &fakeUDPIdentity{
+		publicKey:    append([]byte(nil), pub...),
+		controlNonce: controlNonce,
+		sign: func(challenge []byte) []byte {
+			return crypto.SignIdentityChallenge(priv, challenge)
+		},
+	}
+}
+
+func installFakeUDPSession(srv *Server, agentID, remoteAddr string, identity *fakeUDPIdentity) {
+	srv.sessionsMu.Lock()
+	srv.sessions[agentID] = &agentSession{
+		agentID:           agentID,
+		remoteAddr:        remoteAddr,
+		connectTime:       time.Now(),
+		identityPublicKey: append([]byte(nil), identity.publicKey...),
+		controlNonce:      identity.controlNonce,
+		features:          []string{protocol.FeatureBoundUDPRegister},
+	}
+	srv.sessionsMu.Unlock()
+}
+
+// authedUDPRegister builds a fresh identity- and control-generation-bound
+// register packet. It must be called per send because the freshness nonce is
+// single-use within the server's replay window.
+func authedUDPRegister(token string, sessionID crypto.UDPSessionID, agentID string, identity *fakeUDPIdentity) ([]byte, error) {
+	payload, err := crypto.BuildBoundUDPRegister(token, sessionID, identity.controlNonce, agentID, identity.sign)
 	if err != nil {
 		return nil, err
 	}
@@ -91,20 +148,16 @@ func startFakeUDPAgentAs(t *testing.T, ctx context.Context, srv *Server, dataAdd
 		t.Fatal(err)
 	}
 	agent := &fakeUDPAgent{conn: conn, seen: make(map[string]int)}
+	identity := newFakeUDPIdentity(t)
 
-	// UDP register requires a live control session from the same host.
+	// UDP register requires a live control session with the matching identity
+	// and control generation.
 	if srv != nil {
-		srv.sessionsMu.Lock()
-		srv.sessions[agentID] = &agentSession{
-			agentID:     agentID,
-			remoteAddr:  "127.0.0.1:9",
-			connectTime: time.Now(),
-		}
-		srv.sessionsMu.Unlock()
+		installFakeUDPSession(srv, agentID, "127.0.0.1:9", identity)
 	}
 
 	sendRegister := func() {
-		data, err := authedUDPRegister(token, sessionID, agentID)
+		data, err := authedUDPRegister(token, sessionID, agentID, identity)
 		if err == nil {
 			_, _ = conn.WriteToUDP(data, serverAddr)
 		}
@@ -493,14 +546,10 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
 
-	// Live control session required before UDP register is accepted.
-	srv.sessionsMu.Lock()
-	srv.sessions[protocol.DefaultAgentID] = &agentSession{
-		agentID:     protocol.DefaultAgentID,
-		remoteAddr:  "127.0.0.1:9",
-		connectTime: time.Now(),
-	}
-	srv.sessionsMu.Unlock()
+	// A matching authenticated control generation is required before UDP
+	// registration is accepted.
+	identity := newFakeUDPIdentity(t)
+	installFakeUDPSession(srv, protocol.DefaultAgentID, "127.0.0.1:9", identity)
 
 	serverUDPAddr, err := net.ResolveUDPAddr("udp", dataAddr)
 	if err != nil {
@@ -512,7 +561,7 @@ func TestAgentUDPDataRefreshesTimeout(t *testing.T) {
 	}
 	defer agentConn.Close()
 
-	reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID)
+	reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID, identity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,8 +635,11 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub, sig := testIdentity(serverNonce)
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub, IdentitySig: sig})
+	identity := newFakeUDPIdentityForControl(t, serverNonce)
+	verPayload, _ := json.Marshal(protocol.VersionPayload{
+		Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures,
+		PublicKey: identity.publicKey, IdentitySig: identity.sign(serverNonce),
+	})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		t.Fatal(err)
 	}
@@ -607,7 +659,7 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 	}
 
 	waitTunnelCondition(t, 2*time.Second, "agent UDP registration did not reach server", func() bool {
-		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID)
+		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID, identity)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -618,8 +670,8 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 		t.Fatal("agent UDP address was not stored after control connect")
 	}
 
-	// Displacing the control session must not clear UDP (same agent reconnects);
-	// only a full disconnect of the current session clears it.
+	// Displacing the control session preserves the last authenticated UDP path
+	// during the reconnect grace while the replacement proves its generation.
 	conn2 := dialTCPForLifecycleTest(t, controlAddr)
 	defer conn2.Close()
 	if err := conn2.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -629,8 +681,11 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub2, sig2 := testIdentity(serverNonce2)
-	verPayload2, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub2, IdentitySig: sig2})
+	identity2 := newFakeUDPIdentityForControl(t, serverNonce2)
+	verPayload2, _ := json.Marshal(protocol.VersionPayload{
+		Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures,
+		PublicKey: identity2.publicKey, IdentitySig: identity2.sign(serverNonce2),
+	})
 	if err := protocol.WritePacket(conn2, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload2}); err != nil {
 		t.Fatal(err)
 	}
@@ -642,7 +697,18 @@ func TestAgentControlConnectKeepsUDPState(t *testing.T) {
 	}
 
 	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
-		t.Fatal("agent UDP state should persist across control reconnect")
+		t.Fatal("agent UDP state should persist during control reconnect grace")
+	}
+
+	if err := conn2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitTunnelCondition(t, 2*time.Second, "replacement control session did not disconnect", func() bool {
+		_, ok := srv.sessionForAgent(protocol.DefaultAgentID)
+		return !ok
+	})
+	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("agent UDP state was cleared immediately instead of entering disconnect grace")
 	}
 }
 
@@ -673,8 +739,9 @@ func TestUDPRegisterRejectedWithoutControlSession(t *testing.T) {
 	}
 	defer agentConn.Close()
 
+	identity := newFakeUDPIdentity(t)
 	for i := 0; i < 5; i++ {
-		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID)
+		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), protocol.DefaultAgentID, identity)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -686,7 +753,7 @@ func TestUDPRegisterRejectedWithoutControlSession(t *testing.T) {
 	}
 }
 
-func TestUDPRegisterRejectedFromMismatchedIP(t *testing.T) {
+func TestLegacyUDPRegisterRejectedByProtocolV3(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -703,14 +770,66 @@ func TestUDPRegisterRejectedFromMismatchedIP(t *testing.T) {
 	go func() { _ = srv.Run(ctx) }()
 	waitPublicUDPRoute(t, srv, "game")
 
-	// Control peer appears to be a non-loopback address; UDP from 127.0.0.1 must fail.
-	srv.sessionsMu.Lock()
-	srv.sessions[protocol.DefaultAgentID] = &agentSession{
-		agentID:     protocol.DefaultAgentID,
-		remoteAddr:  "203.0.113.10:12345",
-		connectTime: time.Now(),
+	identity := newFakeUDPIdentity(t)
+	installFakeUDPSession(srv, protocol.DefaultAgentID, "127.0.0.1:9", identity)
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", dataAddr)
+	if err != nil {
+		t.Fatal(err)
 	}
-	srv.sessionsMu.Unlock()
+	agentConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentConn.Close()
+
+	sessionID := newTestSessionID(t)
+	legacyPayload, err := crypto.BuildUDPRegister("testtoken", sessionID, protocol.DefaultAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := protocol.MarshalUDP(&protocol.Packet{Type: protocol.TypeRegister, Payload: legacyPayload}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		_, _ = agentConn.WriteToUDP(legacy, serverUDPAddr)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("protocol v3 accepted a legacy token-only UDP register")
+	}
+
+	bound, err := authedUDPRegister("testtoken", sessionID, protocol.DefaultAgentID, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitTunnelCondition(t, 2*time.Second, "valid bound UDP register was not accepted", func() bool {
+		_, _ = agentConn.WriteToUDP(bound, serverUDPAddr)
+		return srv.testUDPAddrValid(protocol.DefaultAgentID)
+	})
+}
+
+func TestBoundUDPRegisterAcceptedFromMismatchedIP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	controlAddr := freeTCPAddr(t)
+	dataAddr := freeTCPAddr(t)
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "game", Proto: "udp", PublicAddr: freeUDPAddr(t)}},
+		Token:       "testtoken",
+		PairTimeout: 5 * time.Second,
+		DisableTLS:  true,
+	}, nil)
+	go func() { _ = srv.Run(ctx) }()
+	waitPublicUDPRoute(t, srv, "game")
+
+	// Identity/control-generation proof—not source-IP equality—authorizes
+	// split-path and NATed UDP endpoints.
+	identity := newFakeUDPIdentity(t)
+	installFakeUDPSession(srv, protocol.DefaultAgentID, "203.0.113.10:12345", identity)
 
 	serverUDPAddr, err := net.ResolveUDPAddr("udp", dataAddr)
 	if err != nil {
@@ -723,14 +842,14 @@ func TestUDPRegisterRejectedFromMismatchedIP(t *testing.T) {
 	defer agentConn.Close()
 
 	for i := 0; i < 5; i++ {
-		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), "default")
+		reg, err := authedUDPRegister("testtoken", newTestSessionID(t), "default", identity)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_, _ = agentConn.WriteToUDP(reg, serverUDPAddr)
 		time.Sleep(20 * time.Millisecond)
 	}
-	if srv.testUDPAddrValid(protocol.DefaultAgentID) {
-		t.Fatal("UDP register must be rejected when source IP does not match control peer")
+	if !srv.testUDPAddrValid(protocol.DefaultAgentID) {
+		t.Fatal("valid bound UDP register was rejected because its source IP differed from control")
 	}
 }

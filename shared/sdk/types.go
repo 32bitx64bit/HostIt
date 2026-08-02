@@ -13,6 +13,7 @@ type RegisterResponse = apitypes.RegisterResponse
 type DomainsResponse = apitypes.DomainsResponse
 type DomainSelectRequest = apitypes.DomainSelectRequest
 type StatusResponse = apitypes.StatusResponse
+type ServerInfoResponse = apitypes.ServerInfoResponse
 type DomainOption = apitypes.DomainOption
 
 type RouteUpdate = apitypes.RouteUpdate

@@ -2,8 +2,11 @@ package appstore
 
 import (
 	"context"
+	"database/sql"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func openTestStore(t *testing.T) *Store {
@@ -248,6 +251,178 @@ func TestAddRoute(t *testing.T) {
 	got, _ := s.GetApplication(ctx, "myapp")
 	if len(got.Routes) != 1 {
 		t.Fatalf("expected 1 route, got %d", len(got.Routes))
+	}
+}
+
+func TestUpdateRoutePreservesRowAndApplication(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	app, _ := s.CreateApplication(ctx, "sunshine", "h1")
+	added, err := s.AddRoute(ctx, app.ID, AppRoute{
+		RouteName:  "sunshine-stream",
+		Proto:      "both",
+		PublicAddr: ":47998",
+		LocalAddr:  "127.0.0.1:47998",
+		AgentID:    "agent-a",
+		Enabled:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateRoute(ctx, AppRoute{
+		RouteName:     added.RouteName,
+		Proto:         "both",
+		PublicAddr:    ":48000",
+		LocalAddr:     "127.0.0.1:48000",
+		AgentID:       "agent-a",
+		Encrypted:     true,
+		Domain:        "stream.example.com",
+		DomainEnabled: true,
+		Enabled:       true,
+	}); err != nil {
+		t.Fatalf("UpdateRoute: %v", err)
+	}
+
+	got, err := s.GetRouteByRouteName(ctx, added.RouteName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != added.ID || got.AppID != app.ID || !got.CreatedAt.Equal(added.CreatedAt) {
+		t.Fatalf("row identity changed: before=%+v after=%+v", added, got)
+	}
+	if got.PublicAddr != ":48000" || !got.Encrypted || !got.DomainEnabled {
+		t.Fatalf("updated route fields = %+v", got)
+	}
+	appAfter, err := s.GetApplication(ctx, "sunshine")
+	if err != nil || appAfter == nil || len(appAfter.Routes) != 1 || appAfter.Routes[0].ID != added.ID {
+		t.Fatalf("application route was not preserved: app=%+v err=%v", appAfter, err)
+	}
+
+	if err := s.UpdateRoute(ctx, AppRoute{RouteName: "missing", Proto: "udp"}); err == nil {
+		t.Fatal("UpdateRoute accepted a missing route")
+	}
+}
+
+func TestOpenIgnoresAndPreservesLegacyUDPClassColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-udp-class.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	for _, stmt := range []string{
+		`CREATE TABLE applications (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			label TEXT NOT NULL UNIQUE,
+			api_key_hash TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE app_routes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			app_id INTEGER NOT NULL,
+			route_name TEXT NOT NULL UNIQUE,
+			proto TEXT NOT NULL DEFAULT 'tcp',
+			udp_class TEXT NOT NULL DEFAULT 'standard',
+			public_addr TEXT NOT NULL DEFAULT '',
+			local_addr TEXT NOT NULL DEFAULT '',
+			agent_id TEXT NOT NULL DEFAULT 'default',
+			encrypted INTEGER NOT NULL DEFAULT 0,
+			domain TEXT NOT NULL DEFAULT '',
+			domain_enabled INTEGER NOT NULL DEFAULT 0,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at INTEGER NOT NULL,
+			FOREIGN KEY(app_id) REFERENCES applications(id) ON DELETE CASCADE
+		)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(
+		"INSERT INTO applications(label, api_key_hash, enabled, created_at) VALUES(?, ?, ?, ?)",
+		"legacy", "hash", 1, now,
+	); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO app_routes(app_id, route_name, proto, udp_class, public_addr, local_addr, enabled, created_at)
+		 VALUES(1, ?, ?, ?, ?, ?, 1, ?)`,
+		"legacy-route", "udp", "interactive", ":47999", "127.0.0.1:47999", now,
+	); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy database: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	legacy, err := s.GetRouteByRouteName(ctx, "legacy-route")
+	if err != nil {
+		t.Fatalf("read legacy route: %v", err)
+	}
+	if legacy == nil || legacy.Proto != "udp" || legacy.PublicAddr != ":47999" {
+		t.Fatalf("legacy route = %+v", legacy)
+	}
+
+	app, err := s.GetApplication(ctx, "legacy")
+	if err != nil || app == nil {
+		t.Fatalf("read legacy application: app=%+v err=%v", app, err)
+	}
+	added, err := s.AddRoute(ctx, app.ID, AppRoute{
+		RouteName:  "new-route",
+		Proto:      "both",
+		PublicAddr: ":48000",
+		LocalAddr:  "127.0.0.1:48000",
+		Enabled:    true,
+	})
+	if err != nil {
+		t.Fatalf("add route with legacy column present: %v", err)
+	}
+	readAdded, err := s.GetRouteByRouteName(ctx, added.RouteName)
+	if err != nil || readAdded == nil || readAdded.ID != added.ID {
+		t.Fatalf("read added route: route=%+v err=%v", readAdded, err)
+	}
+
+	if err := s.UpdateRoute(ctx, AppRoute{
+		RouteName:     added.RouteName,
+		Proto:         "udp",
+		PublicAddr:    ":48001",
+		LocalAddr:     "127.0.0.1:48001",
+		Encrypted:     true,
+		Domain:        "stream.example.com",
+		DomainEnabled: true,
+		Enabled:       true,
+	}); err != nil {
+		t.Fatalf("update route with legacy column present: %v", err)
+	}
+	updated, err := s.GetRouteByRouteName(ctx, added.RouteName)
+	if err != nil {
+		t.Fatalf("read updated route: %v", err)
+	}
+	if updated.ID != added.ID || updated.PublicAddr != ":48001" || updated.LocalAddr != "127.0.0.1:48001" || !updated.Encrypted {
+		t.Fatalf("updated route = %+v", updated)
+	}
+
+	var legacyClass, addedClass string
+	if err := s.db.QueryRowContext(ctx, "SELECT udp_class FROM app_routes WHERE route_name = ?", "legacy-route").Scan(&legacyClass); err != nil {
+		t.Fatalf("legacy udp_class column was removed: %v", err)
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT udp_class FROM app_routes WHERE route_name = ?", added.RouteName).Scan(&addedClass); err != nil {
+		t.Fatalf("read default legacy udp_class: %v", err)
+	}
+	if legacyClass != "interactive" || addedClass != "standard" {
+		t.Fatalf("legacy udp_class values changed: legacy=%q added=%q", legacyClass, addedClass)
 	}
 }
 

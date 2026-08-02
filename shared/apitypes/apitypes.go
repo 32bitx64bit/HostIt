@@ -98,6 +98,14 @@ type StatusResponse struct {
 	DomainBase  string `json:"domain_base,omitempty"`
 }
 
+// ServerInfoResponse is returned by GET /api/v1/server.
+type ServerInfoResponse struct {
+	// PublicAddr is the tunnel server's hostname or IP (no port). Combine with
+	// a route's public_addr port (often ":12345") to form a reachable endpoint.
+	PublicAddr string `json:"public_addr"`
+	Connected  bool   `json:"connected"`
+}
+
 type RouteUpdate struct {
 	RequestID  string `json:"request_id"`
 	Name       string `json:"name"`

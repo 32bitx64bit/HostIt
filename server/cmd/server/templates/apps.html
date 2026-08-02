@@ -55,7 +55,7 @@ function buildApps(){
 async function loadApps(){
   var apps=null;
   try{apps=await fetchJSON('/api/apps/list');}catch(e){}
-  if(!apps){$('#onLabel').textContent='error';$('#appsList').innerHTML='<div class="muted">Failed to load apps.</div>';return;}
+  if(!Array.isArray(apps)){$('#onLabel').textContent='error';$('#appsList').innerHTML='<div class="muted">Failed to load apps.</div>';return;}
   $('#onLabel').textContent='ONLINE';
   renderApps(apps);
 }

@@ -30,12 +30,21 @@ type VersionPayload struct {
 const DefaultAgentID = "default"
 
 // ProtocolVersion is the tunnel wire-protocol version (major gates compatibility).
-const ProtocolVersion = "2.0.0"
+// Version 3 requires identity- and control-generation-bound UDP registration.
+const ProtocolVersion = "3.0.0"
 
 var ProtocolVersionParsed = version.MustParse(ProtocolVersion)
 
-// SupportedFeatures are optional capabilities negotiated per connection.
-var SupportedFeatures = []string{}
+const (
+	// FeatureBoundUDPRegister names protocol v3's mandatory UDP registration
+	// capability for diagnostics. Every v3 runtime must require the
+	// identity/control-generation-bound v4 format.
+	FeatureBoundUDPRegister = "udp-register-v4"
+)
+
+// SupportedFeatures are the capability identifiers advertised during version
+// negotiation. FeatureBoundUDPRegister is mandatory for protocol v3 runtimes.
+var SupportedFeatures = []string{FeatureBoundUDPRegister}
 
 func IsCompatibleWith(local, peer version.Version) bool {
 	return local.Major == peer.Major
@@ -63,4 +72,14 @@ func NegotiateFeatures(local, peer []string) []string {
 	}
 	sort.Strings(shared)
 	return shared
+}
+
+// HasFeature reports whether a negotiated feature set contains feature.
+func HasFeature(features []string, feature string) bool {
+	for _, f := range features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
 }

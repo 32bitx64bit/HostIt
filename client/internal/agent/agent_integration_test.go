@@ -140,7 +140,7 @@ func (s *fakeTunnelServer) acceptControl() {
 		close(s.controlReadyCh)
 		return
 	}
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		_ = conn.Close()
 		close(s.controlReadyCh)
@@ -335,8 +335,8 @@ func (s *fakeTunnelServer) waitForAgentUDPAddr(t *testing.T) *net.UDPAddr {
 			continue
 		}
 		if pkt.Type == protocol.TypeRegister {
-			if _, sessionID, _, ok := sharedcrypto.VerifyUDPRegister(s.token, pkt.Payload, time.Now(), time.Minute); ok {
-				s.agentSessionID = sessionID
+			if reg, ok := sharedcrypto.ParseBoundUDPRegister(s.token, pkt.Payload, time.Now(), time.Minute); ok {
+				s.agentSessionID = reg.SessionID
 				s.agentSessionOK = true
 			}
 			return addr

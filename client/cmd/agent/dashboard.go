@@ -1037,6 +1037,29 @@ func serveAgentDashboard(ctx context.Context, addr string, configPath string, ct
 		})
 	})
 
+	mux.HandleFunc("/api/v1/server", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		cfg, running, connected, _, _ := ctrl.Get()
+		publicAddr := ""
+		if ag := ctrl.GetAgent(); ag != nil {
+			publicAddr = ag.ServerPublicAddr()
+		} else if host := strings.TrimSpace(cfg.Server); host != "" {
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				publicAddr = h
+			} else {
+				publicAddr = host
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeOK(w, apitypes.ServerInfoResponse{
+			PublicAddr: publicAddr,
+			Connected:  running && connected,
+		})
+	})
+
 	handleJSON("/api/v1/routes/update", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch && r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")

@@ -134,15 +134,28 @@ func TestMaxSizedFieldsAndPayloadRoundTrip(t *testing.T) {
 		t.Fatal("max-sized TCP packet did not round-trip")
 	}
 
-	udpData, err := MarshalUDP(pkt, nil)
+	if _, err := MarshalUDP(pkt, nil); !errors.Is(err, ErrUDPDatagramTooBig) {
+		t.Fatalf("MarshalUDP oversized datagram error = %v, want ErrUDPDatagramTooBig", err)
+	}
+
+	udpPkt := &Packet{
+		Type:    TypeData,
+		Route:   pkt.Route,
+		Client:  pkt.Client,
+		Payload: payload[:MaxUDPDatagramSize-UDPFrameLen(pkt.Route, pkt.Client, 0)],
+	}
+	udpData, err := MarshalUDP(udpPkt, nil)
 	if err != nil {
-		t.Fatalf("MarshalUDP max packet: %v", err)
+		t.Fatalf("MarshalUDP maximum legal datagram: %v", err)
+	}
+	if len(udpData) != MaxUDPDatagramSize {
+		t.Fatalf("maximum legal UDP datagram len = %d, want %d", len(udpData), MaxUDPDatagramSize)
 	}
 	var udpGot Packet
 	if err := UnmarshalUDPTo(udpData, &udpGot); err != nil {
 		t.Fatalf("UnmarshalUDPTo max packet: %v", err)
 	}
-	if udpGot.Type != pkt.Type || udpGot.Route != pkt.Route || udpGot.Client != pkt.Client || !bytes.Equal(udpGot.Payload, pkt.Payload) {
+	if udpGot.Type != udpPkt.Type || udpGot.Route != udpPkt.Route || udpGot.Client != udpPkt.Client || !bytes.Equal(udpGot.Payload, udpPkt.Payload) {
 		t.Fatal("max-sized UDP packet did not round-trip")
 	}
 }
@@ -201,6 +214,9 @@ func TestMaxPayloadSizeEnforcement(t *testing.T) {
 }
 
 func TestUDPFrameSizeHelpers(t *testing.T) {
+	if RecommendedMaxUDPDatagramSize != 1200 {
+		t.Fatalf("recommended outer UDP datagram size = %d, want 1200", RecommendedMaxUDPDatagramSize)
+	}
 	if got, want := UDPFrameLen("game", "127.0.0.1:40000", 1200), 1+1+len("game")+1+len("127.0.0.1:40000")+1200; got != want {
 		t.Fatalf("UDPFrameLen() = %d, want %d", got, want)
 	}
@@ -212,6 +228,90 @@ func TestUDPFrameSizeHelpers(t *testing.T) {
 	}
 	if !UDPFrameExceedsRecommendedSize(RecommendedMaxUDPDatagramSize + 1) {
 		t.Fatal("frame above recommended max size should be reported")
+	}
+}
+
+func TestMarshalUDPDatagramBoundaries(t *testing.T) {
+	route := "sunshine-control"
+	client := "[2001:db8::1234]:47999"
+	frameOverhead := UDPFrameLen(route, client, 0)
+
+	atTarget := &Packet{
+		Type:    TypeData,
+		Route:   route,
+		Client:  client,
+		Payload: make([]byte, RecommendedMaxUDPDatagramSize-frameOverhead),
+	}
+	targetData, err := MarshalUDP(atTarget, nil)
+	if err != nil {
+		t.Fatalf("MarshalUDP recommended boundary: %v", err)
+	}
+	if len(targetData) != RecommendedMaxUDPDatagramSize {
+		t.Fatalf("recommended-boundary datagram len = %d, want %d", len(targetData), RecommendedMaxUDPDatagramSize)
+	}
+
+	// The recommended target is warning-only: the next byte still marshals.
+	aboveTarget := *atTarget
+	aboveTarget.Payload = make([]byte, len(atTarget.Payload)+1)
+	aboveTargetData, err := MarshalUDP(&aboveTarget, nil)
+	if err != nil {
+		t.Fatalf("MarshalUDP above recommended target: %v", err)
+	}
+	if !UDPFrameExceedsRecommendedSize(len(aboveTargetData)) {
+		t.Fatal("datagram above recommended target was not reported as oversized")
+	}
+
+	atMaximum := *atTarget
+	atMaximum.Payload = make([]byte, MaxUDPDatagramSize-frameOverhead)
+	maximumData, err := MarshalUDP(&atMaximum, nil)
+	if err != nil {
+		t.Fatalf("MarshalUDP maximum boundary: %v", err)
+	}
+	if len(maximumData) != MaxUDPDatagramSize {
+		t.Fatalf("maximum-boundary datagram len = %d, want %d", len(maximumData), MaxUDPDatagramSize)
+	}
+	var decoded Packet
+	if err := UnmarshalUDPTo(maximumData, &decoded); err != nil {
+		t.Fatalf("UnmarshalUDPTo maximum boundary: %v", err)
+	}
+	oversizedWire := append(append([]byte(nil), maximumData...), 0)
+	if err := UnmarshalUDPTo(oversizedWire, &decoded); !errors.Is(err, ErrUDPDatagramTooBig) {
+		t.Fatalf("UnmarshalUDPTo above maximum error = %v, want ErrUDPDatagramTooBig", err)
+	}
+
+	aboveMaximum := atMaximum
+	aboveMaximum.Payload = make([]byte, len(atMaximum.Payload)+1)
+	if _, err := MarshalUDP(&aboveMaximum, nil); !errors.Is(err, ErrUDPDatagramTooBig) {
+		t.Fatalf("MarshalUDP above maximum error = %v, want ErrUDPDatagramTooBig", err)
+	}
+}
+
+func TestMarshalUDPMaximumIncludesEncryptionOverhead(t *testing.T) {
+	const udpEncryptionOverhead = 12 + 16 // GCM nonce plus authentication tag.
+	route := "sunshine-video"
+	client := "203.0.113.10:47998"
+	frameOverhead := UDPFrameLen(route, client, 0)
+	maxPlaintext := MaxUDPDatagramSize - frameOverhead - udpEncryptionOverhead
+
+	// MarshalUDP receives ciphertext, so nonce/tag bytes count toward the
+	// complete datagram limit exactly like application payload bytes.
+	encrypted := &Packet{
+		Type:    TypeData,
+		Route:   route,
+		Client:  client,
+		Payload: make([]byte, maxPlaintext+udpEncryptionOverhead),
+	}
+	data, err := MarshalUDP(encrypted, nil)
+	if err != nil {
+		t.Fatalf("MarshalUDP maximum encrypted payload: %v", err)
+	}
+	if len(data) != MaxUDPDatagramSize {
+		t.Fatalf("maximum encrypted datagram len = %d, want %d", len(data), MaxUDPDatagramSize)
+	}
+
+	encrypted.Payload = make([]byte, maxPlaintext+1+udpEncryptionOverhead)
+	if _, err := MarshalUDP(encrypted, nil); !errors.Is(err, ErrUDPDatagramTooBig) {
+		t.Fatalf("MarshalUDP oversized encrypted payload error = %v, want ErrUDPDatagramTooBig", err)
 	}
 }
 

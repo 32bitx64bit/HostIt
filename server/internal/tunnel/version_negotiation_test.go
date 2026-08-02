@@ -14,6 +14,10 @@ import (
 )
 
 func negotiateAsAgent(t *testing.T, controlAddr, token, agentVersion string) (net.Conn, protocol.VersionPayload) {
+	return negotiateAsAgentWithFeatures(t, controlAddr, token, agentVersion, protocol.SupportedFeatures)
+}
+
+func negotiateAsAgentWithFeatures(t *testing.T, controlAddr, token, agentVersion string, features []string) (net.Conn, protocol.VersionPayload) {
 	t.Helper()
 	var conn net.Conn
 	var err error
@@ -35,7 +39,7 @@ func negotiateAsAgent(t *testing.T, controlAddr, token, agentVersion string) (ne
 		t.Fatalf("auth: %v", err)
 	}
 	pub, sig := testIdentity(serverNonce)
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: agentVersion, PublicKey: pub, IdentitySig: sig})
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: agentVersion, Features: features, PublicKey: pub, IdentitySig: sig})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		conn.Close()
 		t.Fatalf("write version: %v", err)
@@ -95,6 +99,32 @@ func TestVersionMismatchRejectedWithReason(t *testing.T) {
 	}
 }
 
+func TestVersionThreeRequiresBoundUDPFeature(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	controlAddr := freeTCPAddr(t)
+	dataAddr := freeTCPAddr(t)
+	srv := NewServer(ServerConfig{
+		ControlAddr: controlAddr,
+		DataAddr:    dataAddr,
+		Routes:      []RouteConfig{{Name: "default", Proto: "tcp"}},
+		Token:       "testtoken",
+		PairTimeout: time.Second,
+		DisableTLS:  true,
+	}, nil)
+	go func() { _ = srv.Run(ctx) }()
+
+	conn, vp := negotiateAsAgentWithFeatures(t, controlAddr, "testtoken", protocol.ProtocolVersion, nil)
+	defer conn.Close()
+	if vp.Error == "" {
+		t.Fatal("protocol v3 peer without the bound UDP feature was accepted")
+	}
+	if !strings.Contains(vp.Error, protocol.FeatureBoundUDPRegister) {
+		t.Fatalf("rejection %q does not name mandatory feature %q", vp.Error, protocol.FeatureBoundUDPRegister)
+	}
+}
+
 // TestSameMajorNewerMinorAccepted pins the fixed compatibility rule: a peer
 // with the same major but different minor must be accepted in both
 // directions (the old rule rejected any minor difference on one side).
@@ -117,8 +147,8 @@ func TestSameMajorNewerMinorAccepted(t *testing.T) {
 	for _, agentVer := range []string{
 		protocol.ProtocolVersionParsed.String(),
 		// Same major, newer minor and older patch permutations.
-		"2.99.0",
-		"2.0.99",
+		"3.99.0",
+		"3.0.99",
 	} {
 		conn, vp := negotiateAsAgent(t, controlAddr, "testtoken", agentVer)
 		if vp.Error != "" {

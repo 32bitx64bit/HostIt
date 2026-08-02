@@ -170,6 +170,25 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 	return &result, nil
 }
 
+// ServerInfo returns the tunnel server's public hostname or IP so apps can
+// build reachable endpoints from route public_addr values (often ":port").
+func (c *Client) ServerInfo(ctx context.Context) (*ServerInfoResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/server", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var result ServerInfoResponse
+	if err := decodeResponse(resp, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 func (c *Client) UpdateRoute(ctx context.Context, name string, req RouteUpdate) (*RegisterResponse, error) {
 	bodyMap := map[string]any{"name": name}
 	if req.LocalAddr != "" {

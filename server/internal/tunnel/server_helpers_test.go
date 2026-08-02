@@ -42,6 +42,9 @@ func TestBuildHelloPayloadIncludesRoutesAndEmailConfig(t *testing.T) {
 	if !rt.Encrypted {
 		t.Fatal("Encrypted = false, want true")
 	}
+	if payload.PublicAddr != "" {
+		t.Fatalf("PublicAddr = %q, want empty when unset", payload.PublicAddr)
+	}
 	if !payload.Email.Enabled {
 		t.Fatal("Email.Enabled = false, want true")
 	}
@@ -67,6 +70,21 @@ func TestBuildHelloPayloadIncludesRoutesAndEmailConfig(t *testing.T) {
 	}
 	if submissionRT.PublicAddr != ":587" || submissionRT.LocalAddr != "127.0.0.1:1587" {
 		t.Fatalf("submission route = %#v, want public :587 local 127.0.0.1:1587", submissionRT)
+	}
+}
+
+func TestBuildHelloPayloadIncludesServerPublicAddr(t *testing.T) {
+	cfg := ServerConfig{
+		PublicAddr: "203.0.113.10",
+		Routes:     []RouteConfig{{Name: "web", Proto: "tcp", PublicAddr: ":8080"}},
+	}
+	payload := buildHelloPayload(cfg, nil)
+	if payload.PublicAddr != "203.0.113.10" {
+		t.Fatalf("PublicAddr = %q, want %q", payload.PublicAddr, "203.0.113.10")
+	}
+	forAgent := buildHelloPayloadForAgent(cfg, nil, "default")
+	if forAgent.PublicAddr != "203.0.113.10" {
+		t.Fatalf("for-agent PublicAddr = %q, want %q", forAgent.PublicAddr, "203.0.113.10")
 	}
 }
 

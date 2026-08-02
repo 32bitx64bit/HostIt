@@ -10,13 +10,15 @@ import (
 // BenchmarkMarshalUDP measures UDP packet serialization for a range of
 // payload sizes (small DNS/game packets up to full MTU).
 func BenchmarkMarshalUDP(b *testing.B) {
-	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
+	const route, client = "benchroute", "clientabc"
+	recommendedPayload := RecommendedMaxUDPDatagramSize - UDPFrameLen(route, client, 0)
+	sizes := []int{64, 512, recommendedPayload, 8192, 32 * 1024}
 	for _, n := range sizes {
 		b.Run(payloadName(n), func(b *testing.B) {
 			pkt := &Packet{
 				Type:    TypeData,
-				Route:   "benchroute",
-				Client:  "clientabc",
+				Route:   route,
+				Client:  client,
 				Payload: make([]byte, n),
 			}
 			buf := make([]byte, 65536)
@@ -35,13 +37,15 @@ func BenchmarkMarshalUDP(b *testing.B) {
 // BenchmarkUnmarshalUDP measures UDP frame parsing. The cost is paid twice
 // per packet (server ingress and egress to agent).
 func BenchmarkUnmarshalUDP(b *testing.B) {
-	sizes := []int{64, 512, 1400, 8192, 32 * 1024}
+	const route, client = "benchroute", "clientabc"
+	recommendedPayload := RecommendedMaxUDPDatagramSize - UDPFrameLen(route, client, 0)
+	sizes := []int{64, 512, recommendedPayload, 8192, 32 * 1024}
 	for _, n := range sizes {
 		b.Run(payloadName(n), func(b *testing.B) {
 			src := &Packet{
 				Type:    TypeData,
-				Route:   "benchroute",
-				Client:  "clientabc",
+				Route:   route,
+				Client:  client,
 				Payload: make([]byte, n),
 			}
 			frame, err := MarshalUDP(src, make([]byte, 65536))
@@ -154,7 +158,9 @@ func BenchmarkReadPacketTo(b *testing.B) {
 // loopback sockets, surfacing syscall/GC overhead missed by in-memory
 // benchmarks.
 func BenchmarkUDPRoundTrip(b *testing.B) {
-	sizes := []int{64, 512, 1400, 8192}
+	const route, clientID = "rt", "c1"
+	recommendedPayload := RecommendedMaxUDPDatagramSize - UDPFrameLen(route, clientID, 0)
+	sizes := []int{64, 512, recommendedPayload, 8192}
 	for _, n := range sizes {
 		b.Run(payloadName(n), func(b *testing.B) {
 			server, err := net.ListenUDP("udp", nil)
@@ -178,8 +184,8 @@ func BenchmarkUDPRoundTrip(b *testing.B) {
 			rand.Read(payload)
 			outPkt := &Packet{
 				Type:    TypeData,
-				Route:   "rt",
-				Client:  "c1",
+				Route:   route,
+				Client:  clientID,
 				Payload: payload,
 			}
 			outFrame, err := MarshalUDP(outPkt, make([]byte, 65536))

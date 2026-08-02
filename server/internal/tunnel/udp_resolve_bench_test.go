@@ -22,7 +22,7 @@ func benchResolveServer(b *testing.B) (*Server, func()) {
 		Routes:      []RouteConfig{{Name: "rt", Proto: "udp", PublicAddr: ":0", Agent: "agent-a"}},
 	}, nil)
 	srv.updateRouteCache()
-	srv.updateUDPAgentAddr("agent-a", netip.MustParseAddrPort("127.0.0.1:40000"), crypto.UDPSessionID{}, time.Now().UnixNano())
+	srv.updateUDPAgentAddr("agent-a", netip.MustParseAddrPort("127.0.0.1:40000"), crypto.UDPSessionID{}, crypto.UDPControlNonce{}, time.Now().UnixNano())
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		b.Fatal(err)

@@ -39,6 +39,18 @@ func TestIsCompatibleWith(t *testing.T) {
 	}
 }
 
+func TestCurrentProtocolRequiresVersionThree(t *testing.T) {
+	if ProtocolVersion != "3.0.0" {
+		t.Fatalf("ProtocolVersion = %q, want 3.0.0", ProtocolVersion)
+	}
+	if ProtocolVersionParsed.Major != 3 {
+		t.Fatalf("current protocol major = %d, want 3", ProtocolVersionParsed.Major)
+	}
+	if IsCompatibleWith(ProtocolVersionParsed, v("2.99.99")) {
+		t.Fatal("protocol v3 accepted a v2 peer")
+	}
+}
+
 func TestNegotiateFeatures(t *testing.T) {
 	cases := []struct {
 		local, peer, want []string
@@ -54,6 +66,21 @@ func TestNegotiateFeatures(t *testing.T) {
 		if got := NegotiateFeatures(c.local, c.peer); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("NegotiateFeatures(%v, %v) = %v, want %v", c.local, c.peer, got, c.want)
 		}
+	}
+}
+
+func TestBoundUDPRegisterFeatureIsAdvertised(t *testing.T) {
+	if FeatureBoundUDPRegister != "udp-register-v4" {
+		t.Fatalf("bound UDP feature = %q, want udp-register-v4", FeatureBoundUDPRegister)
+	}
+	if !HasFeature(SupportedFeatures, FeatureBoundUDPRegister) {
+		t.Fatalf("mandatory feature %q is not advertised in %v", FeatureBoundUDPRegister, SupportedFeatures)
+	}
+	if HasFeature(SupportedFeatures, "not-supported") {
+		t.Fatal("unknown feature reported as supported")
+	}
+	if HasFeature(nil, FeatureBoundUDPRegister) {
+		t.Fatal("nil feature set reported a feature")
 	}
 }
 

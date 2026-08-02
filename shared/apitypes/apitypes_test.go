@@ -318,6 +318,24 @@ func TestStatusResponseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestServerInfoResponseRoundTrip(t *testing.T) {
+	orig := ServerInfoResponse{
+		PublicAddr: "203.0.113.10",
+		Connected:  true,
+	}
+	data, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ServerInfoResponse
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded != orig {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", decoded, orig)
+	}
+}
+
 func TestAPIKeyRoundTrip(t *testing.T) {
 	orig := APIKey{
 		Key:              "hit_abc123",

@@ -169,6 +169,14 @@ client.UpdateRoute(ctx, "my-app", sdk.RouteUpdate{
 })
 ```
 
+### UDP Scheduling
+
+The UDP tunnel serves one datagram per active route in round-robin order, so a high-volume route cannot monopolize the shared tunnel socket while another route has packets waiting. Registration traffic uses a separate internal priority queue. This behavior is automatic and requires no per-route traffic-class configuration.
+
+> The identity-bound UDP registration and route-fair transport uses protocol v3. Upgrade the server and every agent together; protocol-v2 peers are intentionally rejected instead of silently falling back to the unsafe registration path.
+
+The tunnel warns when an outer UDP datagram exceeds its conservative 1,200-byte path target. If a Sunshine/Moonlight path shows fragmentation loss, measure the path MTU and lower Sunshine's `packetsize` (or the Moonlight equivalent where available); 1,024 bytes is a conservative starting point. HostIt accepts complete outer frames above 1,200 bytes up to the 65,507-byte UDP limit, although normal queue pressure or the network can still drop UDP traffic.
+
 ### Other Operations
 
 ```go
@@ -176,8 +184,22 @@ routes, _ := client.ListRoutes(ctx)               // all active routes
 stats, _  := client.RouteStats(ctx, "my-app")      // per-route status
 client.RemoveRoute(ctx, "my-app")                   // unregister
 status, _ := client.Status(ctx)                     // agent connection status
+info, _   := client.ServerInfo(ctx)                 // tunnel server public IP/hostname
 wsURL    := client.EventsURL()                      // WebSocket URL for live events
 ```
+
+Route `public_addr` values are usually port-only (for example `:47998`). Use `ServerInfo` to get the tunnel server's hostname or IP, then combine them:
+
+```go
+info, err := client.ServerInfo(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+// info.PublicAddr is "203.0.113.10"; resp.PublicAddr is ":12345"
+fmt.Printf("Reachable at %s%s\n", info.PublicAddr, resp.PublicAddr)
+```
+
+Set `PublicAddr` in `server.json` to the hostname or IP clients should dial (no port). When unset, the agent falls back to the host from its configured server address.
 
 ### HTTP API Reference
 
@@ -216,6 +238,7 @@ Every response is a JSON object with a `status` field:
 | `POST` / `PATCH` | `/api/v1/routes/update` | Update an existing route |
 | `GET` | `/api/v1/route/stats?name={name}` | Get per-route status |
 | `GET` | `/api/v1/status` | Get agent connection status |
+| `GET` | `/api/v1/server` | Get tunnel server public IP/hostname |
 | `GET` | `/api/v1/domains` | List available domains |
 | `POST` | `/api/v1/domains/select` | Confirm a domain choice |
 | `WebSocket` | `/api/v1/events` | Subscribe to live route events |
@@ -326,6 +349,17 @@ Only include fields you want to change. The response `data` is `{"status":"updat
   "routes_count": 2
 }
 ```
+
+**`ServerInfoResponse`** — returned by `GET /api/v1/server`
+
+```json
+{
+  "public_addr": "203.0.113.10",
+  "connected": true
+}
+```
+
+`public_addr` is the tunnel server hostname or IP (no port). Combine it with a route's port-only `public_addr` (for example `:12345`) to form a reachable endpoint. Prefer setting `PublicAddr` in `server.json`; otherwise the agent falls back to the host from its configured server address.
 
 **`DomainsResponse`** — returned by `GET /api/v1/domains`
 

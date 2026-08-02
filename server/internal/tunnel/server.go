@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -28,6 +29,7 @@ import (
 	"hostit/shared/netutil"
 	"hostit/shared/protocol"
 	"hostit/shared/relay"
+	"hostit/shared/udpfair"
 	"hostit/shared/version"
 )
 
@@ -60,6 +62,10 @@ const (
 	udpRegisterTimeout     = 60 * time.Second
 	// Clock-skew/replay window for authenticated UDP registers.
 	udpRegisterAuthWindow = 30 * time.Second
+	// Keep the last authenticated UDP path alive across a short control-plane
+	// reconnect. A replacement registration is bound to a fresh control nonce,
+	// so it can safely cancel this expiry without relying on source IP.
+	udpControlLossGrace   = 15 * time.Second
 	domainShutdownTimeout = 5 * time.Second
 	nettestTimeout        = 2 * time.Second
 	bwTestTimeout         = 5 * time.Second
@@ -71,11 +77,13 @@ const (
 var handshakeDeadline = 15 * time.Second
 
 type agentSession struct {
-	conn        net.Conn
-	cancel      context.CancelFunc
-	agentID     string
-	remoteAddr  string
-	connectTime time.Time
+	conn              net.Conn
+	cancel            context.CancelFunc
+	agentID           string
+	remoteAddr        string
+	connectTime       time.Time
+	identityPublicKey []byte
+	controlNonce      crypto.UDPControlNonce
 	// features is the negotiated capability intersection for this session.
 	features []string
 	writeMu  sync.Mutex
@@ -191,11 +199,16 @@ type Server struct {
 	baseKey     []byte
 
 	// Per-agent UDP state, keyed by agent ID. Published copy-on-write by the
-	// acceptAgentUDP goroutine; acceptPublicUDP goroutines read it lock-free.
+	// registry mutation helpers; forwarding goroutines read it lock-free.
 	udpAgents atomic.Pointer[map[string]*agentUDPState]
+	// udpAgentsMu serializes the complete load-clone-store transaction. An
+	// atomic pointer alone does not make concurrent copy-on-write updates safe.
+	udpAgentsMu    sync.Mutex
+	udpGraceTimers map[string]*udpGraceTimer
 
 	mu            sync.RWMutex
 	udpDataConn   *net.UDPConn
+	udpEgress     *serverUDPEgress
 	controlLn     net.Listener
 	dataLn        net.Listener
 	domainHTTPLn  net.Listener
@@ -225,10 +238,14 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// stopping is set before Stop snapshots listeners. Route mutations that
+	// could add a goroutine/listener must reject work once it becomes true.
+	stopping atomic.Bool
 
 	dash *dashState
 
-	routeCache atomic.Value
+	routeCache     atomic.Value
+	nextRouteEpoch uint64 // guarded by mu; zero is reserved for uninitialized routes
 
 	sessionsMu sync.Mutex
 	sessions   map[string]*agentSession
@@ -259,9 +276,102 @@ type Server struct {
 }
 
 type agentUDPState struct {
-	addr     netip.AddrPort
-	lastSeen atomic.Int64 // unix nano
-	crypto   *agentUDPCrypto
+	addr         netip.AddrPort
+	lastSeen     atomic.Int64 // unix nano
+	sessionID    crypto.UDPSessionID
+	crypto       *agentUDPCrypto
+	controlNonce crypto.UDPControlNonce
+}
+
+type udpGraceTimer struct {
+	controlNonce crypto.UDPControlNonce
+	timer        *time.Timer
+}
+
+const maxSeenUDPRegistersPerAgent = 32
+
+// udpRegisterReplayCache keeps replay bookkeeping bounded per authenticated
+// identity. It is owned by the single acceptAgentUDP goroutine and therefore
+// needs no lock. A flooded identity can temporarily deny only its own new
+// registrations; it cannot grow a global map or evict another agent's proofs.
+type udpRegisterReplayCache struct {
+	entries map[string]*udpRegisterReplayBucket
+}
+
+type udpRegisterReplayBucket struct {
+	controlNonce crypto.UDPControlNonce
+	entries      map[crypto.UDPRegisterKey]int64
+}
+
+func newUDPRegisterReplayCache() *udpRegisterReplayCache {
+	return &udpRegisterReplayCache{entries: make(map[string]*udpRegisterReplayBucket)}
+}
+
+// status performs the cheap pre-verification checks for the currently cached
+// control generation. A different generation must first pass live-session and
+// identity verification before it is allowed to replace the bucket.
+func (c *udpRegisterReplayCache) status(agentID string, controlNonce crypto.UDPControlNonce, key crypto.UDPRegisterKey, nowNano int64) (seen, full bool) {
+	bucket := c.entries[agentID]
+	if bucket == nil || bucket.controlNonce != controlNonce {
+		return false, false
+	}
+	expires, ok := bucket.entries[key]
+	if !ok {
+		c.pruneBucket(agentID, bucket, nowNano)
+		return false, len(bucket.entries) >= maxSeenUDPRegistersPerAgent
+	}
+	if expires < nowNano {
+		delete(bucket.entries, key)
+		if len(bucket.entries) == 0 {
+			delete(c.entries, agentID)
+		}
+		return false, false
+	}
+	return true, false
+}
+
+func (c *udpRegisterReplayCache) record(agentID string, controlNonce crypto.UDPControlNonce, key crypto.UDPRegisterKey, expiresNano, nowNano int64) bool {
+	bucket := c.entries[agentID]
+	if bucket == nil || bucket.controlNonce != controlNonce {
+		bucket = &udpRegisterReplayBucket{
+			controlNonce: controlNonce,
+			entries:      make(map[crypto.UDPRegisterKey]int64, maxSeenUDPRegistersPerAgent),
+		}
+		c.entries[agentID] = bucket
+	} else {
+		c.pruneBucket(agentID, bucket, nowNano)
+		// pruneBucket removes an empty bucket from the authoritative map. Do
+		// not populate that detached pointer; recreate it before recording.
+		if c.entries[agentID] == nil {
+			bucket = &udpRegisterReplayBucket{
+				controlNonce: controlNonce,
+				entries:      make(map[crypto.UDPRegisterKey]int64, maxSeenUDPRegistersPerAgent),
+			}
+			c.entries[agentID] = bucket
+		}
+	}
+	if len(bucket.entries) >= maxSeenUDPRegistersPerAgent {
+		return false
+	}
+	bucket.entries[key] = expiresNano
+	return true
+}
+
+func (c *udpRegisterReplayCache) prune(nowNano int64) {
+	for agentID, bucket := range c.entries {
+		c.pruneBucket(agentID, bucket, nowNano)
+	}
+}
+
+func (c *udpRegisterReplayCache) pruneBucket(agentID string, bucket *udpRegisterReplayBucket, nowNano int64) {
+	for key, expires := range bucket.entries {
+		if expires < nowNano {
+			delete(bucket.entries, key)
+		}
+	}
+	if len(bucket.entries) == 0 {
+		delete(c.entries, agentID)
+	}
 }
 
 // agentUDPCrypto is the server's view of one agent UDP session: it seals
@@ -366,12 +476,19 @@ func (s *Server) publishPublicUDPLocked() {
 	s.publicUDPSnap.Store(&cp)
 }
 
-// updateUDPAgentAddr is copy-on-write when the addr/session changes; only
-// acceptAgentUDP calls it (single writer). Refresh-only updates store lastSeen
-// in place to avoid cloning the agent map every ~2s.
-func (s *Server) updateUDPAgentAddr(agentID string, addr netip.AddrPort, sessionID crypto.UDPSessionID, nowNano int64) {
+// updateUDPAgentAddr publishes one authenticated endpoint generation. The
+// mutex covers the whole copy-on-write transaction; callers that also hold
+// sessionsMu must always acquire sessionsMu first.
+func (s *Server) updateUDPAgentAddr(agentID string, addr netip.AddrPort, sessionID crypto.UDPSessionID, controlNonce crypto.UDPControlNonce, nowNano int64) {
+	s.udpAgentsMu.Lock()
+	defer s.udpAgentsMu.Unlock()
+	s.updateUDPAgentAddrLocked(agentID, addr, sessionID, controlNonce, nowNano)
+}
+
+func (s *Server) updateUDPAgentAddrLocked(agentID string, addr netip.AddrPort, sessionID crypto.UDPSessionID, controlNonce crypto.UDPControlNonce, nowNano int64) {
+	s.cancelUDPGraceLocked(agentID)
 	old := s.loadUDPAgents()
-	if st := old[agentID]; st != nil && st.addr == addr && st.crypto != nil && st.crypto.sessionID == sessionID {
+	if st := old[agentID]; st != nil && st.addr == addr && st.sessionID == sessionID && st.controlNonce == controlNonce {
 		st.lastSeen.Store(nowNano)
 		return
 	}
@@ -388,7 +505,7 @@ func (s *Server) updateUDPAgentAddr(agentID string, addr netip.AddrPort, session
 			logging.Global().Infof(logging.CatUDP, "UDP session keys rotated for agent %q session %x…", agentID, sessionID[:4])
 		}
 	}
-	next := &agentUDPState{addr: addr, crypto: uc}
+	next := &agentUDPState{addr: addr, sessionID: sessionID, crypto: uc, controlNonce: controlNonce}
 	next.lastSeen.Store(nowNano)
 	newMap := make(map[string]*agentUDPState, len(old)+1)
 	for k, v := range old {
@@ -399,6 +516,12 @@ func (s *Server) updateUDPAgentAddr(agentID string, addr netip.AddrPort, session
 }
 
 func (s *Server) pruneUDPAgents(nowNano int64) {
+	s.udpAgentsMu.Lock()
+	defer s.udpAgentsMu.Unlock()
+	s.pruneUDPAgentsLocked(nowNano)
+}
+
+func (s *Server) pruneUDPAgentsLocked(nowNano int64) {
 	old := s.loadUDPAgents()
 	if len(old) == 0 {
 		return
@@ -420,8 +543,80 @@ func (s *Server) pruneUDPAgents(nowNano int64) {
 	for _, id := range stale {
 		logging.Global().Infof(logging.CatUDP, "Agent %q UDP address timed out after %s inactivity", id, udpRegisterTimeout)
 		delete(newMap, id)
+		s.cancelUDPGraceLocked(id)
 	}
 	s.udpAgents.Store(&newMap)
+}
+
+// scheduleUDPAgentClearLocked starts a generation-safe expiry for the UDP
+// endpoint currently published for agentID. The caller must hold sessionsMu;
+// this preserves the global sessionsMu -> udpAgentsMu lock order.
+func (s *Server) scheduleUDPAgentClearLocked(agentID string) {
+	s.udpAgentsMu.Lock()
+	defer s.udpAgentsMu.Unlock()
+
+	st := s.loadUDPAgents()[agentID]
+	if st == nil {
+		return
+	}
+	if existing := s.udpGraceTimers[agentID]; existing != nil {
+		if existing.controlNonce == st.controlNonce {
+			return
+		}
+		existing.timer.Stop()
+	}
+	entry := &udpGraceTimer{controlNonce: st.controlNonce}
+	entry.timer = time.AfterFunc(udpControlLossGrace, func() {
+		s.expireUDPAgent(agentID, entry)
+	})
+	s.udpGraceTimers[agentID] = entry
+}
+
+func (s *Server) expireUDPAgent(agentID string, entry *udpGraceTimer) {
+	s.udpAgentsMu.Lock()
+	defer s.udpAgentsMu.Unlock()
+	if s.udpGraceTimers[agentID] != entry {
+		return
+	}
+	delete(s.udpGraceTimers, agentID)
+	st := s.loadUDPAgents()[agentID]
+	if st == nil || st.controlNonce != entry.controlNonce {
+		return
+	}
+	if s.removeUDPAgentLocked(agentID) {
+		logging.Global().Infof(logging.CatUDP, "Agent %q UDP path expired after %s control disconnect grace", agentID, udpControlLossGrace)
+	}
+}
+
+func (s *Server) cancelUDPGraceLocked(agentID string) {
+	if entry := s.udpGraceTimers[agentID]; entry != nil {
+		entry.timer.Stop()
+		delete(s.udpGraceTimers, agentID)
+	}
+}
+
+func (s *Server) removeUDPAgentLocked(agentID string) bool {
+	old := s.loadUDPAgents()
+	if _, ok := old[agentID]; !ok {
+		return false
+	}
+	newMap := make(map[string]*agentUDPState, len(old)-1)
+	for k, v := range old {
+		if k != agentID {
+			newMap[k] = v
+		}
+	}
+	s.udpAgents.Store(&newMap)
+	return true
+}
+
+func (s *Server) stopUDPGraceTimers() {
+	s.udpAgentsMu.Lock()
+	defer s.udpAgentsMu.Unlock()
+	for id, entry := range s.udpGraceTimers {
+		entry.timer.Stop()
+		delete(s.udpGraceTimers, id)
+	}
 }
 
 type pendingTCPKey struct {
@@ -477,9 +672,10 @@ type helloRoute struct {
 }
 
 type helloPayload struct {
-	Routes  map[string]helloRoute `json:"routes"`
-	Email   emailcfg.Config       `json:"email,omitempty"`
-	Version string                `json:"version,omitempty"`
+	Routes     map[string]helloRoute `json:"routes"`
+	Email      emailcfg.Config       `json:"email,omitempty"`
+	Version    string                `json:"version,omitempty"`
+	PublicAddr string                `json:"public_addr,omitempty"` // tunnel server hostname/IP for apps
 }
 
 type ServerStatus struct {
@@ -641,9 +837,20 @@ func (s *Server) EffectiveRoutes() []RouteConfig {
 
 // UDPStats returns aggregate UDP drop counters for the dashboard.
 func (s *Server) UDPStats() map[string]any {
+	var queueStats udpfair.Stats
+	if s.udpEgress != nil {
+		queueStats = s.udpEgress.queue.Stats()
+	}
+	queueDrops := queueStats.Dropped.Overflow + queueStats.Dropped.Expired
 	return map[string]any{
-		"totalDrops":  s.udpDrops.Load(),
-		"lossPercent": 0.0, // end-to-end loss requires nettest; drops are local rejects
+		"totalDrops":         s.udpDrops.Load() + queueDrops,
+		"queueDrops":         queueDrops,
+		"queueOverflowDrops": queueStats.Dropped.Overflow,
+		"queueExpiredDrops":  queueStats.Dropped.Expired,
+		"queuedPackets":      queueStats.QueuedPackets,
+		"queuedBytes":        queueStats.QueuedBytes,
+		"activeRoutes":       queueStats.ActiveRoutes,
+		"lossPercent":        0.0, // end-to-end loss requires nettest; drops are local rejects
 	}
 }
 
@@ -669,6 +876,12 @@ func (s *Server) dropSession(agentID string) {
 	if sess != nil {
 		delete(s.sessions, agentID)
 	}
+	// Administrative drops are intentional revocations, not transient
+	// reconnects, so remove the UDP endpoint immediately.
+	s.udpAgentsMu.Lock()
+	s.cancelUDPGraceLocked(agentID)
+	s.removeUDPAgentLocked(agentID)
+	s.udpAgentsMu.Unlock()
 	s.sessionsMu.Unlock()
 	if sess != nil {
 		if sess.cancel != nil {
@@ -678,43 +891,20 @@ func (s *Server) dropSession(agentID string) {
 			sess.conn.Close()
 		}
 	}
-	// Drop UDP return path so a forged register cannot keep delivering
-	// after the real control session is gone.
-	s.clearUDPAgent(agentID)
 }
 
 // clearUDPAgent removes an agent's UDP registration (copy-on-write).
 func (s *Server) clearUDPAgent(agentID string) {
-	old := s.loadUDPAgents()
-	if _, ok := old[agentID]; !ok {
-		return
-	}
-	newMap := make(map[string]*agentUDPState, len(old))
-	for k, v := range old {
-		if k == agentID {
-			continue
-		}
-		newMap[k] = v
-	}
-	s.udpAgents.Store(&newMap)
+	s.udpAgentsMu.Lock()
+	defer s.udpAgentsMu.Unlock()
+	s.cancelUDPGraceLocked(agentID)
+	s.removeUDPAgentLocked(agentID)
 }
 
-// controlSessionRemoteAddr returns the remote addr string for a live control
-// session, or "" if the agent is not connected on the control plane.
-func (s *Server) controlSessionRemoteAddr(agentID string) string {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	sess := s.sessions[agentID]
-	if sess == nil {
-		return ""
-	}
-	return sess.remoteAddr
-}
-
-// udpRegisterAllowed reports whether a verified UDP register for agentID from
-// udpAddr may be adopted. Requires a live control session whose peer IP matches
-// the UDP source (loopback-to-loopback counts as a match).
-func udpRegisterAllowed(controlRemote string, udpAddr netip.AddrPort) bool {
+// controlPeerIPMatches protects legacy TCP data-pair claims when the one-time
+// pair token's control peer is known. Bound UDP registration intentionally
+// does not use this check because its identity proof supports split paths.
+func controlPeerIPMatches(controlRemote string, udpAddr netip.AddrPort) bool {
 	if controlRemote == "" || !udpAddr.IsValid() {
 		return false
 	}
@@ -845,23 +1035,57 @@ type routeConfig struct {
 	isEncrypted bool
 	derivedKey  []byte
 	owner       string
+	proto       string
+	publicAddr  string
+	localAddr   string
+	algorithm   string
+	epoch       uint64
 }
 
 func (s *Server) updateRouteCache() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.updateRouteCacheLocked()
 }
 
+func sameUDPEgressRouteConfig(a, b routeConfig) bool {
+	if a.enabled != b.enabled || a.isEncrypted != b.isEncrypted || a.owner != b.owner || a.proto != b.proto || a.publicAddr != b.publicAddr || a.localAddr != b.localAddr {
+		return false
+	}
+	if !a.isEncrypted {
+		return true
+	}
+	return a.algorithm == b.algorithm && bytes.Equal(a.derivedKey, b.derivedKey)
+}
+
+func (s *Server) nextRouteEpochLocked() uint64 {
+	s.nextRouteEpoch++
+	if s.nextRouteEpoch == 0 {
+		s.nextRouteEpoch++
+	}
+	return s.nextRouteEpoch
+}
+
 func (s *Server) updateRouteCacheLocked() {
+	oldCache, _ := s.routeCache.Load().(map[string]routeConfig)
 	newCache := make(map[string]routeConfig)
 	for _, rt := range effectiveRoutes(s.cfg, s.dynamicRoutes) {
-		newCache[rt.Name] = routeConfig{
+		rc := routeConfig{
 			enabled:     rt.IsEnabled(),
 			isEncrypted: rt.IsEncrypted(),
 			derivedKey:  s.derivedKeys[rt.Name],
 			owner:       rt.OwnerAgent(),
+			proto:       rt.Proto,
+			publicAddr:  rt.PublicAddr,
+			localAddr:   rt.LocalAddr,
+			algorithm:   s.cfg.EncryptionAlgorithm,
 		}
+		if old, ok := oldCache[rt.Name]; ok && old.epoch != 0 && sameUDPEgressRouteConfig(old, rc) {
+			rc.epoch = old.epoch
+		} else {
+			rc.epoch = s.nextRouteEpochLocked()
+		}
+		newCache[rt.Name] = rc
 	}
 	s.routeCache.Store(newCache)
 	s.publishPublicUDPLocked()
@@ -993,9 +1217,10 @@ func buildHelloRoutes(cfg ServerConfig, dynamicRoutes map[string]dynamicRouteEnt
 
 func buildHelloPayload(cfg ServerConfig, dynamicRoutes map[string]dynamicRouteEntry) helloPayload {
 	return helloPayload{
-		Routes:  buildHelloRoutes(cfg, dynamicRoutes),
-		Email:   emailcfg.Normalize(cfg.Email),
-		Version: protocol.ProtocolVersion,
+		Routes:     buildHelloRoutes(cfg, dynamicRoutes),
+		Email:      emailcfg.Normalize(cfg.Email),
+		Version:    protocol.ProtocolVersion,
+		PublicAddr: strings.TrimSpace(cfg.PublicAddr),
 	}
 }
 
@@ -1024,9 +1249,10 @@ func buildHelloPayloadForAgent(cfg ServerConfig, dynamicRoutes map[string]dynami
 		email = emailcfg.Normalize(cfg.Email)
 	}
 	return helloPayload{
-		Routes:  buildHelloRoutesForAgent(cfg, dynamicRoutes, agentID),
-		Email:   email,
-		Version: protocol.ProtocolVersion,
+		Routes:     buildHelloRoutesForAgent(cfg, dynamicRoutes, agentID),
+		Email:      email,
+		Version:    protocol.ProtocolVersion,
+		PublicAddr: strings.TrimSpace(cfg.PublicAddr),
 	}
 }
 
@@ -1077,12 +1303,13 @@ func (s *Server) broadcastHelloNow() {
 	s.sessionsMu.Unlock()
 
 	for _, t := range targets {
+		t.sess.writeMu.Lock()
 		b, err := s.buildHelloBytesForAgent(t.id)
 		if err != nil {
+			t.sess.writeMu.Unlock()
 			continue
 		}
 		pkt := &protocol.Packet{Type: protocol.TypeHello, Payload: b}
-		t.sess.writeMu.Lock()
 		t.sess.conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
 		if err := protocol.WritePacket(t.sess.conn, pkt); err != nil {
 			logging.Global().Warnf(logging.CatControl, "failed to push hello to agent %q: %v", t.id, err)
@@ -1202,6 +1429,9 @@ func (s *Server) ListApps(ctx context.Context) ([]appstore.Application, error) {
 }
 
 func (s *Server) SetAppEnabled(label string, enabled bool) bool {
+	if s.stopping.Load() {
+		return false
+	}
 	if s.appStore == nil {
 		return false
 	}
@@ -1255,7 +1485,7 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 		ln, err := net.Listen("tcp", need.addr)
 		if err == nil {
 			s.mu.Lock()
-			if s.ctx != nil {
+			if s.ctx != nil && !s.stopping.Load() {
 				s.publicTCP[need.name] = ln
 				s.wg.Add(1)
 				go s.acceptPublicTCP(ln, need.name)
@@ -1270,10 +1500,9 @@ func (s *Server) SetAppEnabled(label string, enabled bool) bool {
 		if err == nil {
 			conn, err := net.ListenUDP("udp", addr)
 			if err == nil {
-				conn.SetReadBuffer(8 * 1024 * 1024)
-				conn.SetWriteBuffer(8 * 1024 * 1024)
+				configureRouteUDPSocket(conn, need.name)
 				s.mu.Lock()
-				if s.ctx != nil {
+				if s.ctx != nil && !s.stopping.Load() {
 					s.publicUDP[need.name] = conn
 					s.publishPublicUDPLocked()
 					s.wg.Add(1)
@@ -1338,8 +1567,12 @@ func (s *Server) handleRouteRequest(conn net.Conn, session *agentSession, payloa
 	s.mu.Unlock()
 
 	// Persist after unlock so slow disk does not freeze the server.
-	if resp.Status != "failed" && resp.Status != "pending_domain" && s.appStore != nil {
-		s.persistRouteToStore(context.Background(), req, resp, session.agentID)
+	// pending_domain with a public address still installs (or will install) a
+	// route worth tracking; pure domain-query responses have no PublicAddr.
+	if resp.Status != "failed" && s.appStore != nil {
+		if resp.Status != "pending_domain" || strings.TrimSpace(resp.PublicAddr) != "" {
+			s.persistRouteToStore(context.Background(), req, resp, session.agentID)
+		}
 	}
 
 	respPayload, err := json.Marshal(resp)
@@ -1360,6 +1593,10 @@ func (s *Server) handleRouteRequest(conn net.Conn, session *agentSession, payloa
 }
 
 func (s *Server) persistRouteToStore(ctx context.Context, req apitypes.RouteRequest, resp apitypes.RouteResponse, owner string) {
+	label := strings.TrimSpace(req.Name)
+	if req.Source != "api" || label == "" {
+		label = strings.TrimSpace(resp.Name)
+	}
 	rt := appstore.AppRoute{
 		RouteName:     resp.Name,
 		Proto:         resp.Proto,
@@ -1371,49 +1608,65 @@ func (s *Server) persistRouteToStore(ctx context.Context, req apitypes.RouteRequ
 		DomainEnabled: resp.Domain != "" && resp.Status != "failed",
 		Enabled:       true,
 	}
-	if req.Source == "api" {
-		app, err := s.appStore.GetApplication(ctx, req.Name)
-		if err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to get application %s: %v", req.Name, err)
-		} else if app == nil {
-			app, err = s.appStore.CreateApplication(ctx, req.Name, "")
-			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to create application %s: %v", req.Name, err)
-			}
-		}
-		if app != nil {
-			if _, err := s.appStore.AddRoute(ctx, app.ID, rt); err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", resp.Name, err)
-			}
-		}
-	} else {
-		routes, err := s.appStore.ListRoutes(ctx)
-		if err == nil {
-			var appID int64
-			for _, r := range routes {
-				if r.RouteName == resp.Name {
-					appID = r.AppID
-					break
-				}
-			}
-			if appID == 0 {
-				app, aerr := s.appStore.CreateApplication(ctx, resp.Name, "")
-				if aerr != nil {
-					logging.Global().Errorf(logging.CatTCP, "failed to create application for non-api route %s: %v", resp.Name, aerr)
-				} else {
-					appID = app.ID
-				}
-			}
-			if appID != 0 {
-				if _, err := s.appStore.AddRoute(ctx, appID, rt); err != nil {
-					logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", resp.Name, err)
-				}
-			}
-		}
+	if err := s.upsertAppRoute(ctx, label, rt); err != nil {
+		logging.Global().Errorf(logging.CatTCP, "failed to persist route %s: %v", resp.Name, err)
 	}
 }
 
+// upsertAppRoute inserts a new application route or updates the existing row in
+// place. Re-registration must not fail the registry write on UNIQUE(route_name).
+func (s *Server) upsertAppRoute(ctx context.Context, appLabel string, rt appstore.AppRoute) error {
+	if s.appStore == nil {
+		return nil
+	}
+	appLabel = strings.TrimSpace(appLabel)
+	if appLabel == "" {
+		appLabel = strings.TrimSpace(rt.RouteName)
+	}
+	if appLabel == "" || strings.TrimSpace(rt.RouteName) == "" {
+		return fmt.Errorf("application label and route name are required")
+	}
+
+	existing, err := s.appStore.GetRouteByRouteName(ctx, rt.RouteName)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return s.appStore.UpdateRoute(ctx, rt)
+	}
+
+	app, err := s.appStore.GetApplication(ctx, appLabel)
+	if err != nil {
+		return err
+	}
+	if app == nil {
+		app, err = s.appStore.CreateApplication(ctx, appLabel, "")
+		if err != nil {
+			if !appstore.IsUniqueConstraint(err) {
+				return err
+			}
+			app, err = s.appStore.GetApplication(ctx, appLabel)
+			if err != nil {
+				return err
+			}
+			if app == nil {
+				return fmt.Errorf("application %q missing after unique conflict", appLabel)
+			}
+		}
+	}
+	if _, err := s.appStore.AddRoute(ctx, app.ID, rt); err != nil {
+		if appstore.IsUniqueConstraint(err) {
+			return s.appStore.UpdateRoute(ctx, rt)
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner string) apitypes.RouteResponse {
+	if s.stopping.Load() {
+		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "server is stopping"}
+	}
 	if strings.TrimSpace(owner) == "" {
 		owner = protocol.DefaultAgentID
 	}
@@ -1429,7 +1682,6 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner stri
 	default:
 		return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "invalid proto"}
 	}
-
 	allRoutes := effectiveRoutes(s.cfg, s.dynamicRoutes)
 	routeNames := make(map[string]bool)
 	for _, rt := range allRoutes {
@@ -1569,8 +1821,7 @@ func (s *Server) processRouteRequestLocked(req apitypes.RouteRequest, owner stri
 			s.rollbackDynamicRouteLocked(req.Name)
 			return apitypes.RouteResponse{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen udp on %s: %v", rt.PublicAddr, err)}
 		}
-		conn.SetReadBuffer(8 * 1024 * 1024)
-		conn.SetWriteBuffer(8 * 1024 * 1024)
+		configureRouteUDPSocket(conn, rt.Name)
 		s.publicUDP[rt.Name] = conn
 		if s.ctx != nil {
 			s.wg.Add(1)
@@ -1689,29 +1940,23 @@ func (s *Server) handleRouteConfirm(conn net.Conn, session *agentSession, payloa
 	}
 	s.mu.Unlock()
 
-	// Persist domain confirm after unlock.
+	// Persist domain confirm after unlock. Create the registry row when the
+	// initial request was pending_domain and never inserted one.
 	if ack.Status != "failed" && s.appStore != nil {
-		if err := s.appStore.RemoveRoute(context.Background(), confirm.Name); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to remove old persisted route %s for confirm: %v", confirm.Name, err)
-		}
-		app, aerr := s.appStore.FindApplicationByRouteName(context.Background(), confirm.Name)
-		if aerr != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to find application for confirmed route %s: %v", confirm.Name, aerr)
-		} else if app != nil {
-			_, err := s.appStore.AddRoute(context.Background(), app.ID, appstore.AppRoute{
-				RouteName:     confirm.Name,
-				Proto:         drProto,
-				PublicAddr:    ack.PublicAddr,
-				LocalAddr:     drLocalAddr,
-				AgentID:       drAgent,
-				Encrypted:     drEncrypted,
-				Domain:        drDomain,
-				DomainEnabled: true,
-				Enabled:       drEnabled,
-			})
-			if err != nil {
-				logging.Global().Errorf(logging.CatTCP, "failed to persist confirmed route %s: %v", confirm.Name, err)
-			}
+		label := confirm.Name
+		err := s.upsertAppRoute(context.Background(), label, appstore.AppRoute{
+			RouteName:     confirm.Name,
+			Proto:         drProto,
+			PublicAddr:    ack.PublicAddr,
+			LocalAddr:     drLocalAddr,
+			AgentID:       drAgent,
+			Encrypted:     drEncrypted,
+			Domain:        drDomain,
+			DomainEnabled: true,
+			Enabled:       drEnabled,
+		})
+		if err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to persist confirmed route %s: %v", confirm.Name, err)
 		}
 	}
 
@@ -1869,22 +2114,27 @@ func (s *Server) handleRouteUpdate(conn net.Conn, session *agentSession, payload
 
 	if ack.Status != "failed" && s.appStore != nil {
 		ctx := context.Background()
-		if existing, err := s.appStore.GetRouteByRouteName(ctx, req.Name); err == nil && existing != nil {
-			ar := appstore.AppRoute{
-				AppID:         existing.AppID,
-				RouteName:     req.Name,
-				Proto:         updProto,
-				PublicAddr:    updPublicAddr,
-				LocalAddr:     updLocalAddr,
-				AgentID:       existing.AgentID,
-				Encrypted:     updEncrypted,
-				Domain:        updDomain,
-				DomainEnabled: updDomainEnabled,
-				Enabled:       updEnabled,
-				CreatedAt:     existing.CreatedAt,
-			}
-			s.appStore.RemoveRoute(ctx, req.Name)
-			s.appStore.AddRoute(ctx, existing.AppID, ar)
+		agentID := ""
+		if existing, err := s.appStore.GetRouteByRouteName(ctx, req.Name); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to load persisted route %s for update: %v", req.Name, err)
+		} else if existing != nil {
+			agentID = existing.AgentID
+		}
+		if agentID == "" {
+			agentID = session.agentID
+		}
+		if err := s.upsertAppRoute(ctx, req.Name, appstore.AppRoute{
+			RouteName:     req.Name,
+			Proto:         updProto,
+			PublicAddr:    updPublicAddr,
+			LocalAddr:     updLocalAddr,
+			AgentID:       agentID,
+			Encrypted:     updEncrypted,
+			Domain:        updDomain,
+			DomainEnabled: updDomainEnabled,
+			Enabled:       updEnabled,
+		}); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to persist route update %s: %v", req.Name, err)
 		}
 	}
 
@@ -1906,6 +2156,9 @@ func (s *Server) handleRouteUpdate(conn net.Conn, session *agentSession, payload
 }
 
 func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate, owner string) apitypes.RouteUpdateAck {
+	if s.stopping.Load() {
+		return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "server is stopping"}
+	}
 	dr, ok := s.dynamicRoutes[req.Name]
 	if !ok {
 		return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "dynamic route not found"}
@@ -1916,7 +2169,6 @@ func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate, owner string
 	if dr.Route.OwnerAgent() != owner {
 		return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: "route owned by another agent"}
 	}
-
 	if req.LocalAddr != "" {
 		dr.Route.LocalAddr = strings.TrimSpace(req.LocalAddr)
 	}
@@ -1962,8 +2214,7 @@ func (s *Server) processRouteUpdateLocked(req apitypes.RouteUpdate, owner string
 					}
 					return apitypes.RouteUpdateAck{RequestID: req.RequestID, Status: "failed", Name: req.Name, Error: fmt.Sprintf("failed to listen udp on %s: %v", newAddr, err)}
 				}
-				conn.SetReadBuffer(8 * 1024 * 1024)
-				conn.SetWriteBuffer(8 * 1024 * 1024)
+				configureRouteUDPSocket(conn, dr.Route.Name)
 				newUDP = conn
 			}
 
@@ -2337,6 +2588,7 @@ func NewServer(cfg ServerConfig, appStore *appstore.Store) *Server {
 		pendingTCP:           make(map[pendingTCPKey]*pendingTCPEntry),
 		dash:                 newDashState(),
 		sessions:             make(map[string]*agentSession),
+		udpGraceTimers:       make(map[string]*udpGraceTimer),
 		probeOutboundTargets: make(map[string]time.Time),
 		maxConnsPerRoute:     defaultMaxConnsPerRoute,
 		dynamicRoutes:        make(map[string]dynamicRouteEntry),
@@ -2480,8 +2732,23 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("udp data listen failed: %w", err)
 	}
-	s.udpDataConn.SetReadBuffer(8 * 1024 * 1024)
-	s.udpDataConn.SetWriteBuffer(8 * 1024 * 1024)
+	bufferResult := netutil.SetUDPBuffers(s.udpDataConn, sharedUDPReadBufferBytes, sharedUDPWriteBufferBytes)
+	if bufferResult.ReadErr != nil {
+		logging.Global().Warnf(logging.CatUDP, "failed to request shared UDP read buffer bytes=%d: %v", bufferResult.ReadBytes, bufferResult.ReadErr)
+	}
+	if bufferResult.WriteErr != nil {
+		logging.Global().Warnf(logging.CatUDP, "failed to request shared UDP write buffer bytes=%d: %v", bufferResult.WriteBytes, bufferResult.WriteErr)
+	}
+	s.udpEgress, err = newServerUDPEgress(s, s.udpDataConn)
+	if err != nil {
+		s.udpDataConn.Close()
+		return fmt.Errorf("create UDP egress scheduler: %w", err)
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.udpEgress.run(s.ctx)
+	}()
 	s.wg.Add(1)
 	go s.acceptAgentUDP()
 
@@ -2509,8 +2776,7 @@ func (s *Server) Start(ctx context.Context) error {
 				logging.Global().Errorf(logging.CatUDP, "failed to listen on public udp %s: %v", rt.PublicAddr, err)
 				continue
 			}
-			conn.SetReadBuffer(8 * 1024 * 1024)
-			conn.SetWriteBuffer(8 * 1024 * 1024)
+			configureRouteUDPSocket(conn, rt.Name)
 			s.mu.Lock()
 			s.publicUDP[rt.Name] = conn
 			s.publishPublicUDPLocked()
@@ -2532,19 +2798,22 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) Stop() {
+	s.stopping.Store(true)
 	s.helloMu.Lock()
 	if s.helloTimer != nil {
 		s.helloTimer.Stop()
 		s.helloTimer = nil
 	}
-	pending := s.helloPending
 	s.helloPending = false
 	s.helloMu.Unlock()
-	if pending {
-		s.broadcastHelloNow()
-	}
+	s.stopUDPGraceTimers()
 
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.udpEgress != nil {
+		s.udpEgress.close()
+	}
 	if s.controlLn != nil {
 		s.controlLn.Close()
 	}
@@ -2553,6 +2822,25 @@ func (s *Server) Stop() {
 	}
 	if s.udpDataConn != nil {
 		s.udpDataConn.Close()
+	}
+
+	// Control readers otherwise remain blocked until their read deadline. Clear
+	// the authoritative map first so deferred cleanup cannot schedule a shutdown
+	// grace timer, then cancel and close sessions outside sessionsMu.
+	s.sessionsMu.Lock()
+	sessions := make([]*agentSession, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		sessions = append(sessions, session)
+	}
+	s.sessions = make(map[string]*agentSession)
+	s.sessionsMu.Unlock()
+	for _, session := range sessions {
+		if session.cancel != nil {
+			session.cancel()
+		}
+		if session.conn != nil {
+			session.conn.Close()
+		}
 	}
 	if s.domainHTTPServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), domainShutdownTimeout)
@@ -2571,13 +2859,34 @@ func (s *Server) Stop() {
 		s.domainHTTPSLn.Close()
 	}
 	s.closeDomainProxyIdleConnections()
+	// Route handlers mutate these maps under s.mu. Snapshot and clear them under
+	// the same lock so shutdown cannot race iteration or retain a published UDP
+	// listener after the snapshot.
+	s.mu.Lock()
+	publicTCP := make([]net.Listener, 0, len(s.publicTCP))
 	for _, ln := range s.publicTCP {
+		publicTCP = append(publicTCP, ln)
+	}
+	publicUDP := make([]*net.UDPConn, 0, len(s.publicUDP))
+	for _, conn := range s.publicUDP {
+		publicUDP = append(publicUDP, conn)
+	}
+	s.publicTCP = make(map[string]net.Listener)
+	s.publicUDP = make(map[string]*net.UDPConn)
+	s.publishPublicUDPLocked()
+	s.abortPendingTCPLocked()
+	s.mu.Unlock()
+	for _, ln := range publicTCP {
 		ln.Close()
 	}
-	for _, conn := range s.publicUDP {
+	for _, conn := range publicUDP {
 		conn.Close()
 	}
 	s.wg.Wait()
+	// A live control goroutine can schedule its disconnect grace while Stop is
+	// closing listeners. Once every producer has exited, drain timers again so
+	// Stop never returns with a callback retaining or mutating this server.
+	s.stopUDPGraceTimers()
 }
 
 // rejectVersion tells an authenticated peer why its negotiation failed
@@ -2667,6 +2976,12 @@ func (s *Server) acceptControl(ln net.Listener) {
 			continue
 		}
 		features := protocol.NegotiateFeatures(protocol.SupportedFeatures, vp.Features)
+		if !protocol.HasFeature(features, protocol.FeatureBoundUDPRegister) {
+			reason := fmt.Sprintf("protocol %s requires feature %q", protocol.ProtocolVersion, protocol.FeatureBoundUDPRegister)
+			logging.Global().Errorf(logging.CatTCP, "rejecting agent from %s: %s", remoteAddr, reason)
+			s.rejectVersion(conn, reason)
+			continue
+		}
 		agentID := strings.TrimSpace(vp.AgentID)
 		if agentID == "" {
 			agentID = protocol.DefaultAgentID
@@ -2682,6 +2997,12 @@ func (s *Server) acceptControl(ln net.Listener) {
 		if len(vp.PublicKey) != crypto.AgentPublicKeyLen || !crypto.VerifyIdentityChallenge(vp.PublicKey, serverNonce, vp.IdentitySig) {
 			logging.Global().Errorf(logging.CatTCP, "agent %q from %s failed identity verification", agentID, remoteAddr)
 			s.rejectVersion(conn, "agent identity signature invalid")
+			continue
+		}
+		controlNonce, ok := crypto.NewUDPControlNonce(serverNonce)
+		if !ok {
+			logging.Global().Errorf(logging.CatTCP, "internal control nonce length mismatch for agent %q", agentID)
+			s.rejectVersion(conn, "invalid control-session nonce")
 			continue
 		}
 		if s.appStore != nil {
@@ -2704,41 +3025,45 @@ func (s *Server) acceptControl(ln net.Listener) {
 		logging.Global().Infof(logging.CatTCP, "Agent %q version negotiated from %s: %s features=%v", agentID, remoteAddr, agentVer, features)
 
 		verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures, AssignedAgentID: agentID})
-		helloPkt, err := s.buildHelloPacketForAgent(agentID)
-		if err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to build HELLO packet: %v", err)
-			conn.Close()
-			continue
-		}
 		conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
 		if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 			logging.Global().Errorf(logging.CatTCP, "failed to send version negotiate to %s: %v", remoteAddr, err)
 			conn.Close()
 			continue
 		}
-		if err := protocol.WritePacket(conn, helloPkt); err != nil {
-			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
+
+		// Adopt after the version response but before HELLO. Receiving HELLO now
+		// guarantees the agent can immediately register against an installed
+		// control generation instead of racing this state transition.
+		var oldSession *agentSession
+		s.sessionsMu.Lock()
+		if s.stopping.Load() {
+			s.sessionsMu.Unlock()
 			conn.Close()
 			continue
 		}
-		conn.SetWriteDeadline(time.Time{})
-
-		// Adopt under agent ID; a new connection with the same ID displaces the old.
-		var oldSession *agentSession
-		s.sessionsMu.Lock()
 		if existing := s.sessions[agentID]; existing != nil {
 			oldSession = existing
 		}
 		sessionCtx, sessionCancel := context.WithCancel(s.ctx)
 		session := &agentSession{
-			conn:        conn,
-			cancel:      sessionCancel,
-			agentID:     agentID,
-			remoteAddr:  remoteAddr,
-			connectTime: time.Now(),
-			features:    features,
+			conn:              conn,
+			cancel:            sessionCancel,
+			agentID:           agentID,
+			remoteAddr:        remoteAddr,
+			connectTime:       time.Now(),
+			identityPublicKey: append([]byte(nil), vp.PublicKey...),
+			controlNonce:      controlNonce,
+			features:          features,
 		}
+		// Once published, broadcastHello and CONNECT producers may obtain this
+		// session immediately. Hold its write lock across publication and the
+		// initial HELLO so no later control frame can overtake or interleave it.
+		session.writeMu.Lock()
 		s.sessions[agentID] = session
+		// Bound any previously published generation while the replacement
+		// proves its UDP endpoint. A valid new registration cancels this timer.
+		s.scheduleUDPAgentClearLocked(agentID)
 		s.sessionsMu.Unlock()
 
 		if oldSession != nil {
@@ -2751,28 +3076,69 @@ func (s *Server) acceptControl(ln net.Listener) {
 			}
 		}
 
+		// Build only after publication while holding writeMu. A route mutation
+		// before this point is included here; a later broadcast must acquire the
+		// same lock before taking its own snapshot, so HELLO snapshots cannot be
+		// delivered in reverse freshness order.
+		helloPkt, err := s.buildHelloPacketForAgent(agentID)
+		if err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to build HELLO packet: %v", err)
+			s.sessionsMu.Lock()
+			if s.sessions[agentID] == session {
+				delete(s.sessions, agentID)
+				s.scheduleUDPAgentClearLocked(agentID)
+			}
+			s.sessionsMu.Unlock()
+			sessionCancel()
+			conn.Close()
+			session.writeMu.Unlock()
+			continue
+		}
+		conn.SetWriteDeadline(time.Now().Add(writeDeadlineStandard))
+		if err := protocol.WritePacket(conn, helloPkt); err != nil {
+			logging.Global().Errorf(logging.CatTCP, "failed to send HELLO: %v", err)
+			s.sessionsMu.Lock()
+			if s.sessions[agentID] == session {
+				delete(s.sessions, agentID)
+				s.scheduleUDPAgentClearLocked(agentID)
+			}
+			s.sessionsMu.Unlock()
+			sessionCancel()
+			conn.Close()
+			session.writeMu.Unlock()
+			continue
+		}
+		conn.SetWriteDeadline(time.Time{})
+		session.writeMu.Unlock()
+
 		s.mu.Lock()
 		s.lastAgentConnectAt = time.Now()
 		s.abortPendingTCPForAgentLocked(agentID)
 		s.mu.Unlock()
 
+		// Serialize the final Add with Stop's session snapshot. If shutdown won
+		// the race, the published session has already been canceled and closed.
+		s.sessionsMu.Lock()
+		if s.stopping.Load() || s.sessions[agentID] != session {
+			s.sessionsMu.Unlock()
+			sessionCancel()
+			conn.Close()
+			continue
+		}
+		s.wg.Add(1)
+		s.sessionsMu.Unlock()
 		logging.Global().Infof(logging.CatTCP, "Agent %q connected to control from %s", agentID, remoteAddr)
 
-		s.wg.Add(1)
 		go func(c net.Conn, session *agentSession, agentID string) {
 			defer s.wg.Done()
 			defer func() {
 				c.Close()
-				cleared := false
 				s.sessionsMu.Lock()
 				if s.sessions[agentID] == session {
 					delete(s.sessions, agentID)
-					cleared = true
+					s.scheduleUDPAgentClearLocked(agentID)
 				}
 				s.sessionsMu.Unlock()
-				if cleared {
-					s.clearUDPAgent(agentID)
-				}
 			}()
 
 			pingCtx, pingCancel := context.WithCancel(sessionCtx)
@@ -3014,7 +3380,7 @@ func (s *Server) acceptData(ln net.Listener) {
 			continue
 		}
 		if ap, err := netip.ParseAddrPort(conn.RemoteAddr().String()); err == nil {
-			if entry.controlRemote != "" && !udpRegisterAllowed(entry.controlRemote, ap) {
+			if entry.controlRemote != "" && !controlPeerIPMatches(entry.controlRemote, ap) {
 				logging.Global().RateLimitedWarn(logging.CatTCP, "data-pair-ip-"+routeName, fmt.Sprintf("rejected data pairing from %s; control peer is %s route=%s client=%s", conn.RemoteAddr(), entry.controlRemote, routeName, clientID))
 				conn.Close()
 				entry.cancel()
@@ -3275,11 +3641,10 @@ func (s *Server) acceptAgentUDP() {
 		}
 	}()
 
-	// seenRegisters dedupes authenticated register nonces within the auth
-	// window to block replays. Only this goroutine touches it, so it needs
-	// no lock. It stays small (one fresh register every ~2s, 30s window).
-	seenRegisters := make(map[crypto.UDPRegisterKey]int64)
-	const maxSeenRegisters = 256
+	// Deduplicate accepted proofs before taking sessionsMu or running Ed25519
+	// verification. Bookkeeping is bounded independently for each live identity.
+	seenRegisters := newUDPRegisterReplayCache()
+	var lastRegisterReplayPrune int64
 
 	// Two-generation client-addr parse cache: the same client strings repeat
 	// on every datagram of a flow, so parsing once per flow avoids the
@@ -3287,6 +3652,11 @@ func (s *Server) acceptAgentUDP() {
 	const maxClientAddrCache = 10000 / 2
 	clientAddrCur := make(map[string]netip.AddrPort)
 	var clientAddrPrev map[string]netip.AddrPort
+	type publicWriteDeadlineState struct {
+		conn *net.UDPConn
+		set  time.Time
+	}
+	publicWriteDeadlines := make(map[string]publicWriteDeadlineState)
 
 	for {
 		n, addr, err := s.udpDataConn.ReadFromUDPAddrPort(buf)
@@ -3303,47 +3673,59 @@ func (s *Server) acceptAgentUDP() {
 		}
 
 		if pkt.Type == protocol.TypeRegister {
-			// The agent UDP address is adopted only from a verified register
-			// with an unseen nonce, so spoofed datagrams cannot hijack the UDP plane.
+			// A v3 peer must prove its identity, UDP session, and exact live control
+			// generation before the observed source is adopted. Source-IP equality
+			// is deliberately unnecessary for split-path/NAT deployments. The signed
+			// nonce blocks token-only impersonation, and the replay cache prevents a
+			// proof from moving the endpoint again after its first accepted use.
 			nowT := time.Now()
-			key, sessionID, regAgentID, ok := crypto.VerifyUDPRegister(s.cfg.Token, pkt.Payload, nowT, udpRegisterAuthWindow)
+			reg, ok := crypto.ParseBoundUDPRegister(s.cfg.Token, pkt.Payload, nowT, udpRegisterAuthWindow)
 			if !ok {
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-reject", fmt.Sprintf("rejected unauthenticated/forged UDP register from %s", addr))
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-reject", fmt.Sprintf("rejected malformed/unauthenticated bound UDP register from %s", addr))
 				continue
+			}
+			if reg.AgentID == "" {
+				reg.AgentID = protocol.DefaultAgentID
 			}
 			nowNano := nowT.UnixNano()
-			if exp, dup := seenRegisters[key]; dup && exp > nowNano {
-				continue // replayed register within the freshness window
+			if nowNano-lastRegisterReplayPrune >= int64(udpRegisterAuthWindow/2) {
+				seenRegisters.prune(nowNano)
+				lastRegisterReplayPrune = nowNano
 			}
-			seenRegisters[key] = nowNano + int64(udpRegisterAuthWindow)
-			if len(seenRegisters) > maxSeenRegisters {
-				for k, exp := range seenRegisters {
-					if exp <= nowNano {
-						delete(seenRegisters, k)
-					}
-				}
+			if seen, full := seenRegisters.status(reg.AgentID, reg.ControlNonce, reg.Key, nowNano); seen || full {
+				continue
 			}
 
-			if regAgentID == "" {
-				regAgentID = protocol.DefaultAgentID
-			}
-			controlRemote := s.controlSessionRemoteAddr(regAgentID)
-			if controlRemote == "" {
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-nosession", fmt.Sprintf("rejected UDP register for agent %q from %s: no live control session", regAgentID, addr))
+			s.sessionsMu.Lock()
+			sess := s.sessions[reg.AgentID]
+			if sess == nil {
+				s.sessionsMu.Unlock()
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-nosession", fmt.Sprintf("rejected UDP register for agent %q from %s: no live control session", reg.AgentID, addr))
 				continue
 			}
-			if !udpRegisterAllowed(controlRemote, addr) {
-				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-ip", fmt.Sprintf("rejected UDP register for agent %q from %s: does not match control peer %s", regAgentID, addr, controlRemote))
+			if !protocol.HasFeature(sess.features, protocol.FeatureBoundUDPRegister) || sess.controlNonce != reg.ControlNonce || !reg.VerifyIdentity(sess.identityPublicKey) {
+				s.sessionsMu.Unlock()
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-generation", fmt.Sprintf("rejected UDP register for agent %q from %s: identity/control generation mismatch", reg.AgentID, addr))
 				continue
 			}
-			prev := s.loadUDPAgents()[regAgentID]
+
+			if !seenRegisters.record(reg.AgentID, reg.ControlNonce, reg.Key, reg.ValidUntil().UnixNano(), nowNano) {
+				s.sessionsMu.Unlock()
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-register-rate-"+reg.AgentID, fmt.Sprintf("rejected excessive UDP registrations for agent %q from %s", reg.AgentID, addr))
+				continue
+			}
+
+			s.udpAgentsMu.Lock()
+			prev := s.loadUDPAgents()[reg.AgentID]
 			if prev == nil {
-				logging.Global().Infof(logging.CatUDP, "Agent %q UDP address registered: %s", regAgentID, addr.String())
+				logging.Global().Infof(logging.CatUDP, "Agent %q UDP address registered: %s", reg.AgentID, addr.String())
 			} else if prev.addr != addr {
-				logging.Global().Infof(logging.CatUDP, "Agent %q UDP address updated: %s", regAgentID, addr.String())
+				logging.Global().Infof(logging.CatUDP, "Agent %q UDP address updated: %s", reg.AgentID, addr.String())
 			}
-			s.updateUDPAgentAddr(regAgentID, addr, sessionID, nowNano)
-			s.pruneUDPAgents(nowNano)
+			s.updateUDPAgentAddrLocked(reg.AgentID, addr, reg.SessionID, reg.ControlNonce, nowNano)
+			s.pruneUDPAgentsLocked(nowNano)
+			s.udpAgentsMu.Unlock()
+			s.sessionsMu.Unlock()
 			continue
 		}
 
@@ -3415,12 +3797,22 @@ func (s *Server) acceptAgentUDP() {
 				pendingBytes = 0
 				pendingBytesTime = time.Time{}
 			}
+			nowT := time.Now()
+			deadlineState := publicWriteDeadlines[routeName]
+			if deadlineState.conn != pubConn || nowT.Sub(deadlineState.set) >= sharedUDPWriteDeadlineRefresh {
+				if err := pubConn.SetWriteDeadline(nowT.Add(sharedUDPWriteTimeout)); err != nil {
+					logging.Global().RateLimitedWarn(logging.CatUDP, "server-public-udp-write-deadline-"+routeName, fmt.Sprintf("failed to bound public UDP write route=%s: %v", routeName, err))
+				}
+				publicWriteDeadlines[routeName] = publicWriteDeadlineState{conn: pubConn, set: nowT}
+			}
 			written, err := pubConn.WriteToUDPAddrPort(payload, clientAddrPort)
 			if err != nil {
+				s.udpDrops.Add(1)
 				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-write-public-"+routeName, fmt.Sprintf("failed to write UDP payload to public client route=%s client=%s bytes=%d err=%v", routeName, clientID, len(payload), err))
 				continue
 			}
 			if written != len(payload) {
+				s.udpDrops.Add(1)
 				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-short-write-public-"+routeName, fmt.Sprintf("short UDP payload write to public client route=%s client=%s wrote=%d want=%d", routeName, clientID, written, len(payload)))
 			}
 		}
@@ -3432,9 +3824,6 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 	defer conn.Close()
 
 	buf := make([]byte, 65536)
-	marshalBuf := make([]byte, 65536)
-	encryptBuf := make([]byte, 65536)
-	aadBuf := make([]byte, 0, 512)
 
 	// Two-generation addr->string cache: when the current generation fills,
 	// it becomes the previous one and live entries are promoted back on
@@ -3442,11 +3831,6 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 	const maxAddrStrCache = 10000 / 2
 	addrStrCur := make(map[netip.AddrPort]string)
 	var addrStrPrev map[netip.AddrPort]string
-	var pkt protocol.Packet
-	// pkt.Type and pkt.Route are stable for the lifetime of this listener.
-	pkt.Type = protocol.TypeData
-	pkt.Route = routeName
-
 	var pendingBytes int64
 	var pendingBytesTime time.Time
 	defer func() {
@@ -3494,37 +3878,7 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			s.udpDrops.Add(1)
 			continue
 		}
-		agentAddr := st.addr
-
-		payload := buf[:n]
-		if rc.isEncrypted {
-			if st.crypto == nil {
-				// No registered agent session yet; nothing to encrypt for.
-				s.udpDrops.Add(1)
-				continue
-			}
-			aadBuf = crypto.AppendUDPDataAAD(aadBuf[:0], routeName, clientStr)
-			encrypted, err := st.crypto.enc.Seal(encryptBuf, payload, aadBuf)
-			if err != nil {
-				s.udpDrops.Add(1)
-				continue
-			}
-			payload = encrypted
-		}
-
-		// pkt.Client and pkt.Payload change per packet; Type and Route
-		// were set once above.
-		pkt.Client = clientStr
-		pkt.Payload = payload
-
-		data, err := protocol.MarshalUDP(&pkt, marshalBuf)
-		if err != nil {
-			logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-marshal-"+routeName, fmt.Sprintf("failed to marshal UDP packet route=%s client=%s payload=%d err=%v", routeName, clientStr, len(payload), err))
-			continue
-		}
-		warnLargeTunneledUDPDatagram("server-to-agent", routeName, clientStr, len(data))
-
-		pendingBytes += int64(len(payload))
+		pendingBytes += int64(n)
 		if pendingBytesTime.IsZero() {
 			pendingBytesTime = time.Now()
 		} else if time.Since(pendingBytesTime) > dashBatchInterval {
@@ -3532,13 +3886,11 @@ func (s *Server) acceptPublicUDP(conn *net.UDPConn, routeName string) {
 			pendingBytes = 0
 			pendingBytesTime = time.Time{}
 		}
-		written, err := s.udpDataConn.WriteToUDPAddrPort(data, agentAddr)
-		if err != nil {
-			logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-write-agent-"+routeName, fmt.Sprintf("failed to write UDP packet to agent route=%s client=%s bytes=%d err=%v", routeName, clientStr, len(data), err))
-			continue
-		}
-		if written != len(data) {
-			logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-short-write-agent-"+routeName, fmt.Sprintf("short UDP packet write to agent route=%s client=%s wrote=%d want=%d", routeName, clientStr, written, len(data)))
+		if err := s.udpEgress.enqueue(routeName, clientStr, owner, rc.epoch, st, buf[:n]); err != nil {
+			if err != udpfair.ErrFull && err != udpfair.ErrClosed {
+				s.udpDrops.Add(1)
+				logging.Global().RateLimitedWarn(logging.CatUDP, "server-udp-enqueue-"+routeName, fmt.Sprintf("failed to queue UDP packet route=%s client=%s payload=%d err=%v", routeName, clientStr, n, err))
+			}
 		}
 	}
 }
