@@ -10,8 +10,8 @@ import (
 
 const (
 	defaultDashboardBucketDur = 30 * time.Second
-	maxRouteEvents            = 200
-	dashboardHistory          = 7 * 24 * time.Hour // always keep 7 days
+	maxRouteEvents            = 50
+	dashboardHistory          = time.Hour
 )
 
 type DashboardPoint struct {
