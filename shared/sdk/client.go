@@ -253,178 +253,39 @@ func (c *Client) RouteStats(ctx context.Context, name string) (*RouteStats, erro
 }
 
 func (c *Client) ListMailAccounts(ctx context.Context) ([]MailAccount, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/mail/accounts", nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var accts []MailAccount
-	if err := decodeResponse(resp, &accts); err != nil {
-		return nil, err
-	}
-	return accts, nil
+	return c.Mail().ListAccounts(ctx)
 }
 
 func (c *Client) CreateMailAccount(ctx context.Context, username, password string) (*MailAccount, error) {
-	body, err := json.Marshal(map[string]string{"username": username, "password": password})
-	if err != nil {
-		return nil, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/accounts", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var result MailAccount
-	if err := decodeResponse(resp, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return c.Mail().CreateAccount(ctx, username, password)
 }
 
 func (c *Client) UpdateMailAccountPassword(ctx context.Context, username, password string) error {
-	body, err := json.Marshal(map[string]string{"password": password})
-	if err != nil {
-		return err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.baseURL+"/api/mail/accounts/"+username, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return decodeResponse(resp, nil)
+	return c.Mail().UpdateAccountPassword(ctx, username, password)
 }
 
 func (c *Client) DeleteMailAccount(ctx context.Context, username string) error {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/mail/accounts/"+username, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return decodeResponse(resp, nil)
+	return c.Mail().DeleteAccount(ctx, username)
 }
 
 func (c *Client) AuthenticateMail(ctx context.Context, username, password string) (string, error) {
-	body, err := json.Marshal(map[string]string{"username": username, "password": password})
-	if err != nil {
-		return "", err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/login", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var result struct {
-		Username string `json:"username"`
-		Address  string `json:"address"`
-	}
-	if err := decodeResponse(resp, &result); err != nil {
-		return "", err
-	}
-	return result.Address, nil
+	return c.Mail().Authenticate(ctx, username, password)
 }
 
 func (c *Client) ListMailMessages(ctx context.Context, username, password string) ([]MailMessage, error) {
-	body, err := json.Marshal(map[string]string{"username": username, "password": password})
-	if err != nil {
-		return nil, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/inbox", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var msgs []MailMessage
-	if err := decodeResponse(resp, &msgs); err != nil {
-		return nil, err
-	}
-	return msgs, nil
+	return c.Mail().ListMessages(ctx, username, password)
 }
 
 func (c *Client) GetMailMessage(ctx context.Context, username, password string, messageID int64) (*MailMessageFull, error) {
-	body, err := json.Marshal(map[string]any{"username": username, "password": password, "messageId": messageID})
-	if err != nil {
-		return nil, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/message", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var result MailMessageFull
-	if err := decodeResponse(resp, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return c.Mail().GetMessage(ctx, username, password, messageID)
 }
 
 func (c *Client) DeleteMailMessage(ctx context.Context, username, password string, messageID int64) error {
-	body, err := json.Marshal(map[string]any{"username": username, "password": password, "messageId": messageID})
-	if err != nil {
-		return err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/delete", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return decodeResponse(resp, nil)
+	return c.Mail().DeleteMessage(ctx, username, password, messageID)
 }
 
 func (c *Client) LockMailService(ctx context.Context, locked bool) error {
-	body, err := json.Marshal(map[string]bool{"locked": locked})
-	if err != nil {
-		return err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/mail/lock", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return decodeResponse(resp, nil)
+	return c.Mail().SetLocked(ctx, locked)
 }
 
 func (c *Client) EventsURL() string {
