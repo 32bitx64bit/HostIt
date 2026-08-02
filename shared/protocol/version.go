@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"fmt"
-	"sort"
 
 	"hostit/shared/version"
 )
@@ -16,14 +15,13 @@ import (
 // (claim confirmation or operator override); Conflict means the proposed ID
 // belongs to a different agent and the agent must pick a new one.
 type VersionPayload struct {
-	Version         string   `json:"version"`
-	AgentID         string   `json:"agent_id,omitempty"`
-	Features        []string `json:"features,omitempty"`
-	Error           string   `json:"error,omitempty"`
-	PublicKey       []byte   `json:"public_key,omitempty"`
-	IdentitySig     []byte   `json:"identity_sig,omitempty"`
-	AssignedAgentID string   `json:"assigned_agent_id,omitempty"`
-	Conflict        bool     `json:"conflict,omitempty"`
+	Version         string `json:"version"`
+	AgentID         string `json:"agent_id,omitempty"`
+	Error           string `json:"error,omitempty"`
+	PublicKey       []byte `json:"public_key,omitempty"`
+	IdentitySig     []byte `json:"identity_sig,omitempty"`
+	AssignedAgentID string `json:"assigned_agent_id,omitempty"`
+	Conflict        bool   `json:"conflict,omitempty"`
 }
 
 // DefaultAgentID is assumed when an agent or route declares no ID.
@@ -35,51 +33,10 @@ const ProtocolVersion = "3.0.0"
 
 var ProtocolVersionParsed = version.MustParse(ProtocolVersion)
 
-const (
-	// FeatureBoundUDPRegister names protocol v3's mandatory UDP registration
-	// capability for diagnostics. Every v3 runtime must require the
-	// identity/control-generation-bound v4 format.
-	FeatureBoundUDPRegister = "udp-register-v4"
-)
-
-// SupportedFeatures are the capability identifiers advertised during version
-// negotiation. FeatureBoundUDPRegister is mandatory for protocol v3 runtimes.
-var SupportedFeatures = []string{FeatureBoundUDPRegister}
-
 func IsCompatibleWith(local, peer version.Version) bool {
 	return local.Major == peer.Major
 }
 
 func IncompatibleVersionError(local, peer version.Version) string {
 	return fmt.Sprintf("protocol version %s is incompatible with %s: major versions must match (update the older side)", peer, local)
-}
-
-// NegotiateFeatures returns the sorted intersection of local and peer features.
-func NegotiateFeatures(local, peer []string) []string {
-	if len(local) == 0 || len(peer) == 0 {
-		return nil
-	}
-	set := make(map[string]struct{}, len(local))
-	for _, f := range local {
-		set[f] = struct{}{}
-	}
-	var shared []string
-	for _, f := range peer {
-		if _, ok := set[f]; ok {
-			shared = append(shared, f)
-			delete(set, f) // dedupe
-		}
-	}
-	sort.Strings(shared)
-	return shared
-}
-
-// HasFeature reports whether a negotiated feature set contains feature.
-func HasFeature(features []string, feature string) bool {
-	for _, f := range features {
-		if f == feature {
-			return true
-		}
-	}
-	return false
 }

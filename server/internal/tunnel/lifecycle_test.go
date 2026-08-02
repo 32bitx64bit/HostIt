@@ -49,7 +49,7 @@ func dialControlForLifecycleTest(t *testing.T, controlAddr, token string) net.Co
 		t.Fatal(err)
 	}
 	pub, sig := testIdentity(serverNonce)
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures, PublicKey: pub, IdentitySig: sig})
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, PublicKey: pub, IdentitySig: sig})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		_ = conn.Close()
 		t.Fatal(err)

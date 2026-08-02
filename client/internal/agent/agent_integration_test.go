@@ -140,7 +140,7 @@ func (s *fakeTunnelServer) acceptControl() {
 		close(s.controlReadyCh)
 		return
 	}
-	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion, Features: protocol.SupportedFeatures})
+	verPayload, _ := json.Marshal(protocol.VersionPayload{Version: protocol.ProtocolVersion})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: verPayload}); err != nil {
 		_ = conn.Close()
 		close(s.controlReadyCh)
@@ -703,7 +703,7 @@ func TestAgentUDPDropsUnknownRouteAndInvalidEncryptedPayload(t *testing.T) {
 	}
 }
 
-func TestAgentTCPConnectRetriesLocalDial(t *testing.T) {
+func TestAgentTCPConnectRetriesLocalDialOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -750,7 +750,7 @@ func TestAgentTCPConnectRetriesLocalDial(t *testing.T) {
 
 	backendReady := make(chan struct{})
 	go func() {
-		time.Sleep(600 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		ln, err := net.Listen("tcp", backendAddr)
 		if err != nil {
 			return

@@ -57,7 +57,7 @@ func controlNegotiate(t *testing.T, controlAddr, token, agentID string, pub ed25
 	}
 	sig := crypto.SignIdentityChallenge(signWith, serverNonce)
 	payload, _ := json.Marshal(protocol.VersionPayload{
-		Version: protocol.ProtocolVersion, AgentID: agentID, Features: protocol.SupportedFeatures, PublicKey: pub, IdentitySig: sig,
+		Version: protocol.ProtocolVersion, AgentID: agentID, PublicKey: pub, IdentitySig: sig,
 	})
 	if err := protocol.WritePacket(conn, &protocol.Packet{Type: protocol.TypeVersionNegotiate, Payload: payload}); err != nil {
 		t.Fatalf("write version: %v", err)
