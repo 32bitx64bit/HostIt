@@ -213,8 +213,7 @@ function buildConfig(){
     Ember.field({label:'Dashboard cert',hint:CFG.webTLSFP?('Cert sha256: '+CFG.webTLSFP):'No dashboard cert generated yet.',content:Ember.button({id:'regenWebBtn',text:'Regen dashboard cert',variant:'danger',cls:'sm'})})+
     Ember.field({label:'Encryption algorithm',hint:'Global encryption standard for tunnel traffic.',content:Ember.select({id:'cfgEnc',options:[
       {value:'none',label:'None',selected:encVal==='none'},
-      {value:'aes-128',label:'AES-128',selected:encVal==='aes-128'},
-      {value:'aes-256',label:'AES-256',selected:encVal==='aes-256'}
+      {value:'aes-256',label:'AES-256',selected:encVal==='aes-256'||encVal==='aes-128'}
     ]})})+
     '<div class="btn-row">'+Ember.button({id:'saveSecurity',text:'Save + restart',variant:'primary'})+'</div>'
   });

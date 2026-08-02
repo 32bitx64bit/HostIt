@@ -406,13 +406,11 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
-	if hasEncryptedRoute {
-		alg := strings.ToLower(strings.TrimSpace(c.EncryptionAlgorithm))
-		if alg == "" {
-			errs = append(errs, "encryption_algorithm is required when any route has encrypted=true")
-		} else if alg != "aes-128" && alg != "aes-256" && alg != "none" {
-			errs = append(errs, fmt.Sprintf("encryption_algorithm must be aes-128, aes-256, or none, got %q", c.EncryptionAlgorithm))
-		}
+	alg := strings.ToLower(strings.TrimSpace(c.EncryptionAlgorithm))
+	if hasEncryptedRoute && alg == "" {
+		errs = append(errs, "encryption_algorithm is required when any route has encrypted=true")
+	} else if alg != "" && alg != "aes-256" && alg != "none" {
+		errs = append(errs, fmt.Sprintf("encryption_algorithm must be aes-256 or none, got %q", c.EncryptionAlgorithm))
 	}
 
 	if len(errs) > 0 {

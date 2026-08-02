@@ -30,7 +30,8 @@ func DeriveKey(token string, alg string) ([]byte, error) {
 
 	switch strings.ToLower(alg) {
 	case AlgAES128:
-		return pbkdf2.Key(sha256.New, token, salt, 600_000, 16)
+		// Accept legacy peers while using the single AES-256 key size.
+		return pbkdf2.Key(sha256.New, token, salt, 600_000, 32)
 	case AlgAES256:
 		return pbkdf2.Key(sha256.New, token, salt, 600_000, 32)
 	case AlgNone, "":

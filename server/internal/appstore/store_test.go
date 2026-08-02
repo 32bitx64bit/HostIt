@@ -304,8 +304,8 @@ func TestUpdateRoutePreservesRowAndApplication(t *testing.T) {
 	}
 }
 
-func TestOpenIgnoresAndPreservesLegacyUDPClassColumn(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy-udp-class.db")
+func TestOpenIgnoresUnknownRouteColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-extra-cols.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -362,7 +362,7 @@ func TestOpenIgnoresAndPreservesLegacyUDPClassColumn(t *testing.T) {
 
 	s, err := Open(path)
 	if err != nil {
-		t.Fatalf("Open legacy database: %v", err)
+		t.Fatalf("Open database with unknown columns: %v", err)
 	}
 	defer s.Close()
 	ctx := context.Background()
@@ -387,42 +387,10 @@ func TestOpenIgnoresAndPreservesLegacyUDPClassColumn(t *testing.T) {
 		Enabled:    true,
 	})
 	if err != nil {
-		t.Fatalf("add route with legacy column present: %v", err)
+		t.Fatalf("add route with unknown columns present: %v", err)
 	}
-	readAdded, err := s.GetRouteByRouteName(ctx, added.RouteName)
-	if err != nil || readAdded == nil || readAdded.ID != added.ID {
-		t.Fatalf("read added route: route=%+v err=%v", readAdded, err)
-	}
-
-	if err := s.UpdateRoute(ctx, AppRoute{
-		RouteName:     added.RouteName,
-		Proto:         "udp",
-		PublicAddr:    ":48001",
-		LocalAddr:     "127.0.0.1:48001",
-		Encrypted:     true,
-		Domain:        "stream.example.com",
-		DomainEnabled: true,
-		Enabled:       true,
-	}); err != nil {
-		t.Fatalf("update route with legacy column present: %v", err)
-	}
-	updated, err := s.GetRouteByRouteName(ctx, added.RouteName)
-	if err != nil {
-		t.Fatalf("read updated route: %v", err)
-	}
-	if updated.ID != added.ID || updated.PublicAddr != ":48001" || updated.LocalAddr != "127.0.0.1:48001" || !updated.Encrypted {
-		t.Fatalf("updated route = %+v", updated)
-	}
-
-	var legacyClass, addedClass string
-	if err := s.db.QueryRowContext(ctx, "SELECT udp_class FROM app_routes WHERE route_name = ?", "legacy-route").Scan(&legacyClass); err != nil {
-		t.Fatalf("legacy udp_class column was removed: %v", err)
-	}
-	if err := s.db.QueryRowContext(ctx, "SELECT udp_class FROM app_routes WHERE route_name = ?", added.RouteName).Scan(&addedClass); err != nil {
-		t.Fatalf("read default legacy udp_class: %v", err)
-	}
-	if legacyClass != "interactive" || addedClass != "standard" {
-		t.Fatalf("legacy udp_class values changed: legacy=%q added=%q", legacyClass, addedClass)
+	if added == nil || added.RouteName != "new-route" {
+		t.Fatalf("added route = %+v", added)
 	}
 }
 

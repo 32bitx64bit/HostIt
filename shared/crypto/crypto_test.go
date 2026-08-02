@@ -598,12 +598,12 @@ func TestCryptoConnRejectsDroppedFrame(t *testing.T) {
 }
 
 func TestDeriveKeyEdgeCases(t *testing.T) {
-	key128, err := DeriveKey("test-token", AlgAES128)
+	legacyKey, err := DeriveKey("test-token", AlgAES128)
 	if err != nil {
-		t.Fatalf("DeriveKey AES-128: %v", err)
+		t.Fatalf("DeriveKey legacy AES-128: %v", err)
 	}
-	if len(key128) != 16 {
-		t.Fatalf("AES-128 key length = %d, want 16", len(key128))
+	if len(legacyKey) != 32 {
+		t.Fatalf("legacy AES-128 key length = %d, want 32", len(legacyKey))
 	}
 
 	key256, err := DeriveKey("test-token", AlgAES256)

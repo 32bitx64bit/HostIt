@@ -97,7 +97,7 @@ func main() {
 		TLSKeyFile:  tlsKey,
 		PairTimeout: pairTimeout,
 	}
-	loaded, _ := configio.Load(configPath, &cfg)
+	_, _ = configio.Load(configPath, &cfg)
 	if disableTLS {
 		cfg.DisableTLS = true
 	}
@@ -107,13 +107,25 @@ func main() {
 	if strings.TrimSpace(tlsKey) != "" {
 		cfg.TLSKeyFile = tlsKey
 	}
-	// Default encryption: aes-128 for fresh installs (~14% faster than aes-256 on AES-NI),
-	// "none" for existing installs so upgrades are not silently opted-in.
+	// Normalize legacy encryption settings before validation. Empty encrypted
+	// configurations opt into the current AES-256 standard; empty unencrypted
+	// configurations remain plaintext for upgrade compatibility.
+	if strings.EqualFold(strings.TrimSpace(cfg.EncryptionAlgorithm), crypto.AlgAES128) {
+		slog.Warn(logging.CatSystem, "aes-128 is deprecated; coercing encryption algorithm to aes-256")
+		cfg.EncryptionAlgorithm = crypto.AlgAES256
+	}
 	if cfg.EncryptionAlgorithm == "" {
-		if !loaded {
-			cfg.EncryptionAlgorithm = "aes-128"
+		hasEncryptedRoute := false
+		for _, route := range cfg.Routes {
+			if route.IsEncrypted() {
+				hasEncryptedRoute = true
+				break
+			}
+		}
+		if hasEncryptedRoute {
+			cfg.EncryptionAlgorithm = crypto.AlgAES256
 		} else {
-			cfg.EncryptionAlgorithm = "none"
+			cfg.EncryptionAlgorithm = crypto.AlgNone
 		}
 	}
 
