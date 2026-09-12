@@ -1,0 +1,40 @@
+name: Sign Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to sign
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: shared/go.mod
+
+      - name: Sign release zips
+        env:
+          HOSTIT_UPDATE_SIGNING_KEY: ${{ secrets.HOSTIT_UPDATE_SIGNING_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          if [ -z "$tag" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          if [ -z "$HOSTIT_UPDATE_SIGNING_KEY" ]; then
+            echo "HOSTIT_UPDATE_SIGNING_KEY secret is not set; cannot publish update signatures."
+            exit 1
+          fi
+          (cd shared && go run ./cmd/sign-release -tag "$tag")

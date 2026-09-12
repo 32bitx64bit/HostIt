@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const Current = "3.2.1"
+const Current = "3.2.2"
 
 type Version struct {
 	Major int
