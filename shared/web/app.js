@@ -67,11 +67,17 @@ function setStatus(id, text, kind) {
   if (!el) return;
   var span = el.querySelector('span:last-child');
   if (span) span.textContent = text;
+  else el.textContent = text;
   el.classList.remove('flash', 'err');
   if (kind === 'ok') el.classList.add('flash');
-  if (kind === 'err') el.classList.add('err');
+  if (kind === 'err') {
+    el.classList.add('err');
+    try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {}
+  }
   clearTimeout(el._t);
-  el._t = setTimeout(function () { el.classList.remove('flash', 'err'); }, 2200);
+  if (kind !== 'err') {
+    el._t = setTimeout(function () { el.classList.remove('flash', 'err'); }, 2200);
+  }
 }
 
 function drawBars(cfg) {

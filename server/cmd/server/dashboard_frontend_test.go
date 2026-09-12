@@ -70,7 +70,7 @@ func TestDashboardTemplateRendersAndPollsStats(t *testing.T) {
 
 func TestConfigTemplateRenders(t *testing.T) {
 	html := mustReadTemplate(t, "templates/config.html")
-	for _, want := range []string{"/config/save", "route_count"} {
+	for _, want := range []string{"/config/save", "route_count", "function validateConfig("} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("config template missing %q", want)
 		}

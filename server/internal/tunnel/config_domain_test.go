@@ -37,6 +37,22 @@ func TestServerConfigValidate_AllowsManagedDomainRoute(t *testing.T) {
 	}
 }
 
+func TestServerConfigValidate_RequiresDomainBaseWhenManagerEnabled(t *testing.T) {
+	cfg := ServerConfig{
+		ControlAddr:          ":7000",
+		DataAddr:             ":7001",
+		Token:                "test-token",
+		DisableTLS:           true,
+		DomainManagerEnabled: true,
+		DomainHTTPSAddr:      ":443",
+	}
+	cfg.Email = emailcfg.Normalize(cfg.Email)
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "domain_base is required") {
+		t.Fatalf("Validate() error = %v, want domain_base required", err)
+	}
+}
+
 func TestServerConfigValidate_RejectsRouteDomainOutsideBase(t *testing.T) {
 	domainEnabled := true
 	cfg := ServerConfig{

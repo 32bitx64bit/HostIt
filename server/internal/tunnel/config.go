@@ -287,7 +287,9 @@ func (c *ServerConfig) Validate() error {
 				errs = append(errs, fmt.Sprintf("domain_http_addr is invalid: %v", err))
 			}
 		}
-		if err := validateHostname(c.DomainBase); err != nil {
+		if strings.TrimSpace(c.DomainBase) == "" {
+			errs = append(errs, "domain_base is required when domain manager is enabled (e.g. example.com)")
+		} else if err := validateHostname(c.DomainBase); err != nil {
 			errs = append(errs, fmt.Sprintf("domain_base is invalid: %v", err))
 		}
 		if c.DomainAutoTLS && strings.TrimSpace(c.DomainHTTPAddr) == "" {

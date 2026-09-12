@@ -136,6 +136,16 @@ function collectRoutes(){
   return out;
 }
 
+function cleanHost(s){
+  s=String(s||'').trim();
+  if(!s)return '';
+  s=s.replace(/^https?:\/\//i,'');
+  s=s.replace(/[/?#].*$/,'');
+  s=s.replace(/:\d+$/,'');
+  s=s.replace(/\.$/,'').toLowerCase();
+  return s;
+}
+
 function collectConfig(){
   var d={};
   d.control=val('cfgControl');
@@ -145,7 +155,7 @@ function collectConfig(){
   d.encryption_algorithm=val('cfgEnc');
   d.web_https=chk('cfgWebHttps')?'1':'';
   d.domain_manager_enabled=chk('cfgDomainEnabled')?'1':'';
-  d.domain_base=val('cfgDomainBase');
+  d.domain_base=cleanHost(val('cfgDomainBase'));
   d.domain_auto_tls=chk('cfgDomainAutoTLS')?'1':'';
   d.domain_http_addr=val('cfgDomainHTTP');
   d.domain_https_addr=val('cfgDomainHTTPS');
@@ -158,22 +168,63 @@ function collectConfig(){
     d['route_'+i+'_proto']=r.proto;
     d['route_'+i+'_public']=r.pub;
     d['route_'+i+'_local']=r.local;
-    d['route_'+i+'_domain']=r.domain;
+    d['route_'+i+'_domain']=cleanHost(r.domain);
     d['route_'+i+'_encrypted']=r.encrypted?'1':'';
-    d['route_'+i+'_domain_enabled']=r.domainEnabled?'1':'';
+    d['route_'+i+'_domain_enabled']=(r.domainEnabled && d.domain_manager_enabled)?'1':'';
   });
   return d;
+}
+
+function configSaveError(msg, focusId){
+  setStatus('cfgStatus','error: '+msg,'err');
+  var el=focusId?$('#'+focusId):$('#cfgStatus');
+  if(el){
+    try{el.scrollIntoView({block:'center',behavior:'smooth'});}catch(e){}
+    if(focusId&&el.focus)try{el.focus();}catch(e){}
+  }
+}
+
+function validateConfig(d){
+  if(d.domain_manager_enabled){
+    if(!d.domain_base){
+      configSaveError('base domain is required when Domain Manager is on (e.g. example.com, not a URL)','cfgDomainBase');
+      return false;
+    }
+    if(d.domain_base.indexOf('.')<0){
+      configSaveError('base domain must be a full domain like example.com','cfgDomainBase');
+      return false;
+    }
+    if(d.domain_auto_tls && !String(d.domain_acme_email||'').trim()){
+      configSaveError('ACME email is required when Automatic TLS is on','cfgACMEEmail');
+      return false;
+    }
+  }
+  var routes=collectRoutes();
+  for(var i=0;i<routes.length;i++){
+    if(!routes[i].domainEnabled||!d.domain_manager_enabled)continue;
+    if(!cleanHost(routes[i].domain)){
+      configSaveError('route #'+i+' has Domain Routing on but no managed domain','rdom_'+i);
+      return false;
+    }
+  }
+  return true;
 }
 
 async function saveConfig(extra){
   var d=collectConfig();
   if(extra)for(var k in extra)d[k]=extra[k];
+  if(!validateConfig(d))return;
   setStatus('cfgStatus','saving + restarting...','ok');
   try{
     var res=await apiPost('/config/save',d);
     if(res.ok){setStatus('cfgStatus','saved + restarted','ok');scheduleReload();}
-    else{var t=await res.text();setStatus('cfgStatus','error: '+t.slice(0,160),'err');}
-  }catch(e){setStatus('cfgStatus','error: '+e.message,'err');}
+    else{
+      var t=await res.text();
+      var msg=t.replace(/\s+/g,' ').trim();
+      try{var j=JSON.parse(t);if(j&&j.message)msg=j.message;}catch(e){}
+      configSaveError(msg.slice(0,400));
+    }
+  }catch(e){configSaveError(e.message||String(e));}
 }
 
 async function genToken(){
@@ -218,7 +269,7 @@ function buildConfig(){
 
   var domain=Ember.panel({title:'Domain Manager',cls:'mt12',body:
     Ember.field({label:'Enable Domain Manager',hint:'Serve web traffic by hostname and forward it through the encrypted tunnel to the agent.',content:Ember.toggle({id:'cfgDomainEnabled',labelId:'cfgDomainEnabledLbl',label:CFG.domainManagerEnabled?'on':'off',checked:CFG.domainManagerEnabled})})+
-    Ember.field({label:'Base domain',hint:'Routes must use this apex domain or one of its subdomains, e.g. example.com.',content:Ember.input({id:'cfgDomainBase',value:CFG.domainBase,placeholder:'example.com'})})+
+    Ember.field({label:'Base domain',hint:'Required if Domain Manager is on. Apex only, no https:// and no port — type example.com.',content:Ember.input({id:'cfgDomainBase',value:CFG.domainBase,placeholder:'example.com'})})+
     Ember.field({label:'Automatic TLS',hint:'Issue and renew public certificates automatically.',content:Ember.toggle({id:'cfgDomainAutoTLS',labelId:'cfgDomainAutoTLSLbl',label:CFG.domainAutoTLS?'on':'off',checked:CFG.domainAutoTLS})})+
     Ember.field({label:'HTTP bind',hint:'Plain HTTP listener for redirects and ACME HTTP-01 challenges.',content:Ember.input({id:'cfgDomainHTTP',value:CFG.domainHTTPAddr,placeholder:':80'})})+
     Ember.field({label:'HTTPS bind',hint:'TLS listener for managed domains.',content:Ember.input({id:'cfgDomainHTTPS',value:CFG.domainHTTPSAddr,placeholder:':443'})})+

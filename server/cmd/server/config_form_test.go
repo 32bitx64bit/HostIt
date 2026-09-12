@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"hostit/server/internal/tunnel"
 )
@@ -75,5 +76,77 @@ func TestParseServerRoutesFormTruncatesLongAgent(t *testing.T) {
 	}
 	if len(routes[0].Agent) != 255 {
 		t.Errorf("over-long agent id not truncated: len=%d", len(routes[0].Agent))
+	}
+}
+
+func TestSanitizeHostnameInputStripsURLChrome(t *testing.T) {
+	cases := map[string]string{
+		"":                                 "",
+		"example.com":                      "example.com",
+		"EXAMPLE.COM.":                     "example.com",
+		"https://example.com":              "example.com",
+		"http://app.example.com/":          "app.example.com",
+		"https://app.example.com:443/path": "app.example.com",
+		"app.example.com:443":              "app.example.com",
+	}
+	for in, want := range cases {
+		if got := sanitizeHostnameInput(in); got != want {
+			t.Errorf("sanitizeHostnameInput(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestParseServerRoutesFormSanitizesDomain(t *testing.T) {
+	form := url.Values{}
+	form.Set("route_count", "1")
+	form.Set("route_0_name", "web")
+	form.Set("route_0_proto", "tcp")
+	form.Set("route_0_local", "127.0.0.1:3000")
+	form.Set("route_0_domain", "https://app.example.com:443")
+	form.Set("route_0_domain_enabled", "1")
+
+	routes := parseServerRoutesForm(&http.Request{Form: form}, nil)
+	if len(routes) != 1 {
+		t.Fatalf("want 1 route, got %d", len(routes))
+	}
+	if routes[0].Domain != "app.example.com" {
+		t.Errorf("domain = %q, want app.example.com", routes[0].Domain)
+	}
+}
+
+func TestParsePairTimeoutForm(t *testing.T) {
+	pt, err := parsePairTimeoutForm("10s", 0)
+	if err != nil || pt != 10*time.Second {
+		t.Fatalf("10s: got %v, %v", pt, err)
+	}
+	pt, err = parsePairTimeoutForm("10", 0)
+	if err != nil || pt != 10*time.Second {
+		t.Fatalf("bare 10: got %v, %v", pt, err)
+	}
+	pt, err = parsePairTimeoutForm("", 8*time.Second)
+	if err != nil || pt != 8*time.Second {
+		t.Fatalf("empty with fallback: got %v, %v", pt, err)
+	}
+	if _, err := parsePairTimeoutForm("nope", 10*time.Second); err == nil {
+		t.Fatal("expected error for invalid pair timeout")
+	}
+}
+
+func TestDisableDomainManagerExtras(t *testing.T) {
+	on := true
+	cfg := tunnel.ServerConfig{
+		DomainManagerEnabled: false,
+		DomainAutoTLS:        true,
+		Routes: []tunnel.RouteConfig{{
+			Name:          "web",
+			DomainEnabled: &on,
+		}},
+	}
+	disableDomainManagerExtras(&cfg)
+	if cfg.DomainAutoTLS {
+		t.Fatal("auto TLS should be cleared when domain manager is off")
+	}
+	if cfg.Routes[0].IsDomainEnabled() {
+		t.Fatal("route domain routing should be cleared when domain manager is off")
 	}
 }

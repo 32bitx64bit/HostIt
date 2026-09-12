@@ -1649,20 +1649,6 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				http.Error(w, "csrf", http.StatusBadRequest)
 				return
 			}
-			pt, err := time.ParseDuration(r.Form.Get("pair_timeout"))
-			if err != nil {
-				http.Error(w, "invalid pair timeout", http.StatusBadRequest)
-				return
-			}
-			if pt < 1*time.Second {
-				http.Error(w, "pair timeout must be at least 1 second", http.StatusBadRequest)
-				return
-			}
-			if pt > 5*time.Minute {
-				http.Error(w, "pair timeout must be at most 5 minutes", http.StatusBadRequest)
-				return
-			}
-
 			msgs := make([]string, 0, 3)
 			addMsg := func(s string) {
 				if strings.TrimSpace(s) == "" {
@@ -1671,6 +1657,11 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				msgs = append(msgs, s)
 			}
 			old, _, _ := runner.Get()
+			pt, err := parsePairTimeoutForm(r.Form.Get("pair_timeout"), old.PairTimeout)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			cfg := old
 			webWas := cfg.WebHTTPS
 			cfg.ControlAddr = r.Form.Get("control")
@@ -1681,7 +1672,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 			cfg.DomainManagerEnabled = strings.TrimSpace(r.Form.Get("domain_manager_enabled")) != ""
 			cfg.DomainHTTPAddr = strings.TrimSpace(r.Form.Get("domain_http_addr"))
 			cfg.DomainHTTPSAddr = strings.TrimSpace(r.Form.Get("domain_https_addr"))
-			cfg.DomainBase = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(r.Form.Get("domain_base"))), ".")
+			cfg.DomainBase = sanitizeHostnameInput(r.Form.Get("domain_base"))
 			cfg.DomainAutoTLS = strings.TrimSpace(r.Form.Get("domain_auto_tls")) != ""
 			cfg.DomainACMEEmail = strings.TrimSpace(r.Form.Get("domain_acme_email"))
 			cfg.EncryptionAlgorithm = r.Form.Get("encryption_algorithm")
@@ -1695,6 +1686,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				addMsg("Token was empty; generated a new token")
 			}
 			cfg.Routes = parseServerRoutesForm(r, old.Routes)
+			disableDomainManagerExtras(&cfg)
 
 			if strings.TrimSpace(r.Form.Get("tls_regen")) != "" {
 				if cfg.DisableTLS {
@@ -1795,7 +1787,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				_, _ = fmt.Fprintf(w, "<!doctype html><html><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>Redirect</title></head><body style=\"font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px\"><h2>Dashboard HTTPS updated</h2><p>Open: <a href=\"%s\">%s</a></p><p style=\"opacity:.8\">Self-signed certs will show a browser warning; that's expected.</p></body></html>", target, target)
 				return
 			}
-			http.Redirect(w, r, "/config", http.StatusSeeOther)
+			writeJSON(w, map[string]any{"status": "ok"})
 		})))
 
 		mux.HandleFunc("/email/save", securityHeaders(cookieSecure, requireAuth(store, cookieSecure, sessionTTL, func(w http.ResponseWriter, r *http.Request) {
@@ -2222,6 +2214,66 @@ func writeUploadedZipTemp(r *http.Request, fieldName string, pattern string) (st
 	return name, true, nil
 }
 
+func sanitizeHostnameInput(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	lower := strings.ToLower(host)
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		host = strings.TrimSpace(host[len("https://"):])
+	case strings.HasPrefix(lower, "http://"):
+		host = strings.TrimSpace(host[len("http://"):])
+	}
+	if i := strings.IndexAny(host, "/?#"); i >= 0 {
+		host = host[:i]
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+}
+
+func parsePairTimeoutForm(raw string, fallback time.Duration) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if fallback >= time.Second {
+			return fallback, nil
+		}
+		return 10 * time.Second, nil
+	}
+	pt, err := time.ParseDuration(raw)
+	if err != nil {
+		n, err2 := strconv.ParseFloat(raw, 64)
+		if err2 != nil || n < 1 {
+			return 0, fmt.Errorf("invalid pair timeout %q (use 10s)", raw)
+		}
+		pt = time.Duration(n * float64(time.Second))
+	}
+	if pt < time.Second {
+		return 0, fmt.Errorf("pair timeout must be at least 1 second")
+	}
+	if pt > 5*time.Minute {
+		return 0, fmt.Errorf("pair timeout must be at most 5 minutes")
+	}
+	return pt, nil
+}
+
+func disableDomainManagerExtras(cfg *tunnel.ServerConfig) {
+	if cfg == nil || cfg.DomainManagerEnabled {
+		return
+	}
+	cfg.DomainAutoTLS = false
+	off := false
+	for i := range cfg.Routes {
+		if cfg.Routes[i].IsDomainEnabled() {
+			v := off
+			cfg.Routes[i].DomainEnabled = &v
+		}
+	}
+}
+
 func parseServerRoutesForm(r *http.Request, existing []tunnel.RouteConfig) []tunnel.RouteConfig {
 	count, _ := strconv.Atoi(strings.TrimSpace(r.Form.Get("route_count")))
 	if count < 0 {
@@ -2250,7 +2302,7 @@ func parseServerRoutesForm(r *http.Request, existing []tunnel.RouteConfig) []tun
 		proto := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_proto"))
 		pub := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_public"))
 		local := strings.TrimSpace(r.Form.Get("route_" + strconv.Itoa(i) + "_local"))
-		domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(r.Form.Get("route_"+strconv.Itoa(i)+"_domain"))), ".")
+		domain := sanitizeHostnameInput(r.Form.Get("route_" + strconv.Itoa(i) + "_domain"))
 		if name == "" && proto == "" && pub == "" && local == "" && domain == "" {
 			continue
 		}
