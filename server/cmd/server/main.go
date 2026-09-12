@@ -1686,6 +1686,7 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				addMsg("Token was empty; generated a new token")
 			}
 			cfg.Routes = parseServerRoutesForm(r, old.Routes)
+			tunnel.RewriteHostnamesForBaseChange(&cfg, old.DomainBase, cfg.DomainBase)
 			disableDomainManagerExtras(&cfg)
 
 			if strings.TrimSpace(r.Form.Get("tls_regen")) != "" {
@@ -1805,12 +1806,14 @@ func serveServerDashboard(ctx context.Context, addr string, configPath string, a
 				return
 			}
 			cfg, _, _ := runner.Get()
+			oldBase := cfg.DomainBase
 			emailCfg, err := parseServerEmailForm(r, cfg.Email)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 			cfg.Email = emailcfg.Normalize(emailCfg)
+			tunnel.AlignEmailWithDomainBase(&cfg, oldBase)
 			if err := cfg.Validate(); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return

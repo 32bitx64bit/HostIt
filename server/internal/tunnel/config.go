@@ -113,6 +113,63 @@ func hostnameWithinBase(host, base string) bool {
 	return host == base || strings.HasSuffix(host, "."+base)
 }
 
+func rewriteHostnameBase(host, oldBase, newBase string) string {
+	host = normalizeHostname(host)
+	oldBase = normalizeHostname(oldBase)
+	newBase = normalizeHostname(newBase)
+	if host == "" || oldBase == "" || newBase == "" {
+		return host
+	}
+	if host == oldBase {
+		return newBase
+	}
+	if strings.HasSuffix(host, "."+oldBase) {
+		return host[:len(host)-len(oldBase)] + newBase
+	}
+	return host
+}
+
+// RewriteHostnamesForBaseChange remaps email and route hostnames that lived
+// under oldBase onto newBase. Changing the managed base domain or the email
+// mailbox domain uses this so one panel save cannot 400 against the other.
+func RewriteHostnamesForBaseChange(cfg *ServerConfig, oldBase, newBase string) {
+	if cfg == nil {
+		return
+	}
+	oldBase = normalizeHostname(oldBase)
+	newBase = normalizeHostname(newBase)
+	if newBase == "" || oldBase == newBase {
+		return
+	}
+	if oldBase == "" {
+		emailDomain := normalizeHostname(cfg.Email.Domain)
+		if emailDomain == "" || hostnameWithinBase(emailDomain, newBase) {
+			return
+		}
+		oldBase = emailDomain
+	}
+	cfg.DomainBase = newBase
+	cfg.Email.Domain = rewriteHostnameBase(cfg.Email.Domain, oldBase, newBase)
+	cfg.Email.MailHost = rewriteHostnameBase(cfg.Email.MailHost, oldBase, newBase)
+	for i := range cfg.Routes {
+		cfg.Routes[i].Domain = rewriteHostnameBase(cfg.Routes[i].Domain, oldBase, newBase)
+	}
+}
+
+// AlignEmailWithDomainBase remaps the managed base and route hostnames when
+// the operator changes the email mailbox domain off the current base.
+func AlignEmailWithDomainBase(cfg *ServerConfig, oldBase string) {
+	if cfg == nil {
+		return
+	}
+	oldBase = normalizeHostname(oldBase)
+	newDomain := normalizeHostname(cfg.Email.Domain)
+	if oldBase == "" || newDomain == "" || hostnameWithinBase(newDomain, oldBase) {
+		return
+	}
+	RewriteHostnamesForBaseChange(cfg, oldBase, newDomain)
+}
+
 func validateRouteName(name string) error {
 	name = strings.TrimSpace(name)
 	if len(name) == 0 {

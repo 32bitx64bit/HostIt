@@ -269,7 +269,7 @@ function buildConfig(){
 
   var domain=Ember.panel({title:'Domain Manager',cls:'mt12',body:
     Ember.field({label:'Enable Domain Manager',hint:'Serve web traffic by hostname and forward it through the encrypted tunnel to the agent.',content:Ember.toggle({id:'cfgDomainEnabled',labelId:'cfgDomainEnabledLbl',label:CFG.domainManagerEnabled?'on':'off',checked:CFG.domainManagerEnabled})})+
-    Ember.field({label:'Base domain',hint:'Required if Domain Manager is on. Apex only, no https:// and no port — type example.com.',content:Ember.input({id:'cfgDomainBase',value:CFG.domainBase,placeholder:'example.com'})})+
+    Ember.field({label:'Base domain',hint:'Required if Domain Manager is on. Apex only, no https:// and no port. Saving a new base remaps email and route hostnames that used the old one.',content:Ember.input({id:'cfgDomainBase',value:CFG.domainBase,placeholder:'example.com'})})+
     Ember.field({label:'Automatic TLS',hint:'Issue and renew public certificates automatically.',content:Ember.toggle({id:'cfgDomainAutoTLS',labelId:'cfgDomainAutoTLSLbl',label:CFG.domainAutoTLS?'on':'off',checked:CFG.domainAutoTLS})})+
     Ember.field({label:'HTTP bind',hint:'Plain HTTP listener for redirects and ACME HTTP-01 challenges.',content:Ember.input({id:'cfgDomainHTTP',value:CFG.domainHTTPAddr,placeholder:':80'})})+
     Ember.field({label:'HTTPS bind',hint:'TLS listener for managed domains.',content:Ember.input({id:'cfgDomainHTTPS',value:CFG.domainHTTPSAddr,placeholder:':443'})})+

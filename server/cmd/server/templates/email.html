@@ -163,7 +163,7 @@ function buildEmail(){
 
   var mailBody='<div class="grid cols-2">'+
     Ember.field({label:'Enable Email',hint:'Turns on the built-in local mail stack on the agent.',content:Ember.toggle({id:'emailEnabled',labelId:'emailEnabledLbl',label:CFG.enabled?'on':'off',checked:CFG.enabled})})+
-    Ember.field({label:'Domain',hint:'Mailbox domain. The exact part after @ in your addresses.',content:Ember.input({id:'emailDomain',value:CFG.domain,placeholder:'example.com'})})+
+    Ember.field({label:'Domain',hint:'Mailbox domain after @. Changing this to a new apex also updates the Domain Manager base and route hostnames under the old domain.',content:Ember.input({id:'emailDomain',value:CFG.domain,placeholder:'example.com'})})+
     Ember.field({label:'Mail Host',hint:'Public server hostname for SMTP/TLS. Usually mail.&lt;domain&gt;.',content:Ember.input({id:'emailMailHost',value:CFG.mailHost,placeholder:'mail.example.com'})})+
     Ember.field({label:'Automatic Public TLS',hint:'Use Let\'s Encrypt for the mail host so clients get a trusted cert.',content:Ember.toggle({id:'emailAutoTLS',labelId:'emailAutoTLSLbl',label:CFG.autoTLS?'on':'off',checked:CFG.autoTLS})})+
     Ember.field({label:'ACME Email',hint:'Let\'s Encrypt registration email. Required when Auto TLS is on.',content:Ember.input({id:'emailACMEEmail',value:CFG.acmeEmail,placeholder:'admin@example.com'})})+
